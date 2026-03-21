@@ -6,6 +6,7 @@ Factory functions for Google API clients.
 
 from __future__ import annotations
 
+import json
 import os
 
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
@@ -45,9 +46,22 @@ def build_oauth_flow(settings: Settings) -> Flow:
 
 
 def build_drive_service(settings: Settings) -> Resource:
-    """Return an authenticated Google Drive API v3 service using a service account."""
-    credentials = ServiceAccountCredentials.from_service_account_file(
-        settings.GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=DRIVE_SCOPES,
-    )
+    """
+    Return an authenticated Google Drive API v3 service using a service account.
+
+    Credential resolution order:
+      1. GOOGLE_SERVICE_ACCOUNT_JSON env var (raw JSON string) — used in production.
+      2. GOOGLE_SERVICE_ACCOUNT_FILE path (local JSON file)   — used in local dev.
+    """
+    if settings.GOOGLE_SERVICE_ACCOUNT_JSON:
+        info = json.loads(settings.GOOGLE_SERVICE_ACCOUNT_JSON)
+        credentials = ServiceAccountCredentials.from_service_account_info(
+            info,
+            scopes=DRIVE_SCOPES,
+        )
+    else:
+        credentials = ServiceAccountCredentials.from_service_account_file(
+            settings.GOOGLE_SERVICE_ACCOUNT_FILE,
+            scopes=DRIVE_SCOPES,
+        )
     return build("drive", "v3", credentials=credentials, cache_discovery=False)

@@ -32,7 +32,9 @@ class Settings(BaseSettings):
 
     # ── Google Drive ───────────────────────────────────────────────────
     GOOGLE_DRIVE_FOLDER_ID: str
-    # Path to a GCP service-account JSON key (for server-side Drive access)
+    # Production: store the entire service-account JSON as a string in this var.
+    # Local dev fallback: path to the JSON key file.
+    GOOGLE_SERVICE_ACCOUNT_JSON: str | None = None
     GOOGLE_SERVICE_ACCOUNT_FILE: str = "service_account.json"
 
     # ── Dify.ai ────────────────────────────────────────────────────────
