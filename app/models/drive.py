@@ -17,5 +17,7 @@ class DriveFile(BaseModel):
 
 class DriveFileList(BaseModel):
     """Paginated list of files from a Drive folder."""
+    folder_id: str
+    folder_name: str
     files: list[DriveFile]
     next_page_token: str | None = None

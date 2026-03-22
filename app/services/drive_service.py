@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _FILE_FIELDS = (
     "id, name, mimeType, webViewLink, webContentLink, createdTime, modifiedTime, size"
 )
+_FOLDER_FIELDS = "id, name"
 
 
 class DriveService:
@@ -75,10 +76,32 @@ class DriveService:
             for f in response.get("files", [])
         ]
 
+        folder_name = self._get_folder_name(folder_id)
+
         return DriveFileList(
+            folder_id=folder_id,
+            folder_name=folder_name,
             files=files,
             next_page_token=response.get("nextPageToken"),
         )
+
+    # ── Folder name helper ─────────────────────────────────────────────
+    def _get_folder_name(self, folder_id: str) -> str:
+        """Fetch just the name of the folder itself."""
+        try:
+            folder: dict[str, Any] = (
+                self._service.files()
+                .get(
+                    fileId=folder_id,
+                    fields=_FOLDER_FIELDS,
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+            return folder.get("name", folder_id)
+        except HttpError as exc:
+            logger.warning("Could not fetch folder name for %s: %s", folder_id, exc)
+            return folder_id  # Graceful fallback: return the ID instead of failing
 
     # ── Get metadata for a single file ─────────────────────────────────
     def get_file(self, file_id: str) -> DriveFile:
