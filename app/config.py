@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     # ── App ────────────────────────────────────────────────────────────
     APP_NAME: str = "RenPhil Hub API"
     DEBUG: bool = False
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000", "https://renphil-hub.web.app", "https://renphil-hub.firebaseapp.com"]
 
     # ── Google OAuth ───────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str

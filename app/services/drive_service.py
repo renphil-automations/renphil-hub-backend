@@ -15,13 +15,16 @@ from googleapiclient.errors import HttpError
 from app.config import Settings
 from app.helpers.exceptions import GoogleDriveError
 from app.helpers.google_client import build_drive_service
-from app.models.drive import DriveFile, DriveFileList
+from app.models.drive import DriveFile, DriveFileList, DriveItem, DriveItemList
 
 logger = logging.getLogger(__name__)
 
+_FOLDER_MIME = "application/vnd.google-apps.folder"
+
 # Fields we request from Google Drive
 _FILE_FIELDS = (
-    "id, name, mimeType, webViewLink, webContentLink, createdTime, modifiedTime, size"
+    "id, name, mimeType, parents, webViewLink, webContentLink, "
+    "createdTime, modifiedTime, size"
 )
 _FOLDER_FIELDS = "id, name"
 
@@ -33,7 +36,69 @@ class DriveService:
         self._settings = settings
         self._service = build_drive_service(settings)
 
-    # ── List files in the configured folder ────────────────────────────
+    # ── Recursive nested tree of ALL files / sub-folders ───────────────
+    def list_all_items(self, folder_id: str | None = None) -> DriveItemList:
+        """
+        Recursively list every file and sub-folder under *folder_id*
+        (defaults to the configured root folder).
+
+        Returns a nested :class:`DriveItemList` where each folder item
+        contains its own ``children`` list, building a full tree.
+        """
+        root_id = folder_id or self._settings.GOOGLE_DRIVE_FOLDER_ID
+        items = self._build_tree(root_id)
+        root_name = self._get_folder_name(root_id)
+        return DriveItemList(
+            root_folder_id=root_id,
+            root_folder_name=root_name,
+            items=items,
+        )
+
+    def _build_tree(self, parent_id: str) -> list[DriveItem]:
+        """Return the direct children of *parent_id*, recursing into sub-folders."""
+        children: list[DriveItem] = []
+        page_token: str | None = None
+        while True:
+            try:
+                response: dict[str, Any] = (
+                    self._service.files()
+                    .list(
+                        q=f"'{parent_id}' in parents and trashed = false",
+                        pageSize=100,
+                        pageToken=page_token,
+                        fields=f"nextPageToken, files({_FILE_FIELDS})",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    )
+                    .execute()
+                )
+            except HttpError as exc:
+                logger.error("Drive API error while listing %s: %s", parent_id, exc)
+                raise GoogleDriveError(f"Drive API error: {exc}") from exc
+
+            for f in response.get("files", []):
+                is_folder = f["mimeType"] == _FOLDER_MIME
+                item = DriveItem(
+                    id=f["id"],
+                    name=f["name"],
+                    mime_type=f["mimeType"],
+                    is_folder=is_folder,
+                    parent_id=parent_id,
+                    web_view_link=f.get("webViewLink"),
+                    web_content_link=f.get("webContentLink"),
+                    created_time=f.get("createdTime"),
+                    modified_time=f.get("modifiedTime"),
+                    size=f.get("size"),
+                    children=self._build_tree(f["id"]) if is_folder else [],
+                )
+                children.append(item)
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return children
+
+    # ── Legacy paginated list (kept for backwards compat) ──────────────
     def list_files(
         self,
         page_size: int = 50,
