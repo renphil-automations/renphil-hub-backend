@@ -41,39 +41,177 @@ class Settings(BaseSettings):
     DIFY_API_BASE_URL: str = "https://api.dify.ai/v1"
     DIFY_API_KEY: str
 
-    # ── Airtable ───────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # Airtable
+    # ══════════════════════════════════════════════════════════════════
+    # All Airtable base ids, table ids, personal access tokens and
+    # field names are loaded strictly from the environment — no
+    # in-code defaults are provided. Update the ``.env`` file to
+    # change any of them.
+    # ------------------------------------------------------------------
+
+    # ── Personal access token ─────────────────────────────────────────
     AIRTABLE_API_KEY: str
 
+    # ── Base ids ──────────────────────────────────────────────────────
+    AIRTABLE_FUNDRAISING_BASE_ID: str
+    AIRTABLE_FUND_PROGRAM_BASE_ID: str
+    RENPHIL_HUB_BASE_ID: str
+
+    # ── Table ids / names ─────────────────────────────────────────────
     # Fundraising base
-    AIRTABLE_FUNDRAISING_BASE_ID: str = "appgeVEhaSHWv0jQY"
-    TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME: str = "Total Moved and Deployed"
-
+    TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME: str
     # Fund & Program Tracker base
-    AIRTABLE_FUND_PROGRAM_BASE_ID: str = "appP9ziO5nV1LY7eS"
-    MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE: str = "tblj34ByiDh40US4x"
-    GLOSSARY_TABLE: str = "Glossary"
-    ORG_FRIENDS_TABLE: str = "Org Friends"
-    FUNDERS_TABLE: str = "Funders"
-    FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE: str = (
-        "Funds & Programs Monthly Check-In"
-    )
-    CHECKIN_REPORTING_PERIODS_TABLE: str = "Check-In Reporting Periods"
-    DOC_TITLES_TABLE: str = "Doc Titles"
-    SHAREABLE_DOCS_TABLE: str = "Shareable Docs"
-    CLUSTERS_TABLE: str = "Clusters"
+    MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE: str
+    GLOSSARY_TABLE: str
+    ORG_FRIENDS_TABLE: str
+    FUNDERS_TABLE: str
+    FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE: str
+    CHECKIN_REPORTING_PERIODS_TABLE: str
+    DOC_TITLES_TABLE: str
+    SHAREABLE_DOCS_TABLE: str
+    CLUSTERS_TABLE: str
+    # RenPhil Hub base
+    ADMINS_TABLE: str
+    ANNOUNCEMENTS_TABLE: str
+    TICKETS_TABLE: str
+    PARTNERSHIPS_FUNDRAISING_TABLE: str
+    FINANCE_LINKS_TABLE: str
+    GOOGLE_DOCS_TABS_TABLE: str
+    OFFICE_SPACES_TABLE: str
+    ACCESS_CONTROL_TABLE: str
+    TEAMS_TABLE: str
+    USERS_TABLE: str
+    ROLES_TABLE: str
+    PERMISSIONS_TABLE: str
 
-    # RenPhil Hub base (admins, etc.)
-    RENPHIL_HUB_BASE_ID: str = "appSh6OwO3ZMAkuVE"
-    ADMINS_TABLE: str = "Admins"
-    ADMINS_EMAIL_FIELD: str = "Email"
-    ANNOUNCEMENTS_TABLE: str = "tbl6UrftFbn7EDSC6"
-    TICKETS_TABLE: str = "Tickets"
-    PARTNERSHIPS_FUNDRAISING_TABLE: str = "Partnerships Fundraising"
-    FINANCE_LINKS_TABLE: str = "Finance Links"
-    GOOGLE_DOCS_TABS_TABLE: str = "Google Docs Tabs"
-    OFFICE_SPACES_TABLE: str = "tblcWUSSuY2ATDdce"
+    # ── Field names ───────────────────────────────────────────────────
+    # Admins / Access Control
+    ADMINS_EMAIL_FIELD: str
+    ACCESS_CONTROL_USER_EMAIL_FIELD: str
+    ACCESS_CONTROL_ROLES_FIELD: str
+    ACCESS_CONTROL_PERMISSIONS_FIELD: str
+    ACCESS_CONTROL_SCOPE_FIELD: str
+    ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str
+    ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str
+    ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str
+    ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
+    # Teams / Users
+    TEAMS_WORK_EMAIL_FIELD: str
+    TEAMS_NAME_FIELD: str
+    USERS_WORK_EMAIL_FIELD: str
+    USERS_NAME_FIELD: str
+    USERS_FIRST_NAME_FIELD: str
+    USERS_LAST_NAME_FIELD: str
+    USERS_EMPLOYMENT_TYPE_FIELD: str
+    USERS_STATUS_FIELD: str
+    USERS_DEPARTMENT_FIELD: str
+    USERS_PROGRAM_FIELD: str
+    USERS_START_DATE_FIELD: str
+    USERS_PERSONAL_EMAIL_FIELD: str
+    USERS_POSITION_FIELD: str
+    USERS_DOB_FIELD: str
+    USERS_OFFICE_LOCATION_FIELD: str
+    USERS_HOME_ADDRESS_FIELD: str
+    USERS_BIO_FIELD: str
+    USERS_SCOPE_OF_WORK_FIELD: str
+    USERS_END_DATE_FIELD: str
+    USERS_MANAGER_FIELD: str
+    USERS_TECH_STACK_SELECTIONS_FIELD: str
+    USERS_HEADSHOT_FIELD: str
+    USERS_FOR_WEBSITE_FIELD: str
+    # Roles / Permissions
+    ROLES_NAME_FIELD: str
+    ROLES_PERMISSIONS_FIELD: str
+    PERMISSIONS_NAME_FIELD: str
+    PERMISSIONS_DESCRIPTION_FIELD: str
 
-    # ── Slack webhook ─────────────────────────────────────────────────
+    # ── Fundraising (Total Moved & Deployed) fields ───────────────────
+    AT_F_AMOUNT: str
+    AT_F_FISCAL_YEAR: str
+    AT_F_OPP_REC_TYPE: str
+    AT_F_ACCOUNT_NAME: str
+
+    # ── Fund & Program Tracker fields ─────────────────────────────────
+    AT_F_EXCLUDE_FROM_LISTS: str
+    AT_F_EXCLUDE_FROM_REPORTING: str
+    AT_F_STATUS: str
+    AT_F_SUB_TRACK_OF: str
+    AT_F_SHARE_PUBLICLY: str
+    AT_F_VETTING: str
+    AT_F_ADD_TO_SHAREABLE_DOC: str
+    AT_F_NAME: str
+    AT_F_SCOPING_PROP_OVERVIEW: str
+    AT_F_INITIATIVE_TYPE: str
+    AT_F_FOCUS_AREAS: str
+    AT_F_PROGRAM_LEAD_FELLOW: str
+    AT_F_DAYS_UNTIL_DEADLINE: str
+    AT_F_SUBMISSION_EXTENSION: str
+    AT_F_REPORTING_LEAD: str
+    AT_F_REPORT_COMPLETE: str
+    AT_F_FLAG_FOR_DISCUSSION: str
+    AT_F_PROGRAM_NAME: str
+    AT_F_CHECKIN_HISTORY: str
+    AT_F_CHECKIN_REPORTING_PERIOD: str
+    AT_F_CLUSTER: str
+    AT_F_DASHBOARD_DISPLAY: str
+    AT_F_FOLLOWUP_INDICATED: str
+    AT_F_DEADLINE: str
+    AT_F_REVIEW_UNTIL: str
+    AT_F_PERIOD: str
+
+    # ── Announcements fields ──────────────────────────────────────────
+    AT_F_ANN_ID: str
+    AT_F_ANN_TITLE: str
+    AT_F_ANN_CONTENT: str
+    AT_F_ANN_AUTHOR_EMAIL: str
+    AT_F_ANN_CATEGORY: str
+    AT_F_ANN_ATTACHMENTS: str
+    AT_F_ANN_REVIEWER_COMMENTS: str
+    AT_F_ANN_PRIORITY: str
+    AT_F_ANN_APPROVED: str
+    AT_F_ANN_STATUS: str
+    AT_F_ANN_PUBLISH_TIME: str
+    AT_F_ANN_EXPIRATION_TIME: str
+    AT_F_ANN_APPROVED_BY: str
+
+    # ── Tickets fields ────────────────────────────────────────────────
+    AT_F_TICKET_ID: str
+    AT_F_TICKET_TITLE: str
+    AT_F_TICKET_DESCRIPTION: str
+    AT_F_TICKET_STATUS: str
+    AT_F_TICKET_ASSIGNEE: str
+    AT_F_TICKET_ASSIGNED_BY: str
+    AT_F_TICKET_SOURCE: str
+    AT_F_TICKET_CREATED_DATE: str
+    AT_F_TICKET_DUE_DATE: str
+    AT_F_TICKET_LAST_UPDATED: str
+    AT_F_TICKET_LAST_UPDATED_BY: str
+    AT_F_TICKET_COMMENTS: str
+    AT_F_TICKET_PARENT_LINK: str
+
+    # ── Partnerships Fundraising fields ───────────────────────────────
+    AT_F_PF_ID: str
+    AT_F_PF_DOCUMENT: str
+    AT_F_PF_DOCUMENT_URL: str
+    AT_F_PF_NOTES: str
+
+    # ── Finance Links fields ──────────────────────────────────────────
+    AT_F_FL_ID: str
+    AT_F_FL_DOCUMENT: str
+    AT_F_FL_DOCUMENT_URL: str
+
+    # ── Office Spaces fields ──────────────────────────────────────────
+    AT_F_OS_BRANCH: str
+    AT_F_OS_ADDRESS: str
+    AT_F_OS_DETAILS: str
+
+    # ── Google Docs Tabs fields ───────────────────────────────────────
+    AT_F_GDT_UI_PAGE: str
+
+    # ══════════════════════════════════════════════════════════════════
+    # Slack webhook
+    # ══════════════════════════════════════════════════════════════════
     # Signing secret used to verify Slack request signatures
     # (X-Slack-Signature + X-Slack-Request-Timestamp).
     SLACK_SIGNING_SECRET: str | None = None
@@ -82,35 +220,12 @@ class Settings(BaseSettings):
     # Organization email domain (e.g. ``renphil.org``) used to construct
     # the ``assigned_by`` email from the Slack ``user_name`` field.
     ORG_DOMAIN: str | None = None
-    # ── Gemini (Google Generative AI) ──────────────────────────────────
+
+    # ══════════════════════════════════════════════════════════════════
+    # Gemini (Google Generative AI)
+    # ══════════════════════════════════════════════════════════════════
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.5-flash"
-    # Access-Control tables (defaults to the RenPhil Hub base; override per-env if needed)
-    ACCESS_CONTROL_TABLE: str = "Access Control"
-    ACCESS_CONTROL_USER_EMAIL_FIELD: str = "User Email"
-    ACCESS_CONTROL_ROLES_FIELD: str = "Roles"
-    ACCESS_CONTROL_PERMISSIONS_FIELD: str = "Permissions"
-    ACCESS_CONTROL_SCOPE_FIELD: str = "Scope"
-    ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str = "Fund or Program Name"
-    ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str = "Role Name"
-    ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str = "Permission Name"
-    ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str = "Permission Description"
-
-    TEAMS_TABLE: str = "tbl537cgZO1xCBOQs"
-    TEAMS_WORK_EMAIL_FIELD: str = "Work Email"
-    TEAMS_NAME_FIELD: str = "Name"
-
-    # Users table (RenPhil Hub base) — directory of all hub users.
-    USERS_TABLE: str = "Users"
-    USERS_WORK_EMAIL_FIELD: str = "Work Email"
-
-    ROLES_TABLE: str = "tblBRs7WWDokHyKCy"
-    ROLES_NAME_FIELD: str = "Role Name"
-    ROLES_PERMISSIONS_FIELD: str = "Permissions"
-
-    PERMISSIONS_TABLE: str = "tblprRqGJQGLCN5fq"
-    PERMISSIONS_NAME_FIELD: str = "Permission Name"
-    PERMISSIONS_DESCRIPTION_FIELD: str = "Description"
 
 
 @lru_cache

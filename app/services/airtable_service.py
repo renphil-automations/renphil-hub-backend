@@ -19,7 +19,7 @@ from pyairtable import Api
 from requests.exceptions import RequestException
 from fastapi import HTTPException, status as _http_status
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
 from app.helpers.exceptions import AirtableError
 from app.models.airtable import (
@@ -69,42 +69,48 @@ from app.models.airtable import (
 
 logger = logging.getLogger(__name__)
 
+# All Airtable field names are loaded strictly from the environment via
+# ``app.config.Settings``. The module-level constants below are simple
+# aliases over the loaded settings so that downstream code can keep
+# referring to them by their short identifier.
+_S = get_settings()
+
 # Field name constants for the Total Moved & Deployed table
-_F_AMOUNT = "Amount"
-_F_FISCAL_YEAR = "Fiscal Year"
-_F_OPP_REC_TYPE = "Opportunity Record Type"
-_F_ACCOUNT_NAME = "Account Name"
+_F_AMOUNT = _S.AT_F_AMOUNT
+_F_FISCAL_YEAR = _S.AT_F_FISCAL_YEAR
+_F_OPP_REC_TYPE = _S.AT_F_OPP_REC_TYPE
+_F_ACCOUNT_NAME = _S.AT_F_ACCOUNT_NAME
 
 # Field name constants for the Fund & Program Tracker base
-_F_EXCLUDE_FROM_LISTS = "Exclude from lists"
-_F_EXCLUDE_FROM_REPORTING = "Exclude from Reporting"
-_F_STATUS = "Status"
-_F_SUB_TRACK_OF = "Sub-Track Of"
-_F_SHARE_PUBLICLY = "Can we talk about it publicly"
-_F_VETTING = "Vetting"
-_F_ADD_TO_SHAREABLE_DOC = "Add to New Shareable Doc"
-_F_NAME = "Name"
-_F_SCOPING_PROP_OVERVIEW = "Scoping Proposal / Fund Overview"
-_F_INITIATIVE_TYPE = "Initiative Type"
-_F_FOCUS_AREAS = "Focus Area(s)"
-_F_PROGRAM_LEAD_FELLOW = "Program Lead/Fellow"
+_F_EXCLUDE_FROM_LISTS = _S.AT_F_EXCLUDE_FROM_LISTS
+_F_EXCLUDE_FROM_REPORTING = _S.AT_F_EXCLUDE_FROM_REPORTING
+_F_STATUS = _S.AT_F_STATUS
+_F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
+_F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
+_F_VETTING = _S.AT_F_VETTING
+_F_ADD_TO_SHAREABLE_DOC = _S.AT_F_ADD_TO_SHAREABLE_DOC
+_F_NAME = _S.AT_F_NAME
+_F_SCOPING_PROP_OVERVIEW = _S.AT_F_SCOPING_PROP_OVERVIEW
+_F_INITIATIVE_TYPE = _S.AT_F_INITIATIVE_TYPE
+_F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
+_F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "3. Active Program"
 _STATUS_FELLOWSHIP_SCOPING = "2. Fellowship (Scoping)"
 
-_F_DAYS_UNTIL_DEADLINE = "Days Until Deadline"
-_F_SUBMISSION_EXTENSION = "Submission Extension"
-_F_REPORTING_LEAD = "Reporting Lead"
-_F_REPORT_COMPLETE = "Report Complete?"
-_F_FLAG_FOR_DISCUSSION = "Flag for Discussion?"
-_F_PROGRAM_NAME = "Program Name"
-_F_CHECKIN_HISTORY = "Check-In History"
-_F_CHECKIN_REPORTING_PERIOD = "Check-In Reporting Period"
-_F_CLUSTER = "Cluster"
-_F_DASHBOARD_DISPLAY = "Dashboard Display"
-_F_FOLLOWUP_INDICATED = "Followup Indicated"
-_F_DEADLINE = "Deadline"
-_F_REVIEW_UNTIL = "Review Until (from Check-In Reporting Period)"
-_F_PERIOD = "Period"
+_F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
+_F_SUBMISSION_EXTENSION = _S.AT_F_SUBMISSION_EXTENSION
+_F_REPORTING_LEAD = _S.AT_F_REPORTING_LEAD
+_F_REPORT_COMPLETE = _S.AT_F_REPORT_COMPLETE
+_F_FLAG_FOR_DISCUSSION = _S.AT_F_FLAG_FOR_DISCUSSION
+_F_PROGRAM_NAME = _S.AT_F_PROGRAM_NAME
+_F_CHECKIN_HISTORY = _S.AT_F_CHECKIN_HISTORY
+_F_CHECKIN_REPORTING_PERIOD = _S.AT_F_CHECKIN_REPORTING_PERIOD
+_F_CLUSTER = _S.AT_F_CLUSTER
+_F_DASHBOARD_DISPLAY = _S.AT_F_DASHBOARD_DISPLAY
+_F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
+_F_DEADLINE = _S.AT_F_DEADLINE
+_F_REVIEW_UNTIL = _S.AT_F_REVIEW_UNTIL
+_F_PERIOD = _S.AT_F_PERIOD
 
 
 class AirtableService:
@@ -1284,8 +1290,10 @@ class AirtableService:
         """
         email_field = self._settings.USERS_WORK_EMAIL_FIELD
         formula = af.OR(
-            af.multiselect_contains_any("Employment Type", ["Fellow (Unpaid)"]),
-            af.eq_str("For Website", "Fellow"),
+            af.multiselect_contains_any(
+                self._settings.USERS_EMPLOYMENT_TYPE_FIELD, ["Fellow (Unpaid)"]
+            ),
+            af.eq_str(self._settings.USERS_FOR_WEBSITE_FIELD, "Fellow"),
         )
         records = await self._list_records(
             self._users_table(),
@@ -1311,20 +1319,20 @@ class AirtableService:
             self._settings.ANNOUNCEMENTS_TABLE,
         )
 
-    # Announcement field name constants
-    _F_ANN_ID = "Id"
-    _F_ANN_TITLE = "Title"
-    _F_ANN_CONTENT = "Content"
-    _F_ANN_AUTHOR_EMAIL = "Author Email"
-    _F_ANN_CATEGORY = "Category"
-    _F_ANN_ATTACHMENTS = "Attachments"
-    _F_ANN_REVIEWER_COMMENTS = "Reviewer Comments"
-    _F_ANN_PRIORITY = "Priority"
-    _F_ANN_APPROVED = "Approved"
-    _F_ANN_STATUS = "Status"
-    _F_ANN_PUBLISH_TIME = "Publish Time"
-    _F_ANN_EXPIRATION_TIME = "Expiration Time"
-    _F_ANN_APPROVED_BY = "Approved By"
+    # Announcement field name constants (loaded from settings/.env)
+    _F_ANN_ID = _S.AT_F_ANN_ID
+    _F_ANN_TITLE = _S.AT_F_ANN_TITLE
+    _F_ANN_CONTENT = _S.AT_F_ANN_CONTENT
+    _F_ANN_AUTHOR_EMAIL = _S.AT_F_ANN_AUTHOR_EMAIL
+    _F_ANN_CATEGORY = _S.AT_F_ANN_CATEGORY
+    _F_ANN_ATTACHMENTS = _S.AT_F_ANN_ATTACHMENTS
+    _F_ANN_REVIEWER_COMMENTS = _S.AT_F_ANN_REVIEWER_COMMENTS
+    _F_ANN_PRIORITY = _S.AT_F_ANN_PRIORITY
+    _F_ANN_APPROVED = _S.AT_F_ANN_APPROVED
+    _F_ANN_STATUS = _S.AT_F_ANN_STATUS
+    _F_ANN_PUBLISH_TIME = _S.AT_F_ANN_PUBLISH_TIME
+    _F_ANN_EXPIRATION_TIME = _S.AT_F_ANN_EXPIRATION_TIME
+    _F_ANN_APPROVED_BY = _S.AT_F_ANN_APPROVED_BY
 
     @staticmethod
     def _attachments_payload(urls: list[str] | None) -> list[dict[str, str]] | None:
@@ -1782,8 +1790,8 @@ class AirtableService:
     async def get_team_size(self) -> CountResponse:
         """Return the number of distinct non-empty 'Name' values in the Users
         table where the 'Status' single-select equals 'Active'."""
-        name_field = "Name"
-        formula = af.eq_str("Status", "Active")
+        name_field = self._settings.USERS_NAME_FIELD
+        formula = af.eq_str(self._settings.USERS_STATUS_FIELD, "Active")
         records = await self._list_records(
             self._users_table(), formula=formula, fields=[name_field]
         )
@@ -1797,10 +1805,10 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════════
     # Partnerships Fundraising (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
-    _F_PF_ID = "Id"
-    _F_PF_DOCUMENT = "Document"
-    _F_PF_DOCUMENT_URL = "Document URL"
-    _F_PF_NOTES = "Notes"
+    _F_PF_ID = _S.AT_F_PF_ID
+    _F_PF_DOCUMENT = _S.AT_F_PF_DOCUMENT
+    _F_PF_DOCUMENT_URL = _S.AT_F_PF_DOCUMENT_URL
+    _F_PF_NOTES = _S.AT_F_PF_NOTES
 
     _PF_UPDATE_FIELD_MAP = {
         "document": _F_PF_DOCUMENT,
@@ -1910,9 +1918,9 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Finance Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_FL_ID = "Id"
-    _F_FL_DOCUMENT = "Document"
-    _F_FL_DOCUMENT_URL = "Document URL"
+    _F_FL_ID = _S.AT_F_FL_ID
+    _F_FL_DOCUMENT = _S.AT_F_FL_DOCUMENT
+    _F_FL_DOCUMENT_URL = _S.AT_F_FL_DOCUMENT_URL
 
     _FL_UPDATE_FIELD_MAP = {
         "document": _F_FL_DOCUMENT,
@@ -2012,9 +2020,9 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Office Spaces (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_OS_BRANCH = "Branch"
-    _F_OS_ADDRESS = "Address"
-    _F_OS_DETAILS = "Details"
+    _F_OS_BRANCH = _S.AT_F_OS_BRANCH
+    _F_OS_ADDRESS = _S.AT_F_OS_ADDRESS
+    _F_OS_DETAILS = _S.AT_F_OS_DETAILS
 
     _OS_FIELD_MAP = {
         "branch": _F_OS_BRANCH,
@@ -2137,7 +2145,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Google Docs Tabs (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_GDT_UI_PAGE = "UI Page"
+    _F_GDT_UI_PAGE = _S.AT_F_GDT_UI_PAGE
 
     def _google_docs_tabs_table(self):
         return self._api.table(
@@ -2246,23 +2254,23 @@ class AirtableService:
             self._settings.TICKETS_TABLE,
         )
 
-    # Ticket field name constants
-    _F_TICKET_ID = "Id"
-    _F_TICKET_TITLE = "Title"
-    _F_TICKET_DESCRIPTION = "Description"
-    _F_TICKET_STATUS = "Status"
-    _F_TICKET_ASSIGNEE = "Assignee"
-    _F_TICKET_ASSIGNED_BY = "Assigned By"
-    _F_TICKET_SOURCE = "Source"
-    _F_TICKET_CREATED_DATE = "Created Date"
-    _F_TICKET_DUE_DATE = "Due Date"
-    _F_TICKET_LAST_UPDATED = "Last Updated"
-    _F_TICKET_LAST_UPDATED_BY = "Last Updated By"
-    _F_TICKET_COMMENTS = "Comments"
+    # Ticket field name constants (loaded from settings/.env)
+    _F_TICKET_ID = _S.AT_F_TICKET_ID
+    _F_TICKET_TITLE = _S.AT_F_TICKET_TITLE
+    _F_TICKET_DESCRIPTION = _S.AT_F_TICKET_DESCRIPTION
+    _F_TICKET_STATUS = _S.AT_F_TICKET_STATUS
+    _F_TICKET_ASSIGNEE = _S.AT_F_TICKET_ASSIGNEE
+    _F_TICKET_ASSIGNED_BY = _S.AT_F_TICKET_ASSIGNED_BY
+    _F_TICKET_SOURCE = _S.AT_F_TICKET_SOURCE
+    _F_TICKET_CREATED_DATE = _S.AT_F_TICKET_CREATED_DATE
+    _F_TICKET_DUE_DATE = _S.AT_F_TICKET_DUE_DATE
+    _F_TICKET_LAST_UPDATED = _S.AT_F_TICKET_LAST_UPDATED
+    _F_TICKET_LAST_UPDATED_BY = _S.AT_F_TICKET_LAST_UPDATED_BY
+    _F_TICKET_COMMENTS = _S.AT_F_TICKET_COMMENTS
     # Linked-record field on the Tickets table used to write the parent
     # relationship. The corresponding lookup field ("Parent Ticket Id")
     # is read-only and only used when returning tickets to clients.
-    _F_TICKET_PARENT_LINK = "Parent Ticket"
+    _F_TICKET_PARENT_LINK = _S.AT_F_TICKET_PARENT_LINK
 
     async def _resolve_parent_ticket_record_id(
         self, parent_ticket_id: int | str
@@ -2570,25 +2578,25 @@ class AirtableService:
     # Users (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
     _USER_UPDATE_FIELD_MAP = {
-        "name": "Name",
-        "first_name": "First Name",
-        "last_name": "Last Name",
-        "employment_type": "Employment Type",
-        "status": "Status",
-        "department": "Department",
-        "program": "Program",
-        "start_date": "Start Date",
-        "work_email": "Work Email",
-        "personal_email": "Personal Email",
-        "position": "Position",
-        "dob": "DOB",
-        "office_location": "Office location",
-        "home_address": "Home Address",
-        "bio": "Bio",
-        "scope_of_work": "ScopeofWork",
-        "end_date": "End Date",
-        "manager": "Manager",
-        "tech_stack_selections": "Tech Stack Selections",
+        "name": _S.USERS_NAME_FIELD,
+        "first_name": _S.USERS_FIRST_NAME_FIELD,
+        "last_name": _S.USERS_LAST_NAME_FIELD,
+        "employment_type": _S.USERS_EMPLOYMENT_TYPE_FIELD,
+        "status": _S.USERS_STATUS_FIELD,
+        "department": _S.USERS_DEPARTMENT_FIELD,
+        "program": _S.USERS_PROGRAM_FIELD,
+        "start_date": _S.USERS_START_DATE_FIELD,
+        "work_email": _S.USERS_WORK_EMAIL_FIELD,
+        "personal_email": _S.USERS_PERSONAL_EMAIL_FIELD,
+        "position": _S.USERS_POSITION_FIELD,
+        "dob": _S.USERS_DOB_FIELD,
+        "office_location": _S.USERS_OFFICE_LOCATION_FIELD,
+        "home_address": _S.USERS_HOME_ADDRESS_FIELD,
+        "bio": _S.USERS_BIO_FIELD,
+        "scope_of_work": _S.USERS_SCOPE_OF_WORK_FIELD,
+        "end_date": _S.USERS_END_DATE_FIELD,
+        "manager": _S.USERS_MANAGER_FIELD,
+        "tech_stack_selections": _S.USERS_TECH_STACK_SELECTIONS_FIELD,
     }
 
     def _users_table(self):
@@ -2648,7 +2656,7 @@ class AirtableService:
         update_fields: dict[str, Any] = {}
         for key, value in data.items():
             if key == "headshot":
-                update_fields["Headshot"] = (
+                update_fields[self._settings.USERS_HEADSHOT_FIELD] = (
                     self._attachments_payload(value) or []
                 )
             elif key in ("employment_type", "tech_stack_selections"):
