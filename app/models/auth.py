@@ -1,6 +1,6 @@
 """Pydantic schemas for authentication / authorization."""
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 
 class TokenResponse(BaseModel):
@@ -10,6 +10,7 @@ class TokenResponse(BaseModel):
     email: str
     name: str
     picture: str | None = None
+    roles: list[str] = Field(default_factory=list)
 
 
 class UserInfo(BaseModel):
@@ -17,3 +18,4 @@ class UserInfo(BaseModel):
     email: EmailStr
     name: str
     picture: str | None = None
+    roles: list[str] = Field(default_factory=list)

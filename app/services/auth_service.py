@@ -25,6 +25,7 @@ from app.config import Settings
 from app.helpers.exceptions import DomainNotAllowedError, GoogleOAuthError
 from app.helpers.google_client import build_oauth_flow
 from app.models.auth import TokenResponse, UserInfo
+from app.services.airtable_service import AirtableService
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,18 @@ class AuthService:
         return auth_url
 
     # ── Step 2: exchange code → user info → JWT ────────────────────────
-    async def handle_callback(self, code: str, state: str) -> tuple[TokenResponse, str]:
+    async def handle_callback(
+        self,
+        code: str,
+        state: str,
+        airtable_service: AirtableService,
+    ) -> tuple[TokenResponse, str]:
         """
         Complete the OAuth callback:
           - exchange auth code for tokens (with PKCE verifier)
           - verify & decode the id_token
           - enforce domain
+          - resolve the user's roles from the Airtable Access Control table
           - mint a local JWT
 
         Returns (TokenResponse, frontend_redirect_uri).
@@ -117,9 +124,12 @@ class AuthService:
         # Enforce domain
         self._enforce_domain(email)
 
+        # Resolve roles from the Airtable Access Control table
+        roles: list[str] = await airtable_service.get_user_roles(email)
+
         # Mint a local JWT for session management
         access_token = self._create_access_token(
-            UserInfo(email=email, name=name, picture=picture)
+            UserInfo(email=email, name=name, picture=picture, roles=roles)
         )
 
         return TokenResponse(
@@ -127,6 +137,7 @@ class AuthService:
             email=email,
             name=name,
             picture=picture,
+            roles=roles,
         ), frontend_redirect_uri
 
     # ── JWT helpers ────────────────────────────────────────────────────
@@ -138,6 +149,7 @@ class AuthService:
             "sub": user.email,
             "name": user.name,
             "picture": user.picture,
+            "roles": user.roles,
             "exp": expire,
         }
         return jwt.encode(
@@ -163,6 +175,7 @@ class AuthService:
             email=payload["sub"],
             name=payload.get("name", ""),
             picture=payload.get("picture"),
+            roles=payload.get("roles") or [],
         )
 
     # ── Domain restriction ─────────────────────────────────────────────

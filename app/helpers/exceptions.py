@@ -47,3 +47,13 @@ class DifyError(HTTPException):
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=detail,
         )
+
+
+class AirtableError(HTTPException):
+    """Raised when interacting with the Airtable API fails."""
+
+    def __init__(self, detail: str = "Failed to fetch data from Airtable.") -> None:
+        super().__init__(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=detail,
+        )

@@ -14,8 +14,9 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import RedirectResponse
 
-from app.dependencies import get_auth_service, get_current_user
+from app.dependencies import get_airtable_service, get_auth_service, get_current_user
 from app.models.auth import TokenResponse, UserInfo
+from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -39,21 +40,27 @@ async def callback(
     code: str = Query(..., description="Authorization code from Google"),
     state: str = Query(..., description="OAuth state parameter (PKCE tie-back)"),
     auth_service: AuthService = Depends(get_auth_service),
+    airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     """
     Google redirects here after the user consents.
     Exchanges the code for tokens (using the PKCE verifier tied to state),
-    verifies the domain, and redirects to the frontend with the JWT.
+    verifies the domain, resolves the user's roles from Airtable, and
+    redirects to the frontend with the JWT and roles.
     """
-    token_response, frontend_redirect_uri = await auth_service.handle_callback(code, state)
-    params = urlencode({
-        "access_token": token_response.access_token,
-        "email": token_response.email,
-        "name": token_response.name,
-        **({
-            "picture": token_response.picture
-        } if token_response.picture else {}),
-    })
+    token_response, frontend_redirect_uri = await auth_service.handle_callback(
+        code, state, airtable_service
+    )
+    params = urlencode(
+        {
+            "access_token": token_response.access_token,
+            "email": token_response.email,
+            "name": token_response.name,
+            "roles": token_response.roles,
+            **({"picture": token_response.picture} if token_response.picture else {}),
+        },
+        doseq=True,
+    )
     return RedirectResponse(f"{frontend_redirect_uri}?{params}")
 
 

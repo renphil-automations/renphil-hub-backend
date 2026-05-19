@@ -119,6 +119,8 @@ class DifyService:
                     )
 
                 async for chunk in response.aiter_bytes():
+                    logger.info(5 * '@\n')
+                    logger.info("Received Dify chunk: %s", chunk)
                     yield chunk
 
         except httpx.RequestError as exc:

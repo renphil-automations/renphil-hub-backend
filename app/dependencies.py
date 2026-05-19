@@ -13,9 +13,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import get_settings
 from app.models.auth import UserInfo
+from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
+from app.services.gemini_service import GeminiService
 
 _bearer_scheme = HTTPBearer()
 
@@ -23,6 +25,8 @@ _bearer_scheme = HTTPBearer()
 _auth_service: AuthService | None = None
 _drive_service: DriveService | None = None
 _dify_service: DifyService | None = None
+_airtable_service: AirtableService | None = None
+_gemini_service: GeminiService | None = None
 
 
 def get_auth_service() -> AuthService:
@@ -44,6 +48,20 @@ def get_dify_service() -> DifyService:
     if _dify_service is None:
         _dify_service = DifyService(get_settings())
     return _dify_service
+
+
+def get_airtable_service() -> AirtableService:
+    global _airtable_service
+    if _airtable_service is None:
+        _airtable_service = AirtableService(get_settings())
+    return _airtable_service
+
+
+def get_gemini_service() -> GeminiService:
+    global _gemini_service
+    if _gemini_service is None:
+        _gemini_service = GeminiService(get_settings())
+    return _gemini_service
 
 
 # ── Current-user dependency ────────────────────────────────────────────
