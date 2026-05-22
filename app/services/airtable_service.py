@@ -65,6 +65,14 @@ from app.models.airtable import (
     UserUpdate,
     YearlyAmountItem,
     YearlyAmountResponse,
+    MeetingCadenceRecord,
+    UsefulLinkRecord,
+    HrAndBenefitsRecord,
+    OnboardingLinkRecord,
+    OnboardingCallRecord,
+    QuickLinkRecord,
+    QuickLinkCreate,
+    QuickLinkUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -2180,6 +2188,291 @@ class AirtableService:
             self._google_docs_tabs_table(), formula=formula, fields=fields
         )
         return self._gdt_to_typed(records)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Meeting Cadence (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    def _meeting_cadence_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.MEETING_CADENCE_TABLE,
+        )
+
+    async def get_meeting_cadence(
+        self, *, fields: list[str] | None = None
+    ) -> list[MeetingCadenceRecord]:
+        """Return all rows from the Meeting Cadence table."""
+        records = await self._list_records(
+            self._meeting_cadence_table(), fields=fields
+        )
+        return self._to_typed(records, MeetingCadenceRecord)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Useful Links (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    def _useful_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.USEFUL_LINKS_TABLE,
+        )
+
+    async def get_useful_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[UsefulLinkRecord]:
+        """Return all rows from the Useful Links table."""
+        records = await self._list_records(
+            self._useful_links_table(), fields=fields
+        )
+        return self._to_typed(records, UsefulLinkRecord)
+
+    # ═══════════════════════════════════════════════════════════════
+    # HR & Benefits (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    def _hr_and_benefits_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.HR_AND_BENEFITS_TABLE,
+        )
+
+    async def get_hr_and_benefits(
+        self, *, fields: list[str] | None = None
+    ) -> list[HrAndBenefitsRecord]:
+        """Return all rows from the HR & Benefits table."""
+        records = await self._list_records(
+            self._hr_and_benefits_table(), fields=fields
+        )
+        return self._to_typed(records, HrAndBenefitsRecord)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Onboarding (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    def _onboarding_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.ONBOARDING_TABLE,
+        )
+
+    async def get_onboarding_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[OnboardingLinkRecord]:
+        """Return all rows from the Onboarding table."""
+        records = await self._list_records(
+            self._onboarding_table(), fields=fields
+        )
+        return self._to_typed(records, OnboardingLinkRecord)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Onboarding Calls (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    def _onboarding_calls_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.ONBOARDING_CALLS_TABLE,
+        )
+
+    async def get_onboarding_calls(
+        self, *, fields: list[str] | None = None
+    ) -> list[OnboardingCallRecord]:
+        """Return all rows from the Onboarding Calls table."""
+        records = await self._list_records(
+            self._onboarding_calls_table(), fields=fields
+        )
+        return self._to_typed(records, OnboardingCallRecord)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Quick Links (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    # Quick Links field name constants (loaded from settings/.env)
+    _F_QL_ID = _S.AT_F_QL_ID
+    _F_QL_ANCHOR_TEXT = _S.AT_F_QL_ANCHOR_TEXT
+    _F_QL_URL = _S.AT_F_QL_URL
+    _F_QL_EMAIL = _S.AT_F_QL_EMAIL
+    _F_QL_ACTION = _S.AT_F_QL_ACTION
+    _F_QL_QA_LINK = _S.AT_F_QL_QUICK_ACTIONS_LINK
+    _F_QA_ACTION = _S.AT_F_QA_ACTION
+
+    def _quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.QUICK_LINKS_TABLE,
+        )
+
+    def _quick_actions_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.QUICK_ACTIONS_TABLE,
+        )
+
+    def _ql_to_typed(
+        self, records: list[dict[str, Any]]
+    ) -> list[QuickLinkRecord]:
+        out: list[QuickLinkRecord] = []
+        for r in records:
+            fields = dict(r.get("fields", {}) or {})
+            fields["record_id"] = r["id"]
+            out.append(QuickLinkRecord.model_validate(fields))
+        return out
+
+    async def get_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[QuickLinkRecord]:
+        """Return all rows from the Quick Links table."""
+        records = await self._list_records(
+            self._quick_links_table(), fields=fields
+        )
+        return self._ql_to_typed(records)
+
+    async def _find_quick_link_by_id(
+        self, quick_link_id: int | str
+    ) -> dict[str, Any] | None:
+        """Find a Quick Links record by its autonumber 'Id' value."""
+        try:
+            numeric = int(quick_link_id)
+            formula = af.eq_num(self._F_QL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_QL_ID, str(quick_link_id))
+
+        table = self._quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick link lookup")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def _find_or_create_quick_action(self, action_text: str) -> str:
+        """Return the Airtable record id of the Quick Action with the given
+        text, creating it first if no such record exists."""
+        text = (action_text or "").strip()
+        if not text:
+            raise AirtableError("Action text must be a non-empty string.")
+
+        table = self._quick_actions_table()
+        formula = af.eq_str(self._F_QA_ACTION, text)
+        try:
+            existing = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+            if existing:
+                return existing[0]["id"]
+            created = await asyncio.to_thread(
+                table.create, {self._F_QA_ACTION: text}
+            )
+        except RequestException as exc:
+            logger.error("Airtable quick action upsert failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick action upsert")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return created["id"]
+
+    async def create_quick_link(
+        self, payload: QuickLinkCreate
+    ) -> QuickLinkRecord:
+        """Create a Quick Links row, upserting the linked Quick Action."""
+        qa_record_id = await self._find_or_create_quick_action(payload.action)
+
+        body: dict[str, Any] = {
+            self._F_QL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_QL_QA_LINK: [qa_record_id],
+        }
+        if payload.url is not None:
+            body[self._F_QL_URL] = payload.url
+        if payload.email is not None:
+            body[self._F_QL_EMAIL] = payload.email
+
+        table = self._quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick link create")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return self._ql_to_typed([created])[0]
+
+    async def update_quick_link(
+        self, quick_link_id: int | str, payload: QuickLinkUpdate
+    ) -> QuickLinkRecord:
+        """Update fields on a Quick Links row identified by its autonumber Id.
+
+        Providing ``action`` upserts the value into the Quick Actions table
+        and replaces the linked record.
+        """
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        record = await self._find_quick_link_by_id(quick_link_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Quick Link with Id={quick_link_id} not found.",
+            )
+
+        body: dict[str, Any] = {}
+        if "anchor_text" in data:
+            body[self._F_QL_ANCHOR_TEXT] = data["anchor_text"]
+        if "url" in data:
+            body[self._F_QL_URL] = data["url"]
+        if "email" in data:
+            body[self._F_QL_EMAIL] = data["email"]
+        if "action" in data and data["action"] is not None:
+            qa_record_id = await self._find_or_create_quick_action(data["action"])
+            body[self._F_QL_QA_LINK] = [qa_record_id]
+
+        if not body:
+            # Nothing changed (e.g. only ``action: None`` was sent).
+            return self._ql_to_typed([record])[0]
+
+        table = self._quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], body, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable quick link update failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick link update")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return self._ql_to_typed([updated])[0]
+
+    async def delete_quick_link(
+        self, quick_link_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Quick Links row by its autonumber Id.
+
+        The linked Quick Action row is left intact (not cascade-deleted).
+        """
+        record = await self._find_quick_link_by_id(quick_link_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Quick Link with Id={quick_link_id} not found.",
+            )
+        table = self._quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick link delete")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "quick_link_id": quick_link_id,
+            "deleted": True,
+        }
 
     async def get_unique_roles(self) -> list[Role]:
         """Return all Roles (id + Role Name) with their linked Permissions resolved."""

@@ -83,6 +83,14 @@ from app.models.airtable import (
     UserRecord,
     UserUpdate,
     YearlyAmountResponse,
+    MeetingCadenceRecord,
+    UsefulLinkRecord,
+    HrAndBenefitsRecord,
+    OnboardingLinkRecord,
+    OnboardingCallRecord,
+    QuickLinkRecord,
+    QuickLinkCreate,
+    QuickLinkUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -819,6 +827,157 @@ async def get_google_docs_tabs(
     return await airtable_service.get_google_docs_tabs(
         ui_page=ui_page, fields=fields
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Meeting Cadence / Useful Links / HR & Benefits / Onboarding endpoints
+# ══════════════════════════════════════════════════════════════════════
+@router.get(
+    "/meeting_cadence",
+    response_model=list[MeetingCadenceRecord],
+    summary=(
+        "List rows from the Meeting Cadence table "
+        "(Meeting Title, Description, Attachment URL)."
+    ),
+)
+async def get_meeting_cadence(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_meeting_cadence(fields=fields)
+
+
+@router.get(
+    "/useful_links",
+    response_model=list[UsefulLinkRecord],
+    summary=(
+        "List rows from the Useful Links table "
+        "(Document, Document URL, Description)."
+    ),
+)
+async def get_useful_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_useful_links(fields=fields)
+
+
+@router.get(
+    "/hr_and_benefits",
+    response_model=list[HrAndBenefitsRecord],
+    summary=(
+        "List rows from the HR & Benefits table "
+        "(Document, Document URL, Description)."
+    ),
+)
+async def get_hr_and_benefits(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_hr_and_benefits(fields=fields)
+
+
+@router.get(
+    "/onboarding",
+    response_model=list[OnboardingLinkRecord],
+    summary=(
+        "List rows from the Onboarding table "
+        "(Document, Document URL, Notes)."
+    ),
+)
+async def get_onboarding_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_onboarding_links(fields=fields)
+
+
+@router.get(
+    "/onboarding_calls",
+    response_model=list[OnboardingCallRecord],
+    summary="List rows from the Onboarding Calls table (Date, Notes).",
+)
+async def get_onboarding_calls(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_onboarding_calls(fields=fields)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Quick Links endpoints
+# ══════════════════════════════════════════════════════════════════════
+@router.get(
+    "/quick_links",
+    response_model=list[QuickLinkRecord],
+    summary="List rows from the Quick Links table.",
+)
+async def get_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_quick_links(fields=fields)
+
+
+@router.post(
+    "/quick_links",
+    response_model=QuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Quick Link (admin only)",
+)
+async def create_quick_link(
+    payload: QuickLinkCreate,
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create a quick link.",
+        )
+    return await airtable_service.create_quick_link(payload)
+
+
+@router.patch(
+    "/quick_links/{quick_link_id}",
+    response_model=QuickLinkRecord,
+    summary="Update a Quick Link by its Id (admin only)",
+)
+async def update_quick_link(
+    payload: QuickLinkUpdate,
+    quick_link_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to update a quick link.",
+        )
+    return await airtable_service.update_quick_link(quick_link_id, payload)
+
+
+@router.delete(
+    "/quick_links/{quick_link_id}",
+    summary="Delete a Quick Link by its Id (admin only)",
+)
+async def delete_quick_link(
+    quick_link_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete a quick link.",
+        )
+    return await airtable_service.delete_quick_link(quick_link_id)
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     USERS_TABLE: str
     ROLES_TABLE: str
     PERMISSIONS_TABLE: str
+    MEETING_CADENCE_TABLE: str
+    USEFUL_LINKS_TABLE: str
+    HR_AND_BENEFITS_TABLE: str
+    ONBOARDING_TABLE: str
+    ONBOARDING_CALLS_TABLE: str
+    QUICK_LINKS_TABLE: str
+    QUICK_ACTIONS_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -208,6 +215,41 @@ class Settings(BaseSettings):
 
     # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
+
+    # ── Meeting Cadence fields ────────────────────────────────────────
+    AT_F_MC_MEETING_TITLE: str
+    AT_F_MC_DESCRIPTION: str
+    AT_F_MC_ATTACHMENT_URL: str
+
+    # ── Useful Links fields ───────────────────────────────────────────
+    AT_F_UL_DOCUMENT: str
+    AT_F_UL_DOCUMENT_URL: str
+    AT_F_UL_DESCRIPTION: str
+
+    # ── HR & Benefits fields ──────────────────────────────────────────
+    AT_F_HR_DOCUMENT: str
+    AT_F_HR_DOCUMENT_URL: str
+    AT_F_HR_DESCRIPTION: str
+
+    # ── Onboarding fields ─────────────────────────────────────────────
+    AT_F_OB_DOCUMENT: str
+    AT_F_OB_DOCUMENT_URL: str
+    AT_F_OB_NOTES: str
+
+    # ── Onboarding Calls fields ───────────────────────────────────────
+    AT_F_OBC_DATE: str
+    AT_F_OBC_NOTES: str
+
+    # ── Quick Links fields ────────────────────────────────────────────
+    AT_F_QL_ID: str
+    AT_F_QL_ANCHOR_TEXT: str
+    AT_F_QL_URL: str
+    AT_F_QL_EMAIL: str
+    AT_F_QL_ACTION: str
+    AT_F_QL_QUICK_ACTIONS_LINK: str
+
+    # ── Quick Actions fields ──────────────────────────────────────────
+    AT_F_QA_ACTION: str
 
     # ══════════════════════════════════════════════════════════════════
     # Slack webhook

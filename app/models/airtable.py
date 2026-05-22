@@ -373,6 +373,134 @@ class GoogleDocsTabRecord(BaseModel):
     tab_id: str | None = Field(default=None, alias="Tab Id")
 
 
+# ── Meeting Cadence ────────────────────────────────────────────────────
+class MeetingCadenceRecord(_TypedAirtableRecord):
+    """A row from the Meeting Cadence table."""
+
+    meeting_title: str | None = Field(default=None, alias="Meeting Title")
+    description: str | None = Field(default=None, alias="Description")
+    attachment_url: str | None = Field(
+        default=None,
+        alias="Attachment URL",
+        description="Optional URL to an attachment for this meeting.",
+    )
+
+
+# ── Useful Links ───────────────────────────────────────────────────────
+class UsefulLinkRecord(_TypedAirtableRecord):
+    """A row from the Useful Links table."""
+
+    document: str | None = Field(default=None, alias="Document")
+    document_url: str | None = Field(default=None, alias="Document URL")
+    description: str | None = Field(default=None, alias="Description")
+
+
+# ── HR & Benefits ──────────────────────────────────────────────────────
+class HrAndBenefitsRecord(_TypedAirtableRecord):
+    """A row from the HR & Benefits table."""
+
+    document: str | None = Field(default=None, alias="Document")
+    document_url: str | None = Field(default=None, alias="Document URL")
+    description: str | None = Field(default=None, alias="Description")
+
+
+# ── Onboarding ─────────────────────────────────────────────────────────
+class OnboardingLinkRecord(_TypedAirtableRecord):
+    """A row from the Onboarding table."""
+
+    document: str | None = Field(default=None, alias="Document")
+    document_url: str | None = Field(default=None, alias="Document URL")
+    notes: str | None = Field(default=None, alias="Notes")
+
+
+# ── Onboarding Calls ───────────────────────────────────────────────────
+class OnboardingCallRecord(_TypedAirtableRecord):
+    """A row from the Onboarding Calls table."""
+
+    date: str | None = Field(
+        default=None, alias="Date", description="ISO date (YYYY-MM-DD)."
+    )
+    notes: str | None = Field(default=None, alias="Notes")
+
+
+# ── Quick Links ────────────────────────────────────────────────────────
+class QuickLinkRecord(BaseModel):
+    """A row from the Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``. ``action``
+    is sourced from the Airtable lookup field that pulls the action text
+    from the linked Quick Actions record.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+    action: str | None = Field(
+        default=None,
+        alias="Action",
+        description="Action text resolved from the linked Quick Actions record.",
+    )
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _unwrap_action(cls, value: Any) -> Any:
+        # 'Action' is an Airtable lookup field, which returns its value
+        # as a single-element list. Unwrap to a scalar for clients.
+        if isinstance(value, list):
+            return value[0] if value else None
+        return value
+
+
+class QuickLinkCreate(BaseModel):
+    """Payload to create a new Quick Links record.
+
+    The ``action`` string is upserted into the Quick Actions table and
+    linked to this record via the 'Quick Actions' linked-record field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    anchor_text: str = Field(description="Display text for the link.")
+    action: str = Field(
+        description=(
+            "Action text. Will be created in the Quick Actions table if it "
+            "does not already exist, then linked to this Quick Links row."
+        )
+    )
+    url: str | None = Field(
+        default=None, description="Optional URL the link points to."
+    )
+    email: str | None = Field(
+        default=None, description="Optional email address associated with the link."
+    )
+
+
+class QuickLinkUpdate(BaseModel):
+    """Partial update payload for a Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set ``url`` or ``email`` to ``null`` to
+    clear them. If ``action`` is provided, the value is upserted into
+    the Quick Actions table and the link is updated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    anchor_text: str | None = None
+    url: str | None = None
+    email: str | None = None
+    action: str | None = None
+
+
 # ── Clusters ───────────────────────────────────────────────────────────
 class ClusterRecord(BaseModel):
     """A cluster reference resolved with its display name."""
