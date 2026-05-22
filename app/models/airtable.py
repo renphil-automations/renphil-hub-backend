@@ -120,6 +120,24 @@ class AirtableUserIdResponse(BaseModel):
     name: str | None = None
 
 
+class ActiveProgramItem(BaseModel):
+    """An active program with its lead/fellow assignment."""
+    id: str
+    name: str | None = Field(default=None, alias="Name")
+    program_lead_fellow: Any = Field(default=None, alias="Program Lead/Fellow")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PersonContactItem(BaseModel):
+    """A person identified by first name, last name and work email."""
+    first_name: str | None = Field(default=None, alias="First Name")
+    last_name: str | None = Field(default=None, alias="Last Name")
+    work_email: str | None = Field(default=None, alias="Work Email")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #   Per-table typed record models
 # ══════════════════════════════════════════════════════════════════════

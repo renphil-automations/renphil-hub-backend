@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,24 +19,16 @@ from app.routers import airtable, auth, dify, drive
 
 logger = logging.getLogger(__name__)
 
-LOG_DIR = Path("logs")
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown hooks."""
     settings = get_settings()
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
     logging.basicConfig(
         level=logging.DEBUG if settings.DEBUG else logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=[logging.StreamHandler()],
     )
-    logger.info("Logging to %s", log_file)
     logger.info("Starting %s …", settings.APP_NAME)
     await init_http_client()
     yield

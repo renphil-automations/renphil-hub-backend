@@ -26,6 +26,7 @@ from app.models.airtable import (
     AccessControlAssign,
     AccessControlRecord,
     AccessControlRevoke,
+    ActiveProgramItem,
     AirtableUserIdResponse,
     AmountSumResponse,
     AnnouncementCreate,
@@ -51,6 +52,7 @@ from app.models.airtable import (
     OrgFriendsRecord,
     PartnershipsFundraisingRecord,
     PartnershipsFundraisingUpdate,
+    PersonContactItem,
     FinanceLinkRecord,
     FinanceLinkUpdate,
     GoogleDocsTabRecord,
@@ -103,7 +105,9 @@ _F_INITIATIVE_TYPE = _S.AT_F_INITIATIVE_TYPE
 _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "3. Active Program"
+_STATUS_PUBLICLY_LAUNCHED = "4. Publicly Launched"
 _STATUS_FELLOWSHIP_SCOPING = "2. Fellowship (Scoping)"
+_ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
 _F_SUBMISSION_EXTENSION = _S.AT_F_SUBMISSION_EXTENSION
@@ -1281,42 +1285,119 @@ class AirtableService:
 
     # ── #20 /get_active_programs_count ────────────────────────────────
     async def get_active_programs_count(self) -> CountResponse:
-        """Count records in MASTER_LIST where Status == 'Active Program'."""
-        formula = af.eq_str(_F_STATUS, _STATUS_ACTIVE_PROGRAM)
+        """Count records in MASTER_LIST where Status is an active-program status.
+
+        A program is considered active when its Status equals either
+        '3. Active Program' or '4. Publicly Launched'.
+        """
+        formula = af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES))
         records = await self._list_records(
             self._master_list_table(), formula=formula, fields=[_F_STATUS]
         )
         return CountResponse(count=len(records))
 
-    # ── #21 /get_distinct_program_leads_count ─────────────────────────
-    async def get_distinct_program_leads_count(self) -> CountResponse:
+    # ── /get_active_programs ──────────────────────────────────────────
+    async def get_active_programs(self) -> list[ActiveProgramItem]:
+        """List active programs with their lead/fellow assignment.
+
+        Reads records from MASTER_LIST whose Status equals
+        '3. Active Program' or '4. Publicly Launched', returning the
+        'Name' and 'Program Lead/Fellow' fields.
+        """
+        formula = af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES))
+        records = await self._list_records(
+            self._master_list_table(),
+            formula=formula,
+            fields=[_F_NAME, _F_PROGRAM_LEAD_FELLOW],
+        )
+        items: list[ActiveProgramItem] = []
+        for r in records:
+            fields = r.get("fields", {}) or {}
+            items.append(
+                ActiveProgramItem(
+                    id=r["id"],
+                    name=fields.get(_F_NAME),
+                    program_lead_fellow=fields.get(_F_PROGRAM_LEAD_FELLOW),
+                )
+            )
+        items.sort(key=lambda x: (x.name or "").lower())
+        return items
+
+    # ── #21 /get_distinct_fellows_count ───────────────────────────────
+    async def get_distinct_fellows_count(self) -> CountResponse:
         """Count distinct Work Email values of fellows in the Users table.
 
         A user is counted as a fellow when EITHER:
           * the 'Employment Type' multi-select contains 'Fellow (Unpaid)', OR
           * the 'For Website' single-select equals 'Fellow'.
         """
-        email_field = self._settings.USERS_WORK_EMAIL_FIELD
-        formula = af.OR(
-            af.multiselect_contains_any(
-                self._settings.USERS_EMPLOYMENT_TYPE_FIELD, ["Fellow (Unpaid)"]
-            ),
-            af.eq_str(self._settings.USERS_FOR_WEBSITE_FIELD, "Fellow"),
-        )
-        records = await self._list_records(
-            self._users_table(),
-            formula=formula,
-            fields=[email_field],
-        )
+        records = await self._fetch_fellow_records()
         unique: set[str] = set()
         for r in records:
-            value = r.get("fields", {}).get(email_field)
+            value = r.get("fields", {}).get(self._settings.USERS_WORK_EMAIL_FIELD)
             if not value:
                 continue
             text = str(value).strip().lower()
             if text:
                 unique.add(text)
         return CountResponse(count=len(unique))
+
+    # ── /get_distinct_fellows ─────────────────────────────────────────
+    async def get_distinct_fellows(self) -> list[PersonContactItem]:
+        """List unique fellows with their First Name, Last Name and Work Email.
+
+        Uses the same table and filters as :meth:`get_distinct_fellows_count`;
+        de-duplicated by lower-cased Work Email. Records without a Work
+        Email are returned as-is (not de-duplicated).
+        """
+        records = await self._fetch_fellow_records(include_names=True)
+        s = self._settings
+        seen: set[str] = set()
+        items: list[PersonContactItem] = []
+        for r in records:
+            fields = r.get("fields", {}) or {}
+            email = fields.get(s.USERS_WORK_EMAIL_FIELD)
+            email_key = str(email).strip().lower() if email else ""
+            if email_key:
+                if email_key in seen:
+                    continue
+                seen.add(email_key)
+            items.append(
+                PersonContactItem(
+                    first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
+                    last_name=fields.get(s.USERS_LAST_NAME_FIELD),
+                    work_email=email,
+                )
+            )
+        items.sort(
+            key=lambda x: (
+                (x.last_name or "").lower(),
+                (x.first_name or "").lower(),
+            )
+        )
+        return items
+
+    async def _fetch_fellow_records(
+        self, *, include_names: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return raw Users records matching the fellow criteria."""
+        s = self._settings
+        formula = af.OR(
+            af.multiselect_contains_any(
+                s.USERS_EMPLOYMENT_TYPE_FIELD, ["Fellow (Unpaid)"]
+            ),
+            af.eq_str(s.USERS_FOR_WEBSITE_FIELD, "Fellow"),
+        )
+        fields = [s.USERS_WORK_EMAIL_FIELD]
+        if include_names:
+            fields = [
+                s.USERS_FIRST_NAME_FIELD,
+                s.USERS_LAST_NAME_FIELD,
+                s.USERS_WORK_EMAIL_FIELD,
+            ]
+        return await self._list_records(
+            self._users_table(), formula=formula, fields=fields
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # Announcements (RenPhil Hub base)
@@ -1809,6 +1890,48 @@ class AirtableService:
             if isinstance(value, str) and value.strip():
                 unique.add(value.strip())
         return CountResponse(count=len(unique))
+
+    async def get_team_members(self) -> list[PersonContactItem]:
+        """Return the team members (First Name, Last Name, Work Email)
+        from the Users table where the 'Status' single-select equals
+        'Active'. Uses the same table and filter as :meth:`get_team_size`;
+        de-duplicated by 'Name'."""
+        s = self._settings
+        formula = af.eq_str(s.USERS_STATUS_FIELD, "Active")
+        records = await self._list_records(
+            self._users_table(),
+            formula=formula,
+            fields=[
+                s.USERS_NAME_FIELD,
+                s.USERS_FIRST_NAME_FIELD,
+                s.USERS_LAST_NAME_FIELD,
+                s.USERS_WORK_EMAIL_FIELD,
+            ],
+        )
+        seen: set[str] = set()
+        items: list[PersonContactItem] = []
+        for r in records:
+            fields = r.get("fields", {}) or {}
+            name = fields.get(s.USERS_NAME_FIELD)
+            if isinstance(name, str) and name.strip():
+                key = name.strip().lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+            items.append(
+                PersonContactItem(
+                    first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
+                    last_name=fields.get(s.USERS_LAST_NAME_FIELD),
+                    work_email=fields.get(s.USERS_WORK_EMAIL_FIELD),
+                )
+            )
+        items.sort(
+            key=lambda x: (
+                (x.last_name or "").lower(),
+                (x.first_name or "").lower(),
+            )
+        )
+        return items
 
     # ══════════════════════════════════════════════════════════════════
     # Partnerships Fundraising (RenPhil Hub base)

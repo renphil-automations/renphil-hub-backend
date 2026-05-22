@@ -44,6 +44,7 @@ from app.helpers.slack import (
 from app.models.airtable import (
     AirtableRecord,
     AirtableUserIdResponse,
+    ActiveProgramItem,
     AmountSumResponse,
     AnnouncementCreate,
     AnnouncementRecord,
@@ -65,6 +66,7 @@ from app.models.airtable import (
     OrgFriendsRecord,
     PartnershipsFundraisingRecord,
     PartnershipsFundraisingUpdate,
+    PersonContactItem,
     FinanceLinkRecord,
     FinanceLinkUpdate,
     GoogleDocsTabRecord,
@@ -624,7 +626,10 @@ async def get_airtable_user_id(
 @router.get(
     "/get_active_programs_count",
     response_model=CountResponse,
-    summary="Number of records with Status == 'Active Program' in the Master List",
+    summary=(
+        "Number of records in the Master List whose Status is "
+        "'3. Active Program' or '4. Publicly Launched'"
+    ),
 )
 async def get_active_programs_count(
     _user: UserInfo = Depends(get_current_user),
@@ -633,20 +638,54 @@ async def get_active_programs_count(
     return await airtable_service.get_active_programs_count()
 
 
-# ── #21 /get_distinct_program_leads_count ─────────────────────────────
+# ── /get_active_programs ──────────────────────────────────────────────
 @router.get(
-    "/get_distinct_program_leads_count",
+    "/get_active_programs",
+    response_model=list[ActiveProgramItem],
+    summary=(
+        "List active programs (Name + Program Lead/Fellow) from the "
+        "Master List filtered to Status '3. Active Program' or "
+        "'4. Publicly Launched'"
+    ),
+)
+async def get_active_programs(
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_active_programs()
+
+
+# ── #21 /get_distinct_fellows_count ───────────────────────────────────
+@router.get(
+    "/get_distinct_fellows_count",
     response_model=CountResponse,
     summary=(
         "Number of fellows: distinct Work Email values in the Users table "
         "where Employment Type includes 'Fellow (Unpaid)' OR For Website == 'Fellow'"
     ),
 )
-async def get_distinct_program_leads_count(
+async def get_distinct_fellows_count(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_distinct_program_leads_count()
+    return await airtable_service.get_distinct_fellows_count()
+
+
+# ── /get_distinct_fellows ─────────────────────────────────────────────
+@router.get(
+    "/get_distinct_fellows",
+    response_model=list[PersonContactItem],
+    summary=(
+        "Unique fellows (First Name, Last Name, Work Email) from the Users "
+        "table where Employment Type includes 'Fellow (Unpaid)' OR "
+        "For Website == 'Fellow'"
+    ),
+)
+async def get_distinct_fellows(
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_distinct_fellows()
 
 
 # ── #22 /get_team_size ───────────────────────────────────────
@@ -660,6 +699,22 @@ async def get_team_size(
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     return await airtable_service.get_team_size()
+
+
+# ── /get_team_members ─────────────────────────────────────────────────
+@router.get(
+    "/get_team_members",
+    response_model=list[PersonContactItem],
+    summary=(
+        "Team members (First Name, Last Name, Work Email) from the Users "
+        "table where Status == 'Active'"
+    ),
+)
+async def get_team_members(
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_team_members()
 
 
 # ── /get_partnerships_fundraising ─────────────────────────────────────
