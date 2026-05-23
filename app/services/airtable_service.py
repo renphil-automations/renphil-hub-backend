@@ -1734,7 +1734,6 @@ class AirtableService:
             ),
             roles=roles,
             permissions=permissions,
-            scope=_str_or_none(fields.get(s.ACCESS_CONTROL_SCOPE_FIELD)),
             fund_or_program_name=fund_or_program_name,
         )
 
@@ -2598,14 +2597,16 @@ class AirtableService:
         }
 
     async def get_unique_roles(self) -> list[Role]:
-        """Return all Roles (id + Role Name) with their linked Permissions resolved."""
+        """Return all Roles (id + Role Name + Scope) with their linked Permissions resolved."""
         name_field = self._settings.ROLES_NAME_FIELD
         perms_field = self._settings.ROLES_PERMISSIONS_FIELD
+        scope_field = self._settings.ROLES_SCOPE_FIELD
 
         # Fetch roles and the permissions catalog in parallel.
         roles_records, permissions = await asyncio.gather(
             self._list_records(
-                self._roles_table(), fields=[name_field, perms_field]
+                self._roles_table(),
+                fields=[name_field, perms_field, scope_field],
             ),
             self.get_unique_permissions(),
         )
@@ -2617,6 +2618,8 @@ class AirtableService:
             fields = r.get("fields", {}) or {}
             name = fields.get(name_field)
             name_str = name.strip() if isinstance(name, str) else None
+            scope = fields.get(scope_field)
+            scope_str = scope.strip() if isinstance(scope, str) else None
 
             linked_perm_ids = fields.get(perms_field) or []
             if not isinstance(linked_perm_ids, list):
@@ -2638,6 +2641,7 @@ class AirtableService:
             seen[r["id"]] = Role(
                 id=r["id"],
                 name=name_str or None,
+                scope=scope_str or None,
                 permissions=role_permissions,
             )
         return sorted(seen.values(), key=lambda x: (x.name or "").lower())

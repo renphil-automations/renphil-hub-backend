@@ -674,10 +674,11 @@ class Permission(BaseModel):
 
 
 class Role(BaseModel):
-    """A role with its id, name and the permissions it grants."""
+    """A role with its id, name, scope and the permissions it grants."""
 
     id: str
     name: str | None = None
+    scope: str | None = None
     permissions: list[Permission] = Field(default_factory=list)
 
 
@@ -695,7 +696,6 @@ class AccessControlRecord(BaseModel):
     user_email: str | None = None
     roles: list[Role] = Field(default_factory=list)
     permissions: list[Permission] = Field(default_factory=list)
-    scope: str | None = None
     fund_or_program_name: str | None = None
 
 
