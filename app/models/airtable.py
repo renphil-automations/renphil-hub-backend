@@ -222,7 +222,7 @@ class GlossaryRecord(_TypedAirtableRecord):
 # ── Org Friends ────────────────────────────────────────────────────────
 class OrgFriendsRecord(_TypedAirtableRecord):
     name_of_proposal: str | None = Field(default=None, alias="Name of Proposal")
-    name_of_org: str | None = Field(default=None, alias="Name of Org")
+    name_of_org: str | None = Field(default=None, alias="Name of Org (if applicable)")
     paragraph_summary: str | None = Field(default=None, alias="Paragraph Summary")
     issue_areas: list[str] | None = Field(default=None, alias="Issue Area(s)")
     submitter: Any = Field(default=None, alias="Submitter")

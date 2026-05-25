@@ -145,7 +145,7 @@ class Settings(BaseSettings):
     AT_F_STATUS: str
     AT_F_SUB_TRACK_OF: str
     AT_F_SHARE_PUBLICLY: str
-    AT_F_VETTING: str
+    AT_F_ONBOARDING_STATUS: str
     AT_F_ADD_TO_SHAREABLE_DOC: str
     AT_F_NAME: str
     AT_F_SCOPING_PROP_OVERVIEW: str

@@ -99,7 +99,8 @@ _F_EXCLUDE_FROM_REPORTING = _S.AT_F_EXCLUDE_FROM_REPORTING
 _F_STATUS = _S.AT_F_STATUS
 _F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
 _F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
-_F_VETTING = _S.AT_F_VETTING
+_F_ONBOARDING_STATUS = _S.AT_F_ONBOARDING_STATUS
+_ONBOARDING_STATUS_VETTING = "Vetting"
 _F_ADD_TO_SHAREABLE_DOC = _S.AT_F_ADD_TO_SHAREABLE_DOC
 _F_NAME = _S.AT_F_NAME
 _F_SCOPING_PROP_OVERVIEW = _S.AT_F_SCOPING_PROP_OVERVIEW
@@ -610,7 +611,13 @@ class AirtableService:
             af.checkbox_clause(_F_EXCLUDE_FROM_LISTS, exclude_from_lists),
             af.checkbox_clause(_F_EXCLUDE_FROM_REPORTING, exclude_from_reporting),
             af.checkbox_clause(_F_SHARE_PUBLICLY, share_publicly),
-            af.checkbox_clause(_F_VETTING, vetting),
+            (
+                af.eq_str(_F_ONBOARDING_STATUS, _ONBOARDING_STATUS_VETTING)
+                if vetting is True
+                else af.neq_str(_F_ONBOARDING_STATUS, _ONBOARDING_STATUS_VETTING)
+                if vetting is False
+                else None
+            ),
             af.checkbox_clause(_F_ADD_TO_SHAREABLE_DOC, add_to_shareable_doc),
             af.empty_clause(_F_SCOPING_PROP_OVERVIEW, scoping_prop_overview_empty),
         ]
