@@ -188,7 +188,7 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     amount: float | None = Field(default=None, alias="Amount")
     onboarding_notes: str | None = Field(default=None, alias="Onboarding Notes")
     internal_intake_doc: Any = Field(default=None, alias="Internal/Intake Doc")
-    cluster: Any = Field(default=None, alias="Cluster")
+    cluster: list[str] | None = Field(default=None, alias="Cluster Name")
     onboarding_hours: str | None = Field(default=None, alias="Onboarding hours")
     ongoing_hours: str | None = Field(default=None, alias="Ongoing hours")
     biggest_needs: str | None = Field(default=None, alias="Biggest needs?")
@@ -203,7 +203,10 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     summary_document_concept_note: Any = Field(
         default=None, alias="Summary Document / Concept Note"
     )
-    deliverables: str | None = Field(default=None, alias="Deliverables")
+    deliverables: list[str] | None = Field(
+        default=None,
+        alias="Deliverable Name (from Awarded Opportunities with Designations)",
+    )
     deliverable_due_date: list[str] | None = Field(
         default=None, alias="Deliverable Due Date"
     )
