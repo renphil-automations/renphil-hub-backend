@@ -62,6 +62,8 @@ from app.models.airtable import (
     Permission,
     Role,
     ShareableDocsRecord,
+    OppRecTypeAmountItem,
+    OppRecTypeAmountResponse,
     UniqueAccountsResponse,
     UserRecord,
     UserUpdate,
@@ -467,6 +469,40 @@ class AirtableService:
             for year, amount in sorted(per_year.items())
         ]
         return YearlyAmountResponse(grand_total=grand_total, years=years)
+
+    async def get_sum_amount_by_opp_rec_type(
+        self,
+        *,
+        eq_year: int | None,
+        lt_year: int | None = None,
+        gt_year: int | None = None,
+    ) -> OppRecTypeAmountResponse:
+        formula = self._build_formula(
+            eq_year=eq_year, lt_year=lt_year, gt_year=gt_year
+        )
+        records = await self._list_fundraising_records(
+            formula=formula, fields=[_F_AMOUNT, _F_OPP_REC_TYPE]
+        )
+
+        per_type: dict[str, float] = defaultdict(float)
+        for r in records:
+            opp_type = self._str_field(r, _F_OPP_REC_TYPE) or ""
+            per_type[opp_type] += self._amount_of(r)
+
+        grand_total = sum(per_type.values())
+        items = [
+            OppRecTypeAmountItem(
+                opportunity_rec_type=opp_type,
+                total=amount,
+                percentage=(amount / grand_total * 100.0) if grand_total else 0.0,
+            )
+            for opp_type, amount in sorted(
+                per_type.items(), key=lambda kv: kv[1], reverse=True
+            )
+        ]
+        return OppRecTypeAmountResponse(
+            grand_total=grand_total, opportunity_rec_types=items
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # Fund & Program Tracker base

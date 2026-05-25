@@ -73,6 +73,7 @@ from app.models.airtable import (
     OfficeSpaceCreate,
     OfficeSpaceRecord,
     OfficeSpaceUpdate,
+    OppRecTypeAmountResponse,
     Permission,
     Role,
     ShareableDocsRecord,
@@ -192,6 +193,23 @@ async def get_sum_amount_over_years(
 ):
     return await airtable_service.get_sum_amount_over_years(
         opportunity_rec_type=opportunity_rec_type,
+    )
+
+
+@router.get(
+    "/get_sum_amount_by_opp_rec_type",
+    response_model=OppRecTypeAmountResponse,
+    summary="Sum of Amount per Opportunity Record Type within a Fiscal Year range",
+)
+async def get_sum_amount_by_opp_rec_type(
+    eq_year: int | None = Query(default=None, description="Fiscal Year equals."),
+    lt_year: int | None = Query(default=None, description="Fiscal Year strictly less than."),
+    gt_year: int | None = Query(default=None, description="Fiscal Year strictly greater than."),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_sum_amount_by_opp_rec_type(
+        eq_year=eq_year, lt_year=lt_year, gt_year=gt_year
     )
 
 

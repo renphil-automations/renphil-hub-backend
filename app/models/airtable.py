@@ -79,6 +79,28 @@ class YearlyAmountResponse(BaseModel):
     years: list[YearlyAmountItem]
 
 
+class OppRecTypeAmountItem(BaseModel):
+    """Aggregated Amount for a given Opportunity Record Type."""
+    opportunity_rec_type: str = Field(
+        description="The Opportunity Record Type bucket (as a string)."
+    )
+    total: float = Field(
+        description="Sum of the Amount field for that Opportunity Record Type."
+    )
+    percentage: float = Field(
+        description=(
+            "Percentage of this Opportunity Record Type's total over the "
+            "grand total (0-100)."
+        )
+    )
+
+
+class OppRecTypeAmountResponse(BaseModel):
+    """Response model for the sum-amount-by-opportunity-rec-type endpoint."""
+    grand_total: float
+    opportunity_rec_types: list[OppRecTypeAmountItem]
+
+
 # ── Fund & Program Tracker schemas ─────────────────────────────────────
 class CountResponse(BaseModel):
     """Generic count response."""
