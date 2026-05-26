@@ -649,7 +649,10 @@ class AirtableService:
         )
 
     def _funds_and_programs_table(self):
-        return self._fp_table(self._settings.FUNDS_AND_PROGRAMS_TABLE)
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.FUNDS_AND_PROGRAMS_TABLE,
+        )
 
     async def _find_fund_or_program_id_by_name(self, name: str) -> str | None:
         """Resolve a fund/program name to a Funds & Programs record id (case-insensitive)."""
