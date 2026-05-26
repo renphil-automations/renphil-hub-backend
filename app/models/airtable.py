@@ -281,7 +281,11 @@ class FundersRecord(_TypedAirtableRecord):
 
 # ── Shareable Docs ─────────────────────────────────────────────────────
 class ShareableDocsRecord(_TypedAirtableRecord):
-    programs: str | None = Field(default=None, alias="Programs")
+    programs: list[str] | None = Field(
+        default=None,
+        alias="Programs",
+        description="Linked record ids of the related programs.",
+    )
     document: str | None = Field(
         default=None, alias="Document", description="URL to the document."
     )
