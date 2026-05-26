@@ -208,7 +208,9 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     scoping_proposal_fund_overview: Any = Field(
         default=None, alias="Scoping Proposal / Fund Overview"
     )
-    status_of_program: str | None = Field(default=None, alias="Status of Program")
+    status_of_program: list[str] | None = Field(
+        default=None, alias="Status of Program"
+    )
     summary_of_conversation: str | None = Field(
         default=None, alias="Summary of Conversation"
     )
