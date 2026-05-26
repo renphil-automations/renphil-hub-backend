@@ -253,6 +253,13 @@ async def get_funds_and_subprograms(
     scoping_prop_overview_empty: bool | None = Query(default=None),
     initiative_types: list[str] | None = Query(default=None),
     focus_areas: list[str] | None = Query(default=None),
+    onboarding_empty: bool | None = Query(
+        default=None,
+        description=(
+            "Filter on the 'Onboarding status' field: "
+            "true → empty, false → not empty, omitted → no filter."
+        ),
+    ),
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -272,6 +279,7 @@ async def get_funds_and_subprograms(
         scoping_prop_overview_empty=scoping_prop_overview_empty,
         initiative_types=initiative_types,
         focus_areas=focus_areas,
+        onboarding_empty=onboarding_empty,
         fields=fields,
     )
 

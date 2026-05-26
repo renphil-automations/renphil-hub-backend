@@ -107,6 +107,21 @@ def not_in_str(field: str, values: Iterable[str]) -> str | None:
     return f"NOT({inner})" if inner else None
 
 
+def contains_str(field: str, value: str) -> str:
+    """Case-sensitive substring match: the field's text contains *value*."""
+    return f"FIND('{escape(value)}', {field_ref(field)} & '') > 0"
+
+
+def contains_any_str(field: str, values: Iterable[str]) -> str | None:
+    """OR of substring-contains predicates for each value."""
+    items = [v for v in values if v is not None]
+    if not items:
+        return None
+    if len(items) == 1:
+        return contains_str(field, items[0])
+    return OR(*(contains_str(field, v) for v in items))
+
+
 # Multiselect contains any: use ARRAYJOIN with a delimiter unlikely to appear.
 _SEP = "\u001f"  # ASCII unit separator
 

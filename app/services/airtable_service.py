@@ -718,6 +718,7 @@ class AirtableService:
         scoping_prop_overview_empty: bool | None = None,
         initiative_types: list[str] | None = None,
         focus_areas: list[str] | None = None,
+        onboarding_empty: bool | None = None,
         fields: list[str] | None = None,
     ) -> list[MasterListFundsAndSubprogramsRecord]:
         clauses: list[str | None] = [
@@ -733,15 +734,20 @@ class AirtableService:
             ),
             af.checkbox_clause(_F_ADD_TO_SHAREABLE_DOC, add_to_shareable_doc),
             af.empty_clause(_F_SCOPING_PROP_OVERVIEW, scoping_prop_overview_empty),
+            af.empty_clause(_F_ONBOARDING_STATUS, onboarding_empty),
         ]
 
         # Status filtering:
-        #   * (status_list AND not_status_list) — combined with AND
-        #   * status_empty / not-empty
-        # The two groups above are unioned (OR).
+        #   * status_list: substring match — the Status field contains
+        #     any of the provided values (OR across values).
+        #   * not_status_list: exact-value exclusion.
+        #   * status_empty / not-empty.
+        # The membership clause and empty clause are unioned (OR).
         status_membership_parts: list[str | None] = []
         if status_list:
-            status_membership_parts.append(af.in_str(_F_STATUS, status_list))
+            status_membership_parts.append(
+                af.contains_any_str(_F_STATUS, status_list)
+            )
         if not_status_list:
             status_membership_parts.append(af.not_in_str(_F_STATUS, not_status_list))
         membership_clause = af.AND(*status_membership_parts)
