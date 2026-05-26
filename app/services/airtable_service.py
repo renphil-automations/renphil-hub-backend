@@ -648,6 +648,21 @@ class AirtableService:
             self._settings.MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE
         )
 
+    def _funds_and_programs_table(self):
+        return self._fp_table(self._settings.FUNDS_AND_PROGRAMS_TABLE)
+
+    async def _find_fund_or_program_id_by_name(self, name: str) -> str | None:
+        """Resolve a fund/program name to a Funds & Programs record id (case-insensitive)."""
+        if not name or not name.strip():
+            return None
+        needle = self._escape(name.strip().lower())
+        formula = f"LOWER({{{_F_NAME}}}) = '{needle}'"
+        table = self._funds_and_programs_table()
+        records = await asyncio.to_thread(
+            table.all, formula=formula, max_records=1, fields=[_F_NAME]
+        )
+        return records[0]["id"] if records else None
+
     def _glossary_table(self):
         return self._fp_table(self._settings.GLOSSARY_TABLE)
 
@@ -1961,13 +1976,31 @@ class AirtableService:
         email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
         roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
         permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
-        fund_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD
+        fund_link_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_LINK_FIELD
         function_field = self._settings.ACCESS_CONTROL_FUNCTION_FIELD
 
         roles_in = list(payload.roles or [])
         permissions_in = list(payload.permissions or [])
         fund_in = payload.fund_or_program_name
         function_in = payload.function
+
+        # Resolve fund/program name → Master List record id (linked-record write).
+        _UNSET: Any = object()
+        fund_link_value: Any = _UNSET
+        if fund_in is not None:
+            if fund_in.strip():
+                resolved = await self._find_fund_or_program_id_by_name(fund_in)
+                if not resolved:
+                    raise HTTPException(
+                        status_code=_http_status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            f"No fund or program named '{fund_in}' was found "
+                            "in the Master List."
+                        ),
+                    )
+                fund_link_value = [resolved]
+            else:
+                fund_link_value = None  # clear
         table = self._access_control_table()
 
         existing = await self._find_access_control_by_email(payload.user_email)
@@ -1978,8 +2011,8 @@ class AirtableService:
                     fields[roles_field] = roles_in
                 if permissions_in:
                     fields[permissions_field] = permissions_in
-                if fund_in is not None:
-                    fields[fund_field] = [fund_in] if fund_in else None
+                if fund_link_value is not _UNSET:
+                    fields[fund_link_field] = fund_link_value
                 if function_in is not None:
                     fields[function_field] = function_in or None
                 result = await asyncio.to_thread(
@@ -1998,8 +2031,8 @@ class AirtableService:
                     update_fields[roles_field] = merged_roles
                 if permissions_in and merged_perms != current_perms:
                     update_fields[permissions_field] = merged_perms
-                if fund_in is not None:
-                    update_fields[fund_field] = [fund_in] if fund_in else None
+                if fund_link_value is not _UNSET:
+                    update_fields[fund_link_field] = fund_link_value
                 if function_in is not None:
                     update_fields[function_field] = function_in or None
 
@@ -2028,7 +2061,7 @@ class AirtableService:
         email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
         roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
         permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
-        fund_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD
+        fund_link_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_LINK_FIELD
         function_field = self._settings.ACCESS_CONTROL_FUNCTION_FIELD
 
         existing = await self._find_access_control_by_email(payload.user_email)
@@ -2057,7 +2090,7 @@ class AirtableService:
         if payload.permissions is not None and new_perms != current_perms:
             update_fields[permissions_field] = new_perms
         if payload.clear_fund_or_program_name:
-            update_fields[fund_field] = None
+            update_fields[fund_link_field] = None
         if payload.clear_function:
             update_fields[function_field] = None
 
