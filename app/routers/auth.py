@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import RedirectResponse
 
 from app.dependencies import get_airtable_service, get_auth_service, get_current_user
-from app.models.auth import TokenResponse, UserInfo
+from app.models.auth import MeResponse, TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
 
@@ -64,7 +64,22 @@ async def callback(
     return RedirectResponse(f"{frontend_redirect_uri}?{params}")
 
 
-@router.get("/me", response_model=UserInfo, summary="Current user info")
-async def me(user: UserInfo = Depends(get_current_user)):
-    """Return the authenticated user's profile."""
-    return user
+@router.get("/me", response_model=MeResponse, summary="Current user info")
+async def me(
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    """Return the authenticated user's profile.
+
+    Includes ``scoped_roles``: per-assignment role info from the Access
+    Control table, with each entry's ``role_name``, ``scope``, and
+    ``fund_or_program_name`` (null when the role's scope is ``Hub``).
+    """
+    scoped_roles = await airtable_service.get_user_scoped_roles(user.email)
+    return MeResponse(
+        email=user.email,
+        name=user.name,
+        picture=user.picture,
+        roles=user.roles,
+        scoped_roles=scoped_roles,
+    )

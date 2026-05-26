@@ -160,6 +160,33 @@ class PersonContactItem(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+# ── Generic per-record partial update ─────────────────────────────────
+class RecordFieldsUpdate(BaseModel):
+    """Generic partial update payload for a typed Airtable record.
+
+    The ``fields`` dictionary keys are the Airtable column names (which
+    match the alias of the corresponding field on the table's typed
+    record model — e.g. ``"Name"``, ``"Status"``,
+    ``"Focus Area(s)"``). Values follow Airtable's expected types
+    (string, number, bool, list of strings for multi-select / linked
+    records, etc.). ``typecast=True`` is used server-side so single-
+    select / multi-select string values are accepted as-is.
+
+    Only the fields included in this dictionary are updated; omitted
+    fields are left untouched. Set a key to ``null`` to clear the field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fields: dict[str, Any] = Field(
+        description=(
+            "Map of Airtable field name → new value. "
+            "Must contain at least one entry."
+        ),
+        min_length=1,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════
 #   Per-table typed record models
 # ══════════════════════════════════════════════════════════════════════
@@ -764,6 +791,77 @@ class AccessControlRevoke(BaseModel):
         if not self.roles and not self.permissions:
             raise ValueError(
                 "At least one of 'roles' or 'permissions' must be provided."
+            )
+        return self
+
+
+class RoleCreate(BaseModel):
+    """Payload to create a new Role."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Role name.")
+    scope: str | None = Field(default=None, description="Optional scope value.")
+    permissions: list[str] | None = Field(
+        default=None,
+        description="Optional list of Permission record IDs to link.",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("name must be a non-empty string.")
+        return value
+
+
+class RoleUpdate(BaseModel):
+    """Payload to update an existing Role.
+
+    All fields are optional. ``name`` and ``scope`` replace the current
+    values when provided. ``add_permissions`` / ``remove_permissions``
+    incrementally edit the linked Permissions field by Permission record
+    IDs. ``permissions`` (if provided) overrides the entire linked list
+    and may not be combined with ``add_permissions``/``remove_permissions``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, description="New role name.")
+    scope: str | None = Field(default=None, description="New scope value.")
+    permissions: list[str] | None = Field(
+        default=None,
+        description=(
+            "Replace the linked Permissions with this exact list of "
+            "Permission record IDs."
+        ),
+    )
+    add_permissions: list[str] | None = Field(
+        default=None,
+        description="Permission record IDs to add to the linked list.",
+    )
+    remove_permissions: list[str] | None = Field(
+        default=None,
+        description="Permission record IDs to remove from the linked list.",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RoleUpdate":
+        if (
+            self.name is None
+            and self.scope is None
+            and self.permissions is None
+            and not self.add_permissions
+            and not self.remove_permissions
+        ):
+            raise ValueError("At least one field must be provided.")
+        if self.permissions is not None and (
+            self.add_permissions or self.remove_permissions
+        ):
+            raise ValueError(
+                "'permissions' cannot be combined with "
+                "'add_permissions' or 'remove_permissions'."
             )
         return self
 

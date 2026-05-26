@@ -76,6 +76,8 @@ from app.models.airtable import (
     OppRecTypeAmountResponse,
     Permission,
     Role,
+    RoleUpdate,
+    RoleCreate,
     ShareableDocsRecord,
     SlackTicketWebhookPayload,
     EmailTicketWebhookPayload,
@@ -94,6 +96,7 @@ from app.models.airtable import (
     QuickLinkRecord,
     QuickLinkCreate,
     QuickLinkUpdate,
+    RecordFieldsUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -1243,6 +1246,209 @@ async def get_permissions(
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     return await airtable_service.get_unique_permissions()
+
+
+@router.post(
+    "/access-control/roles",
+    response_model=Role,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Role (admin only)",
+)
+async def create_role(
+    payload: RoleCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service.create_role(payload)
+
+
+@router.patch(
+    "/access-control/roles/{role_id}",
+    response_model=Role,
+    summary="Update a Role: name, scope, and/or permissions (admin only)",
+)
+async def update_role(
+    role_id: str = Path(..., description="Role record id."),
+    payload: RoleUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service.update_role(role_id, payload)
+
+
+@router.delete(
+    "/access-control/roles/{role_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a Role (admin only)",
+)
+async def delete_role(
+    role_id: str = Path(..., description="Role record id."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    await airtable_service.delete_role(role_id)
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#   Admin record updates for typed data tables
+# ═══════════════════════════════════════════════════════════════════
+#
+# Each endpoint takes:
+#   * Path  : the Airtable record id (e.g. "rec...")
+#   * Body  : { "fields": { "<Airtable Field Name>": value, ... } }
+#
+# Keys in ``fields`` are the exact Airtable column names (which match the
+# alias of the corresponding attribute on the typed record model).
+# Values follow Airtable's own JSON shape (string, number, bool, list of
+# strings for multi-select / linked-record fields, etc.). ``typecast``
+# is enabled server-side so single/multi-select values can be sent as
+# plain strings.
+#
+# Returns the refreshed record using the same model as the matching GET.
+
+@router.patch(
+    "/funds_and_subprograms/{record_id}",
+    response_model=MasterListFundsAndSubprogramsRecord,
+    summary="Update a Master List fund/subprogram record (admin only)",
+)
+async def update_funds_and_subprograms_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._master_list_table(),
+        record_id,
+        payload.fields,
+        MasterListFundsAndSubprogramsRecord,
+    )
+
+
+@router.patch(
+    "/glossary/{record_id}",
+    response_model=GlossaryRecord,
+    summary="Update a Glossary record (admin only)",
+)
+async def update_glossary_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._glossary_table(),
+        record_id,
+        payload.fields,
+        GlossaryRecord,
+    )
+
+
+@router.patch(
+    "/org_friends/{record_id}",
+    response_model=OrgFriendsRecord,
+    summary="Update an Org Friends record (admin only)",
+)
+async def update_org_friends_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._org_friends_table(),
+        record_id,
+        payload.fields,
+        OrgFriendsRecord,
+    )
+
+
+@router.patch(
+    "/funders/{record_id}",
+    response_model=FundersRecord,
+    summary="Update a Funders record (admin only)",
+)
+async def update_funders_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._funders_table(),
+        record_id,
+        payload.fields,
+        FundersRecord,
+    )
+
+
+@router.patch(
+    "/monthly_checkin/{record_id}",
+    response_model=MonthlyCheckinRecord,
+    summary="Update a Funds & Programs Monthly Check-In record (admin only)",
+)
+async def update_monthly_checkin_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._monthly_checkin_table(),
+        record_id,
+        payload.fields,
+        MonthlyCheckinRecord,
+    )
+
+
+@router.patch(
+    "/checkin_reporting_periods/{record_id}",
+    response_model=CheckinReportingPeriodRecord,
+    summary="Update a Check-In Reporting Period record (admin only)",
+)
+async def update_checkin_reporting_period_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._checkin_periods_table(),
+        record_id,
+        payload.fields,
+        CheckinReportingPeriodRecord,
+        id_key="record_id",
+    )
+
+
+@router.patch(
+    "/shareable_docs/{record_id}",
+    response_model=ShareableDocsRecord,
+    summary="Update a Shareable Docs record (admin only)",
+)
+async def update_shareable_docs_record(
+    record_id: str = Path(..., description="Airtable record id."),
+    payload: RecordFieldsUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    await _require_admin(user, airtable_service)
+    return await airtable_service._update_typed_record(
+        airtable_service._shareable_docs_table(),
+        record_id,
+        payload.fields,
+        ShareableDocsRecord,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════

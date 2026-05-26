@@ -61,6 +61,8 @@ from app.models.airtable import (
     OfficeSpaceUpdate,
     Permission,
     Role,
+    RoleUpdate,
+    RoleCreate,
     ShareableDocsRecord,
     OppRecTypeAmountItem,
     OppRecTypeAmountResponse,
@@ -239,6 +241,69 @@ class AirtableService:
         roles = await self.get_user_roles(email)
         return self.HUB_ADMIN_ROLE in roles
 
+    # Role scope value that represents a global (non-scoped) role.
+    HUB_SCOPE = "Hub"
+
+    async def get_user_scoped_roles(self, email: str):
+        """Return the per-assignment scoped roles for ``email``.
+
+        Each entry contains the role name, its scope, and the fund or
+        program name from the matching Access Control record. The
+        fund/program is set to ``None`` when the role's scope is
+        ``Hub`` (global).
+        """
+        # Imported here to avoid a circular import with app.models.auth.
+        from app.models.auth import ScopedRole
+
+        if not email:
+            return []
+
+        s = self._settings
+        email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
+        normalized = email.strip().lower()
+        formula = f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
+        table = self._access_control_table()
+        try:
+            records = await asyncio.to_thread(table.all, formula=formula)
+        except RequestException as exc:
+            logger.error("Airtable scoped-role lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during scoped-role lookup")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        if not records:
+            return []
+
+        # Build role_id → (name, scope) map from the Roles catalog.
+        roles_catalog = await self.get_unique_roles()
+        role_by_id = {r.id: r for r in roles_catalog}
+
+        out: list = []
+        seen: set[tuple[str, str, str]] = set()
+        for rec in records:
+            ac = self._build_access_control_record(rec)
+            for role in ac.roles:
+                catalog_role = role_by_id.get(role.id)
+                scope = catalog_role.scope if catalog_role else None
+                name = role.name or (catalog_role.name if catalog_role else None)
+                if scope and scope.strip().lower() == self.HUB_SCOPE.lower():
+                    fund_or_program = None
+                else:
+                    fund_or_program = ac.fund_or_program_name
+                key = (name or "", scope or "", fund_or_program or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    ScopedRole(
+                        role_name=name,
+                        scope=scope,
+                        fund_or_program_name=fund_or_program,
+                    )
+                )
+        return out
+
     @staticmethod
     def _escape(value: str) -> str:
         """Escape backslashes and single quotes for Airtable formula literals."""
@@ -357,6 +422,54 @@ class AirtableService:
             model_cls.model_validate({"id": r["id"], **r.get("fields", {})})
             for r in records
         ]
+
+    async def _update_typed_record(
+        self,
+        table,
+        record_id: str,
+        fields: dict[str, Any],
+        model_cls,
+        *,
+        id_key: str = "id",
+    ):
+        """Update a record by Airtable record id and return the typed result.
+
+        Uses ``typecast=True`` so single/multi-select values can be sent
+        as plain strings. Raises ``HTTPException(404)`` when the record
+        does not exist.
+        """
+        if not record_id:
+            raise HTTPException(
+                status_code=_http_status.HTTP_400_BAD_REQUEST,
+                detail="record_id is required.",
+            )
+        if not fields:
+            raise HTTPException(
+                status_code=_http_status.HTTP_400_BAD_REQUEST,
+                detail="No fields provided to update.",
+            )
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record_id, fields, typecast=True
+            )
+        except RequestException as exc:
+            # pyairtable surfaces 404 as a RequestException with an HTTP
+            # response attached; map it to a proper 404 for the client.
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code == 404:
+                raise HTTPException(
+                    status_code=_http_status.HTTP_404_NOT_FOUND,
+                    detail=f"Record '{record_id}' not found.",
+                ) from exc
+            logger.error("Airtable update failed for %s: %s", record_id, exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during update")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return model_cls.model_validate(
+            {id_key: updated["id"], **updated.get("fields", {})}
+        )
 
     # ── public endpoints ───────────────────────────────────────────────
 
@@ -682,25 +795,28 @@ class AirtableService:
 
             records = [r for r in records if _passes(r)]
 
-        return records
+        return self._to_typed(records, MasterListFundsAndSubprogramsRecord)
 
     # ── #2 /get_glossary_data ──────────────────────────────────────────
     async def get_glossary_data(
         self, *, fields: list[str] | None = None
-    ) -> list[dict[str, Any]]:
-        return await self._list_records(self._glossary_table(), fields=fields)
+    ) -> list[GlossaryRecord]:
+        records = await self._list_records(self._glossary_table(), fields=fields)
+        return self._to_typed(records, GlossaryRecord)
 
     # ── #3 /get_org_friends ────────────────────────────────────────────
     async def get_org_friends(
         self, *, fields: list[str] | None = None
-    ) -> list[dict[str, Any]]:
-        return await self._list_records(self._org_friends_table(), fields=fields)
+    ) -> list[OrgFriendsRecord]:
+        records = await self._list_records(self._org_friends_table(), fields=fields)
+        return self._to_typed(records, OrgFriendsRecord)
 
     # ── #4 /get_funders ────────────────────────────────────────────────
     async def get_funders(
         self, *, fields: list[str] | None = None
-    ) -> list[dict[str, Any]]:
-        return await self._list_records(self._funders_table(), fields=fields)
+    ) -> list[FundersRecord]:
+        records = await self._list_records(self._funders_table(), fields=fields)
+        return self._to_typed(records, FundersRecord)
 
     # ── shared base filters for monthly check-in endpoints ────────────
     @staticmethod
@@ -2707,6 +2823,160 @@ class AirtableService:
                 id=r["id"], name=name_str or None, description=desc_str or None
             )
         return sorted(seen.values(), key=lambda x: (x.name or "").lower())
+
+    async def create_role(self, payload: RoleCreate) -> Role:
+        """Create a new Role record."""
+        s = self._settings
+        name_field = s.ROLES_NAME_FIELD
+        perms_field = s.ROLES_PERMISSIONS_FIELD
+        scope_field = s.ROLES_SCOPE_FIELD
+        table = self._roles_table()
+
+        fields: dict[str, Any] = {name_field: payload.name}
+        if payload.scope is not None:
+            fields[scope_field] = payload.scope.strip()
+        if payload.permissions:
+            fields[perms_field] = list(dict.fromkeys(payload.permissions))
+
+        try:
+            result = await asyncio.to_thread(table.create, fields)
+        except RequestException as exc:
+            logger.error("Airtable role create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during role create")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        permissions_catalog = await self.get_unique_permissions()
+        perm_by_id = {p.id: p for p in permissions_catalog}
+        result_fields = result.get("fields", {}) or {}
+        linked_perm_ids = result_fields.get(perms_field) or []
+        if not isinstance(linked_perm_ids, list):
+            linked_perm_ids = [linked_perm_ids]
+        role_permissions: list[Permission] = []
+        for pid in linked_perm_ids:
+            if not isinstance(pid, str):
+                continue
+            perm = perm_by_id.get(pid)
+            role_permissions.append(
+                perm if perm is not None
+                else Permission(id=pid, name=None, description=None)
+            )
+
+        result_name = result_fields.get(name_field)
+        result_scope = result_fields.get(scope_field)
+        return Role(
+            id=result["id"],
+            name=result_name.strip() if isinstance(result_name, str) and result_name.strip() else None,
+            scope=result_scope.strip() if isinstance(result_scope, str) and result_scope.strip() else None,
+            permissions=role_permissions,
+        )
+
+    async def update_role(self, role_id: str, payload: RoleUpdate) -> Role:
+        """Update a Role record: name, scope, and/or linked Permissions.
+
+        When ``payload.permissions`` is provided it replaces the linked
+        list; otherwise the linked list is incrementally edited using
+        ``add_permissions`` / ``remove_permissions``.
+        """
+        s = self._settings
+        name_field = s.ROLES_NAME_FIELD
+        perms_field = s.ROLES_PERMISSIONS_FIELD
+        scope_field = s.ROLES_SCOPE_FIELD
+        table = self._roles_table()
+
+        try:
+            existing = await asyncio.to_thread(table.get, role_id)
+        except RequestException as exc:
+            logger.error("Airtable role fetch failed: %s", exc)
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Role '{role_id}' not found.",
+            ) from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error fetching role")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        fields_existing = existing.get("fields", {}) or {}
+        update_fields: dict[str, Any] = {}
+
+        if payload.name is not None:
+            update_fields[name_field] = payload.name.strip()
+        if payload.scope is not None:
+            update_fields[scope_field] = payload.scope.strip()
+
+        if payload.permissions is not None:
+            update_fields[perms_field] = list(
+                dict.fromkeys(payload.permissions)
+            )
+        elif payload.add_permissions or payload.remove_permissions:
+            current = list(fields_existing.get(perms_field) or [])
+            to_remove = set(payload.remove_permissions or [])
+            to_add = list(payload.add_permissions or [])
+            new_perms = [p for p in current if p not in to_remove]
+            for pid in to_add:
+                if pid not in new_perms:
+                    new_perms.append(pid)
+            if new_perms != current:
+                update_fields[perms_field] = new_perms
+
+        if not update_fields:
+            result = existing
+        else:
+            try:
+                result = await asyncio.to_thread(
+                    table.update, role_id, update_fields
+                )
+            except RequestException as exc:
+                logger.error("Airtable role update failed: %s", exc)
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception("Unexpected Airtable error during role update")
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        # Build the resolved Role with Permission objects from the catalog.
+        permissions_catalog = await self.get_unique_permissions()
+        perm_by_id = {p.id: p for p in permissions_catalog}
+        result_fields = result.get("fields", {}) or {}
+        linked_perm_ids = result_fields.get(perms_field) or []
+        if not isinstance(linked_perm_ids, list):
+            linked_perm_ids = [linked_perm_ids]
+        role_permissions: list[Permission] = []
+        for pid in linked_perm_ids:
+            if not isinstance(pid, str):
+                continue
+            perm = perm_by_id.get(pid)
+            role_permissions.append(
+                perm if perm is not None
+                else Permission(id=pid, name=None, description=None)
+            )
+
+        result_name = result_fields.get(name_field)
+        result_scope = result_fields.get(scope_field)
+        return Role(
+            id=result["id"],
+            name=result_name.strip() if isinstance(result_name, str) and result_name.strip() else None,
+            scope=result_scope.strip() if isinstance(result_scope, str) and result_scope.strip() else None,
+            permissions=role_permissions,
+        )
+
+    async def delete_role(self, role_id: str) -> None:
+        """Delete a Role record from the Roles table by record id."""
+        table = self._roles_table()
+        try:
+            await asyncio.to_thread(table.delete, role_id)
+        except RequestException as exc:
+            msg = str(exc)
+            if "404" in msg or "NOT_FOUND" in msg.upper():
+                raise HTTPException(
+                    status_code=_http_status.HTTP_404_NOT_FOUND,
+                    detail=f"Role '{role_id}' not found.",
+                ) from exc
+            logger.error("Airtable role delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during role delete")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
 
     # ══════════════════════════════════════════════════════════════════
     # Tickets (RenPhil Hub base)
