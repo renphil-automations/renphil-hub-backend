@@ -36,6 +36,13 @@ class ScopedRole(BaseModel):
             "the role's scope is 'Hub' (i.e. global)."
         ),
     )
+    function: str | None = Field(
+        default=None,
+        description=(
+            "Function value the role is scoped to. Populated only when "
+            "the role's scope is 'Function'; null otherwise."
+        ),
+    )
 
 
 class MeResponse(BaseModel):

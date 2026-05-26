@@ -243,6 +243,8 @@ class AirtableService:
 
     # Role scope value that represents a global (non-scoped) role.
     HUB_SCOPE = "Hub"
+    # Role scope value that targets the 'Function' single-select field.
+    FUNCTION_SCOPE = "Function"
 
     async def get_user_scoped_roles(self, email: str):
         """Return the per-assignment scoped roles for ``email``.
@@ -280,18 +282,29 @@ class AirtableService:
         role_by_id = {r.id: r for r in roles_catalog}
 
         out: list = []
-        seen: set[tuple[str, str, str]] = set()
+        seen: set[tuple[str, str, str, str]] = set()
         for rec in records:
             ac = self._build_access_control_record(rec)
             for role in ac.roles:
                 catalog_role = role_by_id.get(role.id)
                 scope = catalog_role.scope if catalog_role else None
                 name = role.name or (catalog_role.name if catalog_role else None)
-                if scope and scope.strip().lower() == self.HUB_SCOPE.lower():
+                scope_norm = (scope or "").strip().lower()
+                if scope_norm == self.HUB_SCOPE.lower():
                     fund_or_program = None
+                    function = None
+                elif scope_norm == self.FUNCTION_SCOPE.lower():
+                    fund_or_program = None
+                    function = ac.function
                 else:
                     fund_or_program = ac.fund_or_program_name
-                key = (name or "", scope or "", fund_or_program or "")
+                    function = None
+                key = (
+                    name or "",
+                    scope or "",
+                    fund_or_program or "",
+                    function or "",
+                )
                 if key in seen:
                     continue
                 seen.add(key)
@@ -300,6 +313,7 @@ class AirtableService:
                         role_name=name,
                         scope=scope,
                         fund_or_program_name=fund_or_program,
+                        function=function,
                     )
                 )
         return out
@@ -1892,6 +1906,19 @@ class AirtableService:
         else:
             fund_or_program_name = _str_or_none(fund_or_program_raw)
 
+        # Function is a single-select; may also come back as a list if the
+        # Airtable column is later changed — handle both shapes defensively.
+        function_raw = fields.get(s.ACCESS_CONTROL_FUNCTION_FIELD)
+        if isinstance(function_raw, list):
+            fn_items = [
+                str(v).strip()
+                for v in function_raw
+                if v is not None and str(v).strip()
+            ]
+            function_value = ", ".join(fn_items) if fn_items else None
+        else:
+            function_value = _str_or_none(function_raw)
+
         return AccessControlRecord(
             id=record["id"],
             user_email=_str_or_none(
@@ -1900,6 +1927,7 @@ class AirtableService:
             roles=roles,
             permissions=permissions,
             fund_or_program_name=fund_or_program_name,
+            function=function_value,
         )
 
     async def _find_access_control_by_email(
@@ -1933,9 +1961,13 @@ class AirtableService:
         email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
         roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
         permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
+        fund_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD
+        function_field = self._settings.ACCESS_CONTROL_FUNCTION_FIELD
 
         roles_in = list(payload.roles or [])
         permissions_in = list(payload.permissions or [])
+        fund_in = payload.fund_or_program_name
+        function_in = payload.function
         table = self._access_control_table()
 
         existing = await self._find_access_control_by_email(payload.user_email)
@@ -1946,7 +1978,13 @@ class AirtableService:
                     fields[roles_field] = roles_in
                 if permissions_in:
                     fields[permissions_field] = permissions_in
-                result = await asyncio.to_thread(table.create, fields)
+                if fund_in is not None:
+                    fields[fund_field] = [fund_in] if fund_in else None
+                if function_in is not None:
+                    fields[function_field] = function_in or None
+                result = await asyncio.to_thread(
+                    table.create, fields, typecast=True
+                )
             else:
                 fields_existing = existing.get("fields", {}) or {}
                 current_roles = fields_existing.get(roles_field) or []
@@ -1960,12 +1998,19 @@ class AirtableService:
                     update_fields[roles_field] = merged_roles
                 if permissions_in and merged_perms != current_perms:
                     update_fields[permissions_field] = merged_perms
+                if fund_in is not None:
+                    update_fields[fund_field] = [fund_in] if fund_in else None
+                if function_in is not None:
+                    update_fields[function_field] = function_in or None
 
                 if not update_fields:
                     result = existing
                 else:
                     result = await asyncio.to_thread(
-                        table.update, existing["id"], update_fields
+                        table.update,
+                        existing["id"],
+                        update_fields,
+                        typecast=True,
                     )
         except RequestException as exc:
             logger.error("Airtable access-control upsert failed: %s", exc)
@@ -1983,6 +2028,8 @@ class AirtableService:
         email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
         roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
         permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
+        fund_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD
+        function_field = self._settings.ACCESS_CONTROL_FUNCTION_FIELD
 
         existing = await self._find_access_control_by_email(payload.user_email)
         if existing is None:
@@ -2009,6 +2056,10 @@ class AirtableService:
             update_fields[roles_field] = new_roles
         if payload.permissions is not None and new_perms != current_perms:
             update_fields[permissions_field] = new_perms
+        if payload.clear_fund_or_program_name:
+            update_fields[fund_field] = None
+        if payload.clear_function:
+            update_fields[function_field] = None
 
         if not update_fields:
             return self._build_access_control_record(existing)

@@ -755,6 +755,13 @@ class AccessControlRecord(BaseModel):
     roles: list[Role] = Field(default_factory=list)
     permissions: list[Permission] = Field(default_factory=list)
     fund_or_program_name: str | None = None
+    function: str | None = Field(
+        default=None,
+        description=(
+            "Value of the 'Function' single-select field on the Access "
+            "Control record. Populated when the role's scope is 'Function'."
+        ),
+    )
 
 
 class AccessControlAssign(BaseModel):
@@ -769,12 +776,32 @@ class AccessControlAssign(BaseModel):
     permissions: list[str] | None = Field(
         default=None, description="Permission record IDs to add. Optional."
     )
+    fund_or_program_name: str | None = Field(
+        default=None,
+        description=(
+            "Name of the fund or program the assignment is scoped to. "
+            "Used for role scopes 'Fund' / 'Program'. Optional."
+        ),
+    )
+    function: str | None = Field(
+        default=None,
+        description=(
+            "Value of the 'Function' single-select column. Used for the "
+            "'Function' role scope. Optional."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_at_least_one(self) -> "AccessControlAssign":
-        if not self.roles and not self.permissions:
+        if (
+            not self.roles
+            and not self.permissions
+            and self.fund_or_program_name is None
+            and self.function is None
+        ):
             raise ValueError(
-                "At least one of 'roles' or 'permissions' must be provided."
+                "At least one of 'roles', 'permissions', "
+                "'fund_or_program_name', or 'function' must be provided."
             )
         return self
 
@@ -791,12 +818,26 @@ class AccessControlRevoke(BaseModel):
     permissions: list[str] | None = Field(
         default=None, description="Permission record IDs to remove. Optional."
     )
+    clear_fund_or_program_name: bool = Field(
+        default=False,
+        description="If true, clear the 'Fund or Program Name' field.",
+    )
+    clear_function: bool = Field(
+        default=False,
+        description="If true, clear the 'Function' field.",
+    )
 
     @model_validator(mode="after")
     def _check_at_least_one(self) -> "AccessControlRevoke":
-        if not self.roles and not self.permissions:
+        if (
+            not self.roles
+            and not self.permissions
+            and not self.clear_fund_or_program_name
+            and not self.clear_function
+        ):
             raise ValueError(
-                "At least one of 'roles' or 'permissions' must be provided."
+                "At least one of 'roles', 'permissions', "
+                "'clear_fund_or_program_name', or 'clear_function' must be provided."
             )
         return self
 
