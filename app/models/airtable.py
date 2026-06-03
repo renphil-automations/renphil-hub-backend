@@ -617,6 +617,7 @@ class MonthlyCheckinRecord(_TypedAirtableRecord):
     check_in_reporting_period: Any = Field(
         default=None, alias="Check-In Reporting Period"
     )
+    cluster: Any = Field(default=None, alias="Cluster")
     phase_status_from_program_name: Any = Field(
         default=None, alias="Phase/Status (from Program Name)"
     )

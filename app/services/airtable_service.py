@@ -1359,6 +1359,40 @@ class AirtableService:
         records = await self._list_records(
             self._monthly_checkin_table(), formula=formula, fields=fields
         )
+
+        program_ids: set[str] = set()
+        period_ids: set[str] = set()
+        cluster_ids: set[str] = set()
+        for r in records:
+            program_ids.update(self._linked_ids(r, _F_PROGRAM_NAME))
+            period_ids.update(self._linked_ids(r, _F_CHECKIN_REPORTING_PERIOD))
+            for cid in self._linked_ids(r, _F_CLUSTER):
+                if isinstance(cid, str) and cid.startswith("rec"):
+                    cluster_ids.add(cid)
+
+        programs_lookup = (
+            await self._get_records_by_ids(self._master_list_table(), program_ids)
+            if program_ids else {}
+        )
+        periods_lookup = (
+            await self._get_records_by_ids(self._checkin_periods_table(), period_ids)
+            if period_ids else {}
+        )
+        clusters_lookup = (
+            await self._get_records_by_ids(self._clusters_table(), cluster_ids)
+            if cluster_ids else {}
+        )
+
+        self._expand_linked_field(
+            records, field=_F_PROGRAM_NAME, lookup=programs_lookup
+        )
+        self._expand_linked_field(
+            records, field=_F_CHECKIN_REPORTING_PERIOD, lookup=periods_lookup
+        )
+        self._expand_linked_field(
+            records, field=_F_CLUSTER, lookup=clusters_lookup
+        )
+
         return self._to_typed(records, MonthlyCheckinRecord)
 
     # ── #11 /get_archived_reports_by_program ──────────────────────────
