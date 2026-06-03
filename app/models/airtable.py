@@ -578,13 +578,13 @@ class QuickLinkUpdate(BaseModel):
 
 
 # ── Clusters ───────────────────────────────────────────────────────────
-class ClusterRecord(BaseModel):
-    """A cluster reference resolved with its display name."""
+class ClusterRecord(_TypedAirtableRecord):
+    """A Clusters table record with its related funds/programs expanded."""
 
-    model_config = ConfigDict(populate_by_name=True)
-
-    record_id: str = Field(description="Airtable record id of the cluster.")
     name: str | None = Field(default=None, alias="Name")
+    related_funds_programs: list[MasterListFundsAndSubprogramsRecord] | None = (
+        Field(default=None, alias="Related Funds/Programs")
+    )
 
 
 # ── Check-In Reporting Periods ─────────────────────────────────────────

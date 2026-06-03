@@ -124,6 +124,7 @@ _F_PROGRAM_NAME = _S.AT_F_PROGRAM_NAME
 _F_CHECKIN_HISTORY = _S.AT_F_CHECKIN_HISTORY
 _F_CHECKIN_REPORTING_PERIOD = _S.AT_F_CHECKIN_REPORTING_PERIOD
 _F_CLUSTER = _S.AT_F_CLUSTER
+_F_CLUSTER_RELATED_FUNDS_PROGRAMS = _S.AT_F_CLUSTER_RELATED_FUNDS_PROGRAMS
 _F_DASHBOARD_DISPLAY = _S.AT_F_DASHBOARD_DISPLAY
 _F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
 _F_DEADLINE = _S.AT_F_DEADLINE
@@ -1423,31 +1424,28 @@ class AirtableService:
 
     # ── #15 /get_clusters ─────────────────────────────────────────────
     async def get_clusters(self) -> list[ClusterRecord]:
-        records = await self._list_records(
-            self._monthly_checkin_table(), fields=[_F_CLUSTER]
-        )
-        ids: set[str] = set()
+        records = await self._list_records(self._clusters_table())
+
+        related_ids: set[str] = set()
         for r in records:
-            value = r.get("fields", {}).get(_F_CLUSTER)
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str) and item.startswith("rec"):
-                        ids.add(item)
-
-        if not ids:
-            return []
-
-        clusters = await self._get_records_by_ids(
-            self._clusters_table(), ids, fields=[_F_NAME]
-        )
-        return [
-            ClusterRecord(
-                record_id=cid,
-                name=self._str_field(clusters[cid], _F_NAME)
-                if cid in clusters else None,
+            related_ids.update(
+                self._linked_ids(r, _F_CLUSTER_RELATED_FUNDS_PROGRAMS)
             )
-            for cid in sorted(ids)
-        ]
+
+        programs_lookup = (
+            await self._get_records_by_ids(
+                self._master_list_table(), related_ids
+            )
+            if related_ids
+            else {}
+        )
+        self._expand_linked_field(
+            records,
+            field=_F_CLUSTER_RELATED_FUNDS_PROGRAMS,
+            lookup=programs_lookup,
+        )
+
+        return self._to_typed(records, ClusterRecord)
 
     # ── #16 /get_program_names ────────────────────────────────────────
     async def get_program_names(
