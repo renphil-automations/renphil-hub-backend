@@ -208,9 +208,7 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     scoping_proposal_fund_overview: Any = Field(
         default=None, alias="Scoping Proposal / Fund Overview"
     )
-    status_of_program: list[str] | None = Field(
-        default=None, alias="Status of Program"
-    )
+    status_of_program: str | None = Field(default=None, alias="Status of Program")
     summary_of_conversation: str | None = Field(
         default=None, alias="Summary of Conversation"
     )
@@ -270,6 +268,51 @@ class OrgFriendsRecord(_TypedAirtableRecord):
     latest_update: str | None = Field(default=None, alias="Latest update")
 
 
+# ── Awarded Opportunities ──────────────────────────────────────────────
+class MasterListLookupItem(BaseModel):
+    """Resolved Master List of Funds & Subprograms entry, embedded inside an
+    Awarded Opportunity row when its lookup field is requested."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = Field(description="Airtable record id in the Master List table.")
+    official_fund_or_program_name: str | None = Field(
+        default=None, alias="Official Fund or Program Name"
+    )
+    initiative_type: str | None = Field(default=None, alias="Initiative Type")
+    focus_areas: list[str] | None = Field(default=None, alias="Focus Area(s)")
+    program_lead_fellow: Any = Field(default=None, alias="Program Lead/Fellow")
+    status: str | None = Field(default=None, alias="Status")
+    program_summary: str | None = Field(default=None, alias="Program Summary")
+    internal_notes: str | None = Field(default=None, alias="Internal Notes")
+    can_we_talk_about_it_publicly: bool | None = Field(
+        default=None, alias="Can we talk about it publicly"
+    )
+    last_updated: str | None = Field(default=None, alias="Last Updated")
+    scoping_proposal_fund_overview: str | None = Field(
+        default=None, alias="Scoping Proposal / Fund Overview"
+    )
+    summary_document_concept_note: str | None = Field(
+        default=None, alias="Summary Document / Concept Note"
+    )
+    website: str | None = Field(default=None, alias="Website")
+    checkin_history: Any = Field(default=None, alias="Check-In History")
+    technical_document_deep_dive: str | None = Field(
+        default=None, alias="Technical Document / Deep Dive"
+    )
+
+
+class AwardedOpportunityRecord(_TypedAirtableRecord):
+    """An Awarded Opportunity row. The Master List lookup field is enriched
+    server-side: instead of a list of raw record IDs, it carries the resolved
+    Master List entries (subset of fields)."""
+
+    master_list_funds_subprograms: list[MasterListLookupItem] | None = Field(
+        default=None,
+        alias="Master List of Funds & Sub-Programs (from Linked Gift Designation)",
+    )
+
+
 # ── Funders ────────────────────────────────────────────────────────────
 class FundersRecord(_TypedAirtableRecord):
     opportunity_name: str | None = Field(default=None, alias="Opportunity Name")
@@ -283,11 +326,7 @@ class FundersRecord(_TypedAirtableRecord):
 
 # ── Shareable Docs ─────────────────────────────────────────────────────
 class ShareableDocsRecord(_TypedAirtableRecord):
-    programs: list[str] | None = Field(
-        default=None,
-        alias="Programs",
-        description="Linked record ids of the related programs.",
-    )
+    programs: str | None = Field(default=None, alias="Programs")
     document: str | None = Field(
         default=None, alias="Document", description="URL to the document."
     )
@@ -755,13 +794,6 @@ class AccessControlRecord(BaseModel):
     roles: list[Role] = Field(default_factory=list)
     permissions: list[Permission] = Field(default_factory=list)
     fund_or_program_name: str | None = None
-    function: str | None = Field(
-        default=None,
-        description=(
-            "Value of the 'Function' single-select field on the Access "
-            "Control record. Populated when the role's scope is 'Function'."
-        ),
-    )
 
 
 class AccessControlAssign(BaseModel):
@@ -776,32 +808,12 @@ class AccessControlAssign(BaseModel):
     permissions: list[str] | None = Field(
         default=None, description="Permission record IDs to add. Optional."
     )
-    fund_or_program_name: str | None = Field(
-        default=None,
-        description=(
-            "Name of the fund or program the assignment is scoped to. "
-            "Used for role scopes 'Fund' / 'Program'. Optional."
-        ),
-    )
-    function: str | None = Field(
-        default=None,
-        description=(
-            "Value of the 'Function' single-select column. Used for the "
-            "'Function' role scope. Optional."
-        ),
-    )
 
     @model_validator(mode="after")
     def _check_at_least_one(self) -> "AccessControlAssign":
-        if (
-            not self.roles
-            and not self.permissions
-            and self.fund_or_program_name is None
-            and self.function is None
-        ):
+        if not self.roles and not self.permissions:
             raise ValueError(
-                "At least one of 'roles', 'permissions', "
-                "'fund_or_program_name', or 'function' must be provided."
+                "At least one of 'roles' or 'permissions' must be provided."
             )
         return self
 
@@ -818,26 +830,12 @@ class AccessControlRevoke(BaseModel):
     permissions: list[str] | None = Field(
         default=None, description="Permission record IDs to remove. Optional."
     )
-    clear_fund_or_program_name: bool = Field(
-        default=False,
-        description="If true, clear the 'Fund or Program Name' field.",
-    )
-    clear_function: bool = Field(
-        default=False,
-        description="If true, clear the 'Function' field.",
-    )
 
     @model_validator(mode="after")
     def _check_at_least_one(self) -> "AccessControlRevoke":
-        if (
-            not self.roles
-            and not self.permissions
-            and not self.clear_fund_or_program_name
-            and not self.clear_function
-        ):
+        if not self.roles and not self.permissions:
             raise ValueError(
-                "At least one of 'roles', 'permissions', "
-                "'clear_fund_or_program_name', or 'clear_function' must be provided."
+                "At least one of 'roles' or 'permissions' must be provided."
             )
         return self
 

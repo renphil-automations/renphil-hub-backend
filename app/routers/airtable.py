@@ -49,6 +49,7 @@ from app.models.airtable import (
     AnnouncementCreate,
     AnnouncementRecord,
     AnnouncementUpdate,
+    AwardedOpportunityRecord,
     AccessControlAssign,
     AccessControlRecord,
     AccessControlRevoke,
@@ -253,13 +254,6 @@ async def get_funds_and_subprograms(
     scoping_prop_overview_empty: bool | None = Query(default=None),
     initiative_types: list[str] | None = Query(default=None),
     focus_areas: list[str] | None = Query(default=None),
-    onboarding_empty: bool | None = Query(
-        default=None,
-        description=(
-            "Filter on the 'Onboarding status' field: "
-            "true → empty, false → not empty, omitted → no filter."
-        ),
-    ),
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -279,7 +273,6 @@ async def get_funds_and_subprograms(
         scoping_prop_overview_empty=scoping_prop_overview_empty,
         initiative_types=initiative_types,
         focus_areas=focus_areas,
-        onboarding_empty=onboarding_empty,
         fields=fields,
     )
 
@@ -324,6 +317,23 @@ async def get_funders(
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     return await airtable_service.get_funders(fields=fields)
+
+
+# ── /get_awarded_opportunities ──────────────────────────────────────
+@router.get(
+    "/get_awarded_opportunities",
+    response_model=list[AwardedOpportunityRecord],
+    summary=(
+        "List awarded opportunities; the Master List lookup field is "
+        "enriched server-side with selected master-list fields."
+    ),
+)
+async def get_awarded_opportunities(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_awarded_opportunities(fields=fields)
 
 
 # ── #5 /get_funds_progs_monthly_checkin ───────────────────────────────
