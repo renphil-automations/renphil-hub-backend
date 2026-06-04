@@ -587,6 +587,15 @@ class ClusterRecord(_TypedAirtableRecord):
     )
 
 
+# ── Onboarding Checklist ───────────────────────────────────────────────
+class OnboardingChecklistRecord(_TypedAirtableRecord):
+    """An Onboarding Checklist row with its linked Master List rows expanded."""
+
+    master_list_funds_subprograms: list[MasterListFundsAndSubprogramsRecord] | None = (
+        Field(default=None, alias="Master List of Funds & Sub-Programs")
+    )
+
+
 # ── Check-In Reporting Periods ─────────────────────────────────────────
 class CheckinReportingPeriodRecord(BaseModel):
     """A check-in reporting period reference resolved with its Period value."""

@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     ONBOARDING_CALLS_TABLE: str
     QUICK_LINKS_TABLE: str
     QUICK_ACTIONS_TABLE: str
+    ONBOARDING_CHECKLIST_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -255,7 +256,8 @@ class Settings(BaseSettings):
 
     # ── Quick Actions fields ──────────────────────────────────────────
     AT_F_QA_ACTION: str
-
+    # ── Onboarding Checklist fields ──────────────────────────────────
+    AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
     # ══════════════════════════════════════════════════════════════════
     # Slack webhook
     # ══════════════════════════════════════════════════════════════════

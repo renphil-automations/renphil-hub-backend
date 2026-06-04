@@ -49,6 +49,7 @@ from app.models.airtable import (
     IdNameItem,
     MasterListFundsAndSubprogramsRecord,
     MonthlyCheckinRecord,
+    OnboardingChecklistRecord,
     OrgFriendsRecord,
     PartnershipsFundraisingRecord,
     PartnershipsFundraisingUpdate,
@@ -125,6 +126,7 @@ _F_CHECKIN_HISTORY = _S.AT_F_CHECKIN_HISTORY
 _F_CHECKIN_REPORTING_PERIOD = _S.AT_F_CHECKIN_REPORTING_PERIOD
 _F_CLUSTER = _S.AT_F_CLUSTER
 _F_CLUSTER_RELATED_FUNDS_PROGRAMS = _S.AT_F_CLUSTER_RELATED_FUNDS_PROGRAMS
+_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS = _S.AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS
 _F_DASHBOARD_DISPLAY = _S.AT_F_DASHBOARD_DISPLAY
 _F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
 _F_DEADLINE = _S.AT_F_DEADLINE
@@ -694,6 +696,9 @@ class AirtableService:
     def _clusters_table(self):
         return self._fp_table(self._settings.CLUSTERS_TABLE)
 
+    def _onboarding_checklist_table(self):
+        return self._fp_table(self._settings.ONBOARDING_CHECKLIST_TABLE)
+
     # ── generic record fetch (async wrapper) ───────────────────────────
     async def _list_records(
         self,
@@ -1100,9 +1105,13 @@ class AirtableService:
         # Expand linked-record ids → full record dicts for the FE.
         program_ids: set[str] = set()
         period_ids: set[str] = set()
+        cluster_ids: set[str] = set()
         for r in records:
             program_ids.update(self._linked_ids(r, _F_PROGRAM_NAME))
             period_ids.update(self._linked_ids(r, _F_CHECKIN_REPORTING_PERIOD))
+            for cid in self._linked_ids(r, _F_CLUSTER):
+                if isinstance(cid, str) and cid.startswith("rec"):
+                    cluster_ids.add(cid)
 
         programs_lookup = (
             await self._get_records_by_ids(self._master_list_table(), program_ids)
@@ -1114,11 +1123,19 @@ class AirtableService:
             if period_ids
             else {}
         )
+        clusters_lookup = (
+            await self._get_records_by_ids(self._clusters_table(), cluster_ids)
+            if cluster_ids
+            else {}
+        )
         self._expand_linked_field(
             records, field=_F_PROGRAM_NAME, lookup=programs_lookup
         )
         self._expand_linked_field(
             records, field=_F_CHECKIN_REPORTING_PERIOD, lookup=periods_lookup
+        )
+        self._expand_linked_field(
+            records, field=_F_CLUSTER, lookup=clusters_lookup
         )
 
         return self._to_typed(records, MonthlyCheckinRecord)
@@ -1480,6 +1497,35 @@ class AirtableService:
         )
 
         return self._to_typed(records, ClusterRecord)
+
+    # ── /get_onboarding_checklist ─────────────────────────────────────
+    async def get_onboarding_checklist(
+        self, *, fields: list[str] | None = None
+    ) -> list[OnboardingChecklistRecord]:
+        records = await self._list_records(
+            self._onboarding_checklist_table(), fields=fields
+        )
+
+        linked_ids: set[str] = set()
+        for r in records:
+            linked_ids.update(
+                self._linked_ids(r, _F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS)
+            )
+
+        lookup = (
+            await self._get_records_by_ids(
+                self._master_list_table(), linked_ids
+            )
+            if linked_ids
+            else {}
+        )
+        self._expand_linked_field(
+            records,
+            field=_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS,
+            lookup=lookup,
+        )
+
+        return self._to_typed(records, OnboardingChecklistRecord)
 
     # ── #16 /get_program_names ────────────────────────────────────────
     async def get_program_names(
