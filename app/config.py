@@ -63,7 +63,6 @@ class Settings(BaseSettings):
     TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME: str
     # Fund & Program Tracker base
     MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE: str
-    FUNDS_AND_PROGRAMS_TABLE: str
     GLOSSARY_TABLE: str
     ORG_FRIENDS_TABLE: str
     FUNDERS_TABLE: str
@@ -72,6 +71,7 @@ class Settings(BaseSettings):
     DOC_TITLES_TABLE: str
     SHAREABLE_DOCS_TABLE: str
     CLUSTERS_TABLE: str
+    AWARDED_OPPORTUNITIES_TABLE: str
     # RenPhil Hub base
     ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
@@ -92,7 +92,6 @@ class Settings(BaseSettings):
     ONBOARDING_CALLS_TABLE: str
     QUICK_LINKS_TABLE: str
     QUICK_ACTIONS_TABLE: str
-    ONBOARDING_CHECKLIST_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -101,8 +100,6 @@ class Settings(BaseSettings):
     ACCESS_CONTROL_ROLES_FIELD: str
     ACCESS_CONTROL_PERMISSIONS_FIELD: str
     ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str
-    ACCESS_CONTROL_FUND_OR_PROGRAM_LINK_FIELD: str
-    ACCESS_CONTROL_FUNCTION_FIELD: str
     ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str
     ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str
     ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
@@ -150,7 +147,6 @@ class Settings(BaseSettings):
     AT_F_SUB_TRACK_OF: str
     AT_F_SHARE_PUBLICLY: str
     AT_F_ONBOARDING_STATUS: str
-    AT_F_VETTING_STATUS: str
     AT_F_ADD_TO_SHAREABLE_DOC: str
     AT_F_NAME: str
     AT_F_SCOPING_PROP_OVERVIEW: str
@@ -166,7 +162,6 @@ class Settings(BaseSettings):
     AT_F_CHECKIN_HISTORY: str
     AT_F_CHECKIN_REPORTING_PERIOD: str
     AT_F_CLUSTER: str
-    AT_F_CLUSTER_RELATED_FUNDS_PROGRAMS: str
     AT_F_DASHBOARD_DISPLAY: str
     AT_F_FOLLOWUP_INDICATED: str
     AT_F_DEADLINE: str
@@ -256,8 +251,7 @@ class Settings(BaseSettings):
 
     # ── Quick Actions fields ──────────────────────────────────────────
     AT_F_QA_ACTION: str
-    # ── Onboarding Checklist fields ──────────────────────────────────
-    AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
+
     # ══════════════════════════════════════════════════════════════════
     # Slack webhook
     # ══════════════════════════════════════════════════════════════════

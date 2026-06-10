@@ -39,6 +39,7 @@ from app.models.airtable import (
     EmailTicketWebhookPayload,
     CheckinReportingPeriodRecord,
     ClusterRecord,
+    AwardedOpportunityRecord,
     CountResponse,
     DateRangeFilter,
     DistributionItem,
@@ -49,7 +50,6 @@ from app.models.airtable import (
     IdNameItem,
     MasterListFundsAndSubprogramsRecord,
     MonthlyCheckinRecord,
-    OnboardingChecklistRecord,
     OrgFriendsRecord,
     PartnershipsFundraisingRecord,
     PartnershipsFundraisingUpdate,
@@ -104,7 +104,6 @@ _F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
 _F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
 _F_ONBOARDING_STATUS = _S.AT_F_ONBOARDING_STATUS
 _ONBOARDING_STATUS_VETTING = "Vetting"
-_F_VETTING_STATUS = _S.AT_F_VETTING_STATUS
 _F_ADD_TO_SHAREABLE_DOC = _S.AT_F_ADD_TO_SHAREABLE_DOC
 _F_NAME = _S.AT_F_NAME
 _F_SCOPING_PROP_OVERVIEW = _S.AT_F_SCOPING_PROP_OVERVIEW
@@ -125,13 +124,30 @@ _F_PROGRAM_NAME = _S.AT_F_PROGRAM_NAME
 _F_CHECKIN_HISTORY = _S.AT_F_CHECKIN_HISTORY
 _F_CHECKIN_REPORTING_PERIOD = _S.AT_F_CHECKIN_REPORTING_PERIOD
 _F_CLUSTER = _S.AT_F_CLUSTER
-_F_CLUSTER_RELATED_FUNDS_PROGRAMS = _S.AT_F_CLUSTER_RELATED_FUNDS_PROGRAMS
-_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS = _S.AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS
 _F_DASHBOARD_DISPLAY = _S.AT_F_DASHBOARD_DISPLAY
 _F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
 _F_DEADLINE = _S.AT_F_DEADLINE
 _F_REVIEW_UNTIL = _S.AT_F_REVIEW_UNTIL
 _F_PERIOD = _S.AT_F_PERIOD
+
+# Awarded Opportunities → Master List lookup enrichment
+_ML_LOOKUP_FIELD = "Master List of Funds & Sub-Programs (from Linked Gift Designation)"
+_ML_LOOKUP_PROJECT_FIELDS = [
+    "Official Fund or Program Name",
+    "Initiative Type",
+    "Focus Area(s)",
+    "Program Lead/Fellow",
+    "Status",
+    "Program Summary",
+    "Internal Notes",
+    "Can we talk about it publicly",
+    "Last Updated",
+    "Scoping Proposal / Fund Overview",
+    "Summary Document / Concept Note",
+    "Website",
+    "Check-In History",
+    "Technical Document / Deep Dive",
+]
 
 
 class AirtableService:
@@ -247,8 +263,6 @@ class AirtableService:
 
     # Role scope value that represents a global (non-scoped) role.
     HUB_SCOPE = "Hub"
-    # Role scope value that targets the 'Function' single-select field.
-    FUNCTION_SCOPE = "Function"
 
     async def get_user_scoped_roles(self, email: str):
         """Return the per-assignment scoped roles for ``email``.
@@ -286,29 +300,18 @@ class AirtableService:
         role_by_id = {r.id: r for r in roles_catalog}
 
         out: list = []
-        seen: set[tuple[str, str, str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for rec in records:
             ac = self._build_access_control_record(rec)
             for role in ac.roles:
                 catalog_role = role_by_id.get(role.id)
                 scope = catalog_role.scope if catalog_role else None
                 name = role.name or (catalog_role.name if catalog_role else None)
-                scope_norm = (scope or "").strip().lower()
-                if scope_norm == self.HUB_SCOPE.lower():
+                if scope and scope.strip().lower() == self.HUB_SCOPE.lower():
                     fund_or_program = None
-                    function = None
-                elif scope_norm == self.FUNCTION_SCOPE.lower():
-                    fund_or_program = None
-                    function = ac.function
                 else:
                     fund_or_program = ac.fund_or_program_name
-                    function = None
-                key = (
-                    name or "",
-                    scope or "",
-                    fund_or_program or "",
-                    function or "",
-                )
+                key = (name or "", scope or "", fund_or_program or "")
                 if key in seen:
                     continue
                 seen.add(key)
@@ -317,7 +320,6 @@ class AirtableService:
                         role_name=name,
                         scope=scope,
                         fund_or_program_name=fund_or_program,
-                        function=function,
                     )
                 )
         return out
@@ -652,24 +654,6 @@ class AirtableService:
             self._settings.MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE
         )
 
-    def _funds_and_programs_table(self):
-        return self._api.table(
-            self._settings.RENPHIL_HUB_BASE_ID,
-            self._settings.FUNDS_AND_PROGRAMS_TABLE,
-        )
-
-    async def _find_fund_or_program_id_by_name(self, name: str) -> str | None:
-        """Resolve a fund/program name to a Funds & Programs record id (case-insensitive)."""
-        if not name or not name.strip():
-            return None
-        needle = self._escape(name.strip().lower())
-        formula = f"LOWER({{{_F_NAME}}}) = '{needle}'"
-        table = self._funds_and_programs_table()
-        records = await asyncio.to_thread(
-            table.all, formula=formula, max_records=1, fields=[_F_NAME]
-        )
-        return records[0]["id"] if records else None
-
     def _glossary_table(self):
         return self._fp_table(self._settings.GLOSSARY_TABLE)
 
@@ -678,6 +662,9 @@ class AirtableService:
 
     def _funders_table(self):
         return self._fp_table(self._settings.FUNDERS_TABLE)
+
+    def _awarded_opportunities_table(self):
+        return self._fp_table(self._settings.AWARDED_OPPORTUNITIES_TABLE)
 
     def _monthly_checkin_table(self):
         return self._fp_table(
@@ -695,9 +682,6 @@ class AirtableService:
 
     def _clusters_table(self):
         return self._fp_table(self._settings.CLUSTERS_TABLE)
-
-    def _onboarding_checklist_table(self):
-        return self._fp_table(self._settings.ONBOARDING_CHECKLIST_TABLE)
 
     # ── generic record fetch (async wrapper) ───────────────────────────
     async def _list_records(
@@ -733,33 +717,6 @@ class AirtableService:
         recs = await self._list_records(table, formula=formula, fields=fields)
         return {r["id"]: r for r in recs}
 
-    @staticmethod
-    def _expand_linked_field(
-        records: list[dict[str, Any]],
-        *,
-        field: str,
-        lookup: dict[str, dict[str, Any]],
-    ) -> None:
-        """Replace linked-record id lists on ``field`` with full record dicts.
-
-        Each expanded entry has the shape ``{"id": <recId>, **fields}`` —
-        mirroring ``_to_typed`` input — so typed Pydantic models with
-        ``extra='allow'`` capture every projected field.
-        """
-        for r in records:
-            fields_map = r.setdefault("fields", {})
-            ids = fields_map.get(field)
-            if not isinstance(ids, list):
-                continue
-            expanded = []
-            for rid in ids:
-                hit = lookup.get(rid)
-                if hit is None:
-                    expanded.append({"id": rid})
-                else:
-                    expanded.append({"id": hit["id"], **hit.get("fields", {})})
-            fields_map[field] = expanded
-
     # ── post-filter helpers ────────────────────────────────────────────
     @staticmethod
     def _linked_ids(record: dict[str, Any], field: str) -> list[str]:
@@ -784,8 +741,6 @@ class AirtableService:
         scoping_prop_overview_empty: bool | None = None,
         initiative_types: list[str] | None = None,
         focus_areas: list[str] | None = None,
-        onboarding_empty: bool | None = None,
-        vetting_status_list: list[str] | None = None,
         fields: list[str] | None = None,
     ) -> list[MasterListFundsAndSubprogramsRecord]:
         clauses: list[str | None] = [
@@ -801,20 +756,15 @@ class AirtableService:
             ),
             af.checkbox_clause(_F_ADD_TO_SHAREABLE_DOC, add_to_shareable_doc),
             af.empty_clause(_F_SCOPING_PROP_OVERVIEW, scoping_prop_overview_empty),
-            af.empty_clause(_F_ONBOARDING_STATUS, onboarding_empty),
         ]
 
         # Status filtering:
-        #   * status_list: substring match — the Status field contains
-        #     any of the provided values (OR across values).
-        #   * not_status_list: exact-value exclusion.
-        #   * status_empty / not-empty.
-        # The membership clause and empty clause are unioned (OR).
+        #   * (status_list AND not_status_list) — combined with AND
+        #   * status_empty / not-empty
+        # The two groups above are unioned (OR).
         status_membership_parts: list[str | None] = []
         if status_list:
-            status_membership_parts.append(
-                af.contains_any_str(_F_STATUS, status_list)
-            )
+            status_membership_parts.append(af.in_str(_F_STATUS, status_list))
         if not_status_list:
             status_membership_parts.append(af.not_in_str(_F_STATUS, not_status_list))
         membership_clause = af.AND(*status_membership_parts)
@@ -844,9 +794,6 @@ class AirtableService:
 
         if focus_areas:
             clauses.append(af.multiselect_contains_any(_F_FOCUS_AREAS, focus_areas))
-
-        if vetting_status_list:
-            clauses.append(af.in_str(_F_VETTING_STATUS, vetting_status_list))
 
         formula = af.AND(*clauses)
         records = await self._list_records(
@@ -893,6 +840,46 @@ class AirtableService:
     ) -> list[FundersRecord]:
         records = await self._list_records(self._funders_table(), fields=fields)
         return self._to_typed(records, FundersRecord)
+
+    # ── /get_awarded_opportunities ────────────────────────────────────
+    async def get_awarded_opportunities(
+        self, *, fields: list[str] | None = None
+    ) -> list[AwardedOpportunityRecord]:
+        records = await self._list_records(
+            self._awarded_opportunities_table(), fields=fields
+        )
+
+        # Enrich the Master List lookup field whenever it is part of the
+        # response. The lookup carries raw linked-record IDs (the source is
+        # a linked-record field), which would otherwise be unreadable.
+        enrich = fields is None or _ML_LOOKUP_FIELD in fields
+        if enrich:
+            id_set: set[str] = set()
+            for r in records:
+                for rid in (r.get("fields", {}).get(_ML_LOOKUP_FIELD) or []):
+                    if isinstance(rid, str):
+                        id_set.add(rid)
+
+            if id_set:
+                ml_recs = await self._get_records_by_ids(
+                    self._master_list_table(),
+                    id_set,
+                    fields=_ML_LOOKUP_PROJECT_FIELDS,
+                )
+                for r in records:
+                    ids = r.get("fields", {}).get(_ML_LOOKUP_FIELD)
+                    if not ids:
+                        continue
+                    r["fields"][_ML_LOOKUP_FIELD] = [
+                        {
+                            "id": rid,
+                            **(ml_recs.get(rid, {}).get("fields", {})),
+                        }
+                        for rid in ids
+                        if isinstance(rid, str)
+                    ]
+
+        return self._to_typed(records, AwardedOpportunityRecord)
 
     # ── shared base filters for monthly check-in endpoints ────────────
     @staticmethod
@@ -1101,43 +1088,6 @@ class AirtableService:
             checkin_user_id=checkin_user_id,
             not_program_status=not_program_status,
         )
-
-        # Expand linked-record ids → full record dicts for the FE.
-        program_ids: set[str] = set()
-        period_ids: set[str] = set()
-        cluster_ids: set[str] = set()
-        for r in records:
-            program_ids.update(self._linked_ids(r, _F_PROGRAM_NAME))
-            period_ids.update(self._linked_ids(r, _F_CHECKIN_REPORTING_PERIOD))
-            for cid in self._linked_ids(r, _F_CLUSTER):
-                if isinstance(cid, str) and cid.startswith("rec"):
-                    cluster_ids.add(cid)
-
-        programs_lookup = (
-            await self._get_records_by_ids(self._master_list_table(), program_ids)
-            if program_ids
-            else {}
-        )
-        periods_lookup = (
-            await self._get_records_by_ids(self._checkin_periods_table(), period_ids)
-            if period_ids
-            else {}
-        )
-        clusters_lookup = (
-            await self._get_records_by_ids(self._clusters_table(), cluster_ids)
-            if cluster_ids
-            else {}
-        )
-        self._expand_linked_field(
-            records, field=_F_PROGRAM_NAME, lookup=programs_lookup
-        )
-        self._expand_linked_field(
-            records, field=_F_CHECKIN_REPORTING_PERIOD, lookup=periods_lookup
-        )
-        self._expand_linked_field(
-            records, field=_F_CLUSTER, lookup=clusters_lookup
-        )
-
         return self._to_typed(records, MonthlyCheckinRecord)
 
     # ── shared base filters for the count / distribution endpoints ────
@@ -1376,40 +1326,6 @@ class AirtableService:
         records = await self._list_records(
             self._monthly_checkin_table(), formula=formula, fields=fields
         )
-
-        program_ids: set[str] = set()
-        period_ids: set[str] = set()
-        cluster_ids: set[str] = set()
-        for r in records:
-            program_ids.update(self._linked_ids(r, _F_PROGRAM_NAME))
-            period_ids.update(self._linked_ids(r, _F_CHECKIN_REPORTING_PERIOD))
-            for cid in self._linked_ids(r, _F_CLUSTER):
-                if isinstance(cid, str) and cid.startswith("rec"):
-                    cluster_ids.add(cid)
-
-        programs_lookup = (
-            await self._get_records_by_ids(self._master_list_table(), program_ids)
-            if program_ids else {}
-        )
-        periods_lookup = (
-            await self._get_records_by_ids(self._checkin_periods_table(), period_ids)
-            if period_ids else {}
-        )
-        clusters_lookup = (
-            await self._get_records_by_ids(self._clusters_table(), cluster_ids)
-            if cluster_ids else {}
-        )
-
-        self._expand_linked_field(
-            records, field=_F_PROGRAM_NAME, lookup=programs_lookup
-        )
-        self._expand_linked_field(
-            records, field=_F_CHECKIN_REPORTING_PERIOD, lookup=periods_lookup
-        )
-        self._expand_linked_field(
-            records, field=_F_CLUSTER, lookup=clusters_lookup
-        )
-
         return self._to_typed(records, MonthlyCheckinRecord)
 
     # ── #11 /get_archived_reports_by_program ──────────────────────────
@@ -1475,57 +1391,31 @@ class AirtableService:
 
     # ── #15 /get_clusters ─────────────────────────────────────────────
     async def get_clusters(self) -> list[ClusterRecord]:
-        records = await self._list_records(self._clusters_table())
-
-        related_ids: set[str] = set()
-        for r in records:
-            related_ids.update(
-                self._linked_ids(r, _F_CLUSTER_RELATED_FUNDS_PROGRAMS)
-            )
-
-        programs_lookup = (
-            await self._get_records_by_ids(
-                self._master_list_table(), related_ids
-            )
-            if related_ids
-            else {}
-        )
-        self._expand_linked_field(
-            records,
-            field=_F_CLUSTER_RELATED_FUNDS_PROGRAMS,
-            lookup=programs_lookup,
-        )
-
-        return self._to_typed(records, ClusterRecord)
-
-    # ── /get_onboarding_checklist ─────────────────────────────────────
-    async def get_onboarding_checklist(
-        self, *, fields: list[str] | None = None
-    ) -> list[OnboardingChecklistRecord]:
         records = await self._list_records(
-            self._onboarding_checklist_table(), fields=fields
+            self._monthly_checkin_table(), fields=[_F_CLUSTER]
         )
-
-        linked_ids: set[str] = set()
+        ids: set[str] = set()
         for r in records:
-            linked_ids.update(
-                self._linked_ids(r, _F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS)
-            )
+            value = r.get("fields", {}).get(_F_CLUSTER)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.startswith("rec"):
+                        ids.add(item)
 
-        lookup = (
-            await self._get_records_by_ids(
-                self._master_list_table(), linked_ids
-            )
-            if linked_ids
-            else {}
-        )
-        self._expand_linked_field(
-            records,
-            field=_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS,
-            lookup=lookup,
-        )
+        if not ids:
+            return []
 
-        return self._to_typed(records, OnboardingChecklistRecord)
+        clusters = await self._get_records_by_ids(
+            self._clusters_table(), ids, fields=[_F_NAME]
+        )
+        return [
+            ClusterRecord(
+                record_id=cid,
+                name=self._str_field(clusters[cid], _F_NAME)
+                if cid in clusters else None,
+            )
+            for cid in sorted(ids)
+        ]
 
     # ── #16 /get_program_names ────────────────────────────────────────
     async def get_program_names(
@@ -2059,19 +1949,6 @@ class AirtableService:
         else:
             fund_or_program_name = _str_or_none(fund_or_program_raw)
 
-        # Function is a single-select; may also come back as a list if the
-        # Airtable column is later changed — handle both shapes defensively.
-        function_raw = fields.get(s.ACCESS_CONTROL_FUNCTION_FIELD)
-        if isinstance(function_raw, list):
-            fn_items = [
-                str(v).strip()
-                for v in function_raw
-                if v is not None and str(v).strip()
-            ]
-            function_value = ", ".join(fn_items) if fn_items else None
-        else:
-            function_value = _str_or_none(function_raw)
-
         return AccessControlRecord(
             id=record["id"],
             user_email=_str_or_none(
@@ -2080,7 +1957,6 @@ class AirtableService:
             roles=roles,
             permissions=permissions,
             fund_or_program_name=fund_or_program_name,
-            function=function_value,
         )
 
     async def _find_access_control_by_email(
@@ -2114,31 +1990,9 @@ class AirtableService:
         email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
         roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
         permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
-        fund_link_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_LINK_FIELD
-        function_field = self._settings.ACCESS_CONTROL_FUNCTION_FIELD
 
         roles_in = list(payload.roles or [])
         permissions_in = list(payload.permissions or [])
-        fund_in = payload.fund_or_program_name
-        function_in = payload.function
-
-        # Resolve fund/program name → Master List record id (linked-record write).
-        _UNSET: Any = object()
-        fund_link_value: Any = _UNSET
-        if fund_in is not None:
-            if fund_in.strip():
-                resolved = await self._find_fund_or_program_id_by_name(fund_in)
-                if not resolved:
-                    raise HTTPException(
-                        status_code=_http_status.HTTP_400_BAD_REQUEST,
-                        detail=(
-                            f"No fund or program named '{fund_in}' was found "
-                            "in the Master List."
-                        ),
-                    )
-                fund_link_value = [resolved]
-            else:
-                fund_link_value = None  # clear
         table = self._access_control_table()
 
         existing = await self._find_access_control_by_email(payload.user_email)
@@ -2149,13 +2003,7 @@ class AirtableService:
                     fields[roles_field] = roles_in
                 if permissions_in:
                     fields[permissions_field] = permissions_in
-                if fund_link_value is not _UNSET:
-                    fields[fund_link_field] = fund_link_value
-                if function_in is not None:
-                    fields[function_field] = function_in or None
-                result = await asyncio.to_thread(
-                    table.create, fields, typecast=True
-                )
+                result = await asyncio.to_thread(table.create, fields)
             else:
                 fields_existing = existing.get("fields", {}) or {}
                 current_roles = fields_existing.get(roles_field) or []
@@ -2169,19 +2017,12 @@ class AirtableService:
                     update_fields[roles_field] = merged_roles
                 if permissions_in and merged_perms != current_perms:
                     update_fields[permissions_field] = merged_perms
-                if fund_link_value is not _UNSET:
-                    update_fields[fund_link_field] = fund_link_value
-                if function_in is not None:
-                    update_fields[function_field] = function_in or None
 
                 if not update_fields:
                     result = existing
                 else:
                     result = await asyncio.to_thread(
-                        table.update,
-                        existing["id"],
-                        update_fields,
-                        typecast=True,
+                        table.update, existing["id"], update_fields
                     )
         except RequestException as exc:
             logger.error("Airtable access-control upsert failed: %s", exc)
@@ -2199,8 +2040,6 @@ class AirtableService:
         email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
         roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
         permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
-        fund_link_field = self._settings.ACCESS_CONTROL_FUND_OR_PROGRAM_LINK_FIELD
-        function_field = self._settings.ACCESS_CONTROL_FUNCTION_FIELD
 
         existing = await self._find_access_control_by_email(payload.user_email)
         if existing is None:
@@ -2227,10 +2066,6 @@ class AirtableService:
             update_fields[roles_field] = new_roles
         if payload.permissions is not None and new_perms != current_perms:
             update_fields[permissions_field] = new_perms
-        if payload.clear_fund_or_program_name:
-            update_fields[fund_link_field] = None
-        if payload.clear_function:
-            update_fields[function_field] = None
 
         if not update_fields:
             return self._build_access_control_record(existing)
