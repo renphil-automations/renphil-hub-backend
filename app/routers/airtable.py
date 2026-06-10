@@ -94,6 +94,7 @@ from app.models.airtable import (
     HrAndBenefitsRecord,
     OnboardingLinkRecord,
     OnboardingCallRecord,
+    OnboardingChecklistRecord,
     QuickLinkRecord,
     QuickLinkCreate,
     QuickLinkUpdate,
@@ -573,6 +574,20 @@ async def get_shareable_docs(
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     return await airtable_service.get_shareable_docs(fields=fields)
+
+
+# ── /get_onboarding_checklist ─────────────────────────────────
+@router.get(
+    "/get_onboarding_checklist",
+    response_model=list[OnboardingChecklistRecord],
+    summary="List onboarding checklist rows with linked Master List expanded",
+)
+async def get_onboarding_checklist(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_onboarding_checklist(fields=fields)
 
 # ── #14 /get_unique_checkin_reporting_periods ─────────────────────────
 @router.get(

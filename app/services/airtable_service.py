@@ -50,6 +50,7 @@ from app.models.airtable import (
     IdNameItem,
     MasterListFundsAndSubprogramsRecord,
     MonthlyCheckinRecord,
+    OnboardingChecklistRecord,
     OrgFriendsRecord,
     PartnershipsFundraisingRecord,
     PartnershipsFundraisingUpdate,
@@ -130,6 +131,7 @@ _F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
 _F_DEADLINE = _S.AT_F_DEADLINE
 _F_REVIEW_UNTIL = _S.AT_F_REVIEW_UNTIL
 _F_PERIOD = _S.AT_F_PERIOD
+_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS = _S.AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS
 
 # Awarded Opportunities → Master List lookup enrichment
 _ML_LOOKUP_FIELD = "Master List of Funds & Sub-Programs (from Linked Gift Designation)"
@@ -683,6 +685,9 @@ class AirtableService:
 
     def _clusters_table(self):
         return self._fp_table(self._settings.CLUSTERS_TABLE)
+
+    def _onboarding_checklist_table(self):
+        return self._fp_table(self._settings.ONBOARDING_CHECKLIST_TABLE)
 
     # ── generic record fetch (async wrapper) ───────────────────────────
     async def _list_records(
@@ -1362,6 +1367,39 @@ class AirtableService:
             self._shareable_docs_table(), fields=fields
         )
         return self._to_typed(records, ShareableDocsRecord)
+
+    # ── /get_onboarding_checklist ─────────────────────────────────────
+    async def get_onboarding_checklist(
+        self, *, fields: list[str] | None = None
+    ) -> list[OnboardingChecklistRecord]:
+        records = await self._list_records(
+            self._onboarding_checklist_table(), fields=fields
+        )
+
+        linked_ids: set[str] = set()
+        for r in records:
+            for rid in self._linked_ids(r, _F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS):
+                if isinstance(rid, str):
+                    linked_ids.add(rid)
+
+        if linked_ids:
+            lookup = await self._get_records_by_ids(
+                self._master_list_table(), linked_ids
+            )
+            for r in records:
+                ids = r.get("fields", {}).get(_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS)
+                if not ids:
+                    continue
+                r["fields"][_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS] = [
+                    {
+                        "id": rid,
+                        **(lookup.get(rid, {}).get("fields", {})),
+                    }
+                    for rid in ids
+                    if isinstance(rid, str)
+                ]
+
+        return self._to_typed(records, OnboardingChecklistRecord)
 
     # ── #14 /get_unique_checkin_reporting_periods ─────────────────────
     async def get_unique_checkin_reporting_periods(
