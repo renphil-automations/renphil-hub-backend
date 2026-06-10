@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     ONBOARDING_CALLS_TABLE: str
     QUICK_LINKS_TABLE: str
     QUICK_ACTIONS_TABLE: str
+    GENERAL_FUNDRAISING_RESOURCES_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control

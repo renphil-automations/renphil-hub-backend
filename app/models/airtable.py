@@ -519,6 +519,14 @@ class HrAndBenefitsRecord(_TypedAirtableRecord):
     description: str | None = Field(default=None, alias="Description")
 
 
+# ── General Fundraising Resources ──────────────────────────────────────
+class GeneralFundraisingResourceRecord(_TypedAirtableRecord):
+    """A row from the General Fundraising Resources table."""
+
+    document: str | None = Field(default=None, alias="Document")
+    document_url: str | None = Field(default=None, alias="Document URL")
+
+
 # ── Onboarding ─────────────────────────────────────────────────────────
 class OnboardingLinkRecord(_TypedAirtableRecord):
     """A row from the Onboarding table."""

@@ -98,6 +98,7 @@ from app.models.airtable import (
     QuickLinkCreate,
     QuickLinkUpdate,
     RecordFieldsUpdate,
+    GeneralFundraisingResourceRecord,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -972,6 +973,22 @@ async def get_hr_and_benefits(
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     return await airtable_service.get_hr_and_benefits(fields=fields)
+
+
+@router.get(
+    "/get_general_fundraising_resources",
+    response_model=list[GeneralFundraisingResourceRecord],
+    summary=(
+        "List rows from the General Fundraising Resources table "
+        "(Document, Document URL)."
+    ),
+)
+async def get_general_fundraising_resources(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_general_fundraising_resources(fields=fields)
 
 
 @router.get(

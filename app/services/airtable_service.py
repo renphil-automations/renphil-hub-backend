@@ -80,6 +80,7 @@ from app.models.airtable import (
     QuickLinkRecord,
     QuickLinkCreate,
     QuickLinkUpdate,
+    GeneralFundraisingResourceRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -2586,6 +2587,24 @@ class AirtableService:
             self._hr_and_benefits_table(), fields=fields
         )
         return self._to_typed(records, HrAndBenefitsRecord)
+
+    # ═══════════════════════════════════════════════════════════════
+    # General Fundraising Resources (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    def _general_fundraising_resources_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.GENERAL_FUNDRAISING_RESOURCES_TABLE,
+        )
+
+    async def get_general_fundraising_resources(
+        self, *, fields: list[str] | None = None
+    ) -> list[GeneralFundraisingResourceRecord]:
+        """Return all rows from the General Fundraising Resources table."""
+        records = await self._list_records(
+            self._general_fundraising_resources_table(), fields=fields
+        )
+        return self._to_typed(records, GeneralFundraisingResourceRecord)
 
     # ═══════════════════════════════════════════════════════════════
     # Onboarding (RenPhil Hub base)
