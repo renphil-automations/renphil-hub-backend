@@ -1366,6 +1366,33 @@ class AirtableService:
         records = await self._list_records(
             self._shareable_docs_table(), fields=fields
         )
+
+        # Expand the "Programs" linked-record field into full Master List
+        # of Funds & Sub-Programs rows, mirroring the onboarding-checklist
+        # enrichment pattern.
+        linked_ids: set[str] = set()
+        for r in records:
+            for rid in self._linked_ids(r, "Programs"):
+                if isinstance(rid, str):
+                    linked_ids.add(rid)
+
+        if linked_ids:
+            lookup = await self._get_records_by_ids(
+                self._master_list_table(), linked_ids
+            )
+            for r in records:
+                ids = r.get("fields", {}).get("Programs")
+                if not ids:
+                    continue
+                r["fields"]["Programs"] = [
+                    {
+                        "id": rid,
+                        **(lookup.get(rid, {}).get("fields", {})),
+                    }
+                    for rid in ids
+                    if isinstance(rid, str)
+                ]
+
         return self._to_typed(records, ShareableDocsRecord)
 
     # ── /get_onboarding_checklist ─────────────────────────────────────
