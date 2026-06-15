@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # ── Google OAuth ───────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str
     GOOGLE_CLIENT_SECRET: str
-    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/callback"
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
     ALLOWED_EMAIL_DOMAIN: str = "renphil.org"
 
     # ── JWT Tokens (issued after OAuth) ────────────────────────────────
