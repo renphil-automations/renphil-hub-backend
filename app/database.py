@@ -2,19 +2,78 @@ import os
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.engine import URL
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+def _resolve_database_url() -> str | URL:
+    """
+    Resolve the database connection from environment variables.
+
+    Two configuration styles are supported:
+
+    1. A single DATABASE_URL (preferred — standard SQLAlchemy / Vercel / Neon).
+       Example:
+         postgresql+psycopg2://user:pass@host:5432/dbname?sslmode=require
+
+    2. Discrete PG_* parts (libpq-style). Used if DATABASE_URL is missing.
+       Required: PG_HOST, PG_DATABASE, PG_USER, PG_PASSWORD
+       Optional: PG_PORT (default 5432), PG_SSLMODE, PG_CONNECT_TIMEOUT
+
+    Raises RuntimeError with a clear message if neither style is configured.
+    """
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
+
+    host = os.getenv("PG_HOST")
+    database = os.getenv("PG_DATABASE")
+    user = os.getenv("PG_USER")
+    password = os.getenv("PG_PASSWORD")
+
+    if not all([host, database, user, password]):
+        raise RuntimeError(
+            "Database is not configured. Set DATABASE_URL, or provide all of "
+            "PG_HOST, PG_DATABASE, PG_USER, PG_PASSWORD (with optional PG_PORT, "
+            "PG_SSLMODE, PG_CONNECT_TIMEOUT). On Vercel, configure these under "
+            "Settings → Environment Variables and redeploy."
+        )
+
+    port_raw = os.getenv("PG_PORT", "5432")
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise RuntimeError(f"PG_PORT must be an integer, got {port_raw!r}") from exc
+
+    query: dict[str, str] = {}
+    sslmode = os.getenv("PG_SSLMODE")
+    if sslmode:
+        query["sslmode"] = sslmode
+    connect_timeout = os.getenv("PG_CONNECT_TIMEOUT")
+    if connect_timeout:
+        query["connect_timeout"] = connect_timeout
+
+    return URL.create(
+        drivername="postgresql+psycopg2",
+        username=user,
+        password=password,
+        host=host,
+        port=port,
+        database=database,
+        query=query,
+    )
+
+
+DATABASE_URL = _resolve_database_url()
 
 engine = create_engine(DATABASE_URL)
 
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine
+    bind=engine,
 )
 
 Base = declarative_base()
