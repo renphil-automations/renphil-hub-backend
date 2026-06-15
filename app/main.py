@@ -58,6 +58,8 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ────────────────────────────────────────────────────────
+    api_prefix = ""
+
     app.include_router(auth.router, prefix=api_prefix)
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
