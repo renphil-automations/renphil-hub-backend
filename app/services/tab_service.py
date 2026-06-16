@@ -352,6 +352,7 @@ def _format_tab_summaries(db: Session, tabs: list[Tab]) -> list[dict[str, Any]]:
 
     return [
         {
+            "id": tab.id,
             "documentId": tab.document_id,
             "title": tab.title,
             "order": _safe_order(tab),
@@ -369,6 +370,7 @@ def _format_parent(tab: Tab | None) -> dict[str, Any] | None:
         return None
 
     return {
+        "id": tab.id,
         "documentId": tab.document_id,
         "title": tab.title,
         "order": _safe_order(tab),
@@ -672,6 +674,7 @@ def get_tab_workspace(db: Session, document_id: str) -> dict[str, Any] | None:
     )
 
     return {
+        "id": tab.id,
         "documentId": tab.document_id,
         "title": tab.title,
         "order": _safe_order(tab),
@@ -704,6 +707,7 @@ def get_tab_breadcrumb(db: Session, document_id: str) -> list[dict[str, Any]] | 
 
         breadcrumb.append(
             {
+                "id": current_tab.id,
                 "documentId": current_tab.document_id,
                 "title": current_tab.title,
                 "order": _safe_order(current_tab),
@@ -973,6 +977,7 @@ def create_tab(
         db.refresh(new_tab)
 
         return {
+            "id": new_tab.id,
             "documentId": new_tab.document_id,
             "title": new_tab.title,
             "order": _safe_order(new_tab),
@@ -1162,6 +1167,7 @@ def delete_tab_subtree_by_document_id(
         for current_tab in tabs_to_delete:
             deleted_tabs.append(
                 {
+                    "id": current_tab.id,
                     "documentId": current_tab.document_id,
                     "title": current_tab.title,
                 }

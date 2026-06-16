@@ -82,12 +82,14 @@ class AccessControlResponse(BaseModel):
 # ---------------------------------------------------------
 
 class TabParentResponse(BaseModel):
+    id: int | None = None
     documentId: StrictStr | None = None
     title: StrictStr | None = None
     order: int = 0
 
 
 class TabSummaryResponse(BaseModel):
+    id: int | None = None
     documentId: StrictStr | None = None
     title: StrictStr | None = None
     order: int = 0
@@ -100,6 +102,7 @@ class TabSummaryResponse(BaseModel):
 
 
 class TabWorkspaceResponse(BaseModel):
+    id: int | None = None
     documentId: StrictStr | None = None
     title: StrictStr | None = None
     order: int = 0
@@ -119,6 +122,7 @@ class TabWorkspaceResponse(BaseModel):
 
 
 class BreadcrumbItemResponse(BaseModel):
+    id: int | None = None
     documentId: StrictStr | None = None
     title: StrictStr | None = None
     order: int = 0
