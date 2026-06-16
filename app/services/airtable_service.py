@@ -1080,8 +1080,20 @@ class AirtableService:
 
         formula = af.AND(*base_clauses)
 
+        # When the caller projects a subset of fields, make sure the columns
+        # required by post-filters and by the Program Name enrichment are
+        # always fetched so they cannot be silently dropped.
+        effective_fields: list[str] | None = None
+        if fields is not None:
+            required = [_F_PROGRAM_NAME]
+            if user_id:
+                required.append(_F_REPORTING_LEAD)
+            effective_fields = list(dict.fromkeys([*fields, *required]))
+
         records = await self._list_records(
-            self._monthly_checkin_table(), formula=formula, fields=fields
+            self._monthly_checkin_table(),
+            formula=formula,
+            fields=effective_fields,
         )
 
         # Post-filters
@@ -1094,6 +1106,32 @@ class AirtableService:
             checkin_user_id=checkin_user_id,
             not_program_status=not_program_status,
         )
+
+        # Enrich the linked Program Name field with the full Master List
+        # of Funds & Sub-Programs rows (same pattern as get_shareable_docs).
+        linked_ids: set[str] = set()
+        for r in records:
+            for rid in self._linked_ids(r, _F_PROGRAM_NAME):
+                if isinstance(rid, str):
+                    linked_ids.add(rid)
+
+        if linked_ids:
+            lookup = await self._get_records_by_ids(
+                self._master_list_table(), linked_ids
+            )
+            for r in records:
+                ids = r.get("fields", {}).get(_F_PROGRAM_NAME)
+                if not ids:
+                    continue
+                r["fields"][_F_PROGRAM_NAME] = [
+                    {
+                        "id": rid,
+                        **(lookup.get(rid, {}).get("fields", {})),
+                    }
+                    for rid in ids
+                    if isinstance(rid, str)
+                ]
+
         return self._to_typed(records, MonthlyCheckinRecord)
 
     # ── shared base filters for the count / distribution endpoints ────
