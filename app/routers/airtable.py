@@ -772,34 +772,47 @@ async def get_team_members(
     return await airtable_service.get_team_members()
 
 
-# ── /get_partnerships_fundraising ─────────────────────────────────────
+# ── /get_partnerships_links ───────────────────────────────────────────
 @router.get(
-    "/get_partnerships_fundraising",
+    "/get_partnerships_links",
     response_model=list[PartnershipsFundraisingRecord],
     summary=(
         "List rows from the Partnerships Fundraising table "
-        "(Document, Document URL, Notes). Document URL may be empty."
+        "(Document, Document URL, Notes, Category, Type). Document URL may be empty. "
+        "Optionally filter by exact Category match."
     ),
 )
-async def get_partnerships_fundraising(
+async def get_partnerships_links(
+    category: str | None = Query(
+        default=None,
+        description=(
+            "If provided, return only records whose 'Category' equals this "
+            "value. Omit to return all rows."
+        ),
+    ),
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_partnerships_fundraising(fields=fields)
+    return await airtable_service.get_partnerships_fundraising(
+        category=category, fields=fields
+    )
 
 
-# ── PATCH /partnerships_fundraising/{id} ──────────────────────────────
+# ── PATCH /partnerships_links ─────────────────────────────────────────
 @router.patch(
-    "/partnerships_fundraising/{pf_id}",
+    "/partnerships_links",
     response_model=PartnershipsFundraisingRecord,
     summary=(
-        "Update a Partnerships Fundraising record by its 'Id' "
+        "Update a Partnerships Fundraising record by its 'Id' value "
         "(admin only). Any subset of fields may be provided."
     ),
 )
-async def update_partnerships_fundraising(
-    pf_id: int,
+async def update_partnerships_links(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (Autonumber) field of the record to update.",
+    ),
     payload: PartnershipsFundraisingUpdate = Body(...),
     user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -809,7 +822,34 @@ async def update_partnerships_fundraising(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Partnerships Fundraising records.",
         )
-    return await airtable_service.update_partnerships_fundraising(pf_id, payload)
+    return await airtable_service.update_partnerships_fundraising(id, payload)
+
+
+# ── DELETE /partnerships_links ────────────────────────────────────────
+@router.delete(
+    "/partnerships_links",
+    summary=(
+        "Delete a Partnerships Fundraising record by its 'Id' value "
+        "(admin only). If 'id' is omitted, ALL records in the table are deleted."
+    ),
+)
+async def delete_partnerships_links(
+    id: int | None = Query(
+        default=None,
+        description=(
+            "Value of the 'Id' (Autonumber) field of the record to delete. "
+            "If omitted, every record in the table will be deleted."
+        ),
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Partnerships Fundraising records.",
+        )
+    return await airtable_service.delete_partnerships_fundraising(id)
 
 
 # ── /get_finance_links ────────────────────────────────────────────────

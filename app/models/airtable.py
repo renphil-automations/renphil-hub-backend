@@ -375,6 +375,8 @@ class PartnershipsFundraisingRecord(BaseModel):
         ),
     )
     notes: str | None = Field(default=None, alias="Notes")
+    category: str | None = Field(default=None, alias="Category")
+    type: str | None = Field(default=None, alias="Type")
 
 
 class PartnershipsFundraisingUpdate(BaseModel):
@@ -390,6 +392,8 @@ class PartnershipsFundraisingUpdate(BaseModel):
     document: str | None = Field(default=None, alias="Document")
     document_url: str | None = Field(default=None, alias="Document URL")
     notes: str | None = Field(default=None, alias="Notes")
+    category: str | None = Field(default=None, alias="Category")
+    type: str | None = Field(default=None, alias="Type")
 
 
 # ── Finance Links ──────────────────────────────────────────────────────

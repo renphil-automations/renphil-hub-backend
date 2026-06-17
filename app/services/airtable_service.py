@@ -2265,17 +2265,21 @@ class AirtableService:
     _F_PF_DOCUMENT = _S.AT_F_PF_DOCUMENT
     _F_PF_DOCUMENT_URL = _S.AT_F_PF_DOCUMENT_URL
     _F_PF_NOTES = _S.AT_F_PF_NOTES
+    _F_PF_CATEGORY = _S.AT_F_PF_CATEGORY
+    _F_PF_TYPE = _S.AT_F_PF_TYPE
 
     _PF_UPDATE_FIELD_MAP = {
         "document": _F_PF_DOCUMENT,
         "document_url": _F_PF_DOCUMENT_URL,
         "notes": _F_PF_NOTES,
+        "category": _F_PF_CATEGORY,
+        "type": _F_PF_TYPE,
     }
 
     def _partnerships_fundraising_table(self):
         return self._api.table(
             self._settings.RENPHIL_HUB_BASE_ID,
-            self._settings.PARTNERSHIPS_FUNDRAISING_TABLE,
+            self._settings.PARTNERSHIPS_LINKS_TABLE,
         )
 
     @staticmethod
@@ -2295,15 +2299,26 @@ class AirtableService:
         ]
 
     async def get_partnerships_fundraising(
-        self, *, fields: list[str] | None = None
+        self,
+        *,
+        category: str | None = None,
+        fields: list[str] | None = None,
     ) -> list[PartnershipsFundraisingRecord]:
-        """Return all rows from the Partnerships Fundraising table.
+        """Return rows from the Partnerships Fundraising table.
 
-        The 'Document URL' field may be empty when 'Document' does not
-        refer to an actual document.
+        If ``category`` is provided, only rows whose ``Category`` field
+        equals it are returned. The 'Document URL' field may be empty
+        when 'Document' does not refer to an actual document.
         """
+        formula = (
+            af.eq_str(self._F_PF_CATEGORY, category)
+            if category is not None and category != ""
+            else None
+        )
         records = await self._list_records(
-            self._partnerships_fundraising_table(), fields=fields
+            self._partnerships_fundraising_table(),
+            formula=formula,
+            fields=fields,
         )
         return self._pf_to_typed(records)
 
@@ -2370,6 +2385,70 @@ class AirtableService:
         return PartnershipsFundraisingRecord.model_validate(
             {"record_id": updated["id"], **updated.get("fields", {})}
         )
+
+    async def delete_partnerships_fundraising(
+        self, pf_id: int | str | None = None
+    ) -> dict[str, Any]:
+        """Delete one or all Partnerships Fundraising records.
+
+        If ``pf_id`` is provided, delete the single record whose ``Id``
+        field matches it (404 if not found). If ``pf_id`` is ``None``,
+        delete every record in the table.
+        """
+        table = self._partnerships_fundraising_table()
+
+        if pf_id is not None:
+            record = await self._find_partnerships_fundraising_by_id(pf_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=_http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        f"Partnerships Fundraising record with id '{pf_id}' "
+                        "not found."
+                    ),
+                )
+            try:
+                result = await asyncio.to_thread(table.delete, record["id"])
+            except RequestException as exc:
+                logger.error(
+                    "Airtable delete partnerships fundraising failed: %s", exc
+                )
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception(
+                    "Unexpected Airtable error during partnerships fundraising delete"
+                )
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            return {
+                "id": pf_id,
+                "record_id": record["id"],
+                "deleted_count": 1,
+                "deleted": (
+                    bool(result.get("deleted", True))
+                    if isinstance(result, dict)
+                    else True
+                ),
+            }
+
+        records = await self._list_records(table, fields=[self._F_PF_ID])
+        record_ids = [r["id"] for r in records]
+        if not record_ids:
+            return {"deleted_count": 0, "deleted": True}
+
+        try:
+            await asyncio.to_thread(table.batch_delete, record_ids)
+        except RequestException as exc:
+            logger.error(
+                "Airtable batch delete partnerships fundraising failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during partnerships fundraising batch delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return {"deleted_count": len(record_ids), "deleted": True}
 
     # ═══════════════════════════════════════════════════════════════
     # Finance Links (RenPhil Hub base)
