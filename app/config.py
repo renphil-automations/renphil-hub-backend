@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
-    PARTNERSHIPS_LINKS_TABLE: str
+    PARTNERSHIPS_FUNDRAISING_TABLE: str
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
     OFFICE_SPACES_TABLE: str
@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     QUICK_ACTIONS_TABLE: str
     ONBOARDING_CHECKLIST_TABLE: str
     GENERAL_FUNDRAISING_RESOURCES_TABLE: str
+    PARTNERSHIPS_LINKS_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -205,8 +206,6 @@ class Settings(BaseSettings):
     AT_F_PF_DOCUMENT: str
     AT_F_PF_DOCUMENT_URL: str
     AT_F_PF_NOTES: str
-    AT_F_PF_CATEGORY: str
-    AT_F_PF_TYPE: str
 
     # ── Finance Links fields ──────────────────────────────────────────
     AT_F_FL_ID: str
@@ -255,6 +254,13 @@ class Settings(BaseSettings):
 
     # ── Quick Actions fields ──────────────────────────────────────────
     AT_F_QA_ACTION: str
+
+    # ── Partnerships Links fields ─────────────────────────────────────
+    AT_F_PL_ID: str
+    AT_F_PL_TEXT: str
+    AT_F_PL_LINK: str
+    AT_F_PL_CATEGORY: str
+    AT_F_PL_TYPE: str
     # ── Onboarding Checklist fields ──────────────────────────────────
     AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
     # ══════════════════════════════════════════════════════════════════

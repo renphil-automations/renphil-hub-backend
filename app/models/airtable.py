@@ -375,8 +375,6 @@ class PartnershipsFundraisingRecord(BaseModel):
         ),
     )
     notes: str | None = Field(default=None, alias="Notes")
-    category: str | None = Field(default=None, alias="Category")
-    type: str | None = Field(default=None, alias="Type")
 
 
 class PartnershipsFundraisingUpdate(BaseModel):
@@ -392,8 +390,6 @@ class PartnershipsFundraisingUpdate(BaseModel):
     document: str | None = Field(default=None, alias="Document")
     document_url: str | None = Field(default=None, alias="Document URL")
     notes: str | None = Field(default=None, alias="Notes")
-    category: str | None = Field(default=None, alias="Category")
-    type: str | None = Field(default=None, alias="Type")
 
 
 # ── Finance Links ──────────────────────────────────────────────────────
@@ -536,6 +532,44 @@ class GeneralFundraisingResourceRecord(_TypedAirtableRecord):
 
     document: str | None = Field(default=None, alias="Document")
     document_url: str | None = Field(default=None, alias="Document URL")
+
+
+# ── Partnerships Links ─────────────────────────────────────────────────
+class PartnershipsLinkRecord(BaseModel):
+    """A row from the Partnerships Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    text: str | None = Field(default=None, alias="Text")
+    link: str | None = Field(default=None, alias="Link")
+    category: str | None = Field(default=None, alias="Category")
+    type: str | None = Field(default=None, alias="Type")
+
+
+class PartnershipsLinkUpdate(BaseModel):
+    """Partial update payload for a Partnerships Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str | None = Field(default=None, alias="Text")
+    link: str | None = Field(default=None, alias="Link")
+    category: str | None = Field(default=None, alias="Category")
+    type: str | None = Field(default=None, alias="Type")
 
 
 # ── Onboarding ─────────────────────────────────────────────────────────
