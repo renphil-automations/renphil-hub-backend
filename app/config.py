@@ -205,7 +205,9 @@ class Settings(BaseSettings):
     AT_F_PF_DOCUMENT: str
     AT_F_PF_DOCUMENT_URL: str
     AT_F_PF_NOTES: str
-    AT_F_PF_CATEGORY: str    AT_F_PF_TYPE: str
+    AT_F_PF_CATEGORY: str
+    AT_F_PF_TYPE: str
+
     # ── Finance Links fields ──────────────────────────────────────────
     AT_F_FL_ID: str
     AT_F_FL_DOCUMENT: str
