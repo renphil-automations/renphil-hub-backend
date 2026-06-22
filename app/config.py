@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     APP_NAME: str = "RenPhil Hub API"
     DEBUG: bool = False
     ALLOWED_ORIGINS: list[str] = ["http://localhost:5000", "http://localhost:3000", "https://renphil-hub.web.app", "https://renphil-hub.firebaseapp.com"]
+    # Comma-separated emails granted "Hub Admin" without an Access Control
+    # record. Only takes effect when DEBUG=true — local testing convenience,
+    # never honored in production.
+    DEV_ADMIN_OVERRIDE_EMAILS: str = ""
 
     # ── Google OAuth ───────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str

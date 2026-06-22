@@ -16,6 +16,24 @@ class AirtableRecord(BaseModel):
     createdTime: str | None = None
 
 
+class AirtablePreviewResponse(BaseModel):
+    """Generic read-only preview of an arbitrary Airtable table/view, used
+    by the dashboard's Airtable widget. Unlike the typed record endpoints,
+    field names here are whatever the source Airtable table defines."""
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    fields: list[str] = Field(
+        default_factory=list,
+        description="Union of field names seen across the returned rows, in first-seen order.",
+    )
+    rows: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Each row's raw Airtable 'fields' dict, plus its record 'id'.",
+    )
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 class _TypedAirtableRecord(BaseModel):
     """

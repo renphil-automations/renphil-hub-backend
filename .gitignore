@@ -28,3 +28,8 @@ generate_jwt_key.py
 # Logs
 logs/
 *.log
+
+# Local DB clone dumps (contains production data)
+.dbdump/
+*.yml
+*.ps1

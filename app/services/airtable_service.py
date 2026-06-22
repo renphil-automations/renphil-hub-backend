@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Iterable
@@ -175,6 +176,73 @@ class AirtableService:
             self._settings.ADMINS_TABLE,
         )
 
+    # ── Generic read-only preview (dashboard Airtable widget) ───────────
+    _PREVIEW_MAX_RECORDS = 100
+
+    @staticmethod
+    def _parse_airtable_share_url(url: str) -> tuple[str, str, str | None]:
+        """Extract (base_id, table_id, view_id) from an Airtable share URL.
+
+        Accepts URLs like:
+          https://airtable.com/appXXXXXXXXXXXXXX/tblXXXXXXXXXXXXXX/viwXXXXXXXXXXXXXX
+          https://airtable.com/appXXXXXXXXXXXXXX/tblXXXXXXXXXXXXXX
+        Raises AirtableError (400) if a base id and table id can't both be found.
+        """
+        base_match = re.search(r"app[A-Za-z0-9]{14,}", url or "")
+        table_match = re.search(r"tbl[A-Za-z0-9]{14,}", url or "")
+        view_match = re.search(r"viw[A-Za-z0-9]{14,}", url or "")
+
+        if not base_match or not table_match:
+            raise AirtableError(
+                "Could not find an Airtable base id (app...) and table id "
+                "(tbl...) in the provided URL."
+            )
+
+        return base_match.group(0), table_match.group(0), (
+            view_match.group(0) if view_match else None
+        )
+
+    async def preview_from_url(self, url: str):
+        """Fetch a capped, read-only preview of an arbitrary Airtable
+        table/view referenced by a pasted share URL. Used by the dashboard's
+        Airtable widget — intentionally generic (no fixed field schema)."""
+        from app.models.airtable import AirtablePreviewResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        table = self._api.table(base_id, table_id)
+        kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
+        if view_id:
+            kwargs["view"] = view_id
+
+        try:
+            records = await asyncio.to_thread(table.all, **kwargs)
+        except RequestException as exc:
+            logger.error("Airtable preview request failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during preview fetch")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        seen_fields: list[str] = []
+        seen_set: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for record in records:
+            fields = record.get("fields", {}) or {}
+            for key in fields:
+                if key not in seen_set:
+                    seen_set.add(key)
+                    seen_fields.append(key)
+            rows.append({"id": record.get("id"), **fields})
+
+        return AirtablePreviewResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=seen_fields,
+            rows=rows,
+        )
+
     async def is_admin(self, email: str) -> bool:
         """Return True if the given email has an entry in the Admins table."""
         if not email:
@@ -216,6 +284,10 @@ class AirtableService:
             logger.info("Role lookup skipped: empty email → returning []")
             return []
 
+        if self._is_dev_admin_override(email):
+            logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
+            return [self.HUB_ADMIN_ROLE]
+
         s = self._settings
         email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
         role_name_field = s.ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD
@@ -256,6 +328,21 @@ class AirtableService:
         logger.info("Role lookup for email=%s → roles=%s", normalized, roles)
         return roles
 
+    def _is_dev_admin_override(self, email: str) -> bool:
+        """True when ``email`` is a configured local-testing admin override.
+
+        Gated on DEBUG so this can never silently activate in production.
+        """
+        s = self._settings
+        if not s.DEBUG or not s.DEV_ADMIN_OVERRIDE_EMAILS:
+            return False
+        overrides = {
+            e.strip().lower()
+            for e in s.DEV_ADMIN_OVERRIDE_EMAILS.split(",")
+            if e.strip()
+        }
+        return email.strip().lower() in overrides
+
     # Role name that grants RenPhil Hub administrator privileges.
     HUB_ADMIN_ROLE = "Hub Admin"
 
@@ -282,6 +369,16 @@ class AirtableService:
 
         if not email:
             return []
+
+        if self._is_dev_admin_override(email):
+            logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
+            return [
+                ScopedRole(
+                    role_name=self.HUB_ADMIN_ROLE,
+                    scope=self.HUB_SCOPE,
+                    fund_or_program_name=None,
+                )
+            ]
 
         s = self._settings
         email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
