@@ -138,6 +138,7 @@ _F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS = _S.AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS
 # Awarded Opportunities → Master List lookup enrichment
 _ML_LOOKUP_FIELD = "Master List of Funds & Sub-Programs (from Linked Gift Designation)"
 _ML_LOOKUP_PROJECT_FIELDS = [
+    "Name",
     "Official Fund or Program Name",
     "Initiative Type",
     "Focus Area(s)",
