@@ -762,6 +762,63 @@ class RenphilDueDiligenceLinkUpdate(BaseModel):
     url: str | None = Field(default=None, alias="URL")
 
 
+# ── Board Member List ──────────────────────────────────────────────────
+class BoardMemberRecord(BaseModel):
+    """A row from the Board Member List table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    title: str | None = Field(default=None, alias="Title")
+    full_name: str | None = Field(default=None, alias="Full Name")
+    role: str | None = Field(default=None, alias="Role")
+    organization: str | None = Field(default=None, alias="Organization")
+    contact: str | None = Field(
+        default=None, alias="Contact", description="Email address."
+    )
+
+
+class BoardMemberCreate(BaseModel):
+    """Payload to create a Board Member List record.
+
+    Only ``full_name`` and ``contact`` are required.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    full_name: str = Field(..., alias="Full Name")
+    contact: str = Field(..., alias="Contact", description="Email address.")
+    title: str | None = Field(default=None, alias="Title")
+    role: str | None = Field(default=None, alias="Role")
+    organization: str | None = Field(default=None, alias="Organization")
+
+
+class BoardMemberUpdate(BaseModel):
+    """Partial update payload for a Board Member List record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str | None = Field(default=None, alias="Title")
+    full_name: str | None = Field(default=None, alias="Full Name")
+    role: str | None = Field(default=None, alias="Role")
+    organization: str | None = Field(default=None, alias="Organization")
+    contact: str | None = Field(default=None, alias="Contact")
+
+
 # ── Onboarding ─────────────────────────────────────────────────────────
 class OnboardingLinkRecord(_TypedAirtableRecord):
     """A row from the Onboarding table."""

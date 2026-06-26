@@ -113,6 +113,9 @@ from app.models.airtable import (
     RenphilDueDiligenceLinkRecord,
     RenphilDueDiligenceLinkCreate,
     RenphilDueDiligenceLinkUpdate,
+    BoardMemberRecord,
+    BoardMemberCreate,
+    BoardMemberUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -1391,6 +1394,89 @@ async def delete_renphil_due_diligence_link(
             ),
         )
     return await airtable_service.delete_renphil_due_diligence_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Board Member List endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_board_members",
+    response_model=list[BoardMemberRecord],
+    summary=(
+        "List rows from the Board Member List table "
+        "(Id, Title, Full Name, Role, Organization, Contact)."
+    ),
+)
+async def get_board_members(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_board_members(fields=fields)
+
+
+@router.post(
+    "/board_members",
+    response_model=BoardMemberRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary=(
+        "Create a new Board Member List record (admin only). "
+        "'full_name' and 'contact' are required; other fields are optional."
+    ),
+)
+async def create_board_member(
+    payload: BoardMemberCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Board Member List records.",
+        )
+    return await airtable_service.create_board_member(payload)
+
+
+@router.patch(
+    "/board_members",
+    response_model=BoardMemberRecord,
+    summary=(
+        "Update a Board Member List record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_board_member(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: BoardMemberUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Board Member List records.",
+        )
+    return await airtable_service.update_board_member(id, payload)
+
+
+@router.delete(
+    "/board_members",
+    summary="Delete a Board Member List record by its 'Id' (admin only).",
+)
+async def delete_board_member(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Board Member List records.",
+        )
+    return await airtable_service.delete_board_member(id)
 
 
 @router.get(

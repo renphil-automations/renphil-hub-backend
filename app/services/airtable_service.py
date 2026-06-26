@@ -96,6 +96,9 @@ from app.models.airtable import (
     RenphilDueDiligenceLinkRecord,
     RenphilDueDiligenceLinkCreate,
     RenphilDueDiligenceLinkUpdate,
+    BoardMemberRecord,
+    BoardMemberCreate,
+    BoardMemberUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -3488,6 +3491,163 @@ class AirtableService:
         return {
             "id": record["id"],
             "renphil_due_diligence_link_id": ddl_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Board Member List (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_BM_ID = _S.AT_F_BM_ID
+    _F_BM_TITLE = _S.AT_F_BM_TITLE
+    _F_BM_FULL_NAME = _S.AT_F_BM_FULL_NAME
+    _F_BM_ROLE = _S.AT_F_BM_ROLE
+    _F_BM_ORGANIZATION = _S.AT_F_BM_ORGANIZATION
+    _F_BM_CONTACT = _S.AT_F_BM_CONTACT
+
+    _BM_UPDATE_FIELD_MAP = {
+        "title": _F_BM_TITLE,
+        "full_name": _F_BM_FULL_NAME,
+        "role": _F_BM_ROLE,
+        "organization": _F_BM_ORGANIZATION,
+        "contact": _F_BM_CONTACT,
+    }
+
+    def _board_member_list_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.BOARD_MEMBER_LIST_TABLE,
+        )
+
+    @staticmethod
+    def _bm_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[BoardMemberRecord]:
+        return [
+            BoardMemberRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_board_members(
+        self, *, fields: list[str] | None = None
+    ) -> list[BoardMemberRecord]:
+        """Return all rows from the Board Member List table."""
+        records = await self._list_records(
+            self._board_member_list_table(), fields=fields
+        )
+        return self._bm_to_typed(records)
+
+    async def _find_board_member_by_id(
+        self, bm_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(bm_id)
+            formula = af.eq_num(self._F_BM_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_BM_ID, str(bm_id))
+
+        table = self._board_member_list_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable board member lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_board_member(
+        self, payload: BoardMemberCreate
+    ) -> BoardMemberRecord:
+        """Create a new Board Member List row."""
+        body: dict[str, Any] = {
+            self._F_BM_FULL_NAME: payload.full_name,
+            self._F_BM_CONTACT: payload.contact,
+        }
+        if payload.title is not None:
+            body[self._F_BM_TITLE] = payload.title
+        if payload.role is not None:
+            body[self._F_BM_ROLE] = payload.role
+        if payload.organization is not None:
+            body[self._F_BM_ORGANIZATION] = payload.organization
+
+        table = self._board_member_list_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable board member create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._bm_to_typed([created])[0]
+
+    async def update_board_member(
+        self, bm_id: int | str, payload: BoardMemberUpdate
+    ) -> BoardMemberRecord:
+        """Update a Board Member List record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._BM_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_board_member_by_id(bm_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Board Member List record with id '{bm_id}' not found.",
+            )
+
+        table = self._board_member_list_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update board member failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._bm_to_typed([updated])[0]
+
+    async def delete_board_member(
+        self, bm_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Board Member List row by its autonumber Id."""
+        record = await self._find_board_member_by_id(bm_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Board Member List record with id '{bm_id}' not found.",
+            )
+        table = self._board_member_list_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable board member delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "board_member_id": bm_id,
             "deleted": True,
         }
 
