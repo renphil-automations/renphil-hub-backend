@@ -107,6 +107,12 @@ from app.models.airtable import (
     EventsQuickLinkRecord,
     EventsQuickLinkCreate,
     EventsQuickLinkUpdate,
+    FinanceQuickLinkRecord,
+    FinanceQuickLinkCreate,
+    FinanceQuickLinkUpdate,
+    RenphilDueDiligenceLinkRecord,
+    RenphilDueDiligenceLinkCreate,
+    RenphilDueDiligenceLinkUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -1222,6 +1228,169 @@ async def delete_events_quick_link(
             detail="Admin privileges required to delete Events Quick Links records.",
         )
     return await airtable_service.delete_events_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Finance Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_finance_quick_links",
+    response_model=list[FinanceQuickLinkRecord],
+    summary="List rows from the Finance Quick Links table (Id, Anchor Text, URL).",
+)
+async def get_finance_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_finance_quick_links(fields=fields)
+
+
+@router.post(
+    "/finance_quick_links",
+    response_model=FinanceQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Finance Quick Links record (admin only).",
+)
+async def create_finance_quick_link(
+    payload: FinanceQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Finance Quick Links records.",
+        )
+    return await airtable_service.create_finance_quick_link(payload)
+
+
+@router.patch(
+    "/finance_quick_links",
+    response_model=FinanceQuickLinkRecord,
+    summary=(
+        "Update a Finance Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_finance_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: FinanceQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Finance Quick Links records.",
+        )
+    return await airtable_service.update_finance_quick_link(id, payload)
+
+
+@router.delete(
+    "/finance_quick_links",
+    summary="Delete a Finance Quick Links record by its 'Id' (admin only).",
+)
+async def delete_finance_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Finance Quick Links records.",
+        )
+    return await airtable_service.delete_finance_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   RenPhil Due Diligence Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_renphil_due_diligence_links",
+    response_model=list[RenphilDueDiligenceLinkRecord],
+    summary=(
+        "List rows from the RenPhil Due Diligence Links table "
+        "(Id, Anchor Text, URL)."
+    ),
+)
+async def get_renphil_due_diligence_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_renphil_due_diligence_links(fields=fields)
+
+
+@router.post(
+    "/renphil_due_diligence_links",
+    response_model=RenphilDueDiligenceLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new RenPhil Due Diligence Links record (admin only).",
+)
+async def create_renphil_due_diligence_link(
+    payload: RenphilDueDiligenceLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to create RenPhil Due Diligence Links records."
+            ),
+        )
+    return await airtable_service.create_renphil_due_diligence_link(payload)
+
+
+@router.patch(
+    "/renphil_due_diligence_links",
+    response_model=RenphilDueDiligenceLinkRecord,
+    summary=(
+        "Update a RenPhil Due Diligence Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_renphil_due_diligence_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: RenphilDueDiligenceLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to edit RenPhil Due Diligence Links records."
+            ),
+        )
+    return await airtable_service.update_renphil_due_diligence_link(id, payload)
+
+
+@router.delete(
+    "/renphil_due_diligence_links",
+    summary="Delete a RenPhil Due Diligence Links record by its 'Id' (admin only).",
+)
+async def delete_renphil_due_diligence_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to delete RenPhil Due Diligence Links records."
+            ),
+        )
+    return await airtable_service.delete_renphil_due_diligence_link(id)
 
 
 @router.get(

@@ -90,6 +90,12 @@ from app.models.airtable import (
     EventsQuickLinkRecord,
     EventsQuickLinkCreate,
     EventsQuickLinkUpdate,
+    FinanceQuickLinkRecord,
+    FinanceQuickLinkCreate,
+    FinanceQuickLinkUpdate,
+    RenphilDueDiligenceLinkRecord,
+    RenphilDueDiligenceLinkCreate,
+    RenphilDueDiligenceLinkUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -3182,6 +3188,306 @@ class AirtableService:
         return {
             "id": record["id"],
             "events_quick_link_id": eql_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Finance Quick Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_FQL_ID = _S.AT_F_FQL_ID
+    _F_FQL_ANCHOR_TEXT = _S.AT_F_FQL_ANCHOR_TEXT
+    _F_FQL_URL = _S.AT_F_FQL_URL
+
+    _FQL_UPDATE_FIELD_MAP = {
+        "anchor_text": _F_FQL_ANCHOR_TEXT,
+        "url": _F_FQL_URL,
+    }
+
+    def _finance_quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.FINANCE_QUICK_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _fql_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[FinanceQuickLinkRecord]:
+        return [
+            FinanceQuickLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_finance_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[FinanceQuickLinkRecord]:
+        """Return all rows from the Finance Quick Links table."""
+        records = await self._list_records(
+            self._finance_quick_links_table(), fields=fields
+        )
+        return self._fql_to_typed(records)
+
+    async def _find_finance_quick_link_by_id(
+        self, fql_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(fql_id)
+            formula = af.eq_num(self._F_FQL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_FQL_ID, str(fql_id))
+
+        table = self._finance_quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable finance quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_finance_quick_link(
+        self, payload: FinanceQuickLinkCreate
+    ) -> FinanceQuickLinkRecord:
+        """Create a new Finance Quick Links row."""
+        body: dict[str, Any] = {
+            self._F_FQL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_FQL_URL: payload.url,
+        }
+        table = self._finance_quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable finance quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._fql_to_typed([created])[0]
+
+    async def update_finance_quick_link(
+        self, fql_id: int | str, payload: FinanceQuickLinkUpdate
+    ) -> FinanceQuickLinkRecord:
+        """Update a Finance Quick Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._FQL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_finance_quick_link_by_id(fql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Finance Quick Links record with id '{fql_id}' not found.",
+            )
+
+        table = self._finance_quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update finance quick link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._fql_to_typed([updated])[0]
+
+    async def delete_finance_quick_link(
+        self, fql_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Finance Quick Links row by its autonumber Id."""
+        record = await self._find_finance_quick_link_by_id(fql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Finance Quick Links record with id '{fql_id}' not found.",
+            )
+        table = self._finance_quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable finance quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "finance_quick_link_id": fql_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # RenPhil Due Diligence Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_DDL_ID = _S.AT_F_DDL_ID
+    _F_DDL_ANCHOR_TEXT = _S.AT_F_DDL_ANCHOR_TEXT
+    _F_DDL_URL = _S.AT_F_DDL_URL
+
+    _DDL_UPDATE_FIELD_MAP = {
+        "anchor_text": _F_DDL_ANCHOR_TEXT,
+        "url": _F_DDL_URL,
+    }
+
+    def _renphil_due_diligence_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.RENPHIL_DUE_DILIGENCE_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _ddl_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[RenphilDueDiligenceLinkRecord]:
+        return [
+            RenphilDueDiligenceLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_renphil_due_diligence_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[RenphilDueDiligenceLinkRecord]:
+        """Return all rows from the RenPhil Due Diligence Links table."""
+        records = await self._list_records(
+            self._renphil_due_diligence_links_table(), fields=fields
+        )
+        return self._ddl_to_typed(records)
+
+    async def _find_renphil_due_diligence_link_by_id(
+        self, ddl_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(ddl_id)
+            formula = af.eq_num(self._F_DDL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_DDL_ID, str(ddl_id))
+
+        table = self._renphil_due_diligence_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error(
+                "Airtable RenPhil due diligence link lookup failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_renphil_due_diligence_link(
+        self, payload: RenphilDueDiligenceLinkCreate
+    ) -> RenphilDueDiligenceLinkRecord:
+        """Create a new RenPhil Due Diligence Links row."""
+        body: dict[str, Any] = {
+            self._F_DDL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_DDL_URL: payload.url,
+        }
+        table = self._renphil_due_diligence_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error(
+                "Airtable RenPhil due diligence link create failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._ddl_to_typed([created])[0]
+
+    async def update_renphil_due_diligence_link(
+        self, ddl_id: int | str, payload: RenphilDueDiligenceLinkUpdate
+    ) -> RenphilDueDiligenceLinkRecord:
+        """Update a RenPhil Due Diligence Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._DDL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_renphil_due_diligence_link_by_id(ddl_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"RenPhil Due Diligence Links record with id '{ddl_id}' not found."
+                ),
+            )
+
+        table = self._renphil_due_diligence_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error(
+                "Airtable update RenPhil due diligence link failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._ddl_to_typed([updated])[0]
+
+    async def delete_renphil_due_diligence_link(
+        self, ddl_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a RenPhil Due Diligence Links row by its autonumber Id."""
+        record = await self._find_renphil_due_diligence_link_by_id(ddl_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"RenPhil Due Diligence Links record with id '{ddl_id}' not found."
+                ),
+            )
+        table = self._renphil_due_diligence_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error(
+                "Airtable RenPhil due diligence link delete failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "renphil_due_diligence_link_id": ddl_id,
             "deleted": True,
         }
 

@@ -676,6 +676,92 @@ class EventsQuickLinkCreate(BaseModel):
     email: str | None = Field(default=None, alias="Email")
 
 
+# ── Finance Quick Links ────────────────────────────────────────────────
+class FinanceQuickLinkRecord(BaseModel):
+    """A row from the Finance Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+class FinanceQuickLinkCreate(BaseModel):
+    """Payload to create a Finance Quick Links record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    url: str = Field(..., alias="URL")
+
+
+class FinanceQuickLinkUpdate(BaseModel):
+    """Partial update payload for a Finance Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+# ── RenPhil Due Diligence Links ────────────────────────────────────────
+class RenphilDueDiligenceLinkRecord(BaseModel):
+    """A row from the RenPhil Due Diligence Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+class RenphilDueDiligenceLinkCreate(BaseModel):
+    """Payload to create a RenPhil Due Diligence Links record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    url: str = Field(..., alias="URL")
+
+
+class RenphilDueDiligenceLinkUpdate(BaseModel):
+    """Partial update payload for a RenPhil Due Diligence Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
 # ── Onboarding ─────────────────────────────────────────────────────────
 class OnboardingLinkRecord(_TypedAirtableRecord):
     """A row from the Onboarding table."""

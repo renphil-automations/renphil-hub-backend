@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     PARTNERSHIPS_LINKS_TABLE: str
     POLICY_LINKS_TABLE: str
     EVENTS_QUICK_LINKS_TABLE: str
+    FINANCE_QUICK_LINKS_TABLE: str
+    RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -276,6 +278,16 @@ class Settings(BaseSettings):
     AT_F_EQL_TYPE: str
     AT_F_EQL_URL: str
     AT_F_EQL_EMAIL: str
+
+    # ── Finance Quick Links fields ──────────────────────────────────
+    AT_F_FQL_ID: str
+    AT_F_FQL_ANCHOR_TEXT: str
+    AT_F_FQL_URL: str
+
+    # ── RenPhil Due Diligence Links fields ────────────────────
+    AT_F_DDL_ID: str
+    AT_F_DDL_ANCHOR_TEXT: str
+    AT_F_DDL_URL: str
     # ── Onboarding Checklist fields ──────────────────────────────────
     AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
     # ══════════════════════════════════════════════════════════════════
