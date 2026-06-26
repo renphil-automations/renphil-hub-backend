@@ -116,6 +116,9 @@ from app.models.airtable import (
     BoardMemberRecord,
     BoardMemberCreate,
     BoardMemberUpdate,
+    OrganizationInfoRecord,
+    OrganizationInfoCreate,
+    OrganizationInfoUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -1477,6 +1480,89 @@ async def delete_board_member(
             detail="Admin privileges required to delete Board Member List records.",
         )
     return await airtable_service.delete_board_member(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Organization Info endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_organization_info",
+    response_model=list[OrganizationInfoRecord],
+    summary=(
+        "List rows from the Organization Info table "
+        "(Id, Title, Content, Entity, Tabs)."
+    ),
+)
+async def get_organization_info(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_organization_info(fields=fields)
+
+
+@router.post(
+    "/organization_info",
+    response_model=OrganizationInfoRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary=(
+        "Create a new Organization Info record (admin only). "
+        "'title' and 'content' are required; 'entity' and 'tabs' are optional."
+    ),
+)
+async def create_organization_info(
+    payload: OrganizationInfoCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Organization Info records.",
+        )
+    return await airtable_service.create_organization_info(payload)
+
+
+@router.patch(
+    "/organization_info",
+    response_model=OrganizationInfoRecord,
+    summary=(
+        "Update an Organization Info record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_organization_info(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: OrganizationInfoUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Organization Info records.",
+        )
+    return await airtable_service.update_organization_info(id, payload)
+
+
+@router.delete(
+    "/organization_info",
+    summary="Delete an Organization Info record by its 'Id' (admin only).",
+)
+async def delete_organization_info(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Organization Info records.",
+        )
+    return await airtable_service.delete_organization_info(id)
 
 
 @router.get(

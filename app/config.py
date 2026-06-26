@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     FINANCE_QUICK_LINKS_TABLE: str
     RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str
     BOARD_MEMBER_LIST_TABLE: str
+    ORGANIZATION_INFO_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -297,7 +298,12 @@ class Settings(BaseSettings):
     AT_F_BM_ROLE: str
     AT_F_BM_ORGANIZATION: str
     AT_F_BM_CONTACT: str
-    # ── Onboarding Checklist fields ──────────────────────────────────
+    # ── Organization Info fields ────────────────────────────────
+    AT_F_OI_ID: str
+    AT_F_OI_TITLE: str
+    AT_F_OI_CONTENT: str
+    AT_F_OI_ENTITY: str
+    AT_F_OI_TABS: str    # ── Onboarding Checklist fields ──────────────────────────────────
     AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
     # ══════════════════════════════════════════════════════════════════
     # Slack webhook

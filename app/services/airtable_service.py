@@ -99,6 +99,9 @@ from app.models.airtable import (
     BoardMemberRecord,
     BoardMemberCreate,
     BoardMemberUpdate,
+    OrganizationInfoRecord,
+    OrganizationInfoCreate,
+    OrganizationInfoUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -3648,6 +3651,159 @@ class AirtableService:
         return {
             "id": record["id"],
             "board_member_id": bm_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Organization Info (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_OI_ID = _S.AT_F_OI_ID
+    _F_OI_TITLE = _S.AT_F_OI_TITLE
+    _F_OI_CONTENT = _S.AT_F_OI_CONTENT
+    _F_OI_ENTITY = _S.AT_F_OI_ENTITY
+    _F_OI_TABS = _S.AT_F_OI_TABS
+
+    _OI_UPDATE_FIELD_MAP = {
+        "title": _F_OI_TITLE,
+        "content": _F_OI_CONTENT,
+        "entity": _F_OI_ENTITY,
+        "tabs": _F_OI_TABS,
+    }
+
+    def _organization_info_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.ORGANIZATION_INFO_TABLE,
+        )
+
+    @staticmethod
+    def _oi_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[OrganizationInfoRecord]:
+        return [
+            OrganizationInfoRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_organization_info(
+        self, *, fields: list[str] | None = None
+    ) -> list[OrganizationInfoRecord]:
+        """Return all rows from the Organization Info table."""
+        records = await self._list_records(
+            self._organization_info_table(), fields=fields
+        )
+        return self._oi_to_typed(records)
+
+    async def _find_organization_info_by_id(
+        self, oi_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(oi_id)
+            formula = af.eq_num(self._F_OI_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_OI_ID, str(oi_id))
+
+        table = self._organization_info_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable organization info lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_organization_info(
+        self, payload: OrganizationInfoCreate
+    ) -> OrganizationInfoRecord:
+        """Create a new Organization Info row."""
+        body: dict[str, Any] = {
+            self._F_OI_TITLE: payload.title,
+            self._F_OI_CONTENT: payload.content,
+        }
+        if payload.entity is not None:
+            body[self._F_OI_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_OI_TABS] = payload.tabs
+
+        table = self._organization_info_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable organization info create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._oi_to_typed([created])[0]
+
+    async def update_organization_info(
+        self, oi_id: int | str, payload: OrganizationInfoUpdate
+    ) -> OrganizationInfoRecord:
+        """Update an Organization Info record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._OI_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_organization_info_by_id(oi_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Organization Info record with id '{oi_id}' not found.",
+            )
+
+        table = self._organization_info_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update organization info failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._oi_to_typed([updated])[0]
+
+    async def delete_organization_info(
+        self, oi_id: int | str
+    ) -> dict[str, Any]:
+        """Delete an Organization Info row by its autonumber Id."""
+        record = await self._find_organization_info_by_id(oi_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Organization Info record with id '{oi_id}' not found.",
+            )
+        table = self._organization_info_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable organization info delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "organization_info_id": oi_id,
             "deleted": True,
         }
 

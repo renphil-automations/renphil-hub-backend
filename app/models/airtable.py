@@ -819,6 +819,67 @@ class BoardMemberUpdate(BaseModel):
     contact: str | None = Field(default=None, alias="Contact")
 
 
+# ── Organization Info ──────────────────────────────────────────────────
+class OrganizationInfoRecord(BaseModel):
+    """A row from the Organization Info table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    title: str | None = Field(default=None, alias="Title")
+    content: str | None = Field(default=None, alias="Content")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class OrganizationInfoCreate(BaseModel):
+    """Payload to create an Organization Info record.
+
+    ``title`` and ``content`` are required; ``entity`` and ``tabs`` are
+    optional.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str = Field(..., alias="Title")
+    content: str = Field(..., alias="Content")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class OrganizationInfoUpdate(BaseModel):
+    """Partial update payload for an Organization Info record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str | None = Field(default=None, alias="Title")
+    content: str | None = Field(default=None, alias="Content")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
+
+
 # ── Onboarding ─────────────────────────────────────────────────────────
 class OnboardingLinkRecord(_TypedAirtableRecord):
     """A row from the Onboarding table."""
