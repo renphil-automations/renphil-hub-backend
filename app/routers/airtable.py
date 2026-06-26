@@ -132,10 +132,18 @@ no write-back.
 )
 async def get_airtable_preview(
     url: str = Query(..., description="Airtable share URL to preview."),
+    fields: list[str] | None = Query(
+        default=None,
+        description="Column names to return. Omit (or pass none) for all columns.",
+    ),
+    formula: str | None = Query(
+        default=None,
+        description="Airtable formula to filter rows (e.g. AND({Status}=\"Active\")).",
+    ),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.preview_from_url(url)
+    return await airtable_service.preview_from_url(url, fields=fields, formula=formula)
 
 
 @router.get(

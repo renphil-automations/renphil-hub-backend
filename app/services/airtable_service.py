@@ -202,10 +202,21 @@ class AirtableService:
             view_match.group(0) if view_match else None
         )
 
-    async def preview_from_url(self, url: str):
+    async def preview_from_url(
+        self,
+        url: str,
+        fields: list[str] | None = None,
+        formula: str | None = None,
+    ):
         """Fetch a capped, read-only preview of an arbitrary Airtable
         table/view referenced by a pasted share URL. Used by the dashboard's
-        Airtable widget — intentionally generic (no fixed field schema)."""
+        Airtable widget — intentionally generic (no fixed field schema).
+
+        ``fields`` limits which columns Airtable returns (more efficient than
+        fetching all and discarding). ``formula`` is passed verbatim to
+        Airtable's ``filterByFormula`` parameter and is applied server-side
+        before the row cap, so the cap applies to already-filtered results.
+        """
         from app.models.airtable import AirtablePreviewResponse
 
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
@@ -214,6 +225,10 @@ class AirtableService:
         kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
         if view_id:
             kwargs["view"] = view_id
+        if fields:
+            kwargs["fields"] = fields
+        if formula and formula.strip():
+            kwargs["formula"] = formula.strip()
 
         try:
             records = await asyncio.to_thread(table.all, **kwargs)
