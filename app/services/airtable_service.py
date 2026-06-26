@@ -84,6 +84,12 @@ from app.models.airtable import (
     GeneralFundraisingResourceRecord,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
+    PolicyLinkRecord,
+    PolicyLinkCreate,
+    PolicyLinkUpdate,
+    EventsQuickLinkRecord,
+    EventsQuickLinkCreate,
+    EventsQuickLinkUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,7 +144,6 @@ _F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS = _S.AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS
 # Awarded Opportunities → Master List lookup enrichment
 _ML_LOOKUP_FIELD = "Master List of Funds & Sub-Programs (from Linked Gift Designation)"
 _ML_LOOKUP_PROJECT_FIELDS = [
-    "Name",
     "Official Fund or Program Name",
     "Initiative Type",
     "Focus Area(s)",
@@ -2877,6 +2882,306 @@ class AirtableService:
         return {
             "id": record["id"],
             "partnerships_link_id": pl_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Policy Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_POL_ID = _S.AT_F_POL_ID
+    _F_POL_TEXT = _S.AT_F_POL_TEXT
+    _F_POL_URL = _S.AT_F_POL_URL
+
+    _POL_UPDATE_FIELD_MAP = {
+        "text": _F_POL_TEXT,
+        "url": _F_POL_URL,
+    }
+
+    def _policy_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.POLICY_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _pol_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[PolicyLinkRecord]:
+        return [
+            PolicyLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_policy_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[PolicyLinkRecord]:
+        """Return all rows from the Policy Links table."""
+        records = await self._list_records(
+            self._policy_links_table(), fields=fields
+        )
+        return self._pol_to_typed(records)
+
+    async def _find_policy_link_by_id(
+        self, pol_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(pol_id)
+            formula = af.eq_num(self._F_POL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_POL_ID, str(pol_id))
+
+        table = self._policy_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable policy link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_policy_link(
+        self, payload: PolicyLinkCreate
+    ) -> PolicyLinkRecord:
+        """Create a new Policy Links row."""
+        body: dict[str, Any] = {
+            self._F_POL_TEXT: payload.text,
+            self._F_POL_URL: payload.url,
+        }
+        table = self._policy_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable policy link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._pol_to_typed([created])[0]
+
+    async def update_policy_link(
+        self, pol_id: int | str, payload: PolicyLinkUpdate
+    ) -> PolicyLinkRecord:
+        """Update a Policy Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._POL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_policy_link_by_id(pol_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Policy Links record with id '{pol_id}' not found.",
+            )
+
+        table = self._policy_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update policy link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._pol_to_typed([updated])[0]
+
+    async def delete_policy_link(
+        self, pol_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Policy Links row by its autonumber Id."""
+        record = await self._find_policy_link_by_id(pol_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Policy Links record with id '{pol_id}' not found.",
+            )
+        table = self._policy_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable policy link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "policy_link_id": pol_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Events Quick Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_EQL_ID = _S.AT_F_EQL_ID
+    _F_EQL_TITLE = _S.AT_F_EQL_TITLE
+    _F_EQL_ANCHOR_TEXT = _S.AT_F_EQL_ANCHOR_TEXT
+    _F_EQL_TYPE = _S.AT_F_EQL_TYPE
+    _F_EQL_URL = _S.AT_F_EQL_URL
+    _F_EQL_EMAIL = _S.AT_F_EQL_EMAIL
+
+    _EQL_UPDATE_FIELD_MAP = {
+        "title": _F_EQL_TITLE,
+        "anchor_text": _F_EQL_ANCHOR_TEXT,
+        "type": _F_EQL_TYPE,
+        "url": _F_EQL_URL,
+        "email": _F_EQL_EMAIL,
+    }
+
+    def _events_quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.EVENTS_QUICK_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _eql_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[EventsQuickLinkRecord]:
+        return [
+            EventsQuickLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_events_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[EventsQuickLinkRecord]:
+        """Return all rows from the Events Quick Links table."""
+        records = await self._list_records(
+            self._events_quick_links_table(), fields=fields
+        )
+        return self._eql_to_typed(records)
+
+    async def create_events_quick_link(
+        self, payload: EventsQuickLinkCreate
+    ) -> EventsQuickLinkRecord:
+        """Create a new Events Quick Links row."""
+        body: dict[str, Any] = {
+            self._F_EQL_TITLE: payload.title,
+            self._F_EQL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_EQL_TYPE: payload.type,
+        }
+        if payload.url is not None:
+            body[self._F_EQL_URL] = payload.url
+        if payload.email is not None:
+            body[self._F_EQL_EMAIL] = payload.email
+
+        table = self._events_quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable events quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._eql_to_typed([created])[0]
+
+    async def _find_events_quick_link_by_id(
+        self, eql_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(eql_id)
+            formula = af.eq_num(self._F_EQL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_EQL_ID, str(eql_id))
+
+        table = self._events_quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable events quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def update_events_quick_link(
+        self, eql_id: int | str, payload: EventsQuickLinkUpdate
+    ) -> EventsQuickLinkRecord:
+        """Update an Events Quick Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._EQL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_events_quick_link_by_id(eql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Events Quick Links record with id '{eql_id}' not found.",
+            )
+
+        table = self._events_quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update events quick link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._eql_to_typed([updated])[0]
+
+    async def delete_events_quick_link(
+        self, eql_id: int | str
+    ) -> dict[str, Any]:
+        """Delete an Events Quick Links row by its autonumber Id."""
+        record = await self._find_events_quick_link_by_id(eql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Events Quick Links record with id '{eql_id}' not found.",
+            )
+        table = self._events_quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable events quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "events_quick_link_id": eql_id,
             "deleted": True,
         }
 

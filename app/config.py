@@ -95,6 +95,8 @@ class Settings(BaseSettings):
     ONBOARDING_CHECKLIST_TABLE: str
     GENERAL_FUNDRAISING_RESOURCES_TABLE: str
     PARTNERSHIPS_LINKS_TABLE: str
+    POLICY_LINKS_TABLE: str
+    EVENTS_QUICK_LINKS_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -261,6 +263,19 @@ class Settings(BaseSettings):
     AT_F_PL_LINK: str
     AT_F_PL_CATEGORY: str
     AT_F_PL_TYPE: str
+
+    # ── Policy Links fields ───────────────────────────────────────────
+    AT_F_POL_ID: str
+    AT_F_POL_TEXT: str
+    AT_F_POL_URL: str
+
+    # ── Events Quick Links fields ───────────────────────────────────
+    AT_F_EQL_ID: str
+    AT_F_EQL_TITLE: str
+    AT_F_EQL_ANCHOR_TEXT: str
+    AT_F_EQL_TYPE: str
+    AT_F_EQL_URL: str
+    AT_F_EQL_EMAIL: str
     # ── Onboarding Checklist fields ──────────────────────────────────
     AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
     # ══════════════════════════════════════════════════════════════════

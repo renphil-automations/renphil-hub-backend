@@ -101,6 +101,12 @@ from app.models.airtable import (
     RecordFieldsUpdate,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
+    PolicyLinkRecord,
+    PolicyLinkCreate,
+    PolicyLinkUpdate,
+    EventsQuickLinkRecord,
+    EventsQuickLinkCreate,
+    EventsQuickLinkUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -1059,6 +1065,163 @@ async def delete_partnerships_link(
             detail="Admin privileges required to delete Partnerships Links records.",
         )
     return await airtable_service.delete_partnerships_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Policy Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_policy_links",
+    response_model=list[PolicyLinkRecord],
+    summary="List rows from the Policy Links table (Id, Text, URL).",
+)
+async def get_policy_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_policy_links(fields=fields)
+
+
+@router.post(
+    "/policy_links",
+    response_model=PolicyLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Policy Links record (admin only).",
+)
+async def create_policy_link(
+    payload: PolicyLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Policy Links records.",
+        )
+    return await airtable_service.create_policy_link(payload)
+
+
+@router.patch(
+    "/policy_links",
+    response_model=PolicyLinkRecord,
+    summary=(
+        "Update a Policy Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_policy_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: PolicyLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Policy Links records.",
+        )
+    return await airtable_service.update_policy_link(id, payload)
+
+
+@router.delete(
+    "/policy_links",
+    summary="Delete a Policy Links record by its 'Id' (admin only).",
+)
+async def delete_policy_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Policy Links records.",
+        )
+    return await airtable_service.delete_policy_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Events Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_events_quick_links",
+    response_model=list[EventsQuickLinkRecord],
+    summary=(
+        "List rows from the Events Quick Links table "
+        "(Id, Title, Anchor Text, Type, URL, Email)."
+    ),
+)
+async def get_events_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_events_quick_links(fields=fields)
+
+
+@router.post(
+    "/events_quick_links",
+    response_model=EventsQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Events Quick Links record (admin only).",
+)
+async def create_events_quick_link(
+    payload: EventsQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Events Quick Links records.",
+        )
+    return await airtable_service.create_events_quick_link(payload)
+
+
+@router.patch(
+    "/events_quick_links",
+    response_model=EventsQuickLinkRecord,
+    summary=(
+        "Update an Events Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_events_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: EventsQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Events Quick Links records.",
+        )
+    return await airtable_service.update_events_quick_link(id, payload)
+
+
+@router.delete(
+    "/events_quick_links",
+    summary="Delete an Events Quick Links record by its 'Id' (admin only).",
+)
+async def delete_events_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Events Quick Links records.",
+        )
+    return await airtable_service.delete_events_quick_link(id)
 
 
 @router.get(

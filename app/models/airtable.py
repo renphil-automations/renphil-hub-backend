@@ -572,6 +572,110 @@ class PartnershipsLinkUpdate(BaseModel):
     type: str | None = Field(default=None, alias="Type")
 
 
+# ── Policy Links ───────────────────────────────────────────────────────
+class PolicyLinkRecord(BaseModel):
+    """A row from the Policy Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    text: str | None = Field(default=None, alias="Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+class PolicyLinkCreate(BaseModel):
+    """Payload to create a Policy Links record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str = Field(..., alias="Text")
+    url: str = Field(..., alias="URL")
+
+
+class PolicyLinkUpdate(BaseModel):
+    """Partial update payload for a Policy Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str | None = Field(default=None, alias="Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+# ── Events Quick Links ─────────────────────────────────────────────────
+class EventsQuickLinkRecord(BaseModel):
+    """A row from the Events Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    title: str | None = Field(default=None, alias="Title")
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(
+        default=None,
+        alias="Type",
+        description="Single-select indicating whether the link is a 'URL' or 'Email'.",
+    )
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class EventsQuickLinkUpdate(BaseModel):
+    """Partial update payload for an Events Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str | None = Field(default=None, alias="Title")
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class EventsQuickLinkCreate(BaseModel):
+    """Payload to create an Events Quick Links record.
+
+    ``type`` is the single-select that determines which of ``url`` or
+    ``email`` carries the actual link value. Either ``url`` or ``email``
+    may be omitted depending on ``type``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str = Field(..., alias="Title")
+    anchor_text: str = Field(..., alias="Anchor Text")
+    type: str = Field(..., alias="Type", description="'URL' or 'Email'.")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
 # ── Onboarding ─────────────────────────────────────────────────────────
 class OnboardingLinkRecord(_TypedAirtableRecord):
     """A row from the Onboarding table."""
