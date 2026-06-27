@@ -65,8 +65,9 @@ from app.models.airtable import (
     MasterListFundsAndSubprogramsRecord,
     MonthlyCheckinRecord,
     OrgFriendsRecord,
-    PartnershipsFundraisingRecord,
-    PartnershipsFundraisingUpdate,
+    GrantAppResourceRecord,
+    GrantAppResourceCreate,
+    GrantAppResourceUpdate,
     PersonContactItem,
     FinanceLinkRecord,
     FinanceLinkUpdate,
@@ -101,6 +102,7 @@ from app.models.airtable import (
     RecordFieldsUpdate,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
+    PartnershipsLinkCreate,
     PolicyLinkRecord,
     PolicyLinkCreate,
     PolicyLinkUpdate,
@@ -791,44 +793,94 @@ async def get_team_members(
     return await airtable_service.get_team_members()
 
 
-# ── /get_partnerships_fundraising ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#   Grant Application Resources endpoints
+# ══════════════════════════════════════════════════════════════════════
 @router.get(
-    "/get_partnerships_fundraising",
-    response_model=list[PartnershipsFundraisingRecord],
+    "/get_grant_app_resources",
+    response_model=list[GrantAppResourceRecord],
     summary=(
-        "List rows from the Partnerships Fundraising table "
-        "(Document, Document URL, Notes). Document URL may be empty."
+        "List rows from the Grant Application Resources table "
+        "(Id, Document, Document URL, Notes, Entity, Tabs). "
+        "Document URL may be empty."
     ),
 )
-async def get_partnerships_fundraising(
+async def get_grant_app_resources(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_partnerships_fundraising(fields=fields)
+    return await airtable_service.get_grant_app_resources(fields=fields)
 
 
-# ── PATCH /partnerships_fundraising/{id} ──────────────────────────────
-@router.patch(
-    "/partnerships_fundraising/{pf_id}",
-    response_model=PartnershipsFundraisingRecord,
+@router.post(
+    "/partnerships_grant_app_resources",
+    response_model=GrantAppResourceRecord,
+    status_code=status.HTTP_201_CREATED,
     summary=(
-        "Update a Partnerships Fundraising record by its 'Id' "
-        "(admin only). Any subset of fields may be provided."
+        "Create a new Grant Application Resources record (admin only). "
+        "'document' is required; other fields are optional."
     ),
 )
-async def update_partnerships_fundraising(
-    pf_id: int,
-    payload: PartnershipsFundraisingUpdate = Body(...),
+async def create_grant_app_resource(
+    payload: GrantAppResourceCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     if not await airtable_service.is_hub_admin(user.email):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin privileges required to edit Partnerships Fundraising records.",
+            detail=(
+                "Admin privileges required to create Grant Application Resources records."
+            ),
         )
-    return await airtable_service.update_partnerships_fundraising(pf_id, payload)
+    return await airtable_service.create_grant_app_resource(payload)
+
+
+@router.patch(
+    "/partnerships_grant_app_resources/{pf_id}",
+    response_model=GrantAppResourceRecord,
+    summary=(
+        "Update a Grant Application Resources record by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_grant_app_resource(
+    pf_id: int,
+    payload: GrantAppResourceUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to edit Grant Application Resources records."
+            ),
+        )
+    return await airtable_service.update_grant_app_resource(pf_id, payload)
+
+
+@router.delete(
+    "/partnerships_grant_app_resources/{pf_id}",
+    summary=(
+        "Delete a Grant Application Resources record by its 'Id' "
+        "(admin only)."
+    ),
+)
+async def delete_grant_app_resource(
+    pf_id: int,
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to delete Grant Application Resources records."
+            ),
+        )
+    return await airtable_service.delete_grant_app_resource(pf_id)
 
 
 # ── /get_finance_links ────────────────────────────────────────────────
@@ -1029,6 +1081,28 @@ async def get_partnerships_links(
     return await airtable_service.get_partnerships_links(
         category=category, fields=fields
     )
+
+
+@router.post(
+    "/partnerships_links",
+    response_model=PartnershipsLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary=(
+        "Create a new Partnerships Links record (admin only). "
+        "'text' and 'link' are required; 'category' and 'type' are optional."
+    ),
+)
+async def create_partnerships_link(
+    payload: PartnershipsLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Partnerships Links records.",
+        )
+    return await airtable_service.create_partnerships_link(payload)
 
 
 @router.patch(
@@ -1407,7 +1481,7 @@ async def delete_renphil_due_diligence_link(
     response_model=list[BoardMemberRecord],
     summary=(
         "List rows from the Board Member List table "
-        "(Id, Title, Full Name, Role, Organization, Contact)."
+        "(Id, Title, Full Name, Role, Organization, Contact, Entity, Tabs)."
     ),
 )
 async def get_board_members(
@@ -1424,7 +1498,8 @@ async def get_board_members(
     status_code=status.HTTP_201_CREATED,
     summary=(
         "Create a new Board Member List record (admin only). "
-        "'full_name' and 'contact' are required; other fields are optional."
+        "'full_name' and 'contact' are required; title, role, organization, "
+        "entity, and tabs are optional."
     ),
 )
 async def create_board_member(

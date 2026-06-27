@@ -349,8 +349,8 @@ class DocTitleRecord(_TypedAirtableRecord):
 
 
 # ── Partnerships Fundraising ───────────────────────────────────────────
-class PartnershipsFundraisingRecord(BaseModel):
-    """A row from the Partnerships Fundraising table.
+class GrantAppResourceRecord(BaseModel):
+    """A row from the Grant Application Resources table.
 
     Unlike most other typed Airtable records, the canonical ``id`` here is
     the table's autonumber ``Id`` field. The Airtable record id is
@@ -375,10 +375,35 @@ class PartnershipsFundraisingRecord(BaseModel):
         ),
     )
     notes: str | None = Field(default=None, alias="Notes")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
 
 
-class PartnershipsFundraisingUpdate(BaseModel):
-    """Partial update payload for a Partnerships Fundraising record.
+class GrantAppResourceCreate(BaseModel):
+    """Payload to create a Grant Application Resources record.
+
+    ``document`` is required; other fields are optional.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    document: str = Field(..., alias="Document")
+    document_url: str | None = Field(default=None, alias="Document URL")
+    notes: str | None = Field(default=None, alias="Notes")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class GrantAppResourceUpdate(BaseModel):
+    """Partial update payload for a Grant Application Resources record.
 
     Any subset of fields may be provided. Fields not included in the
     payload are left untouched. Set a field explicitly to ``null`` to
@@ -390,6 +415,8 @@ class PartnershipsFundraisingUpdate(BaseModel):
     document: str | None = Field(default=None, alias="Document")
     document_url: str | None = Field(default=None, alias="Document URL")
     notes: str | None = Field(default=None, alias="Notes")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
 # ── Finance Links ──────────────────────────────────────────────────────
@@ -572,6 +599,21 @@ class PartnershipsLinkUpdate(BaseModel):
     type: str | None = Field(default=None, alias="Type")
 
 
+class PartnershipsLinkCreate(BaseModel):
+    """Payload to create a Partnerships Links record.
+
+    ``text`` and ``link`` are required; ``category`` and ``type`` are
+    optional.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str = Field(..., alias="Text")
+    link: str = Field(..., alias="Link")
+    category: str | None = Field(default=None, alias="Category")
+    type: str | None = Field(default=None, alias="Type")
+
+
 # ── Policy Links ───────────────────────────────────────────────────────
 class PolicyLinkRecord(BaseModel):
     """A row from the Policy Links table.
@@ -694,6 +736,19 @@ class FinanceQuickLinkRecord(BaseModel):
     )
     anchor_text: str | None = Field(default=None, alias="Anchor Text")
     url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description=(
+            "Multi-select values (e.g. 'Application Pack', 'Approvals', "
+            "'US Fed Gov\u2019t Applications')."
+        ),
+    )
 
 
 class FinanceQuickLinkCreate(BaseModel):
@@ -703,6 +758,16 @@ class FinanceQuickLinkCreate(BaseModel):
 
     anchor_text: str = Field(..., alias="Anchor Text")
     url: str = Field(..., alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description="Multi-select values.",
+    )
 
 
 class FinanceQuickLinkUpdate(BaseModel):
@@ -717,6 +782,8 @@ class FinanceQuickLinkUpdate(BaseModel):
 
     anchor_text: str | None = Field(default=None, alias="Anchor Text")
     url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
 # ── RenPhil Due Diligence Links ────────────────────────────────────────
@@ -737,6 +804,19 @@ class RenphilDueDiligenceLinkRecord(BaseModel):
     )
     anchor_text: str | None = Field(default=None, alias="Anchor Text")
     url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description=(
+            "Multi-select values (e.g. 'Application Pack', 'Approvals', "
+            "'US Fed Gov\u2019t Applications')."
+        ),
+    )
 
 
 class RenphilDueDiligenceLinkCreate(BaseModel):
@@ -746,6 +826,16 @@ class RenphilDueDiligenceLinkCreate(BaseModel):
 
     anchor_text: str = Field(..., alias="Anchor Text")
     url: str = Field(..., alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description="Multi-select values.",
+    )
 
 
 class RenphilDueDiligenceLinkUpdate(BaseModel):
@@ -760,6 +850,8 @@ class RenphilDueDiligenceLinkUpdate(BaseModel):
 
     anchor_text: str | None = Field(default=None, alias="Anchor Text")
     url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
 # ── Board Member List ──────────────────────────────────────────────────
@@ -785,6 +877,12 @@ class BoardMemberRecord(BaseModel):
     contact: str | None = Field(
         default=None, alias="Contact", description="Email address."
     )
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
 
 
 class BoardMemberCreate(BaseModel):
@@ -800,6 +898,12 @@ class BoardMemberCreate(BaseModel):
     title: str | None = Field(default=None, alias="Title")
     role: str | None = Field(default=None, alias="Role")
     organization: str | None = Field(default=None, alias="Organization")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
 
 
 class BoardMemberUpdate(BaseModel):
@@ -817,6 +921,8 @@ class BoardMemberUpdate(BaseModel):
     role: str | None = Field(default=None, alias="Role")
     organization: str | None = Field(default=None, alias="Organization")
     contact: str | None = Field(default=None, alias="Contact")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
 # ── Organization Info ──────────────────────────────────────────────────

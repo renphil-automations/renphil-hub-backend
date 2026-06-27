@@ -52,8 +52,9 @@ from app.models.airtable import (
     MonthlyCheckinRecord,
     OnboardingChecklistRecord,
     OrgFriendsRecord,
-    PartnershipsFundraisingRecord,
-    PartnershipsFundraisingUpdate,
+    GrantAppResourceRecord,
+    GrantAppResourceCreate,
+    GrantAppResourceUpdate,
     PersonContactItem,
     FinanceLinkRecord,
     FinanceLinkUpdate,
@@ -84,6 +85,7 @@ from app.models.airtable import (
     GeneralFundraisingResourceRecord,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
+    PartnershipsLinkCreate,
     PolicyLinkRecord,
     PolicyLinkCreate,
     PolicyLinkUpdate,
@@ -2279,117 +2281,174 @@ class AirtableService:
         return items
 
     # ══════════════════════════════════════════════════════════════════
-    # Partnerships Fundraising (RenPhil Hub base)
+    # Grant Application Resources (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
-    _F_PF_ID = _S.AT_F_PF_ID
-    _F_PF_DOCUMENT = _S.AT_F_PF_DOCUMENT
-    _F_PF_DOCUMENT_URL = _S.AT_F_PF_DOCUMENT_URL
-    _F_PF_NOTES = _S.AT_F_PF_NOTES
+    _F_GAR_ID = _S.AT_F_GAR_ID
+    _F_GAR_DOCUMENT = _S.AT_F_GAR_DOCUMENT
+    _F_GAR_DOCUMENT_URL = _S.AT_F_GAR_DOCUMENT_URL
+    _F_GAR_NOTES = _S.AT_F_GAR_NOTES
+    _F_GAR_ENTITY = _S.AT_F_GAR_ENTITY
+    _F_GAR_TABS = _S.AT_F_GAR_TABS
 
-    _PF_UPDATE_FIELD_MAP = {
-        "document": _F_PF_DOCUMENT,
-        "document_url": _F_PF_DOCUMENT_URL,
-        "notes": _F_PF_NOTES,
+    _GAR_UPDATE_FIELD_MAP = {
+        "document": _F_GAR_DOCUMENT,
+        "document_url": _F_GAR_DOCUMENT_URL,
+        "notes": _F_GAR_NOTES,
+        "entity": _F_GAR_ENTITY,
+        "tabs": _F_GAR_TABS,
     }
 
-    def _partnerships_fundraising_table(self):
+    def _grant_app_resources_table(self):
         return self._api.table(
             self._settings.RENPHIL_HUB_BASE_ID,
-            self._settings.PARTNERSHIPS_FUNDRAISING_TABLE,
+            self._settings.GRANT_APPLICATION_RESOURCES_TABLE,
         )
 
     @staticmethod
-    def _pf_to_typed(
+    def _gar_to_typed(
         records: list[dict[str, Any]],
-    ) -> list[PartnershipsFundraisingRecord]:
-        """Convert raw records to PartnershipsFundraisingRecord instances.
+    ) -> list[GrantAppResourceRecord]:
+        """Convert raw records to GrantAppResourceRecord instances.
 
         Maps the Airtable record id to ``record_id`` (instead of ``id``)
         so the table's autonumber ``Id`` field can be exposed as ``id``.
         """
         return [
-            PartnershipsFundraisingRecord.model_validate(
+            GrantAppResourceRecord.model_validate(
                 {"record_id": r["id"], **r.get("fields", {})}
             )
             for r in records
         ]
 
-    async def get_partnerships_fundraising(
+    async def get_grant_app_resources(
         self, *, fields: list[str] | None = None
-    ) -> list[PartnershipsFundraisingRecord]:
-        """Return all rows from the Partnerships Fundraising table.
+    ) -> list[GrantAppResourceRecord]:
+        """Return all rows from the Grant Application Resources table.
 
         The 'Document URL' field may be empty when 'Document' does not
         refer to an actual document.
         """
         records = await self._list_records(
-            self._partnerships_fundraising_table(), fields=fields
+            self._grant_app_resources_table(), fields=fields
         )
-        return self._pf_to_typed(records)
+        return self._gar_to_typed(records)
 
-    async def _find_partnerships_fundraising_by_id(
-        self, pf_id: int | str
+    async def _find_grant_app_resource_by_id(
+        self, gar_id: int | str
     ) -> dict[str, Any] | None:
-        """Find a Partnerships Fundraising record by its 'Id' value."""
+        """Find a Grant Application Resources record by its 'Id' value."""
         try:
-            numeric = int(pf_id)
-            formula = af.eq_num(self._F_PF_ID, numeric)
+            numeric = int(gar_id)
+            formula = af.eq_num(self._F_GAR_ID, numeric)
         except (TypeError, ValueError):
-            formula = af.eq_str(self._F_PF_ID, str(pf_id))
+            formula = af.eq_str(self._F_GAR_ID, str(gar_id))
 
-        table = self._partnerships_fundraising_table()
+        table = self._grant_app_resources_table()
         try:
             records = await asyncio.to_thread(
                 table.all, formula=formula, max_records=1
             )
         except RequestException as exc:
-            logger.error("Airtable partnerships fundraising lookup failed: %s", exc)
+            logger.error("Airtable grant app resource lookup failed: %s", exc)
             raise AirtableError(f"Airtable API error: {exc}") from exc
         except Exception as exc:
             logger.exception(
-                "Unexpected Airtable error during partnerships fundraising lookup"
+                "Unexpected Airtable error during grant app resource lookup"
             )
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
-    async def update_partnerships_fundraising(
-        self, pf_id: int | str, payload: PartnershipsFundraisingUpdate
-    ) -> PartnershipsFundraisingRecord:
-        """Update a Partnerships Fundraising record identified by its Id."""
+    async def create_grant_app_resource(
+        self, payload: GrantAppResourceCreate
+    ) -> GrantAppResourceRecord:
+        """Create a new Grant Application Resources row."""
+        body: dict[str, Any] = {self._F_GAR_DOCUMENT: payload.document}
+        if payload.document_url is not None:
+            body[self._F_GAR_DOCUMENT_URL] = payload.document_url
+        if payload.notes is not None:
+            body[self._F_GAR_NOTES] = payload.notes
+        if payload.entity is not None:
+            body[self._F_GAR_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_GAR_TABS] = payload.tabs
+
+        table = self._grant_app_resources_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable grant app resource create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during grant app resource create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._gar_to_typed([created])[0]
+
+    async def update_grant_app_resource(
+        self, gar_id: int | str, payload: GrantAppResourceUpdate
+    ) -> GrantAppResourceRecord:
+        """Update a Grant Application Resources record identified by its Id."""
         data = payload.model_dump(exclude_unset=True)
         if not data:
             raise AirtableError("No fields provided to update.")
 
         update_fields: dict[str, Any] = {
-            self._PF_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+            self._GAR_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
         }
 
-        record = await self._find_partnerships_fundraising_by_id(pf_id)
+        record = await self._find_grant_app_resource_by_id(gar_id)
         if record is None:
             raise HTTPException(
                 status_code=_http_status.HTTP_404_NOT_FOUND,
                 detail=(
-                    f"Partnerships Fundraising record with id '{pf_id}' not found."
+                    f"Grant Application Resources record with id '{gar_id}' not found."
                 ),
             )
 
-        table = self._partnerships_fundraising_table()
+        table = self._grant_app_resources_table()
         try:
             updated = await asyncio.to_thread(
                 table.update, record["id"], update_fields, typecast=True
             )
         except RequestException as exc:
-            logger.error("Airtable update partnerships fundraising failed: %s", exc)
+            logger.error("Airtable update grant app resource failed: %s", exc)
             raise AirtableError(f"Airtable API error: {exc}") from exc
         except Exception as exc:
             logger.exception(
-                "Unexpected Airtable error during partnerships fundraising update"
+                "Unexpected Airtable error during grant app resource update"
             )
             raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._gar_to_typed([updated])[0]
 
-        return PartnershipsFundraisingRecord.model_validate(
-            {"record_id": updated["id"], **updated.get("fields", {})}
-        )
+    async def delete_grant_app_resource(
+        self, gar_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Grant Application Resources row by its autonumber Id."""
+        record = await self._find_grant_app_resource_by_id(gar_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"Grant Application Resources record with id '{gar_id}' not found."
+                ),
+            )
+        table = self._grant_app_resources_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable grant app resource delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during grant app resource delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "grant_app_resource_id": gar_id,
+            "deleted": True,
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # Finance Links (RenPhil Hub base)
@@ -2800,6 +2859,32 @@ class AirtableService:
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
+    async def create_partnerships_link(
+        self, payload: PartnershipsLinkCreate
+    ) -> PartnershipsLinkRecord:
+        """Create a new Partnerships Links row."""
+        body: dict[str, Any] = {
+            self._F_PL_TEXT: payload.text,
+            self._F_PL_LINK: payload.link,
+        }
+        if payload.category is not None:
+            body[self._F_PL_CATEGORY] = payload.category
+        if payload.type is not None:
+            body[self._F_PL_TYPE] = payload.type
+
+        table = self._partnerships_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable partnerships link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during partnerships link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._pl_to_typed([created])[0]
+
     async def update_partnerships_link(
         self, pl_id: int | str, payload: PartnershipsLinkUpdate
     ) -> PartnershipsLinkRecord:
@@ -3203,10 +3288,14 @@ class AirtableService:
     _F_FQL_ID = _S.AT_F_FQL_ID
     _F_FQL_ANCHOR_TEXT = _S.AT_F_FQL_ANCHOR_TEXT
     _F_FQL_URL = _S.AT_F_FQL_URL
+    _F_FQL_ENTITY = _S.AT_F_FQL_ENTITY
+    _F_FQL_TABS = _S.AT_F_FQL_TABS
 
     _FQL_UPDATE_FIELD_MAP = {
         "anchor_text": _F_FQL_ANCHOR_TEXT,
         "url": _F_FQL_URL,
+        "entity": _F_FQL_ENTITY,
+        "tabs": _F_FQL_TABS,
     }
 
     def _finance_quick_links_table(self):
@@ -3267,6 +3356,10 @@ class AirtableService:
             self._F_FQL_ANCHOR_TEXT: payload.anchor_text,
             self._F_FQL_URL: payload.url,
         }
+        if payload.entity is not None:
+            body[self._F_FQL_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_FQL_TABS] = payload.tabs
         table = self._finance_quick_links_table()
         try:
             created = await asyncio.to_thread(table.create, body, typecast=True)
@@ -3347,10 +3440,14 @@ class AirtableService:
     _F_DDL_ID = _S.AT_F_DDL_ID
     _F_DDL_ANCHOR_TEXT = _S.AT_F_DDL_ANCHOR_TEXT
     _F_DDL_URL = _S.AT_F_DDL_URL
+    _F_DDL_ENTITY = _S.AT_F_DDL_ENTITY
+    _F_DDL_TABS = _S.AT_F_DDL_TABS
 
     _DDL_UPDATE_FIELD_MAP = {
         "anchor_text": _F_DDL_ANCHOR_TEXT,
         "url": _F_DDL_URL,
+        "entity": _F_DDL_ENTITY,
+        "tabs": _F_DDL_TABS,
     }
 
     def _renphil_due_diligence_links_table(self):
@@ -3413,6 +3510,10 @@ class AirtableService:
             self._F_DDL_ANCHOR_TEXT: payload.anchor_text,
             self._F_DDL_URL: payload.url,
         }
+        if payload.entity is not None:
+            body[self._F_DDL_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_DDL_TABS] = payload.tabs
         table = self._renphil_due_diligence_links_table()
         try:
             created = await asyncio.to_thread(table.create, body, typecast=True)
@@ -3506,6 +3607,8 @@ class AirtableService:
     _F_BM_ROLE = _S.AT_F_BM_ROLE
     _F_BM_ORGANIZATION = _S.AT_F_BM_ORGANIZATION
     _F_BM_CONTACT = _S.AT_F_BM_CONTACT
+    _F_BM_ENTITY = _S.AT_F_BM_ENTITY
+    _F_BM_TABS = _S.AT_F_BM_TABS
 
     _BM_UPDATE_FIELD_MAP = {
         "title": _F_BM_TITLE,
@@ -3513,6 +3616,8 @@ class AirtableService:
         "role": _F_BM_ROLE,
         "organization": _F_BM_ORGANIZATION,
         "contact": _F_BM_CONTACT,
+        "entity": _F_BM_ENTITY,
+        "tabs": _F_BM_TABS,
     }
 
     def _board_member_list_table(self):
@@ -3579,6 +3684,10 @@ class AirtableService:
             body[self._F_BM_ROLE] = payload.role
         if payload.organization is not None:
             body[self._F_BM_ORGANIZATION] = payload.organization
+        if payload.entity is not None:
+            body[self._F_BM_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_BM_TABS] = payload.tabs
 
         table = self._board_member_list_table()
         try:
