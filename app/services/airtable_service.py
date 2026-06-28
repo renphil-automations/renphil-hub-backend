@@ -207,6 +207,7 @@ class AirtableService:
         url: str,
         fields: list[str] | None = None,
         formula: str | None = None,
+        api_key: str = "",
     ):
         """Fetch a capped, read-only preview of an arbitrary Airtable
         table/view referenced by a pasted share URL. Used by the dashboard's
@@ -221,7 +222,7 @@ class AirtableService:
 
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
 
-        table = self._api.table(base_id, table_id)
+        table = Api(api_key.strip()).table(base_id, table_id)
         kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
         if view_id:
             kwargs["view"] = view_id

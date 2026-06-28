@@ -24,6 +24,7 @@ from fastapi import (
     APIRouter,
     Body,
     Depends,
+    Header,
     HTTPException,
     Path,
     Query,
@@ -140,10 +141,16 @@ async def get_airtable_preview(
         default=None,
         description="Airtable formula to filter rows (e.g. AND({Status}=\"Active\")).",
     ),
+    x_airtable_pat: str = Header(
+        alias="X-Airtable-PAT",
+        description="Airtable Personal Access Token scoped to the widget's base. Required.",
+    ),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.preview_from_url(url, fields=fields, formula=formula)
+    return await airtable_service.preview_from_url(
+        url, fields=fields, formula=formula, api_key=x_airtable_pat
+    )
 
 
 @router.get(
