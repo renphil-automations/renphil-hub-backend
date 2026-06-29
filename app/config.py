@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # Comma-separated emails granted "Hub Admin" without an Access Control
     # record. Only takes effect when DEBUG=true — local testing convenience,
     # never honored in production.
-    DEV_ADMIN_OVERRIDE_EMAILS: str = ""
+    # DEV_ADMIN_OVERRIDE_EMAILS: str = ""
 
     # ── Google OAuth ───────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str

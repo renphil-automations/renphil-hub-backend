@@ -300,9 +300,9 @@ class AirtableService:
             logger.info("Role lookup skipped: empty email → returning []")
             return []
 
-        if self._is_dev_admin_override(email):
-            logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
-            return [self.HUB_ADMIN_ROLE]
+        # if self._is_dev_admin_override(email):
+        #     logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
+        #     return [self.HUB_ADMIN_ROLE]
 
         s = self._settings
         email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
@@ -344,20 +344,20 @@ class AirtableService:
         logger.info("Role lookup for email=%s → roles=%s", normalized, roles)
         return roles
 
-    def _is_dev_admin_override(self, email: str) -> bool:
-        """True when ``email`` is a configured local-testing admin override.
-
-        Gated on DEBUG so this can never silently activate in production.
-        """
-        s = self._settings
-        if not s.DEBUG or not s.DEV_ADMIN_OVERRIDE_EMAILS:
-            return False
-        overrides = {
-            e.strip().lower()
-            for e in s.DEV_ADMIN_OVERRIDE_EMAILS.split(",")
-            if e.strip()
-        }
-        return email.strip().lower() in overrides
+    # def _is_dev_admin_override(self, email: str) -> bool:
+    #     """True when ``email`` is a configured local-testing admin override.
+    #
+    #     Gated on DEBUG so this can never silently activate in production.
+    #     """
+    #     s = self._settings
+    #     if not s.DEBUG or not s.DEV_ADMIN_OVERRIDE_EMAILS:
+    #         return False
+    #     overrides = {
+    #         e.strip().lower()
+    #         for e in s.DEV_ADMIN_OVERRIDE_EMAILS.split(",")
+    #         if e.strip()
+    #     }
+    #     return email.strip().lower() in overrides
 
     # Role name that grants RenPhil Hub administrator privileges.
     HUB_ADMIN_ROLE = "Hub Admin"
@@ -386,15 +386,15 @@ class AirtableService:
         if not email:
             return []
 
-        if self._is_dev_admin_override(email):
-            logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
-            return [
-                ScopedRole(
-                    role_name=self.HUB_ADMIN_ROLE,
-                    scope=self.HUB_SCOPE,
-                    fund_or_program_name=None,
-                )
-            ]
+        # if self._is_dev_admin_override(email):
+        #     logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
+        #     return [
+        #         ScopedRole(
+        #             role_name=self.HUB_ADMIN_ROLE,
+        #             scope=self.HUB_SCOPE,
+        #             fund_or_program_name=None,
+        #         )
+        #     ]
 
         s = self._settings
         email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
