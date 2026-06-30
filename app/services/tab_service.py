@@ -11,6 +11,102 @@ from app.models.versions import TabVersion, PageContentVersion
 
 
 # ---------------------------------------------------------
+# Widget access-control filtering
+# ---------------------------------------------------------
+
+HUB_ADMIN_ROLE = "Hub Admin"
+
+# Scope values that require a scoped assignment (program or function) to match.
+# We can't verify these without an Airtable round-trip, so we skip them here.
+_SCOPED_ROLE_SCOPES = {"Program", "Function"}
+
+
+def _user_can_view_widget(
+    widget_ac: dict[str, Any],
+    user_email: str,
+    user_role_names: list[str],
+) -> bool:
+    """Return True if the user satisfies the widget's viewer access_control."""
+    viewers: dict[str, Any] = widget_ac.get("viewers") or {}
+    users: list[dict[str, Any]] = viewers.get("users") or []
+    roles: list[dict[str, Any]] = viewers.get("roles") or []
+
+    # Empty viewers group = open to everyone
+    if not users and not roles:
+        return True
+
+    # Direct email match
+    if any(
+        isinstance(u, dict) and u.get("email", "").strip().lower() == user_email.strip().lower()
+        for u in users
+    ):
+        return True
+
+    # Role match — only for non-scoped (global / Hub) roles to avoid Airtable
+    for role_obj in roles:
+        if not isinstance(role_obj, dict):
+            continue
+        name = role_obj.get("name", "")
+        scope = (role_obj.get("scope") or "").strip()
+        if name in user_role_names and scope not in _SCOPED_ROLE_SCOPES:
+            return True
+
+    return False
+
+
+def filter_widget_content_for_user(
+    content: dict[str, Any] | list[Any] | None,
+    user_email: str,
+    user_role_names: list[str],
+) -> dict[str, Any] | list[Any] | None:
+    """Replace widgets the user cannot see with a `restricted` sentinel entry.
+
+    Only processes grid-canvas content (schemaVersion == 2). Any other content
+    shape (BlockNote blocks, None) is returned unchanged.
+
+    Hub admins always receive the full unfiltered content.
+    """
+    if not isinstance(content, dict):
+        return content
+
+    if content.get("schemaVersion") != 2:
+        return content
+
+    # Hub admins bypass per-widget filtering
+    if HUB_ADMIN_ROLE in user_role_names:
+        return content
+
+    widgets: dict[str, Any] = content.get("widgets") or {}
+    if not isinstance(widgets, dict):
+        return content
+
+    filtered_widgets: dict[str, Any] = {}
+    changed = False
+
+    for widget_id, widget_entry in widgets.items():
+        if not isinstance(widget_entry, dict):
+            filtered_widgets[widget_id] = widget_entry
+            continue
+
+        widget_ac = widget_entry.get("access_control")
+        if not widget_ac:
+            # No explicit AC — inherits from tab, which is already enforced separately
+            filtered_widgets[widget_id] = widget_entry
+            continue
+
+        if _user_can_view_widget(widget_ac, user_email, user_role_names):
+            filtered_widgets[widget_id] = widget_entry
+        else:
+            filtered_widgets[widget_id] = {"type": "restricted", "data": None}
+            changed = True
+
+    if not changed:
+        return content
+
+    return {**content, "widgets": filtered_widgets}
+
+
+# ---------------------------------------------------------
 # Default frontend access-control object
 # ---------------------------------------------------------
 

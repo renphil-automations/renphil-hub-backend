@@ -33,3 +33,5 @@ logs/
 .dbdump/
 *.yml
 *.ps1
+RenPhil Partnerships Function.json
+scripts/fetch_tab_content.py
