@@ -295,7 +295,7 @@ class MasterListLookupItem(BaseModel):
 
     id: str = Field(description="Airtable record id in the Master List table.")
     official_fund_or_program_name: str | None = Field(
-        default=None, alias="Official Fund or Program Name"
+        default=None, alias="Name"
     )
     initiative_type: str | None = Field(default=None, alias="Initiative Type")
     focus_areas: list[str] | None = Field(default=None, alias="Focus Area(s)")
@@ -367,8 +367,8 @@ class DocTitleRecord(_TypedAirtableRecord):
 
 
 # ── Partnerships Fundraising ───────────────────────────────────────────
-class PartnershipsFundraisingRecord(BaseModel):
-    """A row from the Partnerships Fundraising table.
+class GrantAppResourceRecord(BaseModel):
+    """A row from the Grant Application Resources table.
 
     Unlike most other typed Airtable records, the canonical ``id`` here is
     the table's autonumber ``Id`` field. The Airtable record id is
@@ -393,10 +393,35 @@ class PartnershipsFundraisingRecord(BaseModel):
         ),
     )
     notes: str | None = Field(default=None, alias="Notes")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
 
 
-class PartnershipsFundraisingUpdate(BaseModel):
-    """Partial update payload for a Partnerships Fundraising record.
+class GrantAppResourceCreate(BaseModel):
+    """Payload to create a Grant Application Resources record.
+
+    ``document`` is required; other fields are optional.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    document: str = Field(..., alias="Document")
+    document_url: str | None = Field(default=None, alias="Document URL")
+    notes: str | None = Field(default=None, alias="Notes")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class GrantAppResourceUpdate(BaseModel):
+    """Partial update payload for a Grant Application Resources record.
 
     Any subset of fields may be provided. Fields not included in the
     payload are left untouched. Set a field explicitly to ``null`` to
@@ -408,6 +433,8 @@ class PartnershipsFundraisingUpdate(BaseModel):
     document: str | None = Field(default=None, alias="Document")
     document_url: str | None = Field(default=None, alias="Document URL")
     notes: str | None = Field(default=None, alias="Notes")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
 # ── Finance Links ──────────────────────────────────────────────────────
@@ -588,6 +615,393 @@ class PartnershipsLinkUpdate(BaseModel):
     link: str | None = Field(default=None, alias="Link")
     category: str | None = Field(default=None, alias="Category")
     type: str | None = Field(default=None, alias="Type")
+
+
+class PartnershipsLinkCreate(BaseModel):
+    """Payload to create a Partnerships Links record.
+
+    ``text`` and ``link`` are required; ``category`` and ``type`` are
+    optional.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str = Field(..., alias="Text")
+    link: str = Field(..., alias="Link")
+    category: str | None = Field(default=None, alias="Category")
+    type: str | None = Field(default=None, alias="Type")
+
+
+# ── Policy Links ───────────────────────────────────────────────────────
+class PolicyLinkRecord(BaseModel):
+    """A row from the Policy Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    text: str | None = Field(default=None, alias="Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+class PolicyLinkCreate(BaseModel):
+    """Payload to create a Policy Links record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str = Field(..., alias="Text")
+    url: str = Field(..., alias="URL")
+
+
+class PolicyLinkUpdate(BaseModel):
+    """Partial update payload for a Policy Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    text: str | None = Field(default=None, alias="Text")
+    url: str | None = Field(default=None, alias="URL")
+
+
+# ── Events Quick Links ─────────────────────────────────────────────────
+class EventsQuickLinkRecord(BaseModel):
+    """A row from the Events Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    title: str | None = Field(default=None, alias="Title")
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(
+        default=None,
+        alias="Type",
+        description="Single-select indicating whether the link is a 'URL' or 'Email'.",
+    )
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class EventsQuickLinkUpdate(BaseModel):
+    """Partial update payload for an Events Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str | None = Field(default=None, alias="Title")
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class EventsQuickLinkCreate(BaseModel):
+    """Payload to create an Events Quick Links record.
+
+    ``type`` is the single-select that determines which of ``url`` or
+    ``email`` carries the actual link value. Either ``url`` or ``email``
+    may be omitted depending on ``type``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str = Field(..., alias="Title")
+    anchor_text: str = Field(..., alias="Anchor Text")
+    type: str = Field(..., alias="Type", description="'URL' or 'Email'.")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+# ── Finance Quick Links ────────────────────────────────────────────────
+class FinanceQuickLinkRecord(BaseModel):
+    """A row from the Finance Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description=(
+            "Multi-select values (e.g. 'Application Pack', 'Approvals', "
+            "'US Fed Gov\u2019t Applications')."
+        ),
+    )
+
+
+class FinanceQuickLinkCreate(BaseModel):
+    """Payload to create a Finance Quick Links record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    url: str = Field(..., alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description="Multi-select values.",
+    )
+
+
+class FinanceQuickLinkUpdate(BaseModel):
+    """Partial update payload for a Finance Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
+
+
+# ── RenPhil Due Diligence Links ────────────────────────────────────────
+class RenphilDueDiligenceLinkRecord(BaseModel):
+    """A row from the RenPhil Due Diligence Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description=(
+            "Multi-select values (e.g. 'Application Pack', 'Approvals', "
+            "'US Fed Gov\u2019t Applications')."
+        ),
+    )
+
+
+class RenphilDueDiligenceLinkCreate(BaseModel):
+    """Payload to create a RenPhil Due Diligence Links record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    url: str = Field(..., alias="URL")
+    entity: str | None = Field(
+        default=None,
+        alias="Entity",
+        description="Single-select value (e.g. 'UK', 'US', 'All').",
+    )
+    tabs: list[str] | None = Field(
+        default=None,
+        alias="Tabs",
+        description="Multi-select values.",
+    )
+
+
+class RenphilDueDiligenceLinkUpdate(BaseModel):
+    """Partial update payload for a RenPhil Due Diligence Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    url: str | None = Field(default=None, alias="URL")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
+
+
+# ── Board Member List ──────────────────────────────────────────────────
+class BoardMemberRecord(BaseModel):
+    """A row from the Board Member List table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    title: str | None = Field(default=None, alias="Title")
+    full_name: str | None = Field(default=None, alias="Full Name")
+    role: str | None = Field(default=None, alias="Role")
+    organization: str | None = Field(default=None, alias="Organization")
+    contact: str | None = Field(
+        default=None, alias="Contact", description="Email address."
+    )
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class BoardMemberCreate(BaseModel):
+    """Payload to create a Board Member List record.
+
+    Only ``full_name`` and ``contact`` are required.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    full_name: str = Field(..., alias="Full Name")
+    contact: str = Field(..., alias="Contact", description="Email address.")
+    title: str | None = Field(default=None, alias="Title")
+    role: str | None = Field(default=None, alias="Role")
+    organization: str | None = Field(default=None, alias="Organization")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class BoardMemberUpdate(BaseModel):
+    """Partial update payload for a Board Member List record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str | None = Field(default=None, alias="Title")
+    full_name: str | None = Field(default=None, alias="Full Name")
+    role: str | None = Field(default=None, alias="Role")
+    organization: str | None = Field(default=None, alias="Organization")
+    contact: str | None = Field(default=None, alias="Contact")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
+
+
+# ── Organization Info ──────────────────────────────────────────────────
+class OrganizationInfoRecord(BaseModel):
+    """A row from the Organization Info table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    title: str | None = Field(default=None, alias="Title")
+    content: str | None = Field(default=None, alias="Content")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class OrganizationInfoCreate(BaseModel):
+    """Payload to create an Organization Info record.
+
+    ``title`` and ``content`` are required; ``entity`` and ``tabs`` are
+    optional.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str = Field(..., alias="Title")
+    content: str = Field(..., alias="Content")
+    entity: str | None = Field(
+        default=None, alias="Entity", description="Single-select value."
+    )
+    tabs: list[str] | None = Field(
+        default=None, alias="Tabs", description="Multi-select values."
+    )
+
+
+class OrganizationInfoUpdate(BaseModel):
+    """Partial update payload for an Organization Info record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str | None = Field(default=None, alias="Title")
+    content: str | None = Field(default=None, alias="Content")
+    entity: str | None = Field(default=None, alias="Entity")
+    tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
 # ── Onboarding ─────────────────────────────────────────────────────────

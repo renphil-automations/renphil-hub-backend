@@ -67,8 +67,9 @@ from app.models.airtable import (
     MasterListFundsAndSubprogramsRecord,
     MonthlyCheckinRecord,
     OrgFriendsRecord,
-    PartnershipsFundraisingRecord,
-    PartnershipsFundraisingUpdate,
+    GrantAppResourceRecord,
+    GrantAppResourceCreate,
+    GrantAppResourceUpdate,
     PersonContactItem,
     FinanceLinkRecord,
     FinanceLinkUpdate,
@@ -103,6 +104,25 @@ from app.models.airtable import (
     RecordFieldsUpdate,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
+    PartnershipsLinkCreate,
+    PolicyLinkRecord,
+    PolicyLinkCreate,
+    PolicyLinkUpdate,
+    EventsQuickLinkRecord,
+    EventsQuickLinkCreate,
+    EventsQuickLinkUpdate,
+    FinanceQuickLinkRecord,
+    FinanceQuickLinkCreate,
+    FinanceQuickLinkUpdate,
+    RenphilDueDiligenceLinkRecord,
+    RenphilDueDiligenceLinkCreate,
+    RenphilDueDiligenceLinkUpdate,
+    BoardMemberRecord,
+    BoardMemberCreate,
+    BoardMemberUpdate,
+    OrganizationInfoRecord,
+    OrganizationInfoCreate,
+    OrganizationInfoUpdate,
 )
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
@@ -815,44 +835,94 @@ async def get_team_members(
     return await airtable_service.get_team_members()
 
 
-# ── /get_partnerships_fundraising ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#   Grant Application Resources endpoints
+# ══════════════════════════════════════════════════════════════════════
 @router.get(
-    "/get_partnerships_fundraising",
-    response_model=list[PartnershipsFundraisingRecord],
+    "/get_grant_app_resources",
+    response_model=list[GrantAppResourceRecord],
     summary=(
-        "List rows from the Partnerships Fundraising table "
-        "(Document, Document URL, Notes). Document URL may be empty."
+        "List rows from the Grant Application Resources table "
+        "(Id, Document, Document URL, Notes, Entity, Tabs). "
+        "Document URL may be empty."
     ),
 )
-async def get_partnerships_fundraising(
+async def get_grant_app_resources(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_partnerships_fundraising(fields=fields)
+    return await airtable_service.get_grant_app_resources(fields=fields)
 
 
-# ── PATCH /partnerships_fundraising/{id} ──────────────────────────────
-@router.patch(
-    "/partnerships_fundraising/{pf_id}",
-    response_model=PartnershipsFundraisingRecord,
+@router.post(
+    "/partnerships_grant_app_resources",
+    response_model=GrantAppResourceRecord,
+    status_code=status.HTTP_201_CREATED,
     summary=(
-        "Update a Partnerships Fundraising record by its 'Id' "
-        "(admin only). Any subset of fields may be provided."
+        "Create a new Grant Application Resources record (admin only). "
+        "'document' is required; other fields are optional."
     ),
 )
-async def update_partnerships_fundraising(
-    pf_id: int,
-    payload: PartnershipsFundraisingUpdate = Body(...),
+async def create_grant_app_resource(
+    payload: GrantAppResourceCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     if not await airtable_service.is_hub_admin(user.email):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin privileges required to edit Partnerships Fundraising records.",
+            detail=(
+                "Admin privileges required to create Grant Application Resources records."
+            ),
         )
-    return await airtable_service.update_partnerships_fundraising(pf_id, payload)
+    return await airtable_service.create_grant_app_resource(payload)
+
+
+@router.patch(
+    "/partnerships_grant_app_resources/{pf_id}",
+    response_model=GrantAppResourceRecord,
+    summary=(
+        "Update a Grant Application Resources record by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_grant_app_resource(
+    pf_id: int,
+    payload: GrantAppResourceUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to edit Grant Application Resources records."
+            ),
+        )
+    return await airtable_service.update_grant_app_resource(pf_id, payload)
+
+
+@router.delete(
+    "/partnerships_grant_app_resources/{pf_id}",
+    summary=(
+        "Delete a Grant Application Resources record by its 'Id' "
+        "(admin only)."
+    ),
+)
+async def delete_grant_app_resource(
+    pf_id: int,
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to delete Grant Application Resources records."
+            ),
+        )
+    return await airtable_service.delete_grant_app_resource(pf_id)
 
 
 # ── /get_finance_links ────────────────────────────────────────────────
@@ -1055,6 +1125,28 @@ async def get_partnerships_links(
     )
 
 
+@router.post(
+    "/partnerships_links",
+    response_model=PartnershipsLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary=(
+        "Create a new Partnerships Links record (admin only). "
+        "'text' and 'link' are required; 'category' and 'type' are optional."
+    ),
+)
+async def create_partnerships_link(
+    payload: PartnershipsLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Partnerships Links records.",
+        )
+    return await airtable_service.create_partnerships_link(payload)
+
+
 @router.patch(
     "/partnerships_links",
     response_model=PartnershipsLinkRecord,
@@ -1101,6 +1193,493 @@ async def delete_partnerships_link(
             detail="Admin privileges required to delete Partnerships Links records.",
         )
     return await airtable_service.delete_partnerships_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Policy Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_policy_links",
+    response_model=list[PolicyLinkRecord],
+    summary="List rows from the Policy Links table (Id, Text, URL).",
+)
+async def get_policy_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_policy_links(fields=fields)
+
+
+@router.post(
+    "/policy_links",
+    response_model=PolicyLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Policy Links record (admin only).",
+)
+async def create_policy_link(
+    payload: PolicyLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Policy Links records.",
+        )
+    return await airtable_service.create_policy_link(payload)
+
+
+@router.patch(
+    "/policy_links",
+    response_model=PolicyLinkRecord,
+    summary=(
+        "Update a Policy Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_policy_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: PolicyLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Policy Links records.",
+        )
+    return await airtable_service.update_policy_link(id, payload)
+
+
+@router.delete(
+    "/policy_links",
+    summary="Delete a Policy Links record by its 'Id' (admin only).",
+)
+async def delete_policy_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Policy Links records.",
+        )
+    return await airtable_service.delete_policy_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Events Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_events_quick_links",
+    response_model=list[EventsQuickLinkRecord],
+    summary=(
+        "List rows from the Events Quick Links table "
+        "(Id, Title, Anchor Text, Type, URL, Email)."
+    ),
+)
+async def get_events_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_events_quick_links(fields=fields)
+
+
+@router.post(
+    "/events_quick_links",
+    response_model=EventsQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Events Quick Links record (admin only).",
+)
+async def create_events_quick_link(
+    payload: EventsQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Events Quick Links records.",
+        )
+    return await airtable_service.create_events_quick_link(payload)
+
+
+@router.patch(
+    "/events_quick_links",
+    response_model=EventsQuickLinkRecord,
+    summary=(
+        "Update an Events Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_events_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: EventsQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Events Quick Links records.",
+        )
+    return await airtable_service.update_events_quick_link(id, payload)
+
+
+@router.delete(
+    "/events_quick_links",
+    summary="Delete an Events Quick Links record by its 'Id' (admin only).",
+)
+async def delete_events_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Events Quick Links records.",
+        )
+    return await airtable_service.delete_events_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Finance Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_finance_quick_links",
+    response_model=list[FinanceQuickLinkRecord],
+    summary="List rows from the Finance Quick Links table (Id, Anchor Text, URL).",
+)
+async def get_finance_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_finance_quick_links(fields=fields)
+
+
+@router.post(
+    "/finance_quick_links",
+    response_model=FinanceQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Finance Quick Links record (admin only).",
+)
+async def create_finance_quick_link(
+    payload: FinanceQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Finance Quick Links records.",
+        )
+    return await airtable_service.create_finance_quick_link(payload)
+
+
+@router.patch(
+    "/finance_quick_links",
+    response_model=FinanceQuickLinkRecord,
+    summary=(
+        "Update a Finance Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_finance_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: FinanceQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Finance Quick Links records.",
+        )
+    return await airtable_service.update_finance_quick_link(id, payload)
+
+
+@router.delete(
+    "/finance_quick_links",
+    summary="Delete a Finance Quick Links record by its 'Id' (admin only).",
+)
+async def delete_finance_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Finance Quick Links records.",
+        )
+    return await airtable_service.delete_finance_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   RenPhil Due Diligence Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_renphil_due_diligence_links",
+    response_model=list[RenphilDueDiligenceLinkRecord],
+    summary=(
+        "List rows from the RenPhil Due Diligence Links table "
+        "(Id, Anchor Text, URL)."
+    ),
+)
+async def get_renphil_due_diligence_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_renphil_due_diligence_links(fields=fields)
+
+
+@router.post(
+    "/renphil_due_diligence_links",
+    response_model=RenphilDueDiligenceLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new RenPhil Due Diligence Links record (admin only).",
+)
+async def create_renphil_due_diligence_link(
+    payload: RenphilDueDiligenceLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to create RenPhil Due Diligence Links records."
+            ),
+        )
+    return await airtable_service.create_renphil_due_diligence_link(payload)
+
+
+@router.patch(
+    "/renphil_due_diligence_links",
+    response_model=RenphilDueDiligenceLinkRecord,
+    summary=(
+        "Update a RenPhil Due Diligence Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_renphil_due_diligence_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: RenphilDueDiligenceLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to edit RenPhil Due Diligence Links records."
+            ),
+        )
+    return await airtable_service.update_renphil_due_diligence_link(id, payload)
+
+
+@router.delete(
+    "/renphil_due_diligence_links",
+    summary="Delete a RenPhil Due Diligence Links record by its 'Id' (admin only).",
+)
+async def delete_renphil_due_diligence_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Admin privileges required to delete RenPhil Due Diligence Links records."
+            ),
+        )
+    return await airtable_service.delete_renphil_due_diligence_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Board Member List endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_board_members",
+    response_model=list[BoardMemberRecord],
+    summary=(
+        "List rows from the Board Member List table "
+        "(Id, Title, Full Name, Role, Organization, Contact, Entity, Tabs)."
+    ),
+)
+async def get_board_members(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_board_members(fields=fields)
+
+
+@router.post(
+    "/board_members",
+    response_model=BoardMemberRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary=(
+        "Create a new Board Member List record (admin only). "
+        "'full_name' and 'contact' are required; title, role, organization, "
+        "entity, and tabs are optional."
+    ),
+)
+async def create_board_member(
+    payload: BoardMemberCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Board Member List records.",
+        )
+    return await airtable_service.create_board_member(payload)
+
+
+@router.patch(
+    "/board_members",
+    response_model=BoardMemberRecord,
+    summary=(
+        "Update a Board Member List record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_board_member(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: BoardMemberUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Board Member List records.",
+        )
+    return await airtable_service.update_board_member(id, payload)
+
+
+@router.delete(
+    "/board_members",
+    summary="Delete a Board Member List record by its 'Id' (admin only).",
+)
+async def delete_board_member(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Board Member List records.",
+        )
+    return await airtable_service.delete_board_member(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   Organization Info endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_organization_info",
+    response_model=list[OrganizationInfoRecord],
+    summary=(
+        "List rows from the Organization Info table "
+        "(Id, Title, Content, Entity, Tabs)."
+    ),
+)
+async def get_organization_info(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_organization_info(fields=fields)
+
+
+@router.post(
+    "/organization_info",
+    response_model=OrganizationInfoRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary=(
+        "Create a new Organization Info record (admin only). "
+        "'title' and 'content' are required; 'entity' and 'tabs' are optional."
+    ),
+)
+async def create_organization_info(
+    payload: OrganizationInfoCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Organization Info records.",
+        )
+    return await airtable_service.create_organization_info(payload)
+
+
+@router.patch(
+    "/organization_info",
+    response_model=OrganizationInfoRecord,
+    summary=(
+        "Update an Organization Info record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+async def update_organization_info(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: OrganizationInfoUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Organization Info records.",
+        )
+    return await airtable_service.update_organization_info(id, payload)
+
+
+@router.delete(
+    "/organization_info",
+    summary="Delete an Organization Info record by its 'Id' (admin only).",
+)
+async def delete_organization_info(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Organization Info records.",
+        )
+    return await airtable_service.delete_organization_info(id)
 
 
 @router.get(

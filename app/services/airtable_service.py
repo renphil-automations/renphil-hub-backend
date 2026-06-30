@@ -53,8 +53,9 @@ from app.models.airtable import (
     MonthlyCheckinRecord,
     OnboardingChecklistRecord,
     OrgFriendsRecord,
-    PartnershipsFundraisingRecord,
-    PartnershipsFundraisingUpdate,
+    GrantAppResourceRecord,
+    GrantAppResourceCreate,
+    GrantAppResourceUpdate,
     PersonContactItem,
     FinanceLinkRecord,
     FinanceLinkUpdate,
@@ -85,6 +86,25 @@ from app.models.airtable import (
     GeneralFundraisingResourceRecord,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
+    PartnershipsLinkCreate,
+    PolicyLinkRecord,
+    PolicyLinkCreate,
+    PolicyLinkUpdate,
+    EventsQuickLinkRecord,
+    EventsQuickLinkCreate,
+    EventsQuickLinkUpdate,
+    FinanceQuickLinkRecord,
+    FinanceQuickLinkCreate,
+    FinanceQuickLinkUpdate,
+    RenphilDueDiligenceLinkRecord,
+    RenphilDueDiligenceLinkCreate,
+    RenphilDueDiligenceLinkUpdate,
+    BoardMemberRecord,
+    BoardMemberCreate,
+    BoardMemberUpdate,
+    OrganizationInfoRecord,
+    OrganizationInfoCreate,
+    OrganizationInfoUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,7 +159,7 @@ _F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS = _S.AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS
 # Awarded Opportunities → Master List lookup enrichment
 _ML_LOOKUP_FIELD = "Master List of Funds & Sub-Programs (from Linked Gift Designation)"
 _ML_LOOKUP_PROJECT_FIELDS = [
-    "Official Fund or Program Name",
+    "Name",
     "Initiative Type",
     "Focus Area(s)",
     "Program Lead/Fellow",
@@ -2374,117 +2394,174 @@ class AirtableService:
         return items
 
     # ══════════════════════════════════════════════════════════════════
-    # Partnerships Fundraising (RenPhil Hub base)
+    # Grant Application Resources (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
-    _F_PF_ID = _S.AT_F_PF_ID
-    _F_PF_DOCUMENT = _S.AT_F_PF_DOCUMENT
-    _F_PF_DOCUMENT_URL = _S.AT_F_PF_DOCUMENT_URL
-    _F_PF_NOTES = _S.AT_F_PF_NOTES
+    _F_GAR_ID = _S.AT_F_GAR_ID
+    _F_GAR_DOCUMENT = _S.AT_F_GAR_DOCUMENT
+    _F_GAR_DOCUMENT_URL = _S.AT_F_GAR_DOCUMENT_URL
+    _F_GAR_NOTES = _S.AT_F_GAR_NOTES
+    _F_GAR_ENTITY = _S.AT_F_GAR_ENTITY
+    _F_GAR_TABS = _S.AT_F_GAR_TABS
 
-    _PF_UPDATE_FIELD_MAP = {
-        "document": _F_PF_DOCUMENT,
-        "document_url": _F_PF_DOCUMENT_URL,
-        "notes": _F_PF_NOTES,
+    _GAR_UPDATE_FIELD_MAP = {
+        "document": _F_GAR_DOCUMENT,
+        "document_url": _F_GAR_DOCUMENT_URL,
+        "notes": _F_GAR_NOTES,
+        "entity": _F_GAR_ENTITY,
+        "tabs": _F_GAR_TABS,
     }
 
-    def _partnerships_fundraising_table(self):
+    def _grant_app_resources_table(self):
         return self._api.table(
             self._settings.RENPHIL_HUB_BASE_ID,
-            self._settings.PARTNERSHIPS_FUNDRAISING_TABLE,
+            self._settings.GRANT_APPLICATION_RESOURCES_TABLE,
         )
 
     @staticmethod
-    def _pf_to_typed(
+    def _gar_to_typed(
         records: list[dict[str, Any]],
-    ) -> list[PartnershipsFundraisingRecord]:
-        """Convert raw records to PartnershipsFundraisingRecord instances.
+    ) -> list[GrantAppResourceRecord]:
+        """Convert raw records to GrantAppResourceRecord instances.
 
         Maps the Airtable record id to ``record_id`` (instead of ``id``)
         so the table's autonumber ``Id`` field can be exposed as ``id``.
         """
         return [
-            PartnershipsFundraisingRecord.model_validate(
+            GrantAppResourceRecord.model_validate(
                 {"record_id": r["id"], **r.get("fields", {})}
             )
             for r in records
         ]
 
-    async def get_partnerships_fundraising(
+    async def get_grant_app_resources(
         self, *, fields: list[str] | None = None
-    ) -> list[PartnershipsFundraisingRecord]:
-        """Return all rows from the Partnerships Fundraising table.
+    ) -> list[GrantAppResourceRecord]:
+        """Return all rows from the Grant Application Resources table.
 
         The 'Document URL' field may be empty when 'Document' does not
         refer to an actual document.
         """
         records = await self._list_records(
-            self._partnerships_fundraising_table(), fields=fields
+            self._grant_app_resources_table(), fields=fields
         )
-        return self._pf_to_typed(records)
+        return self._gar_to_typed(records)
 
-    async def _find_partnerships_fundraising_by_id(
-        self, pf_id: int | str
+    async def _find_grant_app_resource_by_id(
+        self, gar_id: int | str
     ) -> dict[str, Any] | None:
-        """Find a Partnerships Fundraising record by its 'Id' value."""
+        """Find a Grant Application Resources record by its 'Id' value."""
         try:
-            numeric = int(pf_id)
-            formula = af.eq_num(self._F_PF_ID, numeric)
+            numeric = int(gar_id)
+            formula = af.eq_num(self._F_GAR_ID, numeric)
         except (TypeError, ValueError):
-            formula = af.eq_str(self._F_PF_ID, str(pf_id))
+            formula = af.eq_str(self._F_GAR_ID, str(gar_id))
 
-        table = self._partnerships_fundraising_table()
+        table = self._grant_app_resources_table()
         try:
             records = await asyncio.to_thread(
                 table.all, formula=formula, max_records=1
             )
         except RequestException as exc:
-            logger.error("Airtable partnerships fundraising lookup failed: %s", exc)
+            logger.error("Airtable grant app resource lookup failed: %s", exc)
             raise AirtableError(f"Airtable API error: {exc}") from exc
         except Exception as exc:
             logger.exception(
-                "Unexpected Airtable error during partnerships fundraising lookup"
+                "Unexpected Airtable error during grant app resource lookup"
             )
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
-    async def update_partnerships_fundraising(
-        self, pf_id: int | str, payload: PartnershipsFundraisingUpdate
-    ) -> PartnershipsFundraisingRecord:
-        """Update a Partnerships Fundraising record identified by its Id."""
+    async def create_grant_app_resource(
+        self, payload: GrantAppResourceCreate
+    ) -> GrantAppResourceRecord:
+        """Create a new Grant Application Resources row."""
+        body: dict[str, Any] = {self._F_GAR_DOCUMENT: payload.document}
+        if payload.document_url is not None:
+            body[self._F_GAR_DOCUMENT_URL] = payload.document_url
+        if payload.notes is not None:
+            body[self._F_GAR_NOTES] = payload.notes
+        if payload.entity is not None:
+            body[self._F_GAR_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_GAR_TABS] = payload.tabs
+
+        table = self._grant_app_resources_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable grant app resource create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during grant app resource create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._gar_to_typed([created])[0]
+
+    async def update_grant_app_resource(
+        self, gar_id: int | str, payload: GrantAppResourceUpdate
+    ) -> GrantAppResourceRecord:
+        """Update a Grant Application Resources record identified by its Id."""
         data = payload.model_dump(exclude_unset=True)
         if not data:
             raise AirtableError("No fields provided to update.")
 
         update_fields: dict[str, Any] = {
-            self._PF_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+            self._GAR_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
         }
 
-        record = await self._find_partnerships_fundraising_by_id(pf_id)
+        record = await self._find_grant_app_resource_by_id(gar_id)
         if record is None:
             raise HTTPException(
                 status_code=_http_status.HTTP_404_NOT_FOUND,
                 detail=(
-                    f"Partnerships Fundraising record with id '{pf_id}' not found."
+                    f"Grant Application Resources record with id '{gar_id}' not found."
                 ),
             )
 
-        table = self._partnerships_fundraising_table()
+        table = self._grant_app_resources_table()
         try:
             updated = await asyncio.to_thread(
                 table.update, record["id"], update_fields, typecast=True
             )
         except RequestException as exc:
-            logger.error("Airtable update partnerships fundraising failed: %s", exc)
+            logger.error("Airtable update grant app resource failed: %s", exc)
             raise AirtableError(f"Airtable API error: {exc}") from exc
         except Exception as exc:
             logger.exception(
-                "Unexpected Airtable error during partnerships fundraising update"
+                "Unexpected Airtable error during grant app resource update"
             )
             raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._gar_to_typed([updated])[0]
 
-        return PartnershipsFundraisingRecord.model_validate(
-            {"record_id": updated["id"], **updated.get("fields", {})}
-        )
+    async def delete_grant_app_resource(
+        self, gar_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Grant Application Resources row by its autonumber Id."""
+        record = await self._find_grant_app_resource_by_id(gar_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"Grant Application Resources record with id '{gar_id}' not found."
+                ),
+            )
+        table = self._grant_app_resources_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable grant app resource delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during grant app resource delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "grant_app_resource_id": gar_id,
+            "deleted": True,
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # Finance Links (RenPhil Hub base)
@@ -2895,6 +2972,32 @@ class AirtableService:
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
+    async def create_partnerships_link(
+        self, payload: PartnershipsLinkCreate
+    ) -> PartnershipsLinkRecord:
+        """Create a new Partnerships Links row."""
+        body: dict[str, Any] = {
+            self._F_PL_TEXT: payload.text,
+            self._F_PL_LINK: payload.link,
+        }
+        if payload.category is not None:
+            body[self._F_PL_CATEGORY] = payload.category
+        if payload.type is not None:
+            body[self._F_PL_TYPE] = payload.type
+
+        table = self._partnerships_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable partnerships link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during partnerships link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._pl_to_typed([created])[0]
+
     async def update_partnerships_link(
         self, pl_id: int | str, payload: PartnershipsLinkUpdate
     ) -> PartnershipsLinkRecord:
@@ -2989,6 +3092,940 @@ class AirtableService:
         return {
             "id": record["id"],
             "partnerships_link_id": pl_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Policy Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_POL_ID = _S.AT_F_POL_ID
+    _F_POL_TEXT = _S.AT_F_POL_TEXT
+    _F_POL_URL = _S.AT_F_POL_URL
+
+    _POL_UPDATE_FIELD_MAP = {
+        "text": _F_POL_TEXT,
+        "url": _F_POL_URL,
+    }
+
+    def _policy_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.POLICY_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _pol_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[PolicyLinkRecord]:
+        return [
+            PolicyLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_policy_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[PolicyLinkRecord]:
+        """Return all rows from the Policy Links table."""
+        records = await self._list_records(
+            self._policy_links_table(), fields=fields
+        )
+        return self._pol_to_typed(records)
+
+    async def _find_policy_link_by_id(
+        self, pol_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(pol_id)
+            formula = af.eq_num(self._F_POL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_POL_ID, str(pol_id))
+
+        table = self._policy_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable policy link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_policy_link(
+        self, payload: PolicyLinkCreate
+    ) -> PolicyLinkRecord:
+        """Create a new Policy Links row."""
+        body: dict[str, Any] = {
+            self._F_POL_TEXT: payload.text,
+            self._F_POL_URL: payload.url,
+        }
+        table = self._policy_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable policy link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._pol_to_typed([created])[0]
+
+    async def update_policy_link(
+        self, pol_id: int | str, payload: PolicyLinkUpdate
+    ) -> PolicyLinkRecord:
+        """Update a Policy Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._POL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_policy_link_by_id(pol_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Policy Links record with id '{pol_id}' not found.",
+            )
+
+        table = self._policy_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update policy link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._pol_to_typed([updated])[0]
+
+    async def delete_policy_link(
+        self, pol_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Policy Links row by its autonumber Id."""
+        record = await self._find_policy_link_by_id(pol_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Policy Links record with id '{pol_id}' not found.",
+            )
+        table = self._policy_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable policy link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during policy link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "policy_link_id": pol_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Events Quick Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_EQL_ID = _S.AT_F_EQL_ID
+    _F_EQL_TITLE = _S.AT_F_EQL_TITLE
+    _F_EQL_ANCHOR_TEXT = _S.AT_F_EQL_ANCHOR_TEXT
+    _F_EQL_TYPE = _S.AT_F_EQL_TYPE
+    _F_EQL_URL = _S.AT_F_EQL_URL
+    _F_EQL_EMAIL = _S.AT_F_EQL_EMAIL
+
+    _EQL_UPDATE_FIELD_MAP = {
+        "title": _F_EQL_TITLE,
+        "anchor_text": _F_EQL_ANCHOR_TEXT,
+        "type": _F_EQL_TYPE,
+        "url": _F_EQL_URL,
+        "email": _F_EQL_EMAIL,
+    }
+
+    def _events_quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.EVENTS_QUICK_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _eql_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[EventsQuickLinkRecord]:
+        return [
+            EventsQuickLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_events_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[EventsQuickLinkRecord]:
+        """Return all rows from the Events Quick Links table."""
+        records = await self._list_records(
+            self._events_quick_links_table(), fields=fields
+        )
+        return self._eql_to_typed(records)
+
+    async def create_events_quick_link(
+        self, payload: EventsQuickLinkCreate
+    ) -> EventsQuickLinkRecord:
+        """Create a new Events Quick Links row."""
+        body: dict[str, Any] = {
+            self._F_EQL_TITLE: payload.title,
+            self._F_EQL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_EQL_TYPE: payload.type,
+        }
+        if payload.url is not None:
+            body[self._F_EQL_URL] = payload.url
+        if payload.email is not None:
+            body[self._F_EQL_EMAIL] = payload.email
+
+        table = self._events_quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable events quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._eql_to_typed([created])[0]
+
+    async def _find_events_quick_link_by_id(
+        self, eql_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(eql_id)
+            formula = af.eq_num(self._F_EQL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_EQL_ID, str(eql_id))
+
+        table = self._events_quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable events quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def update_events_quick_link(
+        self, eql_id: int | str, payload: EventsQuickLinkUpdate
+    ) -> EventsQuickLinkRecord:
+        """Update an Events Quick Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._EQL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_events_quick_link_by_id(eql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Events Quick Links record with id '{eql_id}' not found.",
+            )
+
+        table = self._events_quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update events quick link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._eql_to_typed([updated])[0]
+
+    async def delete_events_quick_link(
+        self, eql_id: int | str
+    ) -> dict[str, Any]:
+        """Delete an Events Quick Links row by its autonumber Id."""
+        record = await self._find_events_quick_link_by_id(eql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Events Quick Links record with id '{eql_id}' not found.",
+            )
+        table = self._events_quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable events quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during events quick link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "events_quick_link_id": eql_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Finance Quick Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_FQL_ID = _S.AT_F_FQL_ID
+    _F_FQL_ANCHOR_TEXT = _S.AT_F_FQL_ANCHOR_TEXT
+    _F_FQL_URL = _S.AT_F_FQL_URL
+    _F_FQL_ENTITY = _S.AT_F_FQL_ENTITY
+    _F_FQL_TABS = _S.AT_F_FQL_TABS
+
+    _FQL_UPDATE_FIELD_MAP = {
+        "anchor_text": _F_FQL_ANCHOR_TEXT,
+        "url": _F_FQL_URL,
+        "entity": _F_FQL_ENTITY,
+        "tabs": _F_FQL_TABS,
+    }
+
+    def _finance_quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.FINANCE_QUICK_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _fql_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[FinanceQuickLinkRecord]:
+        return [
+            FinanceQuickLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_finance_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[FinanceQuickLinkRecord]:
+        """Return all rows from the Finance Quick Links table."""
+        records = await self._list_records(
+            self._finance_quick_links_table(), fields=fields
+        )
+        return self._fql_to_typed(records)
+
+    async def _find_finance_quick_link_by_id(
+        self, fql_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(fql_id)
+            formula = af.eq_num(self._F_FQL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_FQL_ID, str(fql_id))
+
+        table = self._finance_quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable finance quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_finance_quick_link(
+        self, payload: FinanceQuickLinkCreate
+    ) -> FinanceQuickLinkRecord:
+        """Create a new Finance Quick Links row."""
+        body: dict[str, Any] = {
+            self._F_FQL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_FQL_URL: payload.url,
+        }
+        if payload.entity is not None:
+            body[self._F_FQL_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_FQL_TABS] = payload.tabs
+        table = self._finance_quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable finance quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._fql_to_typed([created])[0]
+
+    async def update_finance_quick_link(
+        self, fql_id: int | str, payload: FinanceQuickLinkUpdate
+    ) -> FinanceQuickLinkRecord:
+        """Update a Finance Quick Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._FQL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_finance_quick_link_by_id(fql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Finance Quick Links record with id '{fql_id}' not found.",
+            )
+
+        table = self._finance_quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update finance quick link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._fql_to_typed([updated])[0]
+
+    async def delete_finance_quick_link(
+        self, fql_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Finance Quick Links row by its autonumber Id."""
+        record = await self._find_finance_quick_link_by_id(fql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Finance Quick Links record with id '{fql_id}' not found.",
+            )
+        table = self._finance_quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable finance quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during finance quick link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "finance_quick_link_id": fql_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # RenPhil Due Diligence Links (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_DDL_ID = _S.AT_F_DDL_ID
+    _F_DDL_ANCHOR_TEXT = _S.AT_F_DDL_ANCHOR_TEXT
+    _F_DDL_URL = _S.AT_F_DDL_URL
+    _F_DDL_ENTITY = _S.AT_F_DDL_ENTITY
+    _F_DDL_TABS = _S.AT_F_DDL_TABS
+
+    _DDL_UPDATE_FIELD_MAP = {
+        "anchor_text": _F_DDL_ANCHOR_TEXT,
+        "url": _F_DDL_URL,
+        "entity": _F_DDL_ENTITY,
+        "tabs": _F_DDL_TABS,
+    }
+
+    def _renphil_due_diligence_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.RENPHIL_DUE_DILIGENCE_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _ddl_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[RenphilDueDiligenceLinkRecord]:
+        return [
+            RenphilDueDiligenceLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_renphil_due_diligence_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[RenphilDueDiligenceLinkRecord]:
+        """Return all rows from the RenPhil Due Diligence Links table."""
+        records = await self._list_records(
+            self._renphil_due_diligence_links_table(), fields=fields
+        )
+        return self._ddl_to_typed(records)
+
+    async def _find_renphil_due_diligence_link_by_id(
+        self, ddl_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(ddl_id)
+            formula = af.eq_num(self._F_DDL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_DDL_ID, str(ddl_id))
+
+        table = self._renphil_due_diligence_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error(
+                "Airtable RenPhil due diligence link lookup failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_renphil_due_diligence_link(
+        self, payload: RenphilDueDiligenceLinkCreate
+    ) -> RenphilDueDiligenceLinkRecord:
+        """Create a new RenPhil Due Diligence Links row."""
+        body: dict[str, Any] = {
+            self._F_DDL_ANCHOR_TEXT: payload.anchor_text,
+            self._F_DDL_URL: payload.url,
+        }
+        if payload.entity is not None:
+            body[self._F_DDL_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_DDL_TABS] = payload.tabs
+        table = self._renphil_due_diligence_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error(
+                "Airtable RenPhil due diligence link create failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._ddl_to_typed([created])[0]
+
+    async def update_renphil_due_diligence_link(
+        self, ddl_id: int | str, payload: RenphilDueDiligenceLinkUpdate
+    ) -> RenphilDueDiligenceLinkRecord:
+        """Update a RenPhil Due Diligence Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._DDL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_renphil_due_diligence_link_by_id(ddl_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"RenPhil Due Diligence Links record with id '{ddl_id}' not found."
+                ),
+            )
+
+        table = self._renphil_due_diligence_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error(
+                "Airtable update RenPhil due diligence link failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._ddl_to_typed([updated])[0]
+
+    async def delete_renphil_due_diligence_link(
+        self, ddl_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a RenPhil Due Diligence Links row by its autonumber Id."""
+        record = await self._find_renphil_due_diligence_link_by_id(ddl_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"RenPhil Due Diligence Links record with id '{ddl_id}' not found."
+                ),
+            )
+        table = self._renphil_due_diligence_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error(
+                "Airtable RenPhil due diligence link delete failed: %s", exc
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during RenPhil due diligence link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "renphil_due_diligence_link_id": ddl_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Board Member List (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_BM_ID = _S.AT_F_BM_ID
+    _F_BM_TITLE = _S.AT_F_BM_TITLE
+    _F_BM_FULL_NAME = _S.AT_F_BM_FULL_NAME
+    _F_BM_ROLE = _S.AT_F_BM_ROLE
+    _F_BM_ORGANIZATION = _S.AT_F_BM_ORGANIZATION
+    _F_BM_CONTACT = _S.AT_F_BM_CONTACT
+    _F_BM_ENTITY = _S.AT_F_BM_ENTITY
+    _F_BM_TABS = _S.AT_F_BM_TABS
+
+    _BM_UPDATE_FIELD_MAP = {
+        "title": _F_BM_TITLE,
+        "full_name": _F_BM_FULL_NAME,
+        "role": _F_BM_ROLE,
+        "organization": _F_BM_ORGANIZATION,
+        "contact": _F_BM_CONTACT,
+        "entity": _F_BM_ENTITY,
+        "tabs": _F_BM_TABS,
+    }
+
+    def _board_member_list_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.BOARD_MEMBER_LIST_TABLE,
+        )
+
+    @staticmethod
+    def _bm_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[BoardMemberRecord]:
+        return [
+            BoardMemberRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_board_members(
+        self, *, fields: list[str] | None = None
+    ) -> list[BoardMemberRecord]:
+        """Return all rows from the Board Member List table."""
+        records = await self._list_records(
+            self._board_member_list_table(), fields=fields
+        )
+        return self._bm_to_typed(records)
+
+    async def _find_board_member_by_id(
+        self, bm_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(bm_id)
+            formula = af.eq_num(self._F_BM_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_BM_ID, str(bm_id))
+
+        table = self._board_member_list_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable board member lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_board_member(
+        self, payload: BoardMemberCreate
+    ) -> BoardMemberRecord:
+        """Create a new Board Member List row."""
+        body: dict[str, Any] = {
+            self._F_BM_FULL_NAME: payload.full_name,
+            self._F_BM_CONTACT: payload.contact,
+        }
+        if payload.title is not None:
+            body[self._F_BM_TITLE] = payload.title
+        if payload.role is not None:
+            body[self._F_BM_ROLE] = payload.role
+        if payload.organization is not None:
+            body[self._F_BM_ORGANIZATION] = payload.organization
+        if payload.entity is not None:
+            body[self._F_BM_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_BM_TABS] = payload.tabs
+
+        table = self._board_member_list_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable board member create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._bm_to_typed([created])[0]
+
+    async def update_board_member(
+        self, bm_id: int | str, payload: BoardMemberUpdate
+    ) -> BoardMemberRecord:
+        """Update a Board Member List record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._BM_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_board_member_by_id(bm_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Board Member List record with id '{bm_id}' not found.",
+            )
+
+        table = self._board_member_list_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update board member failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._bm_to_typed([updated])[0]
+
+    async def delete_board_member(
+        self, bm_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Board Member List row by its autonumber Id."""
+        record = await self._find_board_member_by_id(bm_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Board Member List record with id '{bm_id}' not found.",
+            )
+        table = self._board_member_list_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable board member delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during board member delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "board_member_id": bm_id,
+            "deleted": True,
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Organization Info (RenPhil Hub base)
+    # ══════════════════════════════════════════════════════════════
+    _F_OI_ID = _S.AT_F_OI_ID
+    _F_OI_TITLE = _S.AT_F_OI_TITLE
+    _F_OI_CONTENT = _S.AT_F_OI_CONTENT
+    _F_OI_ENTITY = _S.AT_F_OI_ENTITY
+    _F_OI_TABS = _S.AT_F_OI_TABS
+
+    _OI_UPDATE_FIELD_MAP = {
+        "title": _F_OI_TITLE,
+        "content": _F_OI_CONTENT,
+        "entity": _F_OI_ENTITY,
+        "tabs": _F_OI_TABS,
+    }
+
+    def _organization_info_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.ORGANIZATION_INFO_TABLE,
+        )
+
+    @staticmethod
+    def _oi_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[OrganizationInfoRecord]:
+        return [
+            OrganizationInfoRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_organization_info(
+        self, *, fields: list[str] | None = None
+    ) -> list[OrganizationInfoRecord]:
+        """Return all rows from the Organization Info table."""
+        records = await self._list_records(
+            self._organization_info_table(), fields=fields
+        )
+        return self._oi_to_typed(records)
+
+    async def _find_organization_info_by_id(
+        self, oi_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(oi_id)
+            formula = af.eq_num(self._F_OI_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_OI_ID, str(oi_id))
+
+        table = self._organization_info_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable organization info lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_organization_info(
+        self, payload: OrganizationInfoCreate
+    ) -> OrganizationInfoRecord:
+        """Create a new Organization Info row."""
+        body: dict[str, Any] = {
+            self._F_OI_TITLE: payload.title,
+            self._F_OI_CONTENT: payload.content,
+        }
+        if payload.entity is not None:
+            body[self._F_OI_ENTITY] = payload.entity
+        if payload.tabs is not None:
+            body[self._F_OI_TABS] = payload.tabs
+
+        table = self._organization_info_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable organization info create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._oi_to_typed([created])[0]
+
+    async def update_organization_info(
+        self, oi_id: int | str, payload: OrganizationInfoUpdate
+    ) -> OrganizationInfoRecord:
+        """Update an Organization Info record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._OI_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_organization_info_by_id(oi_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Organization Info record with id '{oi_id}' not found.",
+            )
+
+        table = self._organization_info_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update organization info failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._oi_to_typed([updated])[0]
+
+    async def delete_organization_info(
+        self, oi_id: int | str
+    ) -> dict[str, Any]:
+        """Delete an Organization Info row by its autonumber Id."""
+        record = await self._find_organization_info_by_id(oi_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Organization Info record with id '{oi_id}' not found.",
+            )
+        table = self._organization_info_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable organization info delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during organization info delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "organization_info_id": oi_id,
             "deleted": True,
         }
 
