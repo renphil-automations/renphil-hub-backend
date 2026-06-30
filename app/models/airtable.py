@@ -277,7 +277,7 @@ class MasterListLookupItem(BaseModel):
 
     id: str = Field(description="Airtable record id in the Master List table.")
     official_fund_or_program_name: str | None = Field(
-        default=None, alias="Official Fund or Program Name"
+        default=None, alias="Name"
     )
     initiative_type: str | None = Field(default=None, alias="Initiative Type")
     focus_areas: list[str] | None = Field(default=None, alias="Focus Area(s)")
