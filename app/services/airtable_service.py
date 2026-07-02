@@ -134,9 +134,9 @@ _F_SCOPING_PROP_OVERVIEW = _S.AT_F_SCOPING_PROP_OVERVIEW
 _F_INITIATIVE_TYPE = _S.AT_F_INITIATIVE_TYPE
 _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
-_STATUS_ACTIVE_PROGRAM = "3. Active Program"
-_STATUS_PUBLICLY_LAUNCHED = "4. Publicly Launched"
-_STATUS_FELLOWSHIP_SCOPING = "2. Fellowship (Scoping)"
+_STATUS_ACTIVE_PROGRAM = "Active Program"
+_STATUS_PUBLICLY_LAUNCHED = "Publicly Launched"
+_STATUS_FELLOWSHIP_SCOPING = "Fellowship (Scoping)"
 _ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
@@ -1636,7 +1636,7 @@ class AirtableService:
         """Count records in MASTER_LIST where Status is an active-program status.
 
         A program is considered active when its Status equals either
-        '3. Active Program' or '4. Publicly Launched'.
+        'Active Program' or 'Publicly Launched'.
         """
         formula = af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES))
         records = await self._list_records(
@@ -1649,7 +1649,7 @@ class AirtableService:
         """List active programs with their lead/fellow assignment.
 
         Reads records from MASTER_LIST whose Status equals
-        '3. Active Program' or '4. Publicly Launched', returning the
+        'Active Program' or 'Publicly Launched', returning the
         'Name' and 'Program Lead/Fellow' fields.
         """
         formula = af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES))
