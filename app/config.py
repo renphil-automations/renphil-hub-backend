@@ -331,6 +331,16 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.5-flash"
 
+    # ══════════════════════════════════════════════════════════════════
+    # Cache (Upstash Redis over REST)
+    # ══════════════════════════════════════════════════════════════════
+    # When either URL or TOKEN is missing, the endpoint cache is disabled
+    # and every GET goes straight to Airtable (no error is raised).
+    UPSTASH_REDIS_REST_URL: str | None = None
+    UPSTASH_REDIS_REST_TOKEN: str | None = None
+    # Bumping this rotates the cache namespace and effectively wipes it.
+    CACHE_VERSION: str = "v1"
+
 
 @lru_cache
 def get_settings() -> Settings:
