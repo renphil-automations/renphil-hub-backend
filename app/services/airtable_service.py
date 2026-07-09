@@ -2441,6 +2441,8 @@ class AirtableService:
         The 'Document URL' field may be empty when 'Document' does not
         refer to an actual document.
         """
+        if not self._settings.GRANT_APPLICATION_RESOURCES_TABLE:
+            return []
         records = await self._list_records(
             self._grant_app_resources_table(), fields=fields
         )
@@ -3128,6 +3130,8 @@ class AirtableService:
         self, *, fields: list[str] | None = None
     ) -> list[PolicyLinkRecord]:
         """Return all rows from the Policy Links table."""
+        if not self._settings.POLICY_LINKS_TABLE:
+            return []
         records = await self._list_records(
             self._policy_links_table(), fields=fields
         )
@@ -3278,6 +3282,8 @@ class AirtableService:
         self, *, fields: list[str] | None = None
     ) -> list[EventsQuickLinkRecord]:
         """Return all rows from the Events Quick Links table."""
+        if not self._settings.EVENTS_QUICK_LINKS_TABLE:
+            return []
         records = await self._list_records(
             self._events_quick_links_table(), fields=fields
         )
@@ -3432,6 +3438,8 @@ class AirtableService:
         self, *, fields: list[str] | None = None
     ) -> list[FinanceQuickLinkRecord]:
         """Return all rows from the Finance Quick Links table."""
+        if not self._settings.FINANCE_QUICK_LINKS_TABLE:
+            return []
         records = await self._list_records(
             self._finance_quick_links_table(), fields=fields
         )
@@ -3584,6 +3592,8 @@ class AirtableService:
         self, *, fields: list[str] | None = None
     ) -> list[RenphilDueDiligenceLinkRecord]:
         """Return all rows from the RenPhil Due Diligence Links table."""
+        if not self._settings.RENPHIL_DUE_DILIGENCE_LINKS_TABLE:
+            return []
         records = await self._list_records(
             self._renphil_due_diligence_links_table(), fields=fields
         )
@@ -3754,6 +3764,8 @@ class AirtableService:
         self, *, fields: list[str] | None = None
     ) -> list[BoardMemberRecord]:
         """Return all rows from the Board Member List table."""
+        if not self._settings.BOARD_MEMBER_LIST_TABLE:
+            return []
         records = await self._list_records(
             self._board_member_list_table(), fields=fields
         )
@@ -3913,6 +3925,8 @@ class AirtableService:
         self, *, fields: list[str] | None = None
     ) -> list[OrganizationInfoRecord]:
         """Return all rows from the Organization Info table."""
+        if not self._settings.ORGANIZATION_INFO_TABLE:
+            return []
         records = await self._list_records(
             self._organization_info_table(), fields=fields
         )

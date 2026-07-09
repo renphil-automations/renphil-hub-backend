@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
-    GRANT_APPLICATION_RESOURCES_TABLE: str
+    GRANT_APPLICATION_RESOURCES_TABLE: str | None = None
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
     OFFICE_SPACES_TABLE: str
@@ -99,12 +99,12 @@ class Settings(BaseSettings):
     ONBOARDING_CHECKLIST_TABLE: str
     GENERAL_FUNDRAISING_RESOURCES_TABLE: str
     PARTNERSHIPS_LINKS_TABLE: str
-    POLICY_LINKS_TABLE: str
-    EVENTS_QUICK_LINKS_TABLE: str
-    FINANCE_QUICK_LINKS_TABLE: str
-    RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str
-    BOARD_MEMBER_LIST_TABLE: str
-    ORGANIZATION_INFO_TABLE: str
+    POLICY_LINKS_TABLE: str | None = None
+    EVENTS_QUICK_LINKS_TABLE: str | None = None
+    FINANCE_QUICK_LINKS_TABLE: str | None = None
+    RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str | None = None
+    BOARD_MEMBER_LIST_TABLE: str | None = None
+    ORGANIZATION_INFO_TABLE: str | None = None
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -212,12 +212,12 @@ class Settings(BaseSettings):
     AT_F_TICKET_PARENT_LINK: str
 
     # ── Grant Application Resources fields ────────────────────────────
-    AT_F_GAR_ID: str
-    AT_F_GAR_DOCUMENT: str
-    AT_F_GAR_DOCUMENT_URL: str
-    AT_F_GAR_NOTES: str
-    AT_F_GAR_ENTITY: str
-    AT_F_GAR_TABS: str
+    AT_F_GAR_ID: str | None = None
+    AT_F_GAR_DOCUMENT: str | None = None
+    AT_F_GAR_DOCUMENT_URL: str | None = None
+    AT_F_GAR_NOTES: str | None = None
+    AT_F_GAR_ENTITY: str | None = None
+    AT_F_GAR_TABS: str | None = None
 
     # ── Finance Links fields ──────────────────────────────────────────
     AT_F_FL_ID: str
@@ -275,47 +275,47 @@ class Settings(BaseSettings):
     AT_F_PL_TYPE: str
 
     # ── Policy Links fields ───────────────────────────────────────────
-    AT_F_POL_ID: str
-    AT_F_POL_TEXT: str
-    AT_F_POL_URL: str
+    AT_F_POL_ID: str | None = None
+    AT_F_POL_TEXT: str | None = None
+    AT_F_POL_URL: str | None = None
 
     # ── Events Quick Links fields ───────────────────────────────────
-    AT_F_EQL_ID: str
-    AT_F_EQL_TITLE: str
-    AT_F_EQL_ANCHOR_TEXT: str
-    AT_F_EQL_TYPE: str
-    AT_F_EQL_URL: str
-    AT_F_EQL_EMAIL: str
+    AT_F_EQL_ID: str | None = None
+    AT_F_EQL_TITLE: str | None = None
+    AT_F_EQL_ANCHOR_TEXT: str | None = None
+    AT_F_EQL_TYPE: str | None = None
+    AT_F_EQL_URL: str | None = None
+    AT_F_EQL_EMAIL: str | None = None
 
     # ── Finance Quick Links fields ──────────────────────────────────
-    AT_F_FQL_ID: str
-    AT_F_FQL_ANCHOR_TEXT: str
-    AT_F_FQL_URL: str
-    AT_F_FQL_ENTITY: str
-    AT_F_FQL_TABS: str
+    AT_F_FQL_ID: str | None = None
+    AT_F_FQL_ANCHOR_TEXT: str | None = None
+    AT_F_FQL_URL: str | None = None
+    AT_F_FQL_ENTITY: str | None = None
+    AT_F_FQL_TABS: str | None = None
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
-    AT_F_DDL_ID: str
-    AT_F_DDL_ANCHOR_TEXT: str
-    AT_F_DDL_URL: str
-    AT_F_DDL_ENTITY: str
-    AT_F_DDL_TABS: str
+    AT_F_DDL_ID: str | None = None
+    AT_F_DDL_ANCHOR_TEXT: str | None = None
+    AT_F_DDL_URL: str | None = None
+    AT_F_DDL_ENTITY: str | None = None
+    AT_F_DDL_TABS: str | None = None
 
     # ── Board Member List fields ─────────────────────────────────────
-    AT_F_BM_ID: str
-    AT_F_BM_TITLE: str
-    AT_F_BM_FULL_NAME: str
-    AT_F_BM_ROLE: str
-    AT_F_BM_ORGANIZATION: str
-    AT_F_BM_CONTACT: str
-    AT_F_BM_ENTITY: str
-    AT_F_BM_TABS: str
+    AT_F_BM_ID: str | None = None
+    AT_F_BM_TITLE: str | None = None
+    AT_F_BM_FULL_NAME: str | None = None
+    AT_F_BM_ROLE: str | None = None
+    AT_F_BM_ORGANIZATION: str | None = None
+    AT_F_BM_CONTACT: str | None = None
+    AT_F_BM_ENTITY: str | None = None
+    AT_F_BM_TABS: str | None = None
     # ── Organization Info fields ────────────────────────────────
-    AT_F_OI_ID: str
-    AT_F_OI_TITLE: str
-    AT_F_OI_CONTENT: str
-    AT_F_OI_ENTITY: str
-    AT_F_OI_TABS: str    # ── Onboarding Checklist fields ──────────────────────────────────
+    AT_F_OI_ID: str | None = None
+    AT_F_OI_TITLE: str | None = None
+    AT_F_OI_CONTENT: str | None = None
+    AT_F_OI_ENTITY: str | None = None
+    AT_F_OI_TABS: str | None = None    # ── Onboarding Checklist fields ──────────────────────────────────
     AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
     # ══════════════════════════════════════════════════════════════════
     # Slack webhook
