@@ -1636,9 +1636,15 @@ class AirtableService:
         """Count records in MASTER_LIST where Status is an active-program status.
 
         A program is considered active when its Status equals either
-        'Active Program' or 'Publicly Launched'.
+        'Active Program' or 'Publicly Launched'. Records are additionally
+        required to have an empty 'Sub-Track Of' and an unchecked
+        'Exclude from lists'.
         """
-        formula = af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES))
+        formula = af.AND(
+            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.is_empty(_F_SUB_TRACK_OF),
+            af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
+        )
         records = await self._list_records(
             self._master_list_table(), formula=formula, fields=[_F_STATUS]
         )
@@ -1649,10 +1655,15 @@ class AirtableService:
         """List active programs with their lead/fellow assignment.
 
         Reads records from MASTER_LIST whose Status equals
-        'Active Program' or 'Publicly Launched', returning the
-        'Name' and 'Program Lead/Fellow' fields.
+        'Active Program' or 'Publicly Launched', 'Sub-Track Of' is empty,
+        and 'Exclude from lists' is unchecked, returning the 'Name' and
+        'Program Lead/Fellow' fields.
         """
-        formula = af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES))
+        formula = af.AND(
+            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.is_empty(_F_SUB_TRACK_OF),
+            af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
+        )
         records = await self._list_records(
             self._master_list_table(),
             formula=formula,
