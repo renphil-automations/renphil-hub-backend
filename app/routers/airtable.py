@@ -765,11 +765,12 @@ async def get_active_programs(
     "/get_distinct_fellows_count",
     response_model=CountResponse,
     summary=(
-        "Number of fellows: distinct Work Email values in the Users table "
-        "where Employment Type includes 'Fellow (Unpaid)' OR For Website == 'Fellow'"
+        "Number of fellows: distinct Work Emails resolved from the Master "
+        "List's 'Program Lead/Fellow' values (Status = 'Fellowship (Scoping)') "
+        "matched against the Users table by Name."
     ),
 )
-@airtable_cache(table="USERS_TABLE")
+@airtable_cache(table=["MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "USERS_TABLE"])
 async def get_distinct_fellows_count(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -782,12 +783,12 @@ async def get_distinct_fellows_count(
     "/get_distinct_fellows",
     response_model=list[PersonContactItem],
     summary=(
-        "Unique fellows (First Name, Last Name, Work Email) from the Users "
-        "table where Employment Type includes 'Fellow (Unpaid)' OR "
-        "For Website == 'Fellow'"
+        "Unique fellows (First Name, Last Name, Work Email) resolved from the "
+        "Master List's 'Program Lead/Fellow' values (Status = 'Fellowship "
+        "(Scoping)') matched against the Users table by Name."
     ),
 )
-@airtable_cache(table="USERS_TABLE")
+@airtable_cache(table=["MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "USERS_TABLE"])
 async def get_distinct_fellows(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -2124,6 +2125,8 @@ async def delete_role(
     "get_reports_with_followups",
     "get_recent_complete_reports",
     "get_archived_reports_by_program",
+    "get_distinct_fellows_count",
+    "get_distinct_fellows",
 ])
 async def update_funds_and_subprograms_record(
     record_id: str = Path(..., description="Airtable record id."),

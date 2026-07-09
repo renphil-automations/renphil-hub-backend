@@ -1684,11 +1684,12 @@ class AirtableService:
 
     # ── #21 /get_distinct_fellows_count ───────────────────────────────
     async def get_distinct_fellows_count(self) -> CountResponse:
-        """Count distinct Work Email values of fellows in the Users table.
+        """Count distinct Work Email values of fellows.
 
-        A user is counted as a fellow when EITHER:
-          * the 'Employment Type' multi-select contains 'Fellow (Unpaid)', OR
-          * the 'For Website' single-select equals 'Fellow'.
+        Fellows are derived from the Master List: records whose Status
+        equals 'Fellowship (Scoping)' contribute their 'Program Lead/Fellow'
+        name(s), which are then resolved to Users by matching the 'Name'
+        field. The count is the number of distinct Work Emails obtained.
         """
         records = await self._fetch_fellow_records()
         unique: set[str] = set()
@@ -1705,7 +1706,7 @@ class AirtableService:
     async def get_distinct_fellows(self) -> list[PersonContactItem]:
         """List unique fellows with their First Name, Last Name and Work Email.
 
-        Uses the same table and filters as :meth:`get_distinct_fellows_count`;
+        Uses the same source as :meth:`get_distinct_fellows_count`;
         de-duplicated by lower-cased Work Email. Records without a Work
         Email are returned as-is (not de-duplicated).
         """
@@ -1736,17 +1737,84 @@ class AirtableService:
         )
         return items
 
+    @staticmethod
+    def _extract_lead_fellow_names(value: Any) -> list[str]:
+        """Normalize a 'Program Lead/Fellow' field value into a list of names.
+
+        Handles the common shapes the field may take:
+          * ``None`` / empty → ``[]``
+          * ``str`` → split on commas, trimmed
+          * ``list`` → each item may be a ``str`` or a collaborator-like
+            ``dict`` with a ``"name"`` key
+        Blank names are dropped; order is preserved (first occurrence wins).
+        """
+        if not value:
+            return []
+
+        candidates: list[str] = []
+
+        if isinstance(value, str):
+            candidates = [part.strip() for part in value.split(",")]
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    candidates.append(item.strip())
+                elif isinstance(item, dict):
+                    name = item.get("name")
+                    if isinstance(name, str):
+                        candidates.append(name.strip())
+        # Any other shape is ignored.
+
+        seen: set[str] = set()
+        names: list[str] = []
+        for name in candidates:
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        return names
+
     async def _fetch_fellow_records(
         self, *, include_names: bool = False
     ) -> list[dict[str, Any]]:
-        """Return raw Users records matching the fellow criteria."""
+        """Return raw Users records for fellows sourced from the Master List.
+
+        1. Query MASTER_LIST for records with Status = 'Fellowship (Scoping)',
+           projecting the 'Program Lead/Fellow' field.
+        2. Extract the list of unique lead/fellow names.
+        3. Query USERS matching those names against the 'Name' field,
+           projecting Work Email (and First/Last Name when requested).
+        """
         s = self._settings
-        formula = af.OR(
-            af.multiselect_contains_any(
-                s.USERS_EMPLOYMENT_TYPE_FIELD, ["Fellow (Unpaid)"]
-            ),
-            af.eq_str(s.USERS_FOR_WEBSITE_FIELD, "Fellow"),
+
+        # Step 1: pull Fellowship (Scoping) programs from the Master List.
+        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP_SCOPING)
+        program_records = await self._list_records(
+            self._master_list_table(),
+            formula=program_formula,
+            fields=[_F_PROGRAM_LEAD_FELLOW],
         )
+
+        # Step 2: collect unique lead/fellow names.
+        seen: set[str] = set()
+        names: list[str] = []
+        for r in program_records:
+            value = (r.get("fields", {}) or {}).get(_F_PROGRAM_LEAD_FELLOW)
+            for name in self._extract_lead_fellow_names(value):
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(name)
+
+        if not names:
+            return []
+
+        # Step 3: look those names up in the Users table by Name.
+        user_formula = af.in_str(s.USERS_NAME_FIELD, names)
         fields = [s.USERS_WORK_EMAIL_FIELD]
         if include_names:
             fields = [
@@ -1755,7 +1823,7 @@ class AirtableService:
                 s.USERS_WORK_EMAIL_FIELD,
             ]
         return await self._list_records(
-            self._users_table(), formula=formula, fields=fields
+            self._users_table(), formula=user_formula, fields=fields
         )
 
     # ══════════════════════════════════════════════════════════════════
