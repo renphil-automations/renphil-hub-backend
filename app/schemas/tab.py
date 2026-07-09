@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -100,6 +100,13 @@ class TabSummaryResponse(BaseModel):
     has_children: StrictBool = False
     has_content: StrictBool = False
 
+    # Which backend/schema this tab lives in — 'v1' (default, the original
+    # schema) or 'v2' (the normalized tabs/gridstacks/components schema).
+    # Tells the frontend which API base path (/tabs vs /v2/tabs) to use for
+    # any further operation on this tab. Not to be confused with
+    # GridCanvasContent.schemaVersion (the JSONB content-shape version).
+    apiVersion: Literal["v1", "v2"] = "v1"
+
 
 class TabWorkspaceResponse(BaseModel):
     id: int | None = None
@@ -119,6 +126,8 @@ class TabWorkspaceResponse(BaseModel):
     locked_by: StrictStr = ""
 
     children: list[TabSummaryResponse] = Field(default_factory=list)
+
+    apiVersion: Literal["v1", "v2"] = "v1"
 
 
 class BreadcrumbItemResponse(BaseModel):
