@@ -16,9 +16,11 @@ from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
     CreateTabRequest,
+    CreateTabVariantRequest,
     LockTabRequest,
     MoveTabRequest,
     ReorderTabsRequest,
+    ReorderTabVariantsRequest,
     TabSummaryListAPIResponse,
     TabSummaryResponse,
     TabWorkspaceAPIResponse,
@@ -27,15 +29,19 @@ from app.schemas.tab import (
     UpdateTabRequest,
 )
 from app.services.gridstack_service import (
+    AccessControlCascadeRequired,
     create_tab_v2,
+    create_tab_variant_v2,
     delete_tab_subtree_by_document_id_v2,
     get_component_by_link_v2,
     get_root_tabs_v2,
     get_tab_children_v2,
     get_tab_content_v2,
+    get_tab_variants_v2,
     get_tab_workspace_v2,
     lock_tab_by_document_id_v2,
     move_tab_by_document_id_v2,
+    reorder_tab_variants_v2,
     reorder_tabs_by_document_id_v2,
     resolve_component_location_v2,
     unlock_tab_by_document_id_v2,
@@ -155,6 +161,73 @@ def get_children(document_id: str, db: Session = Depends(get_db_v2)):
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
     return {"data": children}
+
+
+@router.get(
+    "/{document_id}/variants",
+    response_model=TabSummaryListAPIResponse,
+    summary="Get tab variants (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+)
+def get_variants(document_id: str, db: Session = Depends(get_db_v2)):
+    """A tab variant (TabV2.parent_tab_id) is a distinct, one-level nesting
+    axis from /{document_id}/children above (which is gridstack-level
+    nesting) — see gridstack_service.py's TabV2 docstring."""
+    validate_document_id(document_id)
+
+    variants = get_tab_variants_v2(db, document_id)
+    if variants is None:
+        raise HTTPException(status_code=404, detail="Parent tab not found")
+
+    return {"data": variants}
+
+
+@router.post(
+    "/{document_id}/variants",
+    response_model=TabSummaryResponse,
+    summary="Create a tab variant (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+)
+def create_variant(document_id: str, request: CreateTabVariantRequest, db: Session = Depends(get_db_v2)):
+    validate_document_id(document_id)
+
+    try:
+        access_control = (
+            request.access_control.model_dump()
+            if hasattr(request.access_control, "model_dump")
+            else request.access_control
+        )
+        return create_tab_variant_v2(
+            db=db,
+            parent_document_id=document_id,
+            title=request.title,
+            access_control=access_control,
+            order=request.order,
+        )
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+@router.put(
+    "/{document_id}/variants/reorder",
+    response_model=TabSummaryListAPIResponse,
+    summary="Reorder tab variants (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+)
+def reorder_variants(document_id: str, request: ReorderTabVariantsRequest, db: Session = Depends(get_db_v2)):
+    validate_document_id(document_id)
+
+    try:
+        reordered = reorder_tab_variants_v2(
+            db=db,
+            parent_document_id=document_id,
+            ordered_document_ids=request.orderedDocumentIds,
+        )
+        if reordered is None:
+            raise HTTPException(status_code=404, detail="Parent tab not found")
+        return {"data": reordered}
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
 
 
 @router.get(
@@ -303,10 +376,19 @@ def update_tab_metadata(document_id: str, request: UpdateTabRequest, db: Session
             access_control=access_control,
             locked=request.locked,
             locked_by=request.locked_by,
+            cascade_confirmed=request.cascade_confirmed,
         )
         if updated_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": updated_workspace}
+    except AccessControlCascadeRequired as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "needsCascadeConfirmation": True,
+                "affectedVariants": e.affected_variants,
+            },
+        )
     except ValueError as e:
         raise value_error_to_http_exception(e)
 

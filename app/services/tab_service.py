@@ -133,6 +133,100 @@ DEFAULT_ACCESS_CONTROL = {
 
 
 # ---------------------------------------------------------
+# Access-control subset / cascade helpers (tab variants)
+# ---------------------------------------------------------
+#
+# "A cannot be less restrictive than B" is expressed here as
+# access_control_is_subset(A, B): every viewer/admin A grants access to,
+# B must also grant access to. An empty users+roles group means "open to
+# everyone" — the universal set — matching _user_can_view_widget's own
+# `if not users and not roles: return True` semantics above. That makes
+# the universal set the *least* restrictive value, not an empty subset,
+# so it has to be special-cased in both directions below.
+
+def _role_identity(role: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        role.get("name", ""),
+        role.get("scope", ""),
+        role.get("program", ""),
+        role.get("function", ""),
+    )
+
+
+def _group_is_subset(child_group: dict[str, Any], parent_group: dict[str, Any]) -> bool:
+    """True if every user/role `child_group` grants access to is also
+    granted by `parent_group` (i.e. child is at least as restrictive)."""
+    parent_users = {(u.get("email") or "").strip().lower() for u in parent_group.get("users") or []}
+    parent_roles = {_role_identity(r) for r in parent_group.get("roles") or []}
+    if not parent_users and not parent_roles:
+        return True  # parent is open to everyone — nothing can be broader
+
+    child_users = {(u.get("email") or "").strip().lower() for u in child_group.get("users") or []}
+    child_roles = {_role_identity(r) for r in child_group.get("roles") or []}
+    if not child_users and not child_roles:
+        return False  # child is open to everyone, parent is restricted
+
+    return child_users <= parent_users and child_roles <= parent_roles
+
+
+def access_control_is_subset(child_ac: dict[str, Any], parent_ac: dict[str, Any]) -> bool:
+    """True if `child_ac` is equal-or-more-restrictive than `parent_ac`,
+    for both the viewers and admins groups."""
+    return _group_is_subset(
+        child_ac.get("viewers") or {}, parent_ac.get("viewers") or {}
+    ) and _group_is_subset(child_ac.get("admins") or {}, parent_ac.get("admins") or {})
+
+
+def _intersect_group(child_group: dict[str, Any], parent_group: dict[str, Any]) -> dict[str, Any]:
+    """Narrow `child_group` to whatever it and `parent_group` have in
+    common, treating an empty (universal) side as 'everything' — so
+    intersecting a fully-open child with a restricted parent yields
+    exactly the parent's set, and vice versa."""
+    parent_users: list[dict[str, Any]] = parent_group.get("users") or []
+    parent_roles: list[dict[str, Any]] = parent_group.get("roles") or []
+    parent_is_universal = not parent_users and not parent_roles
+
+    child_users: list[dict[str, Any]] = child_group.get("users") or []
+    child_roles: list[dict[str, Any]] = child_group.get("roles") or []
+    child_is_universal = not child_users and not child_roles
+
+    if child_is_universal:
+        return {"users": list(parent_users), "roles": list(parent_roles)}
+    if parent_is_universal:
+        return {"users": list(child_users), "roles": list(child_roles)}
+
+    parent_user_keys = {(u.get("email") or "").strip().lower() for u in parent_users}
+    parent_role_keys = {_role_identity(r) for r in parent_roles}
+    intersected_users = [
+        u for u in child_users if (u.get("email") or "").strip().lower() in parent_user_keys
+    ]
+    intersected_roles = [r for r in child_roles if _role_identity(r) in parent_role_keys]
+
+    if not intersected_users and not intersected_roles:
+        # child and parent are both restricted but share no overlap at all.
+        # Falling through to a literally empty result would flip this
+        # group's *meaning* from "restricted" to "open to everyone" (see
+        # _group_is_subset's / _user_can_view_widget's own
+        # "not users and not roles -> universal" rule) — the exact
+        # opposite of what a narrowing cascade is supposed to do. Fall
+        # back to the parent's own restriction instead, which is still a
+        # valid (trivial) subset of itself.
+        return {"users": list(parent_users), "roles": list(parent_roles)}
+
+    return {"users": intersected_users, "roles": intersected_roles}
+
+
+def intersect_access_control(child_ac: dict[str, Any], parent_ac: dict[str, Any]) -> dict[str, Any]:
+    """Narrow `child_ac` to the intersection with `parent_ac` — used when a
+    parent's access control is tightened and an existing, now-noncompliant
+    child needs to be cascaded down to stay compliant."""
+    return {
+        "viewers": _intersect_group(child_ac.get("viewers") or {}, parent_ac.get("viewers") or {}),
+        "admins": _intersect_group(child_ac.get("admins") or {}, parent_ac.get("admins") or {}),
+    }
+
+
+# ---------------------------------------------------------
 # Validation constants
 # ---------------------------------------------------------
 

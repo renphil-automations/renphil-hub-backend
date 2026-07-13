@@ -100,6 +100,15 @@ class TabSummaryResponse(BaseModel):
     has_children: StrictBool = False
     has_content: StrictBool = False
 
+    # True if this tab has one or more "tab variants" (TabV2.parent_tab_id
+    # children — a distinct nesting axis from has_children above, which
+    # reflects gridstack-level nesting). v2 only, always False for v1.
+    has_variants: StrictBool = False
+
+    # Included so a variant-listing caller can pre-populate ManageAccessModal
+    # without an extra fetch; omitted (None) by callers that don't need it.
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
     # Which backend/schema this tab lives in — 'v1' (default, the original
     # schema) or 'v2' (the normalized tabs/gridstacks/components schema).
     # Tells the frontend which API base path (/tabs vs /v2/tabs) to use for
@@ -126,6 +135,8 @@ class TabWorkspaceResponse(BaseModel):
     locked_by: StrictStr = ""
 
     children: list[TabSummaryResponse] = Field(default_factory=list)
+
+    has_variants: StrictBool = False
 
     apiVersion: Literal["v1", "v2"] = "v1"
 
@@ -214,10 +225,41 @@ class UpdateTabRequest(StrictRequestModel):
         pattern=CLEAN_TEXT_PATTERN,
     )
 
+    # When a v2 tab's own access_control is tightened and it has tab
+    # variants that would become noncompliant, the server rejects the
+    # change with 409 unless this is set — the frontend re-sends the same
+    # request with cascade_confirmed=True after the user confirms.
+    cascade_confirmed: StrictBool = False
+
     @field_validator("order", mode="before")
     @classmethod
     def validate_order(cls, value: Any) -> Any:
         return validate_order_not_bool(value)
+
+
+class CreateTabVariantRequest(StrictRequestModel):
+    title: StrictStr = Field(
+        min_length=1,
+        max_length=255,
+        pattern=CLEAN_TEXT_PATTERN,
+    )
+
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    order: int | None = Field(
+        default=None,
+        ge=MIN_ORDER_VALUE,
+        le=MAX_ORDER_VALUE,
+    )
+
+    @field_validator("order", mode="before")
+    @classmethod
+    def validate_order(cls, value: Any) -> Any:
+        return validate_order_not_bool(value)
+
+
+class ReorderTabVariantsRequest(StrictRequestModel):
+    orderedDocumentIds: list[StrictStr] = Field(default_factory=list)
 
 
 class MoveTabRequest(StrictRequestModel):

@@ -183,8 +183,59 @@ def create_sbn_node(
         if parent is None or not _is_sbn_member(parent):
             raise ValueError("Parent SBN node does not exist")
 
+        # Root's own content becomes permanently unreachable once real
+        # sub-tabs exist — the root itself is never rendered as a selectable
+        # row (see SuperBlockNoteWidget.tsx). The first time the root gains a
+        # real child, transplant whatever it already holds into an
+        # auto-created "Root Content" leaf, first in order, so it stays
+        # reachable (and is a fully normal, renameable/deletable sub-tab from
+        # then on) instead of being silently stranded on the inert root.
+        is_root = parent.super_blocknote_id is None and parent.type == SBN_ROOT_TYPE
+        inserted_root_content = False
+        if is_root and parent.page_content_id is not None and not _has_sbn_children(db, parent.id):
+            root_data = _resolve_component_data(db, parent)
+            root_content = root_data.get("content") or []
+            if root_content:
+                old_page_content_id = parent.page_content_id
+                root_content_node = ComponentV2(
+                    link=_generate_id(),
+                    type=SBN_LEAF_TYPE,
+                    title="Root Content",
+                    props={"locked": False, "locked_by": "", "order": 0},
+                    access_control=parent.access_control or _access_control_or_default(None),
+                    x=0,
+                    y=0,
+                    width=6,
+                    height=6,
+                    gridstack_id=parent.gridstack_id,
+                    super_blocknote_id=parent.id,
+                    page_content_id=None,
+                    current_grid_id=None,
+                )
+                db.add(root_content_node)
+                db.flush()
+                # Root (type="super_block_note") and a leaf (type="block_note")
+                # use different storage conventions in _write_component_data —
+                # a leaf unwraps `data["content"]` before storing, root stores
+                # the dict as-is. Re-writing through the leaf's own convention
+                # here (rather than transplanting the raw page_content_id
+                # pointer) avoids double-wrapping the block list.
+                _write_component_data(db, root_content_node, {"content": root_content})
+                parent.page_content_id = None
+                old_page_content = (
+                    db.query(PageContentV2).filter(PageContentV2.id == old_page_content_id).first()
+                )
+                if old_page_content is not None:
+                    db.delete(old_page_content)
+                db.flush()
+                inserted_root_content = True
+
         if order is None:
             order = db.query(ComponentV2).filter(ComponentV2.super_blocknote_id == parent.id).count()
+        elif inserted_root_content:
+            # Caller computed this order from its own pre-fetch, unaware the
+            # auto-created "Root Content" node above just took position 0.
+            order += 1
 
         new_component = ComponentV2(
             link=_generate_id(),

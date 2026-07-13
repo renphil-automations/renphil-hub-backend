@@ -26,7 +26,23 @@ from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
 
-from app.services.tab_service import DEFAULT_ACCESS_CONTROL
+from app.services.tab_service import (
+    DEFAULT_ACCESS_CONTROL,
+    access_control_is_subset,
+    intersect_access_control,
+)
+
+
+class AccessControlCascadeRequired(Exception):
+    """Raised by update_tab_by_document_id_v2 when tightening a tab's own
+    access_control would make one or more existing tab variants
+    noncompliant, and the caller has not yet confirmed the cascade. Carries
+    enough info for the router to return a 409 the frontend can render a
+    confirmation modal from."""
+
+    def __init__(self, affected_variants: list[dict[str, Any]]) -> None:
+        self.affected_variants = affected_variants
+        super().__init__("Access control change requires cascade confirmation")
 
 
 # ---------------------------------------------------------
@@ -153,16 +169,22 @@ def _safe_locked_pair(db: Session, gridstack: GridstackV2) -> tuple[bool, str]:
     return False, ""
 
 
+def _has_variants(db: Session, tab_id: int) -> bool:
+    return db.query(TabV2.id).filter(TabV2.parent_tab_id == tab_id).first() is not None
+
+
 def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
     locked, locked_by = _safe_locked_pair(db, gridstack)
     node_id = gridstack.parent_tab_id if _is_root(gridstack) else gridstack.id
     title = None
     order = gridstack.position if gridstack.position is not None else 0
+    has_variants = False
 
     if _is_root(gridstack):
         tab = _get_root_tab(db, gridstack)
         title = tab.title if tab else gridstack.name
         order = tab.order if tab and tab.order is not None else order
+        has_variants = _has_variants(db, tab.id) if tab is not None else False
     else:
         title = gridstack.name
 
@@ -175,6 +197,8 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "locked_by": locked_by,
         "has_children": _has_children(db, gridstack.id),
         "has_content": _has_content(db, gridstack.id),
+        "has_variants": has_variants,
+        "access_control": _safe_access_control_for_gridstack(db, gridstack),
         "apiVersion": "v2",
     }
 
@@ -473,14 +497,155 @@ def resolve_component_location_v2(db: Session, link: str) -> dict[str, Any] | No
 # ---------------------------------------------------------
 
 def get_root_tabs_v2(db: Session) -> list[dict[str, Any]]:
+    # A root gridstack whose owning TabV2 itself has parent_tab_id set is a
+    # tab variant, not a top-level tab — it must only ever surface via
+    # get_tab_variants_v2, never duplicated into the main tab bar.
     root_gridstacks = (
         db.query(GridstackV2)
-        .filter(GridstackV2.parent_id.is_(None))
+        .join(TabV2, GridstackV2.parent_tab_id == TabV2.id)
+        .filter(GridstackV2.parent_id.is_(None), TabV2.parent_tab_id.is_(None))
         .all()
     )
     summaries = [_format_tab_summary(db, g) for g in root_gridstacks]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
+
+
+def get_tab_variants_v2(db: Session, parent_document_id: str) -> list[dict[str, Any]] | None:
+    parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
+    if parent_gridstack is None or not _is_root(parent_gridstack):
+        return None
+    parent_tab = _get_root_tab(db, parent_gridstack)
+    if parent_tab is None:
+        return None
+
+    variant_tabs = db.query(TabV2).filter(TabV2.parent_tab_id == parent_tab.id).all()
+    summaries: list[dict[str, Any]] = []
+    for variant_tab in variant_tabs:
+        variant_gridstack = (
+            db.query(GridstackV2)
+            .filter(GridstackV2.parent_tab_id == variant_tab.id, GridstackV2.parent_id.is_(None))
+            .first()
+        )
+        if variant_gridstack is None:
+            continue
+        summaries.append(_format_tab_summary(db, variant_gridstack))
+
+    summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
+    return summaries
+
+
+def create_tab_variant_v2(
+    db: Session,
+    parent_document_id: str,
+    title: str,
+    access_control: dict[str, Any] | None = None,
+    order: int | None = None,
+) -> dict[str, Any]:
+    try:
+        title = _validate_title(title)
+        if not title:
+            raise ValueError("Title is required")
+        parent_document_id = _validate_document_id_value(parent_document_id, "parentDocumentId")
+        order = _validate_order(order)
+
+        parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
+        if parent_gridstack is None or not _is_root(parent_gridstack):
+            raise ValueError("Parent tab does not exist")
+
+        parent_tab = _get_root_tab(db, parent_gridstack)
+        if parent_tab is None:
+            raise ValueError("Parent tab does not exist")
+
+        if parent_tab.parent_tab_id is not None:
+            raise ValueError("A tab variant cannot itself have tab variants")
+
+        parent_ac = _access_control_or_default(parent_tab.access_control)
+        effective_ac = access_control if access_control is not None else parent_ac
+        if not access_control_is_subset(effective_ac, parent_ac):
+            raise ValueError("A tab variant's access control cannot be broader than its parent's")
+
+        existing = (
+            db.query(TabV2)
+            .filter(TabV2.parent_tab_id == parent_tab.id, TabV2.title == title)
+            .first()
+        )
+        if existing is not None:
+            raise ValueError("A tab variant with this title already exists under the same parent")
+
+        now = _utc_now()
+        new_tab = TabV2(
+            document_id=_generate_id(),
+            title=title,
+            order=order,
+            access_control=effective_ac,
+            locked=False,
+            locked_by="",
+            parent_tab_id=parent_tab.id,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(new_tab)
+        db.flush()
+
+        new_gridstack = GridstackV2(
+            document_id=new_tab.document_id,
+            name=title,
+            settings={},
+            position=order,
+            parent_id=None,
+            parent_tab_id=new_tab.id,
+        )
+        db.add(new_gridstack)
+        db.flush()
+
+        db.commit()
+        return _format_tab_summary(db, new_gridstack)
+
+    except Exception:
+        db.rollback()
+        raise
+
+
+def reorder_tab_variants_v2(
+    db: Session,
+    parent_document_id: str,
+    ordered_document_ids: list[str],
+) -> list[dict[str, Any]] | None:
+    try:
+        parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
+        if parent_gridstack is None or not _is_root(parent_gridstack):
+            return None
+        parent_tab = _get_root_tab(db, parent_gridstack)
+        if parent_tab is None:
+            return None
+
+        variants_by_document_id = {
+            v.document_id: v
+            for v in db.query(TabV2).filter(TabV2.parent_tab_id == parent_tab.id).all()
+        }
+        for doc_id in ordered_document_ids:
+            if doc_id not in variants_by_document_id:
+                raise ValueError(f"{doc_id} is not a tab variant of this tab")
+
+        for index, doc_id in enumerate(ordered_document_ids):
+            variant_tab = variants_by_document_id[doc_id]
+            variant_tab.order = index
+            variant_tab.updated_at = _utc_now()
+            variant_gridstack = (
+                db.query(GridstackV2)
+                .filter(GridstackV2.parent_tab_id == variant_tab.id, GridstackV2.parent_id.is_(None))
+                .first()
+            )
+            if variant_gridstack is not None:
+                variant_gridstack.position = index
+
+        db.commit()
+        return get_tab_variants_v2(db, parent_document_id)
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_tab_children_v2(db: Session, document_id: str) -> list[dict[str, Any]] | None:
@@ -510,11 +675,13 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
     if gridstack is None:
         return None
 
+    has_variants = False
     if _is_root(gridstack):
         tab = _get_root_tab(db, gridstack)
         node_id = tab.id if tab else None
         title = tab.title if tab else gridstack.name
         order = tab.order if tab and tab.order is not None else (gridstack.position or 0)
+        has_variants = _has_variants(db, tab.id) if tab is not None else False
     else:
         node_id = gridstack.id
         title = gridstack.name
@@ -552,6 +719,7 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         "locked": locked,
         "locked_by": locked_by,
         "children": child_summaries,
+        "has_variants": has_variants,
         "apiVersion": "v2",
     }
 
@@ -559,6 +727,25 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
 # ---------------------------------------------------------
 # Content write: diff incoming GridCanvasContent against existing rows
 # ---------------------------------------------------------
+
+def _cascade_gridstack_id_to_sbn_descendants(
+    db: Session, component_id: int, new_gridstack_id: int
+) -> None:
+    """When a Super Block Note's top-level widget is re-parented into a
+    different gridstack (see the by-`link` re-parenting branch in
+    `update_tab_content_v2`), every descendant (`super_blocknote_id` chain)
+    must move with it. Several other code paths assume a whole SBN tree
+    shares one `gridstack_id` and use it to find/delete the tree as a unit —
+    `delete_tab_subtree_by_document_id_v2`'s own component-deletion query
+    (`ComponentV2.gridstack_id == gid`) is the concrete case that surfaced
+    this: without this cascade, deleting the gridstack the root moved into
+    finds only the root, not its children, which still reference it via
+    `super_blocknote_id` — a foreign key violation."""
+    children = db.query(ComponentV2).filter(ComponentV2.super_blocknote_id == component_id).all()
+    for child in children:
+        child.gridstack_id = new_gridstack_id
+        _cascade_gridstack_id_to_sbn_descendants(db, child.id, new_gridstack_id)
+
 
 def update_tab_content_v2(
     db: Session,
@@ -606,6 +793,28 @@ def update_tab_content_v2(
                 db.delete(component)
                 del existing_components[existing_id]
 
+        # A widget entry can legitimately arrive here still carrying its OLD,
+        # already-persisted `link` even though the row currently belongs to a
+        # DIFFERENT gridstack — e.g. SgsCanvasHost migrating a plain canvas's
+        # content into a freshly-created SGS sub-tab. `existing_components`
+        # above is scoped to THIS gridstack, so such a widget would otherwise
+        # look "new" and get a freshly-generated row/link below — orphaning
+        # any Super Block Note children (`super_blocknote_id` points at the
+        # OLD row's id, never carried over) and breaking any mirror already
+        # targeting the OLD `link`. Resolving by `link` first lets the
+        # existing row be re-parented (gridstack_id updated) in place instead.
+        incoming_links = {
+            entry.get("link")
+            for entry in incoming_widgets.values()
+            if isinstance(entry, dict) and entry.get("link")
+        }
+        components_by_link: dict[str, ComponentV2] = {}
+        if incoming_links:
+            components_by_link = {
+                c.link: c
+                for c in db.query(ComponentV2).filter(ComponentV2.link.in_(incoming_links)).all()
+            }
+
         # Update-in-place or insert.
         for widget_id, widget_entry in incoming_widgets.items():
             if not isinstance(widget_entry, dict):
@@ -636,6 +845,18 @@ def update_tab_content_v2(
             description = widget_entry.get("description")
 
             existing = existing_components.get(widget_id)
+            if existing is None:
+                link = widget_entry.get("link")
+                candidate = components_by_link.get(link) if link else None
+                if (
+                    candidate is not None
+                    and candidate.gridstack_id != gridstack.id
+                    and candidate.super_blocknote_id is None
+                ):
+                    candidate.gridstack_id = gridstack.id
+                    _cascade_gridstack_id_to_sbn_descendants(db, candidate.id, gridstack.id)
+                    existing = candidate
+
             if existing is not None:
                 existing.type = widget_type
                 existing.x = layout_entry.get("x", existing.x)
@@ -802,6 +1023,7 @@ def update_tab_by_document_id_v2(
     access_control: dict[str, Any] | None = None,
     locked: bool | None = None,
     locked_by: str | None = None,
+    cascade_confirmed: bool = False,
 ) -> dict[str, Any] | None:
     try:
         title = _validate_title(title)
@@ -816,6 +1038,54 @@ def update_tab_by_document_id_v2(
             tab = _get_root_tab(db, gridstack)
             if tab is None:
                 return None
+
+            if access_control is not None:
+                if tab.parent_tab_id is not None:
+                    # This tab is itself a variant — a direct attempt to
+                    # broaden its own AC beyond its parent's is a hard
+                    # reject, never a cascade case (cascade only flows
+                    # parent -> children, see the else branch below).
+                    grandparent_tab = (
+                        db.query(TabV2).filter(TabV2.id == tab.parent_tab_id).first()
+                    )
+                    parent_ac = _access_control_or_default(
+                        grandparent_tab.access_control if grandparent_tab else None
+                    )
+                    if not access_control_is_subset(access_control, parent_ac):
+                        raise ValueError(
+                            "A tab variant's access control cannot be broader than its parent tab's"
+                        )
+                else:
+                    # This tab may itself have variants — tightening its AC
+                    # can make an existing variant noncompliant. Requires
+                    # explicit confirmation before anything is written.
+                    variant_tabs = (
+                        db.query(TabV2).filter(TabV2.parent_tab_id == tab.id).all()
+                    )
+                    affected = [
+                        v
+                        for v in variant_tabs
+                        if not access_control_is_subset(
+                            _access_control_or_default(v.access_control), access_control
+                        )
+                    ]
+                    if affected and not cascade_confirmed:
+                        raise AccessControlCascadeRequired(
+                            [
+                                {
+                                    "documentId": v.document_id,
+                                    "title": v.title,
+                                    "access_control": _access_control_or_default(v.access_control),
+                                }
+                                for v in affected
+                            ]
+                        )
+                    for v in affected:
+                        v.access_control = intersect_access_control(
+                            _access_control_or_default(v.access_control), access_control
+                        )
+                        v.updated_at = _utc_now()
+
             if title is not None:
                 tab.title = title
                 gridstack.name = title
@@ -1043,6 +1313,30 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
         if gridstack is None:
             return None
 
+        deleted_tabs: list[dict[str, Any]] = []
+
+        # A root tab may own tab variants (TabV2.parent_tab_id) — a wholly
+        # separate nesting axis from GridstackV2.parent_id below. Each
+        # variant is its own full independent subtree (own root gridstack,
+        # own descendants/components), so deleting it needs this exact same
+        # recursive process, and must happen before this function's own
+        # gridstack-subtree walk deletes the owning TabV2 row further down
+        # (a variant's parent_tab_id would otherwise dangle once its parent
+        # row is gone). Variants can never themselves have variants (depth
+        # is strictly one level), so this never recurses more than once.
+        if _is_root(gridstack):
+            owning_tab = _get_root_tab(db, gridstack)
+            if owning_tab is not None:
+                variant_tabs = (
+                    db.query(TabV2).filter(TabV2.parent_tab_id == owning_tab.id).all()
+                )
+                for variant_tab in variant_tabs:
+                    if not variant_tab.document_id:
+                        continue
+                    variant_result = delete_tab_subtree_by_document_id_v2(db, variant_tab.document_id)
+                    if variant_result:
+                        deleted_tabs.extend(variant_result.get("deleted_tabs", []))
+
         # get_descendant_gridstack_ids returns a pre-order walk (each node
         # appears before its own descendants) — reversing it alone already
         # guarantees every descendant is deleted before its ancestors within
@@ -1052,7 +1346,6 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
         descendant_ids = get_descendant_gridstack_ids(db, gridstack.id)
         gridstack_ids_to_delete = list(reversed(descendant_ids)) + [gridstack.id]
 
-        deleted_tabs = []
         for gid in gridstack_ids_to_delete:
             node = db.query(GridstackV2).filter(GridstackV2.id == gid).first()
             if node is None:
