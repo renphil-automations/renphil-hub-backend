@@ -68,7 +68,17 @@ def _resolve_database_url() -> str | URL:
 
 DATABASE_URL = _resolve_database_url()
 
-engine = create_engine(DATABASE_URL)
+# Neon (and most managed Postgres) close idle server-side connections after a
+# few minutes. Without ``pool_pre_ping`` the pool hands out a stale socket and
+# the next query fails with ``SSL connection has been closed unexpectedly``.
+# ``pool_recycle`` proactively refreshes connections older than the value.
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    connect_args={"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30,
+                  "keepalives_interval": 10, "keepalives_count": 3},
+)
 
 SessionLocal = sessionmaker(
     autocommit=False,

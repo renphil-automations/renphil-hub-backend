@@ -31,3 +31,6 @@ psycopg2-binary>=2.9,<3.0
 # ── Calendar iCal parsing (Calendar widget proxy) ──────────────────
 icalendar>=5.0,<6.0
 recurring-ical-events>=3.0,<4.0
+
+# ── Cache (Upstash Redis over REST) ───────────────
+upstash-redis>=1.4.0,<2.0.0

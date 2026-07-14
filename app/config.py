@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     # ── App ────────────────────────────────────────────────────────────
     APP_NAME: str = "RenPhil Hub API"
     DEBUG: bool = False
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:5000", "http://localhost:3000", "https://renphil-hub.web.app", "https://renphil-hub.firebaseapp.com"]
+    # Loaded strictly from the ALLOWED_ORIGINS environment variable (JSON list)
+    ALLOWED_ORIGINS: list[str]
     # Comma-separated emails granted "Hub Admin" without an Access Control
     # record. Only takes effect when DEBUG=true — local testing convenience,
     # never honored in production.
@@ -334,6 +335,16 @@ class Settings(BaseSettings):
     # ══════════════════════════════════════════════════════════════════
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.5-flash"
+
+    # ══════════════════════════════════════════════════════════════════
+    # Cache (Upstash Redis over REST)
+    # ══════════════════════════════════════════════════════════════════
+    # When either URL or TOKEN is missing, the endpoint cache is disabled
+    # and every GET goes straight to Airtable (no error is raised).
+    UPSTASH_REDIS_REST_URL: str | None = None
+    UPSTASH_REDIS_REST_TOKEN: str | None = None
+    # Bumping this rotates the cache namespace and effectively wipes it.
+    CACHE_VERSION: str = "v1"
 
 
 @lru_cache

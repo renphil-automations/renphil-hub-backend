@@ -38,6 +38,7 @@ from app.dependencies import (
     get_current_user,
     get_gemini_service,
 )
+from app.helpers.cache import airtable_cache, invalidates_cache
 from app.helpers.slack import (
     post_to_response_url,
     verify_slack_signature,
@@ -178,6 +179,7 @@ async def get_airtable_preview(
     response_model=AmountSumResponse,
     summary="Sum of Amount filtered by Opportunity Record Type and Fiscal Year",
 )
+@airtable_cache(table="TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME")
 async def get_total_amount_sum(
     opportunity_rec_type: list[str] | None = Query(
         default=None,
@@ -205,6 +207,7 @@ async def get_total_amount_sum(
     response_model=UniqueAccountsResponse,
     summary="Number of unique Account Name values matching the filters",
 )
+@airtable_cache(table="TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME")
 async def get_nb_unique_accounts(
     opportunity_rec_type: list[str] | None = Query(
         default=None,
@@ -232,6 +235,7 @@ async def get_nb_unique_accounts(
     response_model=DistributionResponse,
     summary="Percentage distribution of Opportunity Record Type values",
 )
+@airtable_cache(table="TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME")
 async def get_opportunity_rec_type_distribution(
     eq_year: int | None = Query(default=None, description="Fiscal Year equals."),
     lt_year: int | None = Query(default=None, description="Fiscal Year strictly less than."),
@@ -249,6 +253,7 @@ async def get_opportunity_rec_type_distribution(
     response_model=YearlyAmountResponse,
     summary="Sum of Amount per Fiscal Year for the given Opportunity Record Type(s)",
 )
+@airtable_cache(table="TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME")
 async def get_sum_amount_over_years(
     opportunity_rec_type: list[str] | None = Query(
         default=None,
@@ -270,6 +275,7 @@ async def get_sum_amount_over_years(
     response_model=OppRecTypeAmountResponse,
     summary="Sum of Amount per Opportunity Record Type within a Fiscal Year range",
 )
+@airtable_cache(table="TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME")
 async def get_sum_amount_by_opp_rec_type(
     eq_year: int | None = Query(default=None, description="Fiscal Year equals."),
     lt_year: int | None = Query(default=None, description="Fiscal Year strictly less than."),
@@ -298,6 +304,7 @@ _FIELDS_DESC = (
     response_model=list[MasterListFundsAndSubprogramsRecord],
     summary="List funds & subprograms with rich filtering",
 )
+@airtable_cache(table="MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE")
 async def get_funds_and_subprograms(
     exclude_from_lists: bool | None = Query(default=None),
     exclude_from_reporting: bool | None = Query(default=None),
@@ -348,6 +355,7 @@ async def get_funds_and_subprograms(
     response_model=list[GlossaryRecord],
     summary="List glossary entries",
 )
+@airtable_cache(table="GLOSSARY_TABLE")
 async def get_glossary_data(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -362,6 +370,7 @@ async def get_glossary_data(
     response_model=list[OrgFriendsRecord],
     summary="List org friends",
 )
+@airtable_cache(table="ORG_FRIENDS_TABLE")
 async def get_org_friends(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -376,6 +385,7 @@ async def get_org_friends(
     response_model=list[FundersRecord],
     summary="List funders",
 )
+@airtable_cache(table="FUNDERS_TABLE")
 async def get_funders(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -393,6 +403,7 @@ async def get_funders(
         "enriched server-side with selected master-list fields."
     ),
 )
+@airtable_cache(table="AWARDED_OPPORTUNITIES_TABLE")
 async def get_awarded_opportunities(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -407,6 +418,7 @@ async def get_awarded_opportunities(
     response_model=list[MonthlyCheckinRecord],
     summary="Funds & programs monthly check-in records",
 )
+@airtable_cache(table=["FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE", "MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "CHECKIN_REPORTING_PERIODS_TABLE", "CLUSTERS_TABLE"])
 async def get_funds_progs_monthly_checkin(
     eq_days_until_deadline: int | None = Query(default=None),
     lt_days_until_deadline: int | None = Query(default=None),
@@ -461,6 +473,7 @@ async def get_funds_progs_monthly_checkin(
     response_model=CountResponse,
     summary="Count of monthly check-in records matching filters",
 )
+@airtable_cache(table="FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE")
 async def get_funds_progs_monthly_checkin_count(
     flag_for_discussion: bool | None = Query(default=None),
     checkin_in_reporting_periods: list[str] | None = Query(default=None),
@@ -487,6 +500,7 @@ async def get_funds_progs_monthly_checkin_count(
     response_model=DistributionResponse,
     summary="Distribution of Dashboard Display values for monthly check-ins",
 )
+@airtable_cache(table="FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE")
 async def get_funds_progs_status_distribution(
     checkin_in_reporting_period: str | None = Query(default=None),
     cluster: str | None = Query(default=None),
@@ -511,6 +525,7 @@ async def get_funds_progs_status_distribution(
     response_model=list[MonthlyCheckinRecord],
     summary="Reports with optional follow-up filters",
 )
+@airtable_cache(table=["FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE", "MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE"])
 async def get_reports_with_followups(
     follow_indicated_empty: bool | None = Query(default=None),
     report_complete: bool | None = Query(default=None),
@@ -543,6 +558,7 @@ async def get_reports_with_followups(
     response_model=list[AirtableRecord],
     summary="Check-in reporting periods filtered by Deadline (OR of OR groups)",
 )
+@airtable_cache(table="CHECKIN_REPORTING_PERIODS_TABLE")
 async def get_checkin_reporting_periods(
     date_filters: list[DateRangeFilter] = Body(
         default_factory=list,
@@ -567,6 +583,7 @@ async def get_checkin_reporting_periods(
     response_model=list[MonthlyCheckinRecord],
     summary="Recent complete reports filtered by review window or days-until-deadline",
 )
+@airtable_cache(table=["FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE", "MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "CHECKIN_REPORTING_PERIODS_TABLE"])
 async def get_recent_complete_reports(
     report_complete: bool | None = Query(default=None),
     eq_days_until_deadline: int | None = Query(default=None),
@@ -597,6 +614,7 @@ async def get_recent_complete_reports(
     response_model=list[MonthlyCheckinRecord],
     summary="Reports filtered by Report Complete and program Status exclusion",
 )
+@airtable_cache(table=["FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE", "MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE"])
 async def get_archived_reports_by_program(
     report_complete: bool | None = Query(default=None),
     not_program_status: str | None = Query(default=None),
@@ -617,6 +635,7 @@ async def get_archived_reports_by_program(
     response_model=list[DocTitleRecord],
     summary="List doc titles",
 )
+@airtable_cache(table="DOC_TITLES_TABLE")
 async def get_doc_titles(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -631,6 +650,7 @@ async def get_doc_titles(
     response_model=list[ShareableDocsRecord],
     summary="List shareable docs",
 )
+@airtable_cache(table="SHAREABLE_DOCS_TABLE")
 async def get_shareable_docs(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -645,6 +665,7 @@ async def get_shareable_docs(
     response_model=list[OnboardingChecklistRecord],
     summary="List onboarding checklist rows with linked Master List expanded",
 )
+@airtable_cache(table=["ONBOARDING_CHECKLIST_TABLE", "MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE"])
 async def get_onboarding_checklist(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -658,6 +679,7 @@ async def get_onboarding_checklist(
     response_model=list[CheckinReportingPeriodRecord],
     summary="Unique Check-In Reporting Period values (record_id + Period)",
 )
+@airtable_cache(table="CHECKIN_REPORTING_PERIODS_TABLE")
 async def get_unique_checkin_reporting_periods(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -671,6 +693,7 @@ async def get_unique_checkin_reporting_periods(
     response_model=list[ClusterRecord],
     summary="Unique Cluster values (record_id + Name)",
 )
+@airtable_cache(table="CLUSTERS_TABLE")
 async def get_clusters(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -684,6 +707,7 @@ async def get_clusters(
     response_model=list[IdNameItem],
     summary="Unique Program Name values (id + Name)",
 )
+@airtable_cache(table="MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE")
 async def get_program_names(
     add_to_sharable_doc: bool | None = Query(
         default=None,
@@ -707,6 +731,7 @@ async def get_program_names(
     response_model=list[str],
     summary="Unique Status values from monthly check-in",
 )
+@airtable_cache(table="FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE")
 async def get_status_values(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -719,6 +744,7 @@ async def get_status_values(
     "/get_reporting_leads",
     summary="Unique Reporting Lead users (id, email, name)",
 )
+@airtable_cache(table="FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE")
 async def get_reporting_leads(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -732,6 +758,7 @@ async def get_reporting_leads(
     response_model=AirtableUserIdResponse,
     summary="Resolve an Airtable user id from an email",
 )
+@airtable_cache(table="USERS_TABLE")
 async def get_airtable_user_id(
     email: str = Query(..., description="Email of the user to resolve."),
     _user: UserInfo = Depends(get_current_user),
@@ -749,6 +776,7 @@ async def get_airtable_user_id(
         "'3. Active Program' or '4. Publicly Launched'"
     ),
 )
+@airtable_cache(table="MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE")
 async def get_active_programs_count(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -766,6 +794,7 @@ async def get_active_programs_count(
         "'4. Publicly Launched'"
     ),
 )
+@airtable_cache(table="MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE")
 async def get_active_programs(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -778,10 +807,12 @@ async def get_active_programs(
     "/get_distinct_fellows_count",
     response_model=CountResponse,
     summary=(
-        "Number of fellows: distinct Work Email values in the Users table "
-        "where Employment Type includes 'Fellow (Unpaid)' OR For Website == 'Fellow'"
+        "Number of fellows: distinct Work Emails resolved from the Master "
+        "List's 'Program Lead/Fellow' values (Status = 'Fellowship (Scoping)') "
+        "matched against the Users table by Name."
     ),
 )
+@airtable_cache(table=["MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "USERS_TABLE"])
 async def get_distinct_fellows_count(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -794,11 +825,12 @@ async def get_distinct_fellows_count(
     "/get_distinct_fellows",
     response_model=list[PersonContactItem],
     summary=(
-        "Unique fellows (First Name, Last Name, Work Email) from the Users "
-        "table where Employment Type includes 'Fellow (Unpaid)' OR "
-        "For Website == 'Fellow'"
+        "Unique fellows (First Name, Last Name, Work Email) resolved from the "
+        "Master List's 'Program Lead/Fellow' values (Status = 'Fellowship "
+        "(Scoping)') matched against the Users table by Name."
     ),
 )
+@airtable_cache(table=["MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "USERS_TABLE"])
 async def get_distinct_fellows(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -812,6 +844,7 @@ async def get_distinct_fellows(
     response_model=CountResponse,
     summary="Number of distinct 'Name' values in the Users table where Status == 'Active'",
 )
+@airtable_cache(table="USERS_TABLE")
 async def get_team_size(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -828,6 +861,7 @@ async def get_team_size(
         "table where Status == 'Active'"
     ),
 )
+@airtable_cache(table="USERS_TABLE")
 async def get_team_members(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -847,6 +881,7 @@ async def get_team_members(
         "Document URL may be empty."
     ),
 )
+@airtable_cache(table="GRANT_APPLICATION_RESOURCES_TABLE")
 async def get_grant_app_resources(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -864,6 +899,7 @@ async def get_grant_app_resources(
         "'document' is required; other fields are optional."
     ),
 )
+@invalidates_cache(["get_grant_app_resources"])
 async def create_grant_app_resource(
     payload: GrantAppResourceCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -887,6 +923,7 @@ async def create_grant_app_resource(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_grant_app_resources"])
 async def update_grant_app_resource(
     pf_id: int,
     payload: GrantAppResourceUpdate = Body(...),
@@ -910,6 +947,7 @@ async def update_grant_app_resource(
         "(admin only)."
     ),
 )
+@invalidates_cache(["get_grant_app_resources"])
 async def delete_grant_app_resource(
     pf_id: int,
     user: UserInfo = Depends(get_current_user),
@@ -931,6 +969,7 @@ async def delete_grant_app_resource(
     response_model=list[FinanceLinkRecord],
     summary="List rows from the Finance Links table (Id, Document, Document URL).",
 )
+@airtable_cache(table="FINANCE_LINKS_TABLE")
 async def get_finance_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -948,6 +987,7 @@ async def get_finance_links(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_finance_links"])
 async def update_finance_link(
     document_url: str = Query(
         ...,
@@ -973,6 +1013,7 @@ async def update_finance_link(
     response_model=list[OfficeSpaceRecord],
     summary="List rows from the Office Spaces table (Id, Branch, Address, Details).",
 )
+@airtable_cache(table="OFFICE_SPACES_TABLE")
 async def get_office_spaces(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -990,6 +1031,7 @@ async def get_office_spaces(
         "'branch' and 'address' are required; 'details' is optional."
     ),
 )
+@invalidates_cache(["get_office_spaces"])
 async def create_office_space(
     payload: OfficeSpaceCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1011,6 +1053,7 @@ async def create_office_space(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_office_spaces"])
 async def update_office_space(
     branch: str = Query(
         ...,
@@ -1038,6 +1081,7 @@ async def update_office_space(
         "Optionally filter by 'UI Page'."
     ),
 )
+@airtable_cache(table="GOOGLE_DOCS_TABS_TABLE")
 async def get_google_docs_tabs(
     ui_page: str | None = Query(
         default=None,
@@ -1063,6 +1107,7 @@ async def get_google_docs_tabs(
         "(Meeting Title, Description, Attachment URL)."
     ),
 )
+@airtable_cache(table="MEETING_CADENCE_TABLE")
 async def get_meeting_cadence(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1079,6 +1124,7 @@ async def get_meeting_cadence(
         "(Document, Document URL, Description)."
     ),
 )
+@airtable_cache(table="USEFUL_LINKS_TABLE")
 async def get_useful_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1095,6 +1141,7 @@ async def get_useful_links(
         "(Document, Document URL, Description)."
     ),
 )
+@airtable_cache(table="HR_AND_BENEFITS_TABLE")
 async def get_hr_and_benefits(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1111,6 +1158,7 @@ async def get_hr_and_benefits(
         "(Id, Text, Link, Category, Type), optionally filtered by Category."
     ),
 )
+@airtable_cache(table="PARTNERSHIPS_LINKS_TABLE")
 async def get_partnerships_links(
     category: str | None = Query(
         default=None,
@@ -1134,6 +1182,7 @@ async def get_partnerships_links(
         "'text' and 'link' are required; 'category' and 'type' are optional."
     ),
 )
+@invalidates_cache(["get_partnerships_links"])
 async def create_partnerships_link(
     payload: PartnershipsLinkCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1155,6 +1204,7 @@ async def create_partnerships_link(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_partnerships_links"])
 async def update_partnerships_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: PartnershipsLinkUpdate = Body(...),
@@ -1176,6 +1226,7 @@ async def update_partnerships_link(
         "If 'id' is omitted, ALL records in the table are deleted."
     ),
 )
+@invalidates_cache(["get_partnerships_links"])
 async def delete_partnerships_link(
     id: int | None = Query(
         default=None,
@@ -1203,6 +1254,7 @@ async def delete_partnerships_link(
     response_model=list[PolicyLinkRecord],
     summary="List rows from the Policy Links table (Id, Text, URL).",
 )
+@airtable_cache(table="POLICY_LINKS_TABLE")
 async def get_policy_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1217,6 +1269,7 @@ async def get_policy_links(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Policy Links record (admin only).",
 )
+@invalidates_cache(["get_policy_links"])
 async def create_policy_link(
     payload: PolicyLinkCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1238,6 +1291,7 @@ async def create_policy_link(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_policy_links"])
 async def update_policy_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: PolicyLinkUpdate = Body(...),
@@ -1256,6 +1310,7 @@ async def update_policy_link(
     "/policy_links",
     summary="Delete a Policy Links record by its 'Id' (admin only).",
 )
+@invalidates_cache(["get_policy_links"])
 async def delete_policy_link(
     id: int = Query(
         ...,
@@ -1283,6 +1338,7 @@ async def delete_policy_link(
         "(Id, Title, Anchor Text, Type, URL, Email)."
     ),
 )
+@airtable_cache(table="EVENTS_QUICK_LINKS_TABLE")
 async def get_events_quick_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1297,6 +1353,7 @@ async def get_events_quick_links(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Events Quick Links record (admin only).",
 )
+@invalidates_cache(["get_events_quick_links"])
 async def create_events_quick_link(
     payload: EventsQuickLinkCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1318,6 +1375,7 @@ async def create_events_quick_link(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_events_quick_links"])
 async def update_events_quick_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: EventsQuickLinkUpdate = Body(...),
@@ -1336,6 +1394,7 @@ async def update_events_quick_link(
     "/events_quick_links",
     summary="Delete an Events Quick Links record by its 'Id' (admin only).",
 )
+@invalidates_cache(["get_events_quick_links"])
 async def delete_events_quick_link(
     id: int = Query(
         ...,
@@ -1360,6 +1419,7 @@ async def delete_events_quick_link(
     response_model=list[FinanceQuickLinkRecord],
     summary="List rows from the Finance Quick Links table (Id, Anchor Text, URL).",
 )
+@airtable_cache(table="FINANCE_QUICK_LINKS_TABLE")
 async def get_finance_quick_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1374,6 +1434,7 @@ async def get_finance_quick_links(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Finance Quick Links record (admin only).",
 )
+@invalidates_cache(["get_finance_quick_links"])
 async def create_finance_quick_link(
     payload: FinanceQuickLinkCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1395,6 +1456,7 @@ async def create_finance_quick_link(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_finance_quick_links"])
 async def update_finance_quick_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: FinanceQuickLinkUpdate = Body(...),
@@ -1413,6 +1475,7 @@ async def update_finance_quick_link(
     "/finance_quick_links",
     summary="Delete a Finance Quick Links record by its 'Id' (admin only).",
 )
+@invalidates_cache(["get_finance_quick_links"])
 async def delete_finance_quick_link(
     id: int = Query(
         ...,
@@ -1440,6 +1503,7 @@ async def delete_finance_quick_link(
         "(Id, Anchor Text, URL)."
     ),
 )
+@airtable_cache(table="RENPHIL_DUE_DILIGENCE_LINKS_TABLE")
 async def get_renphil_due_diligence_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1454,6 +1518,7 @@ async def get_renphil_due_diligence_links(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new RenPhil Due Diligence Links record (admin only).",
 )
+@invalidates_cache(["get_renphil_due_diligence_links"])
 async def create_renphil_due_diligence_link(
     payload: RenphilDueDiligenceLinkCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1477,6 +1542,7 @@ async def create_renphil_due_diligence_link(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_renphil_due_diligence_links"])
 async def update_renphil_due_diligence_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: RenphilDueDiligenceLinkUpdate = Body(...),
@@ -1497,6 +1563,7 @@ async def update_renphil_due_diligence_link(
     "/renphil_due_diligence_links",
     summary="Delete a RenPhil Due Diligence Links record by its 'Id' (admin only).",
 )
+@invalidates_cache(["get_renphil_due_diligence_links"])
 async def delete_renphil_due_diligence_link(
     id: int = Query(
         ...,
@@ -1526,6 +1593,7 @@ async def delete_renphil_due_diligence_link(
         "(Id, Title, Full Name, Role, Organization, Contact, Entity, Tabs)."
     ),
 )
+@airtable_cache(table="BOARD_MEMBER_LIST_TABLE")
 async def get_board_members(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1544,6 +1612,7 @@ async def get_board_members(
         "entity, and tabs are optional."
     ),
 )
+@invalidates_cache(["get_board_members"])
 async def create_board_member(
     payload: BoardMemberCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1565,6 +1634,7 @@ async def create_board_member(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_board_members"])
 async def update_board_member(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: BoardMemberUpdate = Body(...),
@@ -1583,6 +1653,7 @@ async def update_board_member(
     "/board_members",
     summary="Delete a Board Member List record by its 'Id' (admin only).",
 )
+@invalidates_cache(["get_board_members"])
 async def delete_board_member(
     id: int = Query(
         ...,
@@ -1610,6 +1681,7 @@ async def delete_board_member(
         "(Id, Title, Content, Entity, Tabs)."
     ),
 )
+@airtable_cache(table="ORGANIZATION_INFO_TABLE")
 async def get_organization_info(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1627,6 +1699,7 @@ async def get_organization_info(
         "'title' and 'content' are required; 'entity' and 'tabs' are optional."
     ),
 )
+@invalidates_cache(["get_organization_info"])
 async def create_organization_info(
     payload: OrganizationInfoCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1648,6 +1721,7 @@ async def create_organization_info(
         "(admin only). Any subset of fields may be provided."
     ),
 )
+@invalidates_cache(["get_organization_info"])
 async def update_organization_info(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: OrganizationInfoUpdate = Body(...),
@@ -1666,6 +1740,7 @@ async def update_organization_info(
     "/organization_info",
     summary="Delete an Organization Info record by its 'Id' (admin only).",
 )
+@invalidates_cache(["get_organization_info"])
 async def delete_organization_info(
     id: int = Query(
         ...,
@@ -1690,6 +1765,7 @@ async def delete_organization_info(
         "(Document, Document URL, Notes)."
     ),
 )
+@airtable_cache(table="ONBOARDING_TABLE")
 async def get_onboarding_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1703,6 +1779,7 @@ async def get_onboarding_links(
     response_model=list[OnboardingCallRecord],
     summary="List rows from the Onboarding Calls table (Date, Notes).",
 )
+@airtable_cache(table="ONBOARDING_CALLS_TABLE")
 async def get_onboarding_calls(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1719,6 +1796,7 @@ async def get_onboarding_calls(
     response_model=list[QuickLinkRecord],
     summary="List rows from the Quick Links table.",
 )
+@airtable_cache(table="QUICK_LINKS_TABLE")
 async def get_quick_links(
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
@@ -1733,6 +1811,7 @@ async def get_quick_links(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Quick Link (admin only)",
 )
+@invalidates_cache(["get_quick_links"])
 async def create_quick_link(
     payload: QuickLinkCreate,
     user: UserInfo = Depends(get_current_user),
@@ -1751,6 +1830,7 @@ async def create_quick_link(
     response_model=QuickLinkRecord,
     summary="Update a Quick Link by its Id (admin only)",
 )
+@invalidates_cache(["get_quick_links"])
 async def update_quick_link(
     payload: QuickLinkUpdate,
     quick_link_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
@@ -1769,6 +1849,7 @@ async def update_quick_link(
     "/quick_links/{quick_link_id}",
     summary="Delete a Quick Link by its Id (admin only)",
 )
+@invalidates_cache(["get_quick_links"])
 async def delete_quick_link(
     quick_link_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     user: UserInfo = Depends(get_current_user),
@@ -1790,6 +1871,7 @@ async def delete_quick_link(
     response_model=AnnouncementRecord,
     summary="Create a new announcement (Status defaults to 'Drafted')",
 )
+@invalidates_cache(["list_announcements", "get_announcement_categories", "list_announcements_by_author"])
 async def create_announcement(
     payload: AnnouncementCreate = Body(...),
     _user: UserInfo = Depends(get_current_user),
@@ -1803,6 +1885,7 @@ async def create_announcement(
     response_model=AnnouncementRecord,
     summary="Update one or more fields on an announcement by its Announcement Id",
 )
+@invalidates_cache(["list_announcements", "get_announcement_categories", "list_announcements_by_author"])
 async def update_announcement(
     announcement_id: int = Path(..., description="Value of the 'Announcement Id' (Autonumber) field."),
     payload: AnnouncementUpdate = Body(...),
@@ -1812,11 +1895,27 @@ async def update_announcement(
     return await airtable_service.update_announcement(announcement_id, payload)
 
 
+# Dependency form — enforces the admin check for ``?all=true`` BEFORE the
+# cache layer, so a non-admin can never receive a cached full-list response.
+async def _list_announcements_authz(
+    all: bool = Query(default=False),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+) -> None:
+    if all and not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to list all announcements.",
+        )
+
+
 @router.get(
     "/announcements",
     response_model=list[AnnouncementRecord],
+    dependencies=[Depends(_list_announcements_authz)],
     summary="List announcements (published only by default; admins may list all)",
 )
+@airtable_cache(table="ANNOUNCEMENTS_TABLE")
 async def list_announcements(
     all: bool = Query(
         default=False,
@@ -1826,15 +1925,9 @@ async def list_announcements(
             "announcements with Status='Published' are returned."
         ),
     ),
-    user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     if all:
-        if not await airtable_service.is_hub_admin(user.email):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin privileges required to list all announcements.",
-            )
         return await airtable_service.list_announcements(published_only=False)
     return await airtable_service.list_announcements(published_only=True)
 
@@ -1844,6 +1937,7 @@ async def list_announcements(
     response_model=list[str],
     summary="Unique Category values used across announcements",
 )
+@airtable_cache(table="ANNOUNCEMENTS_TABLE")
 async def get_announcement_categories(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -1856,6 +1950,7 @@ async def get_announcement_categories(
     response_model=list[AnnouncementRecord],
     summary="List announcements authored by a specific email",
 )
+@airtable_cache(table="ANNOUNCEMENTS_TABLE")
 async def list_announcements_by_author(
     author_email: str = Path(..., description="Author email to filter by."),
     _user: UserInfo = Depends(get_current_user),
@@ -1868,6 +1963,7 @@ async def list_announcements_by_author(
     "/announcements/{announcement_id}",
     summary="Delete an announcement by its Id (admin only)",
 )
+@invalidates_cache(["list_announcements", "get_announcement_categories", "list_announcements_by_author"])
 async def delete_announcement(
     announcement_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     user: UserInfo = Depends(get_current_user),
@@ -1897,16 +1993,25 @@ async def _require_admin(
         )
 
 
+# Dependency form — runs BEFORE the cache layer so cached responses can never
+# be served to a non-admin.
+async def _require_admin_dep(
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+) -> None:
+    await _require_admin(user, airtable_service)
+
+
 @router.get(
     "/access-control",
     response_model=list[AccessControlRecord],
+    dependencies=[Depends(_require_admin_dep)],
     summary="List all Access Control records (admin only)",
 )
+@airtable_cache(table="ACCESS_CONTROL_TABLE")
 async def list_access_control(
-    user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
     return await airtable_service.list_access_control_records()
 
 
@@ -1915,6 +2020,7 @@ async def list_access_control(
     response_model=AccessControlRecord,
     summary="Upsert role(s) and/or permission(s) for a user email (admin only)",
 )
+@invalidates_cache(["list_access_control"])
 async def assign_access_control(
     payload: AccessControlAssign = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1929,6 +2035,7 @@ async def assign_access_control(
     response_model=AccessControlRecord,
     summary="Remove role(s) and/or permission(s) for a user email (admin only)",
 )
+@invalidates_cache(["list_access_control"])
 async def revoke_access_control(
     payload: AccessControlRevoke = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1943,6 +2050,7 @@ async def revoke_access_control(
     response_model=list[str],
     summary="Unique Work Email values from the Teams table",
 )
+@airtable_cache(table="TEAMS_TABLE")
 async def get_team_emails(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -1955,6 +2063,7 @@ async def get_team_emails(
     response_model=list[Role],
     summary="Roles from the Roles table with their resolved Permissions",
 )
+@airtable_cache(table="ROLES_TABLE")
 async def get_roles(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -1967,6 +2076,7 @@ async def get_roles(
     response_model=list[Permission],
     summary="Permissions from the Permissions table (id + Permission Name + Description)",
 )
+@airtable_cache(table="PERMISSIONS_TABLE")
 async def get_permissions(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -1980,6 +2090,7 @@ async def get_permissions(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Role (admin only)",
 )
+@invalidates_cache(["get_roles", "list_access_control"])
 async def create_role(
     payload: RoleCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1994,6 +2105,7 @@ async def create_role(
     response_model=Role,
     summary="Update a Role: name, scope, and/or permissions (admin only)",
 )
+@invalidates_cache(["get_roles", "list_access_control"])
 async def update_role(
     role_id: str = Path(..., description="Role record id."),
     payload: RoleUpdate = Body(...),
@@ -2009,6 +2121,7 @@ async def update_role(
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a Role (admin only)",
 )
+@invalidates_cache(["get_roles", "list_access_control"])
 async def delete_role(
     role_id: str = Path(..., description="Role record id."),
     user: UserInfo = Depends(get_current_user),
@@ -2041,6 +2154,22 @@ async def delete_role(
     response_model=MasterListFundsAndSubprogramsRecord,
     summary="Update a Master List fund/subprogram record (admin only)",
 )
+@invalidates_cache([
+    "get_funds_and_subprograms",
+    "get_active_programs_count",
+    "get_active_programs",
+    "get_program_names",
+    "get_onboarding_checklist",
+    "get_awarded_opportunities",
+    "get_funds_progs_monthly_checkin",
+    "get_funds_progs_monthly_checkin_count",
+    "get_funds_progs_status_distribution",
+    "get_reports_with_followups",
+    "get_recent_complete_reports",
+    "get_archived_reports_by_program",
+    "get_distinct_fellows_count",
+    "get_distinct_fellows",
+])
 async def update_funds_and_subprograms_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2061,6 +2190,7 @@ async def update_funds_and_subprograms_record(
     response_model=GlossaryRecord,
     summary="Update a Glossary record (admin only)",
 )
+@invalidates_cache(["get_glossary_data"])
 async def update_glossary_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2081,6 +2211,7 @@ async def update_glossary_record(
     response_model=OrgFriendsRecord,
     summary="Update an Org Friends record (admin only)",
 )
+@invalidates_cache(["get_org_friends"])
 async def update_org_friends_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2101,6 +2232,7 @@ async def update_org_friends_record(
     response_model=FundersRecord,
     summary="Update a Funders record (admin only)",
 )
+@invalidates_cache(["get_funders"])
 async def update_funders_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2121,6 +2253,16 @@ async def update_funders_record(
     response_model=MonthlyCheckinRecord,
     summary="Update a Funds & Programs Monthly Check-In record (admin only)",
 )
+@invalidates_cache([
+    "get_funds_progs_monthly_checkin",
+    "get_funds_progs_monthly_checkin_count",
+    "get_funds_progs_status_distribution",
+    "get_reports_with_followups",
+    "get_recent_complete_reports",
+    "get_archived_reports_by_program",
+    "get_status_values",
+    "get_reporting_leads",
+])
 async def update_monthly_checkin_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2141,6 +2283,7 @@ async def update_monthly_checkin_record(
     response_model=CheckinReportingPeriodRecord,
     summary="Update a Check-In Reporting Period record (admin only)",
 )
+@invalidates_cache(["get_checkin_reporting_periods", "get_unique_checkin_reporting_periods"])
 async def update_checkin_reporting_period_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2162,6 +2305,7 @@ async def update_checkin_reporting_period_record(
     response_model=ShareableDocsRecord,
     summary="Update a Shareable Docs record (admin only)",
 )
+@invalidates_cache(["get_shareable_docs"])
 async def update_shareable_docs_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
@@ -2185,6 +2329,7 @@ async def update_shareable_docs_record(
     response_model=list[TicketRecord],
     summary="List all tickets",
 )
+@airtable_cache(table="TICKETS_TABLE")
 async def list_tickets(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -2197,6 +2342,7 @@ async def list_tickets(
     response_model=list[TicketRecord],
     summary="List tickets assigned to a specific assignee email",
 )
+@airtable_cache(table="TICKETS_TABLE")
 async def list_tickets_by_assignee(
     assignee_email: str = Path(..., description="Assignee email to filter by."),
     _user: UserInfo = Depends(get_current_user),
@@ -2210,6 +2356,7 @@ async def list_tickets_by_assignee(
     response_model=TicketRecord,
     summary="Create a new ticket",
 )
+@invalidates_cache(["list_tickets", "list_tickets_by_assignee"])
 async def create_ticket(
     payload: TicketCreate = Body(...),
     _user: UserInfo = Depends(get_current_user),
@@ -2456,6 +2603,7 @@ async def _process_slack_ticket(
     "/tickets/webhook/slack",
     summary="Slash-command webhook: receives the /tickets command from Slack.",
 )
+@invalidates_cache(["list_tickets", "list_tickets_by_assignee"])
 async def slack_ticket_webhook(
     request: Request,
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -2660,6 +2808,7 @@ async def _process_email_ticket(
     "/tickets/webhook/email",
     summary="Webhook: create a ticket from an email-based assignment.",
 )
+@invalidates_cache(["list_tickets", "list_tickets_by_assignee"])
 async def email_ticket_webhook(
     payload: EmailTicketWebhookPayload = Body(...),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -2725,6 +2874,7 @@ def _is_ticket_assignee(record: dict, email: str) -> bool:
         "the assignee may edit only the Status)"
     ),
 )
+@invalidates_cache(["list_tickets", "list_tickets_by_assignee"])
 async def update_ticket(
     ticket_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     payload: TicketUpdate = Body(...),
@@ -2779,6 +2929,7 @@ async def update_ticket(
     "/tickets/{ticket_id}",
     summary="Delete a ticket (admins or the original creator only)",
 )
+@invalidates_cache(["list_tickets", "list_tickets_by_assignee"])
 async def delete_ticket(
     ticket_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     user: UserInfo = Depends(get_current_user),
@@ -2809,6 +2960,7 @@ _USER_SELF_EDITABLE_FIELDS = {"dob", "home_address", "personal_email"}
     response_model=UserRecord,
     summary="Get a user by Work Email",
 )
+@airtable_cache(table="USERS_TABLE")
 async def get_user_by_email(
     work_email: str = Path(..., description="Work Email of the user to fetch."),
     _user: UserInfo = Depends(get_current_user),
@@ -2826,6 +2978,14 @@ async def get_user_by_email(
         "Personal Email."
     ),
 )
+@invalidates_cache([
+    "get_user_by_email",
+    "get_distinct_fellows_count",
+    "get_distinct_fellows",
+    "get_team_size",
+    "get_team_members",
+    "get_airtable_user_id",
+])
 async def update_user_by_email(
     work_email: str = Path(..., description="Work Email of the user to update."),
     payload: UserUpdate = Body(...),

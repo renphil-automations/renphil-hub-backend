@@ -35,3 +35,6 @@ logs/
 *.ps1
 RenPhil Partnerships Function.json
 scripts/fetch_tab_content.py
+scripts/
+app/db_v2/__init__.py
+app/db_v2/models/__init__.py
