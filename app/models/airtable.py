@@ -210,6 +210,16 @@ class RecordFieldsUpdate(BaseModel):
 # ══════════════════════════════════════════════════════════════════════
 
 # ── Master List of Funds & Subprograms ─────────────────────────────────
+class DeliverableItem(BaseModel):
+    """A resolved Deliverables row, embedded inside a Master List record when
+    its 'Upcoming Deliverables' lookup field is requested. Carries the full
+    set of fields from the Deliverables table (record id plus all columns)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = Field(description="Airtable record id in the Deliverables table.")
+
+
 class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     name: str | None = Field(default=None, alias="Name")
     fundraising_stage: list[str] | None = Field(default=None, alias="Fundraising Stage")
@@ -254,6 +264,15 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     )
     deliverable_due_date: list[str] | None = Field(
         default=None, alias="Deliverable Due Date"
+    )
+    upcoming_deliverables: list[DeliverableItem] | None = Field(
+        default=None,
+        alias="Upcoming Deliverables",
+        description=(
+            "Resolved Deliverables rows. This lookup field carries raw linked "
+            "Deliverables record ids in Airtable; they are resolved server-side "
+            "into the full Deliverables records (all fields)."
+        ),
     )
 
 
