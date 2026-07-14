@@ -174,6 +174,12 @@ _ML_LOOKUP_PROJECT_FIELDS = [
     "Technical Document / Deep Dive",
 ]
 
+# Master List → Deliverables lookup enrichment. The "Upcoming Deliverables"
+# lookup field carries raw linked Deliverables record ids (its source is a
+# linked-record field on the Awarded Opportunities table). They are resolved
+# server-side into the full Deliverables records.
+_UPCOMING_DELIVERABLES_FIELD = "Upcoming Deliverables"
+
 
 class AirtableService:
     """Async-friendly wrapper around ``pyairtable``."""
@@ -691,6 +697,9 @@ class AirtableService:
     def _awarded_opportunities_table(self):
         return self._fp_table(self._settings.AWARDED_OPPORTUNITIES_TABLE)
 
+    def _deliverables_table(self):
+        return self._fp_table(self._settings.DELIVERABLES_TABLE)
+
     def _monthly_checkin_table(self):
         return self._fp_table(
             self._settings.FUNDS_AND_PROGRAMS_MONTHLY_CHECKIN_TABLE
@@ -845,6 +854,37 @@ class AirtableService:
                 return empty_match
 
             records = [r for r in records if _passes(r)]
+
+        # Enrich the "Upcoming Deliverables" lookup whenever it is part of the
+        # response. The lookup carries raw linked Deliverables record ids
+        # (its source is a linked-record field), which are resolved here into
+        # the full Deliverables records (all fields).
+        enrich_deliverables = fields is None or _UPCOMING_DELIVERABLES_FIELD in fields
+        if enrich_deliverables:
+            id_set: set[str] = set()
+            for r in records:
+                for rid in (
+                    r.get("fields", {}).get(_UPCOMING_DELIVERABLES_FIELD) or []
+                ):
+                    if isinstance(rid, str):
+                        id_set.add(rid)
+
+            if id_set:
+                deliverable_recs = await self._get_records_by_ids(
+                    self._deliverables_table(), id_set
+                )
+                for r in records:
+                    ids = r.get("fields", {}).get(_UPCOMING_DELIVERABLES_FIELD)
+                    if not ids:
+                        continue
+                    r["fields"][_UPCOMING_DELIVERABLES_FIELD] = [
+                        {
+                            "id": rid,
+                            **(deliverable_recs.get(rid, {}).get("fields", {})),
+                        }
+                        for rid in ids
+                        if isinstance(rid, str)
+                    ]
 
         return self._to_typed(records, MasterListFundsAndSubprogramsRecord)
 

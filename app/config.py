@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     SHAREABLE_DOCS_TABLE: str
     CLUSTERS_TABLE: str
     AWARDED_OPPORTUNITIES_TABLE: str
+    DELIVERABLES_TABLE: str
     # RenPhil Hub base
     ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
