@@ -535,6 +535,61 @@ def get_tab_variants_v2(db: Session, parent_document_id: str) -> list[dict[str, 
     return summaries
 
 
+def _migrate_root_content_to_variant(
+    db: Session,
+    root_gridstack: GridstackV2,
+    variant_gridstack: GridstackV2,
+    variant_tab: TabV2,
+) -> None:
+    """Move a root tab's entire canvas into its first variant's gridstack.
+
+    Once any variant exists, the root's own canvas is no longer rendered (the
+    variant shown in its place is — see DashboardV2Page), so on the 0->1
+    transition the root's content must move into this first variant or it's
+    stranded (reachable only by deleting the variant). Mirrors the same
+    "first child adopts the content, container is left empty" pattern already
+    used by SGS's own 0->1 sub-tab migration and the SBN root-content
+    transplant.
+
+    Two things carry the content, and they're structural, not a serialized
+    blob — which is exactly why the frontend `updateTabContentV2` path can't
+    do this (it only diffs top-level widgets within one gridstack):
+      1. Direct child gridstacks (the root's SGS sub-tab subtree) are
+         re-parented onto the variant's gridstack. Their descendants keep
+         their own parent_id chain but all adopt the variant tab as their
+         owning tab (parent_tab_id) — matching move_tab_by_document_id_v2's
+         cascade on an ordinary move.
+      2. Top-level components sitting directly on the root canvas are moved
+         across. Super Block Note descendants (super_blocknote_id set) aren't
+         top-level and are skipped here, but cascade with their SBN root via
+         _cascade_gridstack_id_to_sbn_descendants (same rule as the by-link
+         re-parenting branch in update_tab_content_v2).
+    The root gridstack is left empty — a pure container from then on.
+    """
+    child_gridstacks = (
+        db.query(GridstackV2).filter(GridstackV2.parent_id == root_gridstack.id).all()
+    )
+    for child in child_gridstacks:
+        child.parent_id = variant_gridstack.id
+        child.parent_tab_id = variant_tab.id
+        for descendant_id in get_descendant_gridstack_ids(db, child.id):
+            descendant = db.query(GridstackV2).filter(GridstackV2.id == descendant_id).first()
+            if descendant is not None:
+                descendant.parent_tab_id = variant_tab.id
+
+    top_level_components = (
+        db.query(ComponentV2)
+        .filter(
+            ComponentV2.gridstack_id == root_gridstack.id,
+            ComponentV2.super_blocknote_id.is_(None),
+        )
+        .all()
+    )
+    for component in top_level_components:
+        component.gridstack_id = variant_gridstack.id
+        _cascade_gridstack_id_to_sbn_descendants(db, component.id, variant_gridstack.id)
+
+
 def create_tab_variant_v2(
     db: Session,
     parent_document_id: str,
@@ -573,6 +628,14 @@ def create_tab_variant_v2(
         if existing is not None:
             raise ValueError("A tab variant with this title already exists under the same parent")
 
+        # The first variant created under a root adopts the root's entire
+        # existing canvas (see _migrate_root_content_to_variant); later
+        # variants start blank. Determine this before the new variant row is
+        # added below so the count reflects only pre-existing variants.
+        is_first_variant = (
+            db.query(TabV2).filter(TabV2.parent_tab_id == parent_tab.id).count() == 0
+        )
+
         now = _utc_now()
         new_tab = TabV2(
             document_id=_generate_id(),
@@ -591,13 +654,19 @@ def create_tab_variant_v2(
         new_gridstack = GridstackV2(
             document_id=new_tab.document_id,
             name=title,
-            settings={},
+            # The first variant inherits the root gridstack's settings (e.g.
+            # the SGS tab-bar position) since it adopts the root's whole
+            # canvas; later variants start with a blank settings dict.
+            settings=dict(parent_gridstack.settings or {}) if is_first_variant else {},
             position=order,
             parent_id=None,
             parent_tab_id=new_tab.id,
         )
         db.add(new_gridstack)
         db.flush()
+
+        if is_first_variant:
+            _migrate_root_content_to_variant(db, parent_gridstack, new_gridstack, new_tab)
 
         db.commit()
         return _format_tab_summary(db, new_gridstack)
@@ -895,6 +964,25 @@ def update_tab_content_v2(
                 if widget_type != MIRROR_WIDGET_TYPE:
                     db.flush()
                     _write_component_data(db, new_component, widget_data if isinstance(widget_data, dict) else {})
+
+        # Persist the Super GridStack tab-bar config. It rides in the canvas
+        # `content` (content.sgs) but is stored on the gridstack's own
+        # `settings` — this is the only runtime path that writes it (previously
+        # the field was silently dropped here, so a custom tab-bar position
+        # reverted to the 'top' default on every reload). Content is
+        # authoritative: set it when present, drop it when the canvas is no
+        # longer SGS-flagged. SGS rendering itself is driven by having child
+        # gridstacks, not by this flag, so this only governs tab-bar position.
+        if isinstance(content, dict):
+            settings = dict(gridstack.settings or {})
+            incoming_sgs = content.get("sgs")
+            if incoming_sgs is not None:
+                if settings.get("sgs") != incoming_sgs:
+                    settings["sgs"] = incoming_sgs
+                    gridstack.settings = settings
+            elif "sgs" in settings:
+                del settings["sgs"]
+                gridstack.settings = settings
 
         if _is_root(gridstack):
             tab = _get_root_tab(db, gridstack)

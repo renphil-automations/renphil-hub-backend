@@ -73,7 +73,19 @@ def _resolve_database_url_v2() -> str | URL:
 
 DATABASE_URL_V2 = _resolve_database_url_v2()
 
-engine_v2 = create_engine(DATABASE_URL_V2)
+# Neon (and most managed Postgres) close idle server-side connections after a
+# few minutes. Without ``pool_pre_ping`` the pool hands out a stale socket and
+# the next query fails with ``server closed the connection unexpectedly``.
+# ``pool_recycle`` proactively refreshes connections older than the value.
+# Mirrors the primary engine's config in ``app.database`` — this v2 engine is a
+# fully separate connection pool and needs the same safeguards independently.
+engine_v2 = create_engine(
+    DATABASE_URL_V2,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    connect_args={"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30,
+                  "keepalives_interval": 10, "keepalives_count": 3},
+)
 
 SessionLocalV2 = sessionmaker(
     autocommit=False,
