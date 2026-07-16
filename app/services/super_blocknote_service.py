@@ -38,6 +38,11 @@ from app.services.gridstack_service import (
 
 SBN_ROOT_TYPE = "super_block_note"
 SBN_LEAF_TYPE = "block_note"
+# Title of the auto-managed leaf that holds a Super Block Note root's own
+# blocknote content once it's moved off the (never-rendered) root — created
+# either when the root gains its first real child (create_sbn_node) or when
+# content is saved to a root that has no sub-tabs yet (update_sbn_content).
+OVERVIEW_TITLE = "Overview"
 
 
 def get_component_by_link(db: Session, link: str) -> ComponentV2 | None:
@@ -142,6 +147,53 @@ def get_sbn_content(db: Session, link: str) -> dict[str, Any] | None:
     return {"documentId": component.link, "content": data.get("content")}
 
 
+def _create_overview_leaf(
+    db: Session, root: ComponentV2, content: Any, order: int = 0
+) -> ComponentV2:
+    """Create the auto-managed "Overview" leaf under an SBN root and store
+    `content` in it. The root is a pure container from then on; the leaf is a
+    fully normal, renameable / deletable / reorderable sub-tab. Used from two
+    call sites — the first-child transplant (`create_sbn_node`) and the
+    save-with-no-sub-tabs redirect (`update_sbn_content`)."""
+    leaf = ComponentV2(
+        link=_generate_id(),
+        type=SBN_LEAF_TYPE,
+        title=OVERVIEW_TITLE,
+        props={"locked": False, "locked_by": "", "order": order},
+        access_control=root.access_control or _access_control_or_default(None),
+        x=0,
+        y=0,
+        width=6,
+        height=6,
+        gridstack_id=root.gridstack_id,
+        super_blocknote_id=root.id,
+        page_content_id=None,
+        current_grid_id=None,
+    )
+    db.add(leaf)
+    db.flush()
+    # A leaf (type="block_note") unwraps `data["content"]` before storing the
+    # bare list — re-write through its own convention rather than transplanting
+    # a raw page_content_id pointer, which would double-wrap the block list.
+    _write_component_data(db, leaf, {"content": content})
+    return leaf
+
+
+def _drop_root_content(db: Session, root: ComponentV2) -> None:
+    """Clear a root's own directly-held content, making it a pure container.
+    Its content has just been (or is being) moved into an "Overview" leaf."""
+    old_page_content_id = root.page_content_id
+    if old_page_content_id is None:
+        return
+    root.page_content_id = None
+    old_page_content = (
+        db.query(PageContentV2).filter(PageContentV2.id == old_page_content_id).first()
+    )
+    if old_page_content is not None:
+        db.delete(old_page_content)
+    db.flush()
+
+
 def update_sbn_content(
     db: Session, link: str, content: dict[str, Any] | list[Any] | None
 ) -> dict[str, Any] | None:
@@ -149,6 +201,26 @@ def update_sbn_content(
         component = get_component_by_link(db, link)
         if component is None or not _is_sbn_member(component):
             return None
+
+        # A Super Block Note's root is never rendered as a selectable row, so
+        # content saved directly on it would be unreachable once sub-tabs
+        # exist. When content is saved to a root that has NO sub-tabs yet,
+        # auto-create an "Overview" leaf holding it (first in order) and keep
+        # the root a pure container — so the content is always reachable as a
+        # normal sub-tab. Mirrors create_sbn_node's first-child transplant.
+        is_childless_root = (
+            component.type == SBN_ROOT_TYPE
+            and component.super_blocknote_id is None
+            and not _has_sbn_children(db, component.id)
+        )
+        block_content = content.get("content") if isinstance(content, dict) else content
+        if is_childless_root and block_content:
+            _create_overview_leaf(db, component, block_content, order=0)
+            _drop_root_content(db, component)
+            db.commit()
+            # The root is now an empty container; its content lives in the
+            # freshly-created "Overview" child (surfaced via /workspace).
+            return get_sbn_content(db, link)
 
         # Every SBN node's content is a plain BlockNote doc (Block[]) — the
         # user's confirmed scope narrowing (no rich per-sub-tab canvas yet).
@@ -187,47 +259,17 @@ def create_sbn_node(
         # sub-tabs exist — the root itself is never rendered as a selectable
         # row (see SuperBlockNoteWidget.tsx). The first time the root gains a
         # real child, transplant whatever it already holds into an
-        # auto-created "Root Content" leaf, first in order, so it stays
-        # reachable (and is a fully normal, renameable/deletable sub-tab from
-        # then on) instead of being silently stranded on the inert root.
+        # auto-created "Overview" leaf, first in order, so it stays reachable
+        # (and is a fully normal, renameable/deletable sub-tab from then on)
+        # instead of being silently stranded on the inert root.
         is_root = parent.super_blocknote_id is None and parent.type == SBN_ROOT_TYPE
         inserted_root_content = False
         if is_root and parent.page_content_id is not None and not _has_sbn_children(db, parent.id):
             root_data = _resolve_component_data(db, parent)
             root_content = root_data.get("content") or []
             if root_content:
-                old_page_content_id = parent.page_content_id
-                root_content_node = ComponentV2(
-                    link=_generate_id(),
-                    type=SBN_LEAF_TYPE,
-                    title="Root Content",
-                    props={"locked": False, "locked_by": "", "order": 0},
-                    access_control=parent.access_control or _access_control_or_default(None),
-                    x=0,
-                    y=0,
-                    width=6,
-                    height=6,
-                    gridstack_id=parent.gridstack_id,
-                    super_blocknote_id=parent.id,
-                    page_content_id=None,
-                    current_grid_id=None,
-                )
-                db.add(root_content_node)
-                db.flush()
-                # Root (type="super_block_note") and a leaf (type="block_note")
-                # use different storage conventions in _write_component_data —
-                # a leaf unwraps `data["content"]` before storing, root stores
-                # the dict as-is. Re-writing through the leaf's own convention
-                # here (rather than transplanting the raw page_content_id
-                # pointer) avoids double-wrapping the block list.
-                _write_component_data(db, root_content_node, {"content": root_content})
-                parent.page_content_id = None
-                old_page_content = (
-                    db.query(PageContentV2).filter(PageContentV2.id == old_page_content_id).first()
-                )
-                if old_page_content is not None:
-                    db.delete(old_page_content)
-                db.flush()
+                _create_overview_leaf(db, parent, root_content, order=0)
+                _drop_root_content(db, parent)
                 inserted_root_content = True
 
         if order is None:
