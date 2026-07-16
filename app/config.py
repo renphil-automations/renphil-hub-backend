@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     POLICY_LINKS_TABLE: str
     EVENTS_QUICK_LINKS_TABLE: str
     FINANCE_QUICK_LINKS_TABLE: str
+    COMMS_QUICK_LINKS_TABLE: str
     RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str
     BOARD_MEMBER_LIST_TABLE: str
     ORGANIZATION_INFO_TABLE: str
@@ -263,6 +264,7 @@ class Settings(BaseSettings):
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
     # ── Quick Actions fields ──────────────────────────────────────────
+    AT_F_QA_ID: str
     AT_F_QA_ACTION: str
 
     # ── Partnerships Links fields ─────────────────────────────────────
@@ -291,6 +293,13 @@ class Settings(BaseSettings):
     AT_F_FQL_URL: str
     AT_F_FQL_ENTITY: str
     AT_F_FQL_TABS: str
+
+    # ── Comms Quick Links fields ────────────────────────────────────
+    AT_F_CQL_ID: str
+    AT_F_CQL_ANCHOR_TEXT: str
+    AT_F_CQL_TYPE: str
+    AT_F_CQL_URL: str
+    AT_F_CQL_EMAIL: str
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
     AT_F_DDL_ID: str
