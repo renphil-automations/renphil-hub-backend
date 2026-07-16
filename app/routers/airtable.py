@@ -100,6 +100,9 @@ from app.models.airtable import (
     QuickLinkRecord,
     QuickLinkCreate,
     QuickLinkUpdate,
+    QuickActionRecord,
+    QuickActionCreate,
+    QuickActionUpdate,
     RecordFieldsUpdate,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
@@ -113,6 +116,9 @@ from app.models.airtable import (
     FinanceQuickLinkRecord,
     FinanceQuickLinkCreate,
     FinanceQuickLinkUpdate,
+    CommsQuickLinkRecord,
+    CommsQuickLinkCreate,
+    CommsQuickLinkUpdate,
     RenphilDueDiligenceLinkRecord,
     RenphilDueDiligenceLinkCreate,
     RenphilDueDiligenceLinkUpdate,
@@ -1451,6 +1457,87 @@ async def delete_finance_quick_link(
 
 
 # ═════════════════════════════════════════════════════════════════════
+#   Comms Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_comms_quick_links",
+    response_model=list[CommsQuickLinkRecord],
+    summary="List rows from the Comms Quick Links table (Id, Anchor Text, Type, URL, Email).",
+)
+@airtable_cache(table="COMMS_QUICK_LINKS_TABLE")
+async def get_comms_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_comms_quick_links(fields=fields)
+
+
+@router.post(
+    "/comms_quick_links",
+    response_model=CommsQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Comms Quick Links record (admin only).",
+)
+@invalidates_cache(["get_comms_quick_links"])
+async def create_comms_quick_link(
+    payload: CommsQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Comms Quick Links records.",
+        )
+    return await airtable_service.create_comms_quick_link(payload)
+
+
+@router.patch(
+    "/comms_quick_links",
+    response_model=CommsQuickLinkRecord,
+    summary=(
+        "Update a Comms Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+@invalidates_cache(["get_comms_quick_links"])
+async def update_comms_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: CommsQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Comms Quick Links records.",
+        )
+    return await airtable_service.update_comms_quick_link(id, payload)
+
+
+@router.delete(
+    "/comms_quick_links",
+    summary="Delete a Comms Quick Links record by its 'Id' (admin only).",
+)
+@invalidates_cache(["get_comms_quick_links"])
+async def delete_comms_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Comms Quick Links records.",
+        )
+    return await airtable_service.delete_comms_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
 #   RenPhil Due Diligence Links endpoints
 # ═════════════════════════════════════════════════════════════════════
 @router.get(
@@ -1819,6 +1906,67 @@ async def delete_quick_link(
             detail="Admin privileges required to delete a quick link.",
         )
     return await airtable_service.delete_quick_link(quick_link_id)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Quick Actions endpoints
+# ══════════════════════════════════════════════════════════════════════
+@router.post(
+    "/quick_actions",
+    response_model=QuickActionRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Quick Action from an 'Action' value (admin only)",
+)
+@invalidates_cache(["get_quick_links"])
+async def create_quick_action(
+    payload: QuickActionCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create a quick action.",
+        )
+    return await airtable_service.create_quick_action(payload)
+
+
+@router.patch(
+    "/quick_actions/{quick_action_id}",
+    response_model=QuickActionRecord,
+    summary="Update a Quick Action's 'Action' text by its Id (admin only)",
+)
+@invalidates_cache(["get_quick_links"])
+async def update_quick_action(
+    payload: QuickActionUpdate,
+    quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to update a quick action.",
+        )
+    return await airtable_service.update_quick_action(quick_action_id, payload)
+
+
+@router.delete(
+    "/quick_actions/{quick_action_id}",
+    summary="Delete a Quick Action by its Id (admin only)",
+)
+@invalidates_cache(["get_quick_links"])
+async def delete_quick_action(
+    quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete a quick action.",
+        )
+    return await airtable_service.delete_quick_action(quick_action_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
