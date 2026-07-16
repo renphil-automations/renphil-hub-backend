@@ -827,10 +827,28 @@ async def get_distinct_fellows(
 )
 @airtable_cache(table="USERS_TABLE")
 async def get_team_size(
+    included_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Keep only users whose 'Employment Type' contains any of these "
+            "values (substring, robust to spaces/dots/hyphens/case). "
+            "Omit or leave empty to skip."
+        ),
+    ),
+    excluded_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Drop users whose 'Employment Type' contains any of these values. "
+            "Takes precedence over included_employment_types on conflict."
+        ),
+    ),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_team_size()
+    return await airtable_service.get_team_size(
+        included_employment_types=included_employment_types,
+        excluded_employment_types=excluded_employment_types,
+    )
 
 
 # ── /get_team_members ─────────────────────────────────────────────────
@@ -844,10 +862,28 @@ async def get_team_size(
 )
 @airtable_cache(table="USERS_TABLE")
 async def get_team_members(
+    included_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Keep only users whose 'Employment Type' contains any of these "
+            "values (substring, robust to spaces/dots/hyphens/case). "
+            "Omit or leave empty to skip."
+        ),
+    ),
+    excluded_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Drop users whose 'Employment Type' contains any of these values. "
+            "Takes precedence over included_employment_types on conflict."
+        ),
+    ),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_team_members()
+    return await airtable_service.get_team_members(
+        included_employment_types=included_employment_types,
+        excluded_employment_types=excluded_employment_types,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════

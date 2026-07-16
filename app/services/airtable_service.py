@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Iterable
@@ -2427,13 +2428,85 @@ class AirtableService:
                 unique.add(value.strip())
         return sorted(unique)
 
-    async def get_team_size(self) -> CountResponse:
+    @staticmethod
+    def _normalize_employment_type(value: str) -> str:
+        """Normalize an employment-type token for robust matching.
+
+        Lower-cases and strips every non-alphanumeric character so that
+        differences in spaces, dots, hyphens, etc. are ignored (e.g.
+        'Full-Time', 'full time' and 'FullTime' all normalize equally)."""
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    def _filter_by_employment_type(
+        self,
+        records: list[dict[str, Any]],
+        included: list[str] | None,
+        excluded: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        """Filter Users records by the 'Employment Type' field.
+
+        * ``included`` — keep a record only if any of its Employment Type
+          values *contains* (normalized substring) any included token.
+        * ``excluded`` — drop a record if any of its Employment Type values
+          *contains* any excluded token.
+        * Both — apply both; exclusion takes precedence on conflict.
+        * Neither / empty — no filtering.
+
+        Matching is robust against spaces, dots, hyphens and case (see
+        :meth:`_normalize_employment_type`)."""
+        included_norm = [
+            n for n in (self._normalize_employment_type(v) for v in (included or [])) if n
+        ]
+        excluded_norm = [
+            n for n in (self._normalize_employment_type(v) for v in (excluded or [])) if n
+        ]
+        if not included_norm and not excluded_norm:
+            return records
+
+        emp_field = self._settings.USERS_EMPLOYMENT_TYPE_FIELD
+
+        def _entries(rec: dict[str, Any]) -> list[str]:
+            raw = rec.get("fields", {}).get(emp_field)
+            if raw is None:
+                return []
+            values = raw if isinstance(raw, list) else [raw]
+            return [self._normalize_employment_type(str(v)) for v in values]
+
+        out: list[dict[str, Any]] = []
+        for rec in records:
+            entries = _entries(rec)
+            if excluded_norm and any(
+                token in entry for entry in entries for token in excluded_norm
+            ):
+                continue  # exclusion wins
+            if included_norm and not any(
+                token in entry for entry in entries for token in included_norm
+            ):
+                continue
+            out.append(rec)
+        return out
+
+    async def get_team_size(
+        self,
+        *,
+        included_employment_types: list[str] | None = None,
+        excluded_employment_types: list[str] | None = None,
+    ) -> CountResponse:
         """Return the number of distinct non-empty 'Name' values in the Users
-        table where the 'Status' single-select equals 'Active'."""
-        name_field = self._settings.USERS_NAME_FIELD
-        formula = af.eq_str(self._settings.USERS_STATUS_FIELD, "Active")
+        table where the 'Status' single-select equals 'Active'.
+
+        Optionally filtered by the 'Employment Type' field (see
+        :meth:`_filter_by_employment_type`)."""
+        s = self._settings
+        name_field = s.USERS_NAME_FIELD
+        formula = af.eq_str(s.USERS_STATUS_FIELD, "Active")
         records = await self._list_records(
-            self._users_table(), formula=formula, fields=[name_field]
+            self._users_table(),
+            formula=formula,
+            fields=[name_field, s.USERS_EMPLOYMENT_TYPE_FIELD],
+        )
+        records = self._filter_by_employment_type(
+            records, included_employment_types, excluded_employment_types
         )
         unique: set[str] = set()
         for r in records:
@@ -2442,11 +2515,19 @@ class AirtableService:
                 unique.add(value.strip())
         return CountResponse(count=len(unique))
 
-    async def get_team_members(self) -> list[PersonContactItem]:
+    async def get_team_members(
+        self,
+        *,
+        included_employment_types: list[str] | None = None,
+        excluded_employment_types: list[str] | None = None,
+    ) -> list[PersonContactItem]:
         """Return the team members (First Name, Last Name, Work Email)
         from the Users table where the 'Status' single-select equals
         'Active'. Uses the same table and filter as :meth:`get_team_size`;
-        de-duplicated by 'Name'."""
+        de-duplicated by 'Name'.
+
+        Optionally filtered by the 'Employment Type' field (see
+        :meth:`_filter_by_employment_type`)."""
         s = self._settings
         formula = af.eq_str(s.USERS_STATUS_FIELD, "Active")
         records = await self._list_records(
@@ -2457,7 +2538,11 @@ class AirtableService:
                 s.USERS_FIRST_NAME_FIELD,
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
+                s.USERS_EMPLOYMENT_TYPE_FIELD,
             ],
+        )
+        records = self._filter_by_employment_type(
+            records, included_employment_types, excluded_employment_types
         )
         seen: set[str] = set()
         items: list[PersonContactItem] = []
