@@ -4252,8 +4252,23 @@ class AirtableService:
     async def create_quick_link(
         self, payload: QuickLinkCreate
     ) -> QuickLinkRecord:
-        """Create a Quick Links row, upserting the linked Quick Action."""
-        qa_record_id = await self._find_or_create_quick_action(payload.action)
+        """Create a Quick Links row linked to a Quick Action.
+
+        The Quick Action is resolved from either ``quick_action_id`` (an
+        existing record) or ``action`` (upserted by text).
+        """
+        if payload.quick_action_id is not None:
+            qa_record = await self._find_quick_action_by_id(payload.quick_action_id)
+            if qa_record is None:
+                raise HTTPException(
+                    status_code=_http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        f"Quick Action with Id={payload.quick_action_id} not found."
+                    ),
+                )
+            qa_record_id = qa_record["id"]
+        else:
+            qa_record_id = await self._find_or_create_quick_action(payload.action)
 
         body: dict[str, Any] = {
             self._F_QL_ANCHOR_TEXT: payload.anchor_text,

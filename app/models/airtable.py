@@ -1144,18 +1144,31 @@ class QuickLinkRecord(BaseModel):
 class QuickLinkCreate(BaseModel):
     """Payload to create a new Quick Links record.
 
-    The ``action`` string is upserted into the Quick Actions table and
-    linked to this record via the 'Quick Actions' linked-record field.
+    Provide exactly one of:
+
+    * ``action`` — action text; upserted into the Quick Actions table
+      (created if it does not already exist) and linked to this row.
+    * ``quick_action_id`` — the autonumber 'Id' of an existing Quick
+      Action to link to directly (no upsert).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     anchor_text: str = Field(description="Display text for the link.")
-    action: str = Field(
+    action: str | None = Field(
+        default=None,
         description=(
             "Action text. Will be created in the Quick Actions table if it "
-            "does not already exist, then linked to this Quick Links row."
-        )
+            "does not already exist, then linked to this Quick Links row. "
+            "Mutually exclusive with 'quick_action_id'."
+        ),
+    )
+    quick_action_id: int | None = Field(
+        default=None,
+        description=(
+            "Autonumber 'Id' of an existing Quick Action to link to. "
+            "Mutually exclusive with 'action'."
+        ),
     )
     url: str | None = Field(
         default=None, description="Optional URL the link points to."
@@ -1163,6 +1176,16 @@ class QuickLinkCreate(BaseModel):
     email: str | None = Field(
         default=None, description="Optional email address associated with the link."
     )
+
+    @model_validator(mode="after")
+    def _require_exactly_one_action_ref(self) -> "QuickLinkCreate":
+        has_action = bool(self.action and self.action.strip())
+        has_id = self.quick_action_id is not None
+        if has_action == has_id:
+            raise ValueError(
+                "Provide exactly one of 'action' or 'quick_action_id'."
+            )
+        return self
 
 
 class QuickLinkUpdate(BaseModel):
