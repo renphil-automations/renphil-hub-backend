@@ -1911,13 +1911,27 @@ async def delete_quick_link(
 # ══════════════════════════════════════════════════════════════════════
 #   Quick Actions endpoints
 # ══════════════════════════════════════════════════════════════════════
+@router.get(
+    "/quick_actions",
+    response_model=list[QuickActionRecord],
+    summary="List rows from the Quick Actions table (Id, Action).",
+)
+@airtable_cache(table="QUICK_ACTIONS_TABLE")
+async def get_quick_actions(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_quick_actions(fields=fields)
+
+
 @router.post(
     "/quick_actions",
     response_model=QuickActionRecord,
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Quick Action from an 'Action' value (admin only)",
 )
-@invalidates_cache(["get_quick_links"])
+@invalidates_cache(["get_quick_actions", "get_quick_links"])
 async def create_quick_action(
     payload: QuickActionCreate = Body(...),
     user: UserInfo = Depends(get_current_user),
@@ -1936,7 +1950,7 @@ async def create_quick_action(
     response_model=QuickActionRecord,
     summary="Update a Quick Action's 'Action' text by its Id (admin only)",
 )
-@invalidates_cache(["get_quick_links"])
+@invalidates_cache(["get_quick_actions", "get_quick_links"])
 async def update_quick_action(
     payload: QuickActionUpdate,
     quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
@@ -1955,7 +1969,7 @@ async def update_quick_action(
     "/quick_actions/{quick_action_id}",
     summary="Delete a Quick Action by its Id (admin only)",
 )
-@invalidates_cache(["get_quick_links"])
+@invalidates_cache(["get_quick_actions", "get_quick_links"])
 async def delete_quick_action(
     quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     user: UserInfo = Depends(get_current_user),

@@ -4343,6 +4343,15 @@ class AirtableService:
             for r in records
         ]
 
+    async def get_quick_actions(
+        self, *, fields: list[str] | None = None
+    ) -> list[QuickActionRecord]:
+        """Return all rows from the Quick Actions table."""
+        records = await self._list_records(
+            self._quick_actions_table(), fields=fields
+        )
+        return self._qa_to_typed(records)
+
     async def _find_quick_action_by_id(
         self, quick_action_id: int | str
     ) -> dict[str, Any] | None:
