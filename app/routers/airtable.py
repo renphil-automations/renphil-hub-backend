@@ -290,6 +290,21 @@ async def get_funds_and_subprograms(
     scoping_prop_overview_empty: bool | None = Query(default=None),
     initiative_types: list[str] | None = Query(default=None),
     focus_areas: list[str] | None = Query(default=None),
+    excluded_clusters: list[str] | None = Query(
+        default=None,
+        description=(
+            "Cluster 'Name' values to exclude. Records linked to any of these "
+            "clusters are omitted. Takes precedence over included_clusters on "
+            "overlap."
+        ),
+    ),
+    included_clusters: list[str] | None = Query(
+        default=None,
+        description=(
+            "Cluster 'Name' values to require. Only records linked to at least "
+            "one of these clusters are returned."
+        ),
+    ),
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -309,6 +324,8 @@ async def get_funds_and_subprograms(
         scoping_prop_overview_empty=scoping_prop_overview_empty,
         initiative_types=initiative_types,
         focus_areas=focus_areas,
+        excluded_clusters=excluded_clusters,
+        included_clusters=included_clusters,
         fields=fields,
     )
 

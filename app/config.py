@@ -174,6 +174,7 @@ class Settings(BaseSettings):
     AT_F_CHECKIN_HISTORY: str
     AT_F_CHECKIN_REPORTING_PERIOD: str
     AT_F_CLUSTER: str
+    AT_F_CLUSTER_NAME: str
     AT_F_DASHBOARD_DISPLAY: str
     AT_F_FOLLOWUP_INDICATED: str
     AT_F_DEADLINE: str

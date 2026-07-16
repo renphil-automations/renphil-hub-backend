@@ -154,6 +154,7 @@ _F_PROGRAM_NAME = _S.AT_F_PROGRAM_NAME
 _F_CHECKIN_HISTORY = _S.AT_F_CHECKIN_HISTORY
 _F_CHECKIN_REPORTING_PERIOD = _S.AT_F_CHECKIN_REPORTING_PERIOD
 _F_CLUSTER = _S.AT_F_CLUSTER
+_F_CLUSTER_NAME = _S.AT_F_CLUSTER_NAME
 _F_DASHBOARD_DISPLAY = _S.AT_F_DASHBOARD_DISPLAY
 _F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
 _F_DEADLINE = _S.AT_F_DEADLINE
@@ -784,6 +785,8 @@ class AirtableService:
         scoping_prop_overview_empty: bool | None = None,
         initiative_types: list[str] | None = None,
         focus_areas: list[str] | None = None,
+        excluded_clusters: list[str] | None = None,
+        included_clusters: list[str] | None = None,
         fields: list[str] | None = None,
     ) -> list[MasterListFundsAndSubprogramsRecord]:
         clauses: list[str | None] = [
@@ -837,6 +840,26 @@ class AirtableService:
 
         if focus_areas:
             clauses.append(af.multiselect_contains_any(_F_FOCUS_AREAS, focus_areas))
+
+        # Cluster Name filtering (lookup of the linked Cluster's 'Name').
+        #   * included_clusters — record must carry at least one of these names.
+        #   * excluded_clusters — record must carry NONE of these names.
+        # Exclusion takes precedence: any name present in both lists is
+        # treated as excluded (dropped from the inclusion set).
+        excluded_cluster_set = {c for c in (excluded_clusters or []) if c}
+        effective_included = [
+            c for c in (included_clusters or []) if c and c not in excluded_cluster_set
+        ]
+        if effective_included:
+            clauses.append(
+                af.multiselect_contains_any(_F_CLUSTER_NAME, effective_included)
+            )
+        if excluded_cluster_set:
+            excluded_clause = af.multiselect_contains_any(
+                _F_CLUSTER_NAME, sorted(excluded_cluster_set)
+            )
+            if excluded_clause:
+                clauses.append(f"NOT({excluded_clause})")
 
         formula = af.AND(*clauses)
         records = await self._list_records(
