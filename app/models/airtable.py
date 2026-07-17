@@ -885,6 +885,63 @@ class CommsQuickLinkUpdate(BaseModel):
     email: str | None = Field(default=None, alias="Email")
 
 
+# ── HR Quick Links ─────────────────────────────────────
+class HrQuickLinkRecord(BaseModel):
+    """A row from the HR Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(
+        default=None,
+        alias="Type",
+        description="Single-select value indicating the link kind.",
+    )
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class HrQuickLinkCreate(BaseModel):
+    """Payload to create an HR Quick Links record.
+
+    ``anchor_text`` is required; ``type``, ``url`` and ``email`` are
+    optional depending on the kind of link.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class HrQuickLinkUpdate(BaseModel):
+    """Partial update payload for an HR Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
 # ── RenPhil Due Diligence Links ────────────────────────────────────────
 class RenphilDueDiligenceLinkRecord(BaseModel):
     """A row from the RenPhil Due Diligence Links table.
