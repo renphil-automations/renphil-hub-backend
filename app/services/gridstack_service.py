@@ -59,6 +59,17 @@ MAX_ORDER_VALUE = 2147483647
 RESTRICTED_WIDGET_TYPE = "restricted"
 MIRROR_WIDGET_TYPE = "mirror"
 
+# A component row that represents a gridstack itself (see ComponentV2's
+# current_grid_id), not a real widget on any canvas. Every gridstack gets
+# exactly one, created alongside it. Starts as GRIDSTACK_WIDGET_TYPE; flips
+# to SUPER_GRIDSTACK_WIDGET_TYPE while its gridstack's settings.sgs tab-bar
+# config is set, and back when it's cleared (see the sync in
+# update_tab_content_v2). Never a pickable/renderable widget — every query
+# that lists "real" components on a canvas must exclude both types.
+GRIDSTACK_WIDGET_TYPE = "gridstack"
+SUPER_GRIDSTACK_WIDGET_TYPE = "super_gridstack"
+GRIDSTACK_REPRESENTATION_TYPES = (GRIDSTACK_WIDGET_TYPE, SUPER_GRIDSTACK_WIDGET_TYPE)
+
 
 # ---------------------------------------------------------
 # Small validation / generation helpers
@@ -115,6 +126,36 @@ def _access_control_or_default(access_control: dict[str, Any] | None) -> dict[st
     return access_control if access_control else DEFAULT_ACCESS_CONTROL
 
 
+def _create_gridstack_component(db: Session, gridstack: GridstackV2) -> ComponentV2:
+    """Create the ComponentV2 row that represents `gridstack` itself (see
+    current_grid_id on the model). Called once per gridstack, right after it
+    is flushed (so `gridstack.id` exists). Its type/props mirror the
+    gridstack's own settings.sgs at creation time, matching the sync in
+    update_tab_content_v2 — this lets a first tab-variant that inherits its
+    root's settings (including an already-set sgs config) start out already
+    flagged as a super gridstack, with no special-casing needed here."""
+    sgs = (gridstack.settings or {}).get("sgs")
+    component = ComponentV2(
+        link=_generate_id(),
+        title=None,
+        description=None,
+        type=SUPER_GRIDSTACK_WIDGET_TYPE if sgs else GRIDSTACK_WIDGET_TYPE,
+        x=None,
+        y=None,
+        width=None,
+        height=None,
+        props={"sgs": sgs} if sgs else None,
+        access_control=None,
+        current_grid_id=gridstack.id,
+        gridstack_id=gridstack.id,
+        page_content_id=None,
+        super_blocknote_id=None,
+    )
+    db.add(component)
+    db.flush()
+    return component
+
+
 # ---------------------------------------------------------
 # Lookup helpers
 # ---------------------------------------------------------
@@ -144,7 +185,10 @@ def _has_children(db: Session, gridstack_id: int) -> bool:
 def _has_content(db: Session, gridstack_id: int) -> bool:
     return (
         db.query(ComponentV2.id)
-        .filter(ComponentV2.gridstack_id == gridstack_id)
+        .filter(
+            ComponentV2.gridstack_id == gridstack_id,
+            ComponentV2.type.notin_(GRIDSTACK_REPRESENTATION_TYPES),
+        )
         .first()
         is not None
     )
@@ -361,11 +405,14 @@ def _serialize_gridstack_content(db: Session, gridstack: GridstackV2) -> dict[st
     # though they share this same gridstack_id (a NOT NULL column they must
     # still populate) — they're never real top-level canvas widgets, only
     # reachable through their own SBN tree (see super_blocknote_service.py).
+    # Also excludes the gridstack's own self-representation component (see
+    # current_grid_id on ComponentV2) — never a real widget either.
     components = (
         db.query(ComponentV2)
         .filter(
             ComponentV2.gridstack_id == gridstack.id,
             ComponentV2.super_blocknote_id.is_(None),
+            ComponentV2.type.notin_(GRIDSTACK_REPRESENTATION_TYPES),
         )
         .order_by(ComponentV2.id.asc())
         .all()
@@ -582,6 +629,7 @@ def _migrate_root_content_to_variant(
         .filter(
             ComponentV2.gridstack_id == root_gridstack.id,
             ComponentV2.super_blocknote_id.is_(None),
+            ComponentV2.type.notin_(GRIDSTACK_REPRESENTATION_TYPES),
         )
         .all()
     )
@@ -664,6 +712,7 @@ def create_tab_variant_v2(
         )
         db.add(new_gridstack)
         db.flush()
+        _create_gridstack_component(db, new_gridstack)
 
         if is_first_variant:
             _migrate_root_content_to_variant(db, parent_gridstack, new_gridstack, new_tab)
@@ -830,8 +879,9 @@ def update_tab_content_v2(
         incoming_layout = {entry.get("id"): entry for entry in (incoming.get("layout") or [])}
         incoming_widgets = incoming.get("widgets") or {}
 
-        # Excludes Super Block Note descendants (super_blocknote_id set) —
-        # they share this gridstack_id but are never part of the top-level
+        # Excludes Super Block Note descendants (super_blocknote_id set) and
+        # the gridstack's own self-representation component (current_grid_id)
+        # — both share this gridstack_id but are never part of the top-level
         # canvas diff; without this filter, every save of an unrelated
         # top-level widget would see them as "removed" (never present in
         # incoming_widgets, which only ever carries top-level entries) and
@@ -842,6 +892,7 @@ def update_tab_content_v2(
             .filter(
                 ComponentV2.gridstack_id == gridstack.id,
                 ComponentV2.super_blocknote_id.is_(None),
+                ComponentV2.type.notin_(GRIDSTACK_REPRESENTATION_TYPES),
             )
             .all()
         }
@@ -976,13 +1027,33 @@ def update_tab_content_v2(
         if isinstance(content, dict):
             settings = dict(gridstack.settings or {})
             incoming_sgs = content.get("sgs")
+            settings_changed = False
             if incoming_sgs is not None:
                 if settings.get("sgs") != incoming_sgs:
                     settings["sgs"] = incoming_sgs
                     gridstack.settings = settings
+                    settings_changed = True
             elif "sgs" in settings:
                 del settings["sgs"]
                 gridstack.settings = settings
+                settings_changed = True
+
+            # Keep this gridstack's own self-representation component (see
+            # current_grid_id on ComponentV2) in sync: gridstack while
+            # untouched/plain, super_gridstack while its tab-bar config is
+            # set, reverting back to gridstack if that config is cleared.
+            if settings_changed:
+                gridstack_component = (
+                    db.query(ComponentV2)
+                    .filter(ComponentV2.current_grid_id == gridstack.id)
+                    .first()
+                )
+                if gridstack_component is not None:
+                    new_sgs = settings.get("sgs")
+                    gridstack_component.type = (
+                        SUPER_GRIDSTACK_WIDGET_TYPE if new_sgs else GRIDSTACK_WIDGET_TYPE
+                    )
+                    gridstack_component.props = {"sgs": new_sgs} if new_sgs else None
 
         if _is_root(gridstack):
             tab = _get_root_tab(db, gridstack)
@@ -1073,6 +1144,7 @@ def create_tab_v2(
             )
             db.add(new_gridstack)
             db.flush()
+            _create_gridstack_component(db, new_gridstack)
         else:
             existing = _gridstack_exists_under_parent(
                 db, title, parent_tab_id=parent_gridstack.parent_tab_id, parent_id=parent_gridstack.id
@@ -1090,6 +1162,7 @@ def create_tab_v2(
             )
             db.add(new_gridstack)
             db.flush()
+            _create_gridstack_component(db, new_gridstack)
 
         if content:
             update_tab_content_v2(db, new_gridstack.document_id, content)
