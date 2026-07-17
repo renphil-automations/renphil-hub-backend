@@ -15,7 +15,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.helpers.http_client import close_http_client, init_http_client
-from app.routers import airtable, auth, dify, drive, tabs, diagnostics
+from app.routers import (
+    airtable,
+    auth,
+    calendar,
+    dify,
+    drive,
+    super_blocknote_v2,
+    tabs,
+    tabs_v2,
+    diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +74,11 @@ def create_app() -> FastAPI:
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
     app.include_router(airtable.router, prefix=api_prefix)
+    app.include_router(calendar.router, prefix=api_prefix)
 
     app.include_router(tabs.router, prefix=api_prefix)
+    app.include_router(tabs_v2.router, prefix=api_prefix)
+    app.include_router(super_blocknote_v2.router, prefix=api_prefix)
     app.include_router(diagnostics.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────

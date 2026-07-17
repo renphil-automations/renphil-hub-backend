@@ -24,6 +24,7 @@ from fastapi import (
     APIRouter,
     Body,
     Depends,
+    Header,
     HTTPException,
     Path,
     Query,
@@ -43,6 +44,7 @@ from app.helpers.slack import (
     verify_slack_signature,
 )
 from app.models.airtable import (
+    AirtablePreviewResponse,
     AirtableRecord,
     AirtableUserIdResponse,
     ActiveProgramItem,
@@ -130,6 +132,46 @@ from app.services.gemini_service import GeminiService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["Data"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Generic Airtable preview (dashboard Airtable widget)
+# ══════════════════════════════════════════════════════════════════════
+@router.get(
+    "/airtable/preview",
+    response_model=AirtablePreviewResponse,
+    summary="Read-only preview of an arbitrary Airtable table/view by share URL",
+    description="""
+Resolves a pasted Airtable share URL (containing an app... base id and a
+tbl... table id, optionally a viw... view id) to a capped, read-only set
+of rows.
+
+Unlike every other endpoint in this router, this is not tied to a fixed
+business table/schema — it's used by the dashboard's Airtable widget to
+display an arbitrary table the user points it at. Capped at 100 rows,
+no write-back.
+""",
+)
+async def get_airtable_preview(
+    url: str = Query(..., description="Airtable share URL to preview."),
+    fields: list[str] | None = Query(
+        default=None,
+        description="Column names to return. Omit (or pass none) for all columns.",
+    ),
+    formula: str | None = Query(
+        default=None,
+        description="Airtable formula to filter rows (e.g. AND({Status}=\"Active\")).",
+    ),
+    x_airtable_pat: str = Header(
+        alias="X-Airtable-PAT",
+        description="Airtable Personal Access Token scoped to the widget's base. Required.",
+    ),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.preview_from_url(
+        url, fields=fields, formula=formula, api_key=x_airtable_pat
+    )
 
 
 @router.get(

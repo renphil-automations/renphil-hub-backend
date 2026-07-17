@@ -28,3 +28,13 @@ generate_jwt_key.py
 # Logs
 logs/
 *.log
+
+# Local DB clone dumps (contains production data)
+.dbdump/
+*.yml
+*.ps1
+RenPhil Partnerships Function.json
+scripts/fetch_tab_content.py
+scripts/
+app/db_v2/__init__.py
+app/db_v2/models/__init__.py
