@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     EVENTS_QUICK_LINKS_TABLE: str
     FINANCE_QUICK_LINKS_TABLE: str
     COMMS_QUICK_LINKS_TABLE: str
+    HR_QUICK_LINKS_TABLE: str
     RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str
     BOARD_MEMBER_LIST_TABLE: str
     ORGANIZATION_INFO_TABLE: str
@@ -301,6 +302,13 @@ class Settings(BaseSettings):
     AT_F_CQL_TYPE: str
     AT_F_CQL_URL: str
     AT_F_CQL_EMAIL: str
+
+    # ── HR Quick Links fields ───────────────────────────────────────
+    AT_F_HRQL_ID: str
+    AT_F_HRQL_ANCHOR_TEXT: str
+    AT_F_HRQL_TYPE: str
+    AT_F_HRQL_URL: str
+    AT_F_HRQL_EMAIL: str
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
     AT_F_DDL_ID: str
