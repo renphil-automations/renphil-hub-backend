@@ -101,12 +101,14 @@ class Settings(BaseSettings):
     ONBOARDING_CHECKLIST_TABLE: str
     GENERAL_FUNDRAISING_RESOURCES_TABLE: str
     PARTNERSHIPS_LINKS_TABLE: str
-    POLICY_LINKS_TABLE: str | None = None
-    EVENTS_QUICK_LINKS_TABLE: str | None = None
-    FINANCE_QUICK_LINKS_TABLE: str | None = None
-    RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str | None = None
-    BOARD_MEMBER_LIST_TABLE: str | None = None
-    ORGANIZATION_INFO_TABLE: str | None = None
+    POLICY_LINKS_TABLE: str
+    EVENTS_QUICK_LINKS_TABLE: str
+    FINANCE_QUICK_LINKS_TABLE: str
+    COMMS_QUICK_LINKS_TABLE: str
+    HR_QUICK_LINKS_TABLE: str
+    RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str
+    BOARD_MEMBER_LIST_TABLE: str
+    ORGANIZATION_INFO_TABLE: str
 
     # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
@@ -177,6 +179,7 @@ class Settings(BaseSettings):
     AT_F_CHECKIN_HISTORY: str
     AT_F_CHECKIN_REPORTING_PERIOD: str
     AT_F_CLUSTER: str
+    AT_F_CLUSTER_NAME: str
     AT_F_DASHBOARD_DISPLAY: str
     AT_F_FOLLOWUP_INDICATED: str
     AT_F_DEADLINE: str
@@ -267,6 +270,7 @@ class Settings(BaseSettings):
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
     # ── Quick Actions fields ──────────────────────────────────────────
+    AT_F_QA_ID: str
     AT_F_QA_ACTION: str
 
     # ── Partnerships Links fields ─────────────────────────────────────
@@ -295,6 +299,20 @@ class Settings(BaseSettings):
     AT_F_FQL_URL: str | None = None
     AT_F_FQL_ENTITY: str | None = None
     AT_F_FQL_TABS: str | None = None
+
+    # ── Comms Quick Links fields ────────────────────────────────────
+    AT_F_CQL_ID: str
+    AT_F_CQL_ANCHOR_TEXT: str
+    AT_F_CQL_TYPE: str
+    AT_F_CQL_URL: str
+    AT_F_CQL_EMAIL: str
+
+    # ── HR Quick Links fields ───────────────────────────────────────
+    AT_F_HRQL_ID: str
+    AT_F_HRQL_ANCHOR_TEXT: str
+    AT_F_HRQL_TYPE: str
+    AT_F_HRQL_URL: str
+    AT_F_HRQL_EMAIL: str
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
     AT_F_DDL_ID: str | None = None

@@ -83,6 +83,9 @@ from app.models.airtable import (
     QuickLinkRecord,
     QuickLinkCreate,
     QuickLinkUpdate,
+    QuickActionRecord,
+    QuickActionCreate,
+    QuickActionUpdate,
     GeneralFundraisingResourceRecord,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
@@ -96,6 +99,12 @@ from app.models.airtable import (
     FinanceQuickLinkRecord,
     FinanceQuickLinkCreate,
     FinanceQuickLinkUpdate,
+    CommsQuickLinkRecord,
+    CommsQuickLinkCreate,
+    CommsQuickLinkUpdate,
+    HrQuickLinkRecord,
+    HrQuickLinkCreate,
+    HrQuickLinkUpdate,
     RenphilDueDiligenceLinkRecord,
     RenphilDueDiligenceLinkCreate,
     RenphilDueDiligenceLinkUpdate,
@@ -149,6 +158,7 @@ _F_PROGRAM_NAME = _S.AT_F_PROGRAM_NAME
 _F_CHECKIN_HISTORY = _S.AT_F_CHECKIN_HISTORY
 _F_CHECKIN_REPORTING_PERIOD = _S.AT_F_CHECKIN_REPORTING_PERIOD
 _F_CLUSTER = _S.AT_F_CLUSTER
+_F_CLUSTER_NAME = _S.AT_F_CLUSTER_NAME
 _F_DASHBOARD_DISPLAY = _S.AT_F_DASHBOARD_DISPLAY
 _F_FOLLOWUP_INDICATED = _S.AT_F_FOLLOWUP_INDICATED
 _F_DEADLINE = _S.AT_F_DEADLINE
@@ -891,6 +901,8 @@ class AirtableService:
         scoping_prop_overview_empty: bool | None = None,
         initiative_types: list[str] | None = None,
         focus_areas: list[str] | None = None,
+        excluded_clusters: list[str] | None = None,
+        included_clusters: list[str] | None = None,
         fields: list[str] | None = None,
     ) -> list[MasterListFundsAndSubprogramsRecord]:
         clauses: list[str | None] = [
@@ -944,6 +956,26 @@ class AirtableService:
 
         if focus_areas:
             clauses.append(af.multiselect_contains_any(_F_FOCUS_AREAS, focus_areas))
+
+        # Cluster Name filtering (lookup of the linked Cluster's 'Name').
+        #   * included_clusters — record must carry at least one of these names.
+        #   * excluded_clusters — record must carry NONE of these names.
+        # Exclusion takes precedence: any name present in both lists is
+        # treated as excluded (dropped from the inclusion set).
+        excluded_cluster_set = {c for c in (excluded_clusters or []) if c}
+        effective_included = [
+            c for c in (included_clusters or []) if c and c not in excluded_cluster_set
+        ]
+        if effective_included:
+            clauses.append(
+                af.multiselect_contains_any(_F_CLUSTER_NAME, effective_included)
+            )
+        if excluded_cluster_set:
+            excluded_clause = af.multiselect_contains_any(
+                _F_CLUSTER_NAME, sorted(excluded_cluster_set)
+            )
+            if excluded_clause:
+                clauses.append(f"NOT({excluded_clause})")
 
         formula = af.AND(*clauses)
         records = await self._list_records(
@@ -2511,13 +2543,85 @@ class AirtableService:
                 unique.add(value.strip())
         return sorted(unique)
 
-    async def get_team_size(self) -> CountResponse:
+    @staticmethod
+    def _normalize_employment_type(value: str) -> str:
+        """Normalize an employment-type token for robust matching.
+
+        Lower-cases and strips every non-alphanumeric character so that
+        differences in spaces, dots, hyphens, etc. are ignored (e.g.
+        'Full-Time', 'full time' and 'FullTime' all normalize equally)."""
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    def _filter_by_employment_type(
+        self,
+        records: list[dict[str, Any]],
+        included: list[str] | None,
+        excluded: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        """Filter Users records by the 'Employment Type' field.
+
+        * ``included`` — keep a record only if any of its Employment Type
+          values *contains* (normalized substring) any included token.
+        * ``excluded`` — drop a record if any of its Employment Type values
+          *contains* any excluded token.
+        * Both — apply both; exclusion takes precedence on conflict.
+        * Neither / empty — no filtering.
+
+        Matching is robust against spaces, dots, hyphens and case (see
+        :meth:`_normalize_employment_type`)."""
+        included_norm = [
+            n for n in (self._normalize_employment_type(v) for v in (included or [])) if n
+        ]
+        excluded_norm = [
+            n for n in (self._normalize_employment_type(v) for v in (excluded or [])) if n
+        ]
+        if not included_norm and not excluded_norm:
+            return records
+
+        emp_field = self._settings.USERS_EMPLOYMENT_TYPE_FIELD
+
+        def _entries(rec: dict[str, Any]) -> list[str]:
+            raw = rec.get("fields", {}).get(emp_field)
+            if raw is None:
+                return []
+            values = raw if isinstance(raw, list) else [raw]
+            return [self._normalize_employment_type(str(v)) for v in values]
+
+        out: list[dict[str, Any]] = []
+        for rec in records:
+            entries = _entries(rec)
+            if excluded_norm and any(
+                token in entry for entry in entries for token in excluded_norm
+            ):
+                continue  # exclusion wins
+            if included_norm and not any(
+                token in entry for entry in entries for token in included_norm
+            ):
+                continue
+            out.append(rec)
+        return out
+
+    async def get_team_size(
+        self,
+        *,
+        included_employment_types: list[str] | None = None,
+        excluded_employment_types: list[str] | None = None,
+    ) -> CountResponse:
         """Return the number of distinct non-empty 'Name' values in the Users
-        table where the 'Status' single-select equals 'Active'."""
-        name_field = self._settings.USERS_NAME_FIELD
-        formula = af.eq_str(self._settings.USERS_STATUS_FIELD, "Active")
+        table where the 'Status' single-select equals 'Active'.
+
+        Optionally filtered by the 'Employment Type' field (see
+        :meth:`_filter_by_employment_type`)."""
+        s = self._settings
+        name_field = s.USERS_NAME_FIELD
+        formula = af.eq_str(s.USERS_STATUS_FIELD, "Active")
         records = await self._list_records(
-            self._users_table(), formula=formula, fields=[name_field]
+            self._users_table(),
+            formula=formula,
+            fields=[name_field, s.USERS_EMPLOYMENT_TYPE_FIELD],
+        )
+        records = self._filter_by_employment_type(
+            records, included_employment_types, excluded_employment_types
         )
         unique: set[str] = set()
         for r in records:
@@ -2526,11 +2630,19 @@ class AirtableService:
                 unique.add(value.strip())
         return CountResponse(count=len(unique))
 
-    async def get_team_members(self) -> list[PersonContactItem]:
+    async def get_team_members(
+        self,
+        *,
+        included_employment_types: list[str] | None = None,
+        excluded_employment_types: list[str] | None = None,
+    ) -> list[PersonContactItem]:
         """Return the team members (First Name, Last Name, Work Email)
         from the Users table where the 'Status' single-select equals
         'Active'. Uses the same table and filter as :meth:`get_team_size`;
-        de-duplicated by 'Name'."""
+        de-duplicated by 'Name'.
+
+        Optionally filtered by the 'Employment Type' field (see
+        :meth:`_filter_by_employment_type`)."""
         s = self._settings
         formula = af.eq_str(s.USERS_STATUS_FIELD, "Active")
         records = await self._list_records(
@@ -2541,7 +2653,11 @@ class AirtableService:
                 s.USERS_FIRST_NAME_FIELD,
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
+                s.USERS_EMPLOYMENT_TYPE_FIELD,
             ],
+        )
+        records = self._filter_by_employment_type(
+            records, included_employment_types, excluded_employment_types
         )
         seen: set[str] = set()
         items: list[PersonContactItem] = []
@@ -4264,6 +4380,7 @@ class AirtableService:
     _F_QL_EMAIL = _S.AT_F_QL_EMAIL
     _F_QL_ACTION = _S.AT_F_QL_ACTION
     _F_QL_QA_LINK = _S.AT_F_QL_QUICK_ACTIONS_LINK
+    _F_QA_ID = _S.AT_F_QA_ID
     _F_QA_ACTION = _S.AT_F_QA_ACTION
 
     def _quick_links_table(self):
@@ -4349,8 +4466,23 @@ class AirtableService:
     async def create_quick_link(
         self, payload: QuickLinkCreate
     ) -> QuickLinkRecord:
-        """Create a Quick Links row, upserting the linked Quick Action."""
-        qa_record_id = await self._find_or_create_quick_action(payload.action)
+        """Create a Quick Links row linked to a Quick Action.
+
+        The Quick Action is resolved from either ``quick_action_id`` (an
+        existing record) or ``action`` (upserted by text).
+        """
+        if payload.quick_action_id is not None:
+            qa_record = await self._find_quick_action_by_id(payload.quick_action_id)
+            if qa_record is None:
+                raise HTTPException(
+                    status_code=_http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        f"Quick Action with Id={payload.quick_action_id} not found."
+                    ),
+                )
+            qa_record_id = qa_record["id"]
+        else:
+            qa_record_id = await self._find_or_create_quick_action(payload.action)
 
         body: dict[str, Any] = {
             self._F_QL_ANCHOR_TEXT: payload.anchor_text,
@@ -4446,6 +4578,419 @@ class AirtableService:
         return {
             "id": record["id"],
             "quick_link_id": quick_link_id,
+            "deleted": True,
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # Quick Actions (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    @staticmethod
+    def _qa_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[QuickActionRecord]:
+        return [
+            QuickActionRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_quick_actions(
+        self, *, fields: list[str] | None = None
+    ) -> list[QuickActionRecord]:
+        """Return all rows from the Quick Actions table."""
+        records = await self._list_records(
+            self._quick_actions_table(), fields=fields
+        )
+        return self._qa_to_typed(records)
+
+    async def _find_quick_action_by_id(
+        self, quick_action_id: int | str
+    ) -> dict[str, Any] | None:
+        """Find a Quick Actions record by its autonumber 'Id' value."""
+        try:
+            numeric = int(quick_action_id)
+            formula = af.eq_num(self._F_QA_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_QA_ID, str(quick_action_id))
+
+        table = self._quick_actions_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable quick action lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick action lookup")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_quick_action(
+        self, payload: QuickActionCreate
+    ) -> QuickActionRecord:
+        """Create a new Quick Actions row from the given 'Action' text."""
+        body = {self._F_QA_ACTION: payload.action}
+        table = self._quick_actions_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable quick action create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick action create")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._qa_to_typed([created])[0]
+
+    async def update_quick_action(
+        self, quick_action_id: int | str, payload: QuickActionUpdate
+    ) -> QuickActionRecord:
+        """Update the 'Action' text of a Quick Actions row by its Id."""
+        record = await self._find_quick_action_by_id(quick_action_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Quick Action with Id={quick_action_id} not found.",
+            )
+        body = {self._F_QA_ACTION: payload.action}
+        table = self._quick_actions_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], body, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable quick action update failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick action update")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._qa_to_typed([updated])[0]
+
+    async def delete_quick_action(
+        self, quick_action_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Quick Actions row by its autonumber Id."""
+        record = await self._find_quick_action_by_id(quick_action_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Quick Action with Id={quick_action_id} not found.",
+            )
+        table = self._quick_actions_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable quick action delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during quick action delete")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "quick_action_id": quick_action_id,
+            "deleted": True,
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # Comms Quick Links (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    _F_CQL_ID = _S.AT_F_CQL_ID
+    _F_CQL_ANCHOR_TEXT = _S.AT_F_CQL_ANCHOR_TEXT
+    _F_CQL_TYPE = _S.AT_F_CQL_TYPE
+    _F_CQL_URL = _S.AT_F_CQL_URL
+    _F_CQL_EMAIL = _S.AT_F_CQL_EMAIL
+
+    _CQL_UPDATE_FIELD_MAP = {
+        "anchor_text": _F_CQL_ANCHOR_TEXT,
+        "type": _F_CQL_TYPE,
+        "url": _F_CQL_URL,
+        "email": _F_CQL_EMAIL,
+    }
+
+    def _comms_quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.COMMS_QUICK_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _cql_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[CommsQuickLinkRecord]:
+        return [
+            CommsQuickLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_comms_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[CommsQuickLinkRecord]:
+        """Return all rows from the Comms Quick Links table."""
+        records = await self._list_records(
+            self._comms_quick_links_table(), fields=fields
+        )
+        return self._cql_to_typed(records)
+
+    async def _find_comms_quick_link_by_id(
+        self, cql_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(cql_id)
+            formula = af.eq_num(self._F_CQL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_CQL_ID, str(cql_id))
+
+        table = self._comms_quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable comms quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during comms quick link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_comms_quick_link(
+        self, payload: CommsQuickLinkCreate
+    ) -> CommsQuickLinkRecord:
+        """Create a new Comms Quick Links row."""
+        body: dict[str, Any] = {self._F_CQL_ANCHOR_TEXT: payload.anchor_text}
+        if payload.type is not None:
+            body[self._F_CQL_TYPE] = payload.type
+        if payload.url is not None:
+            body[self._F_CQL_URL] = payload.url
+        if payload.email is not None:
+            body[self._F_CQL_EMAIL] = payload.email
+        table = self._comms_quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable comms quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during comms quick link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._cql_to_typed([created])[0]
+
+    async def update_comms_quick_link(
+        self, cql_id: int | str, payload: CommsQuickLinkUpdate
+    ) -> CommsQuickLinkRecord:
+        """Update a Comms Quick Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._CQL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_comms_quick_link_by_id(cql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Comms Quick Links record with id '{cql_id}' not found.",
+            )
+
+        table = self._comms_quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update comms quick link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during comms quick link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._cql_to_typed([updated])[0]
+
+    async def delete_comms_quick_link(
+        self, cql_id: int | str
+    ) -> dict[str, Any]:
+        """Delete a Comms Quick Links row by its autonumber Id."""
+        record = await self._find_comms_quick_link_by_id(cql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"Comms Quick Links record with id '{cql_id}' not found.",
+            )
+        table = self._comms_quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable comms quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during comms quick link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "comms_quick_link_id": cql_id,
+            "deleted": True,
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # HR Quick Links (RenPhil Hub base)
+    # ═══════════════════════════════════════════════════════════════
+    _F_HRQL_ID = _S.AT_F_HRQL_ID
+    _F_HRQL_ANCHOR_TEXT = _S.AT_F_HRQL_ANCHOR_TEXT
+    _F_HRQL_TYPE = _S.AT_F_HRQL_TYPE
+    _F_HRQL_URL = _S.AT_F_HRQL_URL
+    _F_HRQL_EMAIL = _S.AT_F_HRQL_EMAIL
+
+    _HRQL_UPDATE_FIELD_MAP = {
+        "anchor_text": _F_HRQL_ANCHOR_TEXT,
+        "type": _F_HRQL_TYPE,
+        "url": _F_HRQL_URL,
+        "email": _F_HRQL_EMAIL,
+    }
+
+    def _hr_quick_links_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.HR_QUICK_LINKS_TABLE,
+        )
+
+    @staticmethod
+    def _hrql_to_typed(
+        records: list[dict[str, Any]],
+    ) -> list[HrQuickLinkRecord]:
+        return [
+            HrQuickLinkRecord.model_validate(
+                {"record_id": r["id"], **r.get("fields", {})}
+            )
+            for r in records
+        ]
+
+    async def get_hr_quick_links(
+        self, *, fields: list[str] | None = None
+    ) -> list[HrQuickLinkRecord]:
+        """Return all rows from the HR Quick Links table."""
+        records = await self._list_records(
+            self._hr_quick_links_table(), fields=fields
+        )
+        return self._hrql_to_typed(records)
+
+    async def _find_hr_quick_link_by_id(
+        self, hrql_id: int | str
+    ) -> dict[str, Any] | None:
+        try:
+            numeric = int(hrql_id)
+            formula = af.eq_num(self._F_HRQL_ID, numeric)
+        except (TypeError, ValueError):
+            formula = af.eq_str(self._F_HRQL_ID, str(hrql_id))
+
+        table = self._hr_quick_links_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable hr quick link lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during hr quick link lookup"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0] if records else None
+
+    async def create_hr_quick_link(
+        self, payload: HrQuickLinkCreate
+    ) -> HrQuickLinkRecord:
+        """Create a new HR Quick Links row."""
+        body: dict[str, Any] = {self._F_HRQL_ANCHOR_TEXT: payload.anchor_text}
+        if payload.type is not None:
+            body[self._F_HRQL_TYPE] = payload.type
+        if payload.url is not None:
+            body[self._F_HRQL_URL] = payload.url
+        if payload.email is not None:
+            body[self._F_HRQL_EMAIL] = payload.email
+        table = self._hr_quick_links_table()
+        try:
+            created = await asyncio.to_thread(table.create, body, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable hr quick link create failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during hr quick link create"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._hrql_to_typed([created])[0]
+
+    async def update_hr_quick_link(
+        self, hrql_id: int | str, payload: HrQuickLinkUpdate
+    ) -> HrQuickLinkRecord:
+        """Update an HR Quick Links record identified by its Id."""
+        data = payload.model_dump(exclude_unset=True)
+        if not data:
+            raise AirtableError("No fields provided to update.")
+
+        update_fields: dict[str, Any] = {
+            self._HRQL_UPDATE_FIELD_MAP[key]: value for key, value in data.items()
+        }
+
+        record = await self._find_hr_quick_link_by_id(hrql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"HR Quick Links record with id '{hrql_id}' not found.",
+            )
+
+        table = self._hr_quick_links_table()
+        try:
+            updated = await asyncio.to_thread(
+                table.update, record["id"], update_fields, typecast=True
+            )
+        except RequestException as exc:
+            logger.error("Airtable update hr quick link failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during hr quick link update"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return self._hrql_to_typed([updated])[0]
+
+    async def delete_hr_quick_link(
+        self, hrql_id: int | str
+    ) -> dict[str, Any]:
+        """Delete an HR Quick Links row by its autonumber Id."""
+        record = await self._find_hr_quick_link_by_id(hrql_id)
+        if record is None:
+            raise HTTPException(
+                status_code=_http_status.HTTP_404_NOT_FOUND,
+                detail=f"HR Quick Links record with id '{hrql_id}' not found.",
+            )
+        table = self._hr_quick_links_table()
+        try:
+            await asyncio.to_thread(table.delete, record["id"])
+        except RequestException as exc:
+            logger.error("Airtable hr quick link delete failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during hr quick link delete"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return {
+            "id": record["id"],
+            "hr_quick_link_id": hrql_id,
             "deleted": True,
         }
 

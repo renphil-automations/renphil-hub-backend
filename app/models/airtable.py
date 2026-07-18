@@ -220,6 +220,21 @@ class DeliverableItem(BaseModel):
     id: str = Field(description="Airtable record id in the Deliverables table.")
 
 
+class ButtonFieldValue(BaseModel):
+    """Value of an Airtable 'Button' field configured to open a URL.
+
+    Airtable returns such fields as ``{"label": ..., "url": ...}``. Only
+    buttons that open a URL are returned by the API; buttons that run an
+    automation/extension are omitted. ``url`` may be ``null`` when the
+    button's URL formula resolves to an empty value.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    label: str | None = Field(default=None, description="The button's label.")
+    url: str | None = Field(default=None, description="The URL the button opens.")
+
+
 class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     name: str | None = Field(default=None, alias="Name")
     fundraising_stage: list[str] | None = Field(default=None, alias="Fundraising Stage")
@@ -272,6 +287,14 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
             "Resolved Deliverables rows. This lookup field carries raw linked "
             "Deliverables record ids in Airtable; they are resolved server-side "
             "into the full Deliverables records (all fields)."
+        ),
+    )
+    update_funding_documents: ButtonFieldValue | None = Field(
+        default=None,
+        alias="Update Funding Documents",
+        description=(
+            "Airtable 'Button' field that opens a URL. Returned as "
+            "{label, url}; present only when the button opens a URL."
         ),
     )
 
@@ -823,6 +846,120 @@ class FinanceQuickLinkUpdate(BaseModel):
     tabs: list[str] | None = Field(default=None, alias="Tabs")
 
 
+# ── Comms Quick Links ──────────────────────────────────
+class CommsQuickLinkRecord(BaseModel):
+    """A row from the Comms Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(
+        default=None,
+        alias="Type",
+        description="Single-select value indicating the link kind.",
+    )
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class CommsQuickLinkCreate(BaseModel):
+    """Payload to create a Comms Quick Links record.
+
+    ``anchor_text`` is required; ``type``, ``url`` and ``email`` are
+    optional depending on the kind of link.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class CommsQuickLinkUpdate(BaseModel):
+    """Partial update payload for a Comms Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+# ── HR Quick Links ─────────────────────────────────────
+class HrQuickLinkRecord(BaseModel):
+    """A row from the HR Quick Links table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(
+        default=None,
+        alias="Type",
+        description="Single-select value indicating the link kind.",
+    )
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class HrQuickLinkCreate(BaseModel):
+    """Payload to create an HR Quick Links record.
+
+    ``anchor_text`` is required; ``type``, ``url`` and ``email`` are
+    optional depending on the kind of link.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str = Field(..., alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
+class HrQuickLinkUpdate(BaseModel):
+    """Partial update payload for an HR Quick Links record.
+
+    Any subset of fields may be provided. Fields not included in the
+    payload are left untouched. Set a field explicitly to ``null`` to
+    clear it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    anchor_text: str | None = Field(default=None, alias="Anchor Text")
+    type: str | None = Field(default=None, alias="Type")
+    url: str | None = Field(default=None, alias="URL")
+    email: str | None = Field(default=None, alias="Email")
+
+
 # ── RenPhil Due Diligence Links ────────────────────────────────────────
 class RenphilDueDiligenceLinkRecord(BaseModel):
     """A row from the RenPhil Due Diligence Links table.
@@ -1082,18 +1219,31 @@ class QuickLinkRecord(BaseModel):
 class QuickLinkCreate(BaseModel):
     """Payload to create a new Quick Links record.
 
-    The ``action`` string is upserted into the Quick Actions table and
-    linked to this record via the 'Quick Actions' linked-record field.
+    Provide exactly one of:
+
+    * ``action`` — action text; upserted into the Quick Actions table
+      (created if it does not already exist) and linked to this row.
+    * ``quick_action_id`` — the autonumber 'Id' of an existing Quick
+      Action to link to directly (no upsert).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     anchor_text: str = Field(description="Display text for the link.")
-    action: str = Field(
+    action: str | None = Field(
+        default=None,
         description=(
             "Action text. Will be created in the Quick Actions table if it "
-            "does not already exist, then linked to this Quick Links row."
-        )
+            "does not already exist, then linked to this Quick Links row. "
+            "Mutually exclusive with 'quick_action_id'."
+        ),
+    )
+    quick_action_id: int | None = Field(
+        default=None,
+        description=(
+            "Autonumber 'Id' of an existing Quick Action to link to. "
+            "Mutually exclusive with 'action'."
+        ),
     )
     url: str | None = Field(
         default=None, description="Optional URL the link points to."
@@ -1101,6 +1251,16 @@ class QuickLinkCreate(BaseModel):
     email: str | None = Field(
         default=None, description="Optional email address associated with the link."
     )
+
+    @model_validator(mode="after")
+    def _require_exactly_one_action_ref(self) -> "QuickLinkCreate":
+        has_action = bool(self.action and self.action.strip())
+        has_id = self.quick_action_id is not None
+        if has_action == has_id:
+            raise ValueError(
+                "Provide exactly one of 'action' or 'quick_action_id'."
+            )
+        return self
 
 
 class QuickLinkUpdate(BaseModel):
@@ -1118,6 +1278,44 @@ class QuickLinkUpdate(BaseModel):
     url: str | None = None
     email: str | None = None
     action: str | None = None
+
+
+# ── Quick Actions ───────────────────────────────────────
+class QuickActionRecord(BaseModel):
+    """A row from the Quick Actions table.
+
+    The canonical ``id`` here is the table's autonumber ``Id`` field. The
+    Airtable record id is returned separately as ``record_id``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    record_id: str = Field(description="Airtable record id (e.g. 'rec...').")
+    id: int | None = Field(
+        default=None,
+        alias="Id",
+        description="Autonumber 'Id' value from the Airtable table.",
+    )
+    action: str | None = Field(default=None, alias="Action")
+
+
+class QuickActionCreate(BaseModel):
+    """Payload to create a new Quick Actions record."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    action: str = Field(..., alias="Action", description="The action text.")
+
+
+class QuickActionUpdate(BaseModel):
+    """Partial update payload for a Quick Actions record.
+
+    ``action`` is the only editable field; it must be provided.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    action: str = Field(..., alias="Action", description="The new action text.")
 
 
 # ── Clusters ───────────────────────────────────────────────────────────

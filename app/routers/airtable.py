@@ -102,6 +102,9 @@ from app.models.airtable import (
     QuickLinkRecord,
     QuickLinkCreate,
     QuickLinkUpdate,
+    QuickActionRecord,
+    QuickActionCreate,
+    QuickActionUpdate,
     RecordFieldsUpdate,
     PartnershipsLinkRecord,
     PartnershipsLinkUpdate,
@@ -115,6 +118,12 @@ from app.models.airtable import (
     FinanceQuickLinkRecord,
     FinanceQuickLinkCreate,
     FinanceQuickLinkUpdate,
+    CommsQuickLinkRecord,
+    CommsQuickLinkCreate,
+    CommsQuickLinkUpdate,
+    HrQuickLinkRecord,
+    HrQuickLinkCreate,
+    HrQuickLinkUpdate,
     RenphilDueDiligenceLinkRecord,
     RenphilDueDiligenceLinkCreate,
     RenphilDueDiligenceLinkUpdate,
@@ -326,6 +335,21 @@ async def get_funds_and_subprograms(
     scoping_prop_overview_empty: bool | None = Query(default=None),
     initiative_types: list[str] | None = Query(default=None),
     focus_areas: list[str] | None = Query(default=None),
+    excluded_clusters: list[str] | None = Query(
+        default=None,
+        description=(
+            "Cluster 'Name' values to exclude. Records linked to any of these "
+            "clusters are omitted. Takes precedence over included_clusters on "
+            "overlap."
+        ),
+    ),
+    included_clusters: list[str] | None = Query(
+        default=None,
+        description=(
+            "Cluster 'Name' values to require. Only records linked to at least "
+            "one of these clusters are returned."
+        ),
+    ),
     fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -345,6 +369,8 @@ async def get_funds_and_subprograms(
         scoping_prop_overview_empty=scoping_prop_overview_empty,
         initiative_types=initiative_types,
         focus_areas=focus_areas,
+        excluded_clusters=excluded_clusters,
+        included_clusters=included_clusters,
         fields=fields,
     )
 
@@ -846,10 +872,28 @@ async def get_distinct_fellows(
 )
 @airtable_cache(table="USERS_TABLE")
 async def get_team_size(
+    included_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Keep only users whose 'Employment Type' contains any of these "
+            "values (substring, robust to spaces/dots/hyphens/case). "
+            "Omit or leave empty to skip."
+        ),
+    ),
+    excluded_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Drop users whose 'Employment Type' contains any of these values. "
+            "Takes precedence over included_employment_types on conflict."
+        ),
+    ),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_team_size()
+    return await airtable_service.get_team_size(
+        included_employment_types=included_employment_types,
+        excluded_employment_types=excluded_employment_types,
+    )
 
 
 # ── /get_team_members ─────────────────────────────────────────────────
@@ -863,10 +907,28 @@ async def get_team_size(
 )
 @airtable_cache(table="USERS_TABLE")
 async def get_team_members(
+    included_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Keep only users whose 'Employment Type' contains any of these "
+            "values (substring, robust to spaces/dots/hyphens/case). "
+            "Omit or leave empty to skip."
+        ),
+    ),
+    excluded_employment_types: list[str] | None = Query(
+        default=None,
+        description=(
+            "Drop users whose 'Employment Type' contains any of these values. "
+            "Takes precedence over included_employment_types on conflict."
+        ),
+    ),
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.get_team_members()
+    return await airtable_service.get_team_members(
+        included_employment_types=included_employment_types,
+        excluded_employment_types=excluded_employment_types,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1493,6 +1555,168 @@ async def delete_finance_quick_link(
 
 
 # ═════════════════════════════════════════════════════════════════════
+#   Comms Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_comms_quick_links",
+    response_model=list[CommsQuickLinkRecord],
+    summary="List rows from the Comms Quick Links table (Id, Anchor Text, Type, URL, Email).",
+)
+@airtable_cache(table="COMMS_QUICK_LINKS_TABLE")
+async def get_comms_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_comms_quick_links(fields=fields)
+
+
+@router.post(
+    "/comms_quick_links",
+    response_model=CommsQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Comms Quick Links record (admin only).",
+)
+@invalidates_cache(["get_comms_quick_links"])
+async def create_comms_quick_link(
+    payload: CommsQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create Comms Quick Links records.",
+        )
+    return await airtable_service.create_comms_quick_link(payload)
+
+
+@router.patch(
+    "/comms_quick_links",
+    response_model=CommsQuickLinkRecord,
+    summary=(
+        "Update a Comms Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+@invalidates_cache(["get_comms_quick_links"])
+async def update_comms_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: CommsQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit Comms Quick Links records.",
+        )
+    return await airtable_service.update_comms_quick_link(id, payload)
+
+
+@router.delete(
+    "/comms_quick_links",
+    summary="Delete a Comms Quick Links record by its 'Id' (admin only).",
+)
+@invalidates_cache(["get_comms_quick_links"])
+async def delete_comms_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete Comms Quick Links records.",
+        )
+    return await airtable_service.delete_comms_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#   HR Quick Links endpoints
+# ═════════════════════════════════════════════════════════════════════
+@router.get(
+    "/get_hr_quick_links",
+    response_model=list[HrQuickLinkRecord],
+    summary="List rows from the HR Quick Links table (Id, Anchor Text, Type, URL, Email).",
+)
+@airtable_cache(table="HR_QUICK_LINKS_TABLE")
+async def get_hr_quick_links(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_hr_quick_links(fields=fields)
+
+
+@router.post(
+    "/hr_quick_links",
+    response_model=HrQuickLinkRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new HR Quick Links record (admin only).",
+)
+@invalidates_cache(["get_hr_quick_links"])
+async def create_hr_quick_link(
+    payload: HrQuickLinkCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create HR Quick Links records.",
+        )
+    return await airtable_service.create_hr_quick_link(payload)
+
+
+@router.patch(
+    "/hr_quick_links",
+    response_model=HrQuickLinkRecord,
+    summary=(
+        "Update an HR Quick Links record identified by its 'Id' "
+        "(admin only). Any subset of fields may be provided."
+    ),
+)
+@invalidates_cache(["get_hr_quick_links"])
+async def update_hr_quick_link(
+    id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
+    payload: HrQuickLinkUpdate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to edit HR Quick Links records.",
+        )
+    return await airtable_service.update_hr_quick_link(id, payload)
+
+
+@router.delete(
+    "/hr_quick_links",
+    summary="Delete an HR Quick Links record by its 'Id' (admin only).",
+)
+@invalidates_cache(["get_hr_quick_links"])
+async def delete_hr_quick_link(
+    id: int = Query(
+        ...,
+        description="Value of the 'Id' (autonumber) field of the record to delete.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete HR Quick Links records.",
+        )
+    return await airtable_service.delete_hr_quick_link(id)
+
+
+# ═════════════════════════════════════════════════════════════════════
 #   RenPhil Due Diligence Links endpoints
 # ═════════════════════════════════════════════════════════════════════
 @router.get(
@@ -1861,6 +2085,81 @@ async def delete_quick_link(
             detail="Admin privileges required to delete a quick link.",
         )
     return await airtable_service.delete_quick_link(quick_link_id)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Quick Actions endpoints
+# ══════════════════════════════════════════════════════════════════════
+@router.get(
+    "/quick_actions",
+    response_model=list[QuickActionRecord],
+    summary="List rows from the Quick Actions table (Id, Action).",
+)
+@airtable_cache(table="QUICK_ACTIONS_TABLE")
+async def get_quick_actions(
+    fields: list[str] | None = Query(default=None, description=_FIELDS_DESC),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.get_quick_actions(fields=fields)
+
+
+@router.post(
+    "/quick_actions",
+    response_model=QuickActionRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Quick Action from an 'Action' value (admin only)",
+)
+@invalidates_cache(["get_quick_actions", "get_quick_links"])
+async def create_quick_action(
+    payload: QuickActionCreate = Body(...),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to create a quick action.",
+        )
+    return await airtable_service.create_quick_action(payload)
+
+
+@router.patch(
+    "/quick_actions/{quick_action_id}",
+    response_model=QuickActionRecord,
+    summary="Update a Quick Action's 'Action' text by its Id (admin only)",
+)
+@invalidates_cache(["get_quick_actions", "get_quick_links"])
+async def update_quick_action(
+    payload: QuickActionUpdate,
+    quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to update a quick action.",
+        )
+    return await airtable_service.update_quick_action(quick_action_id, payload)
+
+
+@router.delete(
+    "/quick_actions/{quick_action_id}",
+    summary="Delete a Quick Action by its Id (admin only)",
+)
+@invalidates_cache(["get_quick_actions", "get_quick_links"])
+async def delete_quick_action(
+    quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    if not await airtable_service.is_hub_admin(user.email):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to delete a quick action.",
+        )
+    return await airtable_service.delete_quick_action(quick_action_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
