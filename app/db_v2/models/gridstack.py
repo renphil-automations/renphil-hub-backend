@@ -12,11 +12,13 @@ class GridstackV2(BaseV2):
     denormalized to the ultimate root tab at every depth, so "all gridstacks
     under tab X" is a flat `parent_tab_id = X` query regardless of nesting depth.
 
-    settings (JSONB) is a catch-all bucket holding:
-      - the Super GridStack tab-bar config, e.g. {"sgs": {"tabBarPosition": ...}}
-      - the per-sub-tab access_control (AccessControl shape), since a
-        sub-tab is no longer its own Tab row and has nowhere else to keep an
-        independent viewer restriction, e.g. {"access_control": {...}}
+    settings (JSONB) is a catch-all bucket holding the Super GridStack
+    tab-bar config, e.g. {"sgs": {"tabBarPosition": ...}}. A sub-tab's own
+    access_control used to live here too (a sub-tab is no longer its own Tab
+    row and had nowhere else to keep an independent viewer restriction), but
+    has moved onto its representation component's own access_control column
+    instead — see ComponentV2.current_grid_id and
+    migrate_subtab_access_control_to_components.py.
     """
 
     __tablename__ = "gridstacks"

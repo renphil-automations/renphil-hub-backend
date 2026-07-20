@@ -126,14 +126,21 @@ def _access_control_or_default(access_control: dict[str, Any] | None) -> dict[st
     return access_control if access_control else DEFAULT_ACCESS_CONTROL
 
 
-def _create_gridstack_component(db: Session, gridstack: GridstackV2) -> ComponentV2:
+def _create_gridstack_component(
+    db: Session, gridstack: GridstackV2, access_control: dict[str, Any] | None = None
+) -> ComponentV2:
     """Create the ComponentV2 row that represents `gridstack` itself (see
     current_grid_id on the model). Called once per gridstack, right after it
     is flushed (so `gridstack.id` exists). Its type/props mirror the
     gridstack's own settings.sgs at creation time, matching the sync in
     update_tab_content_v2 — this lets a first tab-variant that inherits its
     root's settings (including an already-set sgs config) start out already
-    flagged as a super gridstack, with no special-casing needed here."""
+    flagged as a super gridstack, with no special-casing needed here.
+
+    `access_control` is only ever passed for a sub-tab gridstack (a root or
+    variant's own AC lives on its TabV2 row, never here) — see
+    _safe_access_control_for_gridstack, the sub-tab branch of create_tab_v2,
+    and the non-root branch of update_tab_by_document_id_v2."""
     sgs = (gridstack.settings or {}).get("sgs")
     component = ComponentV2(
         link=_generate_id(),
@@ -145,7 +152,7 @@ def _create_gridstack_component(db: Session, gridstack: GridstackV2) -> Componen
         width=None,
         height=None,
         props={"sgs": sgs} if sgs else None,
-        access_control=None,
+        access_control=access_control,
         current_grid_id=gridstack.id,
         gridstack_id=gridstack.id,
         page_content_id=None,
@@ -173,6 +180,14 @@ def _get_root_tab(db: Session, gridstack: GridstackV2) -> TabV2 | None:
     return db.query(TabV2).filter(TabV2.id == gridstack.parent_tab_id).first()
 
 
+def _get_gridstack_component(db: Session, gridstack_id: int) -> ComponentV2 | None:
+    """The ComponentV2 row that represents `gridstack_id` itself (see
+    current_grid_id on the model) — the sub-tab access_control migration's
+    new home. May be None for a gridstack created before the current_grid_id
+    backfill (migrate_subtab_access_control_to_components.py) has run for it."""
+    return db.query(ComponentV2).filter(ComponentV2.current_grid_id == gridstack_id).first()
+
+
 def _has_children(db: Session, gridstack_id: int) -> bool:
     return (
         db.query(GridstackV2.id)
@@ -198,8 +213,14 @@ def _safe_access_control_for_gridstack(db: Session, gridstack: GridstackV2) -> d
     if _is_root(gridstack):
         tab = _get_root_tab(db, gridstack)
         return _access_control_or_default(tab.access_control if tab else None)
-    settings = gridstack.settings or {}
-    return _access_control_or_default(settings.get("access_control"))
+
+    # A sub-tab's access_control lives on its own representation component
+    # (current_grid_id) — see migrate_subtab_access_control_to_components.py,
+    # which relocated it off the legacy gridstacks.settings["access_control"]
+    # location (now unused; that migration + this read/write path have both
+    # been deployed and verified).
+    component = _get_gridstack_component(db, gridstack.id)
+    return _access_control_or_default(component.access_control if component else None)
 
 
 def _safe_locked_pair(db: Session, gridstack: GridstackV2) -> tuple[bool, str]:
@@ -1155,14 +1176,16 @@ def create_tab_v2(
             new_gridstack = GridstackV2(
                 document_id=_generate_id(),
                 name=title,
-                settings={"access_control": access_control or DEFAULT_ACCESS_CONTROL},
+                settings={},
                 position=order,
                 parent_id=parent_gridstack.id,
                 parent_tab_id=parent_gridstack.parent_tab_id,
             )
             db.add(new_gridstack)
             db.flush()
-            _create_gridstack_component(db, new_gridstack)
+            _create_gridstack_component(
+                db, new_gridstack, access_control=access_control or DEFAULT_ACCESS_CONTROL
+            )
 
         if content:
             update_tab_content_v2(db, new_gridstack.document_id, content)
@@ -1266,9 +1289,14 @@ def update_tab_by_document_id_v2(
             if order is not None:
                 gridstack.position = order
             if access_control is not None:
-                settings = dict(gridstack.settings or {})
-                settings["access_control"] = access_control
-                gridstack.settings = settings
+                component = _get_gridstack_component(db, gridstack.id)
+                if component is None:
+                    # Sub-tab gridstack created before the current_grid_id
+                    # backfill (migrate_subtab_access_control_to_components.py)
+                    # — create its representation component now rather than
+                    # falling back to gridstacks.settings.
+                    component = _create_gridstack_component(db, gridstack)
+                component.access_control = access_control
             if locked is not None or locked_by is not None:
                 raise ValueError(
                     "Locking is only supported for top-level tabs in this schema version"
