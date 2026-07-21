@@ -9,7 +9,7 @@ from pydantic import (
     field_validator,
 )
 
-from app.schemas.page_content import PageContentWorkspaceResponse
+from app.schemas.page_content import PageContentWorkspaceResponse, SearchUpdateReceipt
 
 
 MIN_ORDER_VALUE = -2147483648
@@ -116,6 +116,9 @@ class TabSummaryResponse(BaseModel):
     # GridCanvasContent.schemaVersion (the JSONB content-shape version).
     apiVersion: Literal["v1", "v2"] = "v1"
 
+    # Empty for reads; populated by v2 mutations after their DB commit.
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
+
 
 class TabWorkspaceResponse(BaseModel):
     id: int | None = None
@@ -139,6 +142,9 @@ class TabWorkspaceResponse(BaseModel):
     has_variants: StrictBool = False
 
     apiVersion: Literal["v1", "v2"] = "v1"
+
+    # Empty for reads; populated by v2 mutations after their DB commit.
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
 
 class BreadcrumbItemResponse(BaseModel):
