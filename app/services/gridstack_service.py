@@ -15,6 +15,7 @@ carries the same document_id as its TabV2, see create_tab_v2).
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -69,6 +70,45 @@ MIRROR_WIDGET_TYPE = "mirror"
 GRIDSTACK_WIDGET_TYPE = "gridstack"
 SUPER_GRIDSTACK_WIDGET_TYPE = "super_gridstack"
 GRIDSTACK_REPRESENTATION_TYPES = (GRIDSTACK_WIDGET_TYPE, SUPER_GRIDSTACK_WIDGET_TYPE)
+
+AIRTABLE_WIDGET_TYPE = "airtable"
+
+# Keys on an `airtable` widget's data blob that decide WHO sees WHICH rows,
+# name the data source, or hold the credential used to fetch it.
+#
+# `PUT /v2/tabs/{document_id}/content` — the canvas save that lands in
+# update_tab_content_v2 below — has NO auth dependency, so anything writable
+# through it is writable by anyone who can reach the API. Without this list,
+# an attacker who can no longer *read* the PAT (it is stripped on the way
+# out) could still neutralise the personalize filter around it and have the
+# server fetch every row under the stored token. These keys are therefore
+# read back from storage on every canvas save and the incoming values
+# discarded; the only way to change them is the authenticated
+# `PUT /data/airtable/component/{link}/config` endpoint.
+#
+# The component's own `access_control` COLUMN is protected the same way (it
+# is absent from this tuple only because it is a column, not blob data) —
+# see the two call sites in update_tab_content_v2.
+#
+# NEVER add a field to the frontend's AirtableWidgetData that decides
+# visibility, names the data source, or holds a secret without adding it
+# here too: omitting one silently reopens the bypass this list exists to
+# close. Background: AI Docs/plan_airtable_personalize_backend_enforcement.md
+AIRTABLE_PROTECTED_DATA_FIELDS = (
+    "pat",
+    "patUpdatedAt",
+    "sourceUrl",
+    "personalizeEnabled",
+    "personalizeColumn",
+)
+
+# Keys the SERVER derives on every read and must never store. `hasPat` stands
+# in for the stripped `pat` so the UI can render "configured" without ever
+# seeing the token. It rides the same blob that round-trips through the canvas
+# save, so it has to be dropped on the way back in — otherwise a client could
+# assert `hasPat: true` for a widget with no token, and the stored value would
+# be indistinguishable from the computed one on the next read.
+AIRTABLE_COMPUTED_DATA_FIELDS = ("hasPat",)
 
 
 # ---------------------------------------------------------
@@ -272,10 +312,18 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
 # Content serialization: ComponentV2 rows <-> GridCanvasContent
 # ---------------------------------------------------------
 
-def _resolve_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
-    """The widget-facing `data` blob for one component — shared by the normal
-    serializer path, a mirror's resolution of its target, and the by-link
-    lookup endpoint, so all three agree on how content gets resolved.
+def _raw_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
+    """The component's `data` blob EXACTLY as stored, secrets included.
+
+    Server-internal only. Every client-facing path must go through
+    `_resolve_component_data` below, which strips what viewers must not see.
+
+    Callers that legitimately need the raw blob are the ones that read it in
+    order to write it back (`update_airtable_component_config`,
+    `_apply_airtable_protection`'s stored-value read) or that need the secret
+    itself (`get_airtable_component_config`, `get_airtable_pat_for_component`).
+    Reading the sanitised view in any of those would silently DELETE the PAT
+    on the next write.
 
     Every component type's `data` lives in `page_content` via
     `page_content_id` (not `props` — see ComponentV2's docstring). `block_note`
@@ -316,13 +364,47 @@ def _resolve_component_data(db: Session, component: ComponentV2) -> dict[str, An
     return legacy_data
 
 
+def _resolve_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
+    """The CLIENT-FACING `data` blob for one component — shared by the normal
+    serializer path, a mirror's resolution of its target, and the by-link
+    lookup endpoint, so all three agree on what a client is allowed to see.
+
+    Identical to `_raw_component_data` except that an `airtable` widget's
+    stored PAT is removed and replaced with the boolean `hasPat`. Doing it
+    here rather than at each endpoint covers the tab serializer, mirror-target
+    resolution and the by-link lookup in one place — including
+    `GET /v2/tabs/{id}/content`, which has no auth dependency and would
+    otherwise hand a workspace-scoped Airtable token to anyone who asked.
+
+    `hasPat` is computed on every read and never persisted — see
+    `_write_component_data`, which drops it again on the way back in.
+    """
+    data = _raw_component_data(db, component)
+
+    if component.type == AIRTABLE_WIDGET_TYPE:
+        pat = data.get("pat")
+        data = {k: v for k, v in data.items() if k not in AIRTABLE_COMPUTED_DATA_FIELDS}
+        data.pop("pat", None)
+        data["hasPat"] = bool(isinstance(pat, str) and pat.strip())
+
+    return data
+
+
 def _write_component_data(db: Session, component: ComponentV2, data: dict[str, Any] | None) -> None:
     """Persists `data` into `page_content`, creating a new `PageContentV2` row
     on first write if `page_content_id` is still unset. Mirrors
     `_resolve_component_data`'s wrap/unwrap convention for `block_note`. Never
     called for a `mirror` component (its only persisted data is `target_link`,
-    which lives in `props`, not `page_content` — see `update_tab_content_v2`)."""
+    which lives in `props`, not `page_content` — see `update_tab_content_v2`).
+
+    Server-derived keys (AIRTABLE_COMPUTED_DATA_FIELDS) are dropped here
+    rather than at each caller: BOTH write paths — the canvas save and the
+    config endpoint — funnel through this function, so stripping once here
+    makes it impossible for a caller to forget."""
     stored = (data or {}).get("content", []) if component.type == "block_note" else (data or {})
+
+    if component.type == AIRTABLE_WIDGET_TYPE and isinstance(stored, dict):
+        stored = {k: v for k, v in stored.items() if k not in AIRTABLE_COMPUTED_DATA_FIELDS}
 
     if component.page_content_id is not None:
         page_content = (
@@ -340,6 +422,56 @@ def _write_component_data(db: Session, component: ComponentV2, data: dict[str, A
         db.add(page_content)
         db.flush()
         component.page_content_id = page_content.id
+
+
+def _apply_airtable_protection(
+    stored: dict[str, Any] | None, incoming: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Return `incoming` with every AIRTABLE_PROTECTED_DATA_FIELDS key forced
+    back to its stored value, dropping the key entirely when nothing is
+    stored yet.
+
+    Called on the canvas-save path only, which is unauthenticated — see
+    AIRTABLE_PROTECTED_DATA_FIELDS for why. A brand-new airtable widget
+    therefore lands with none of its protected fields set; the frontend
+    follows the content save with a `PUT /data/airtable/component/{link}/config`
+    call (which IS authenticated) to populate them.
+    """
+    incoming = incoming if isinstance(incoming, dict) else {}
+    stored = stored if isinstance(stored, dict) else {}
+
+    protected = {
+        key: stored[key]
+        for key in AIRTABLE_PROTECTED_DATA_FIELDS
+        if key in stored
+    }
+    unprotected = {
+        key: value
+        for key, value in incoming.items()
+        if key not in AIRTABLE_PROTECTED_DATA_FIELDS
+    }
+    return {**unprotected, **protected}
+
+
+def _pat_hint(pat: Any) -> str | None:
+    """A non-secret identifier for a stored PAT, safe to show an editor.
+
+    Airtable tokens are `pat<id>.<secret>`; the part before the dot is the
+    token id Airtable's own token-management UI displays, so echoing it lets
+    an admin match a widget against a token in that UI (which is the only
+    way to answer "which widgets use the token I am about to revoke?" once
+    the PAT itself is write-only).
+
+    Any token not matching that shape is reduced to a short digest instead —
+    never echo part of a secret whose structure we do not recognise.
+    """
+    if not isinstance(pat, str) or not pat.strip():
+        return None
+    token = pat.strip()
+    prefix, separator, _secret = token.partition(".")
+    if separator and prefix.startswith("pat") and len(prefix) > 3:
+        return prefix
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
 def _serialize_component(db: Session, component: ComponentV2) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -484,6 +616,159 @@ def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
         "title": component.title,
         "data": _resolve_component_data(db, component),
     }
+
+
+# ---------------------------------------------------------
+# Airtable widget configuration (protected fields)
+#
+# The only supported way to write AIRTABLE_PROTECTED_DATA_FIELDS or an
+# airtable widget's access_control. Both endpoints backing these functions
+# require authentication, unlike the canvas save.
+# ---------------------------------------------------------
+
+_UNSET: Any = object()
+
+
+def _airtable_component_by_link(db: Session, link: str) -> ComponentV2 | None:
+    link = (link or "").strip()
+    if not link:
+        return None
+    component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
+    if component is None or component.type != AIRTABLE_WIDGET_TYPE:
+        return None
+    return component
+
+
+def get_airtable_component_config(db: Session, link: str) -> dict[str, Any] | None:
+    """Non-secret view of one airtable widget's stored configuration.
+
+    Never returns the PAT itself — `hasPat` says whether one is stored and
+    `patHint` identifies WHICH token it is (see _pat_hint). Returns None for
+    an unknown link or a component that is not an airtable widget.
+    """
+    component = _airtable_component_by_link(db, link)
+    if component is None:
+        return None
+
+    # RAW: this function's whole job is to report ON the secret (hasPat /
+    # patHint), which the sanitised view has already removed.
+    data = _raw_component_data(db, component)
+    pat = data.get("pat")
+
+    return {
+        "link": component.link,
+        "sourceUrl": data.get("sourceUrl") or "",
+        "personalizeEnabled": bool(data.get("personalizeEnabled")),
+        "personalizeColumn": data.get("personalizeColumn") or None,
+        "hasPat": bool(isinstance(pat, str) and pat.strip()),
+        "patHint": _pat_hint(pat),
+        "patUpdatedAt": data.get("patUpdatedAt"),
+        "access_control": component.access_control,
+    }
+
+
+def get_airtable_component_data(db: Session, link: str) -> dict[str, Any] | None:
+    """The airtable widget's client-safe data blob (PAT already stripped).
+
+    Used by the row-fetch endpoint to read the fields that are NOT part of
+    the protected config — `selectedColumns`, `filters` — which the canvas
+    save legitimately owns. Returns None for an unknown or non-airtable link.
+    """
+    component = _airtable_component_by_link(db, link)
+    if component is None:
+        return None
+    return _resolve_component_data(db, component)
+
+
+def get_airtable_pat_for_component(db: Session, link: str) -> str | None:
+    """The stored PAT for one airtable widget, in clear.
+
+    SERVER-INTERNAL. The only legitimate consumers are the endpoints that
+    fetch rows on the caller's behalf — the token must never leave the
+    server. Deliberately does NOT go through `_resolve_component_data`, which
+    strips exactly this value on every client-facing path.
+
+    Returns None for an unknown link, a non-airtable component, or a widget
+    with no token configured.
+    """
+    component = _airtable_component_by_link(db, link)
+    if component is None:
+        return None
+    pat = _raw_component_data(db, component).get("pat")
+    return pat.strip() if isinstance(pat, str) and pat.strip() else None
+
+
+def update_airtable_component_config(
+    db: Session,
+    link: str,
+    *,
+    source_url: Any = _UNSET,
+    pat: Any = _UNSET,
+    personalize_enabled: Any = _UNSET,
+    personalize_column: Any = _UNSET,
+    access_control: Any = _UNSET,
+) -> dict[str, Any] | None:
+    """Write one or more protected fields. Arguments left at `_UNSET` are
+    untouched, so a caller can update a single field without resending the
+    rest (and, critically, without having to resend a PAT it cannot read).
+
+    `pat` has three-way semantics, because "leave it alone" and "clear it"
+    must be distinguishable in a write-only field:
+      * omitted, or an empty/whitespace string → preserve the stored token
+        (what the UI sends when the admin edited other fields but did not
+        type a new token);
+      * a non-empty string → replace, refreshing `patUpdatedAt`;
+      * an explicit ``None`` → clear the token and its timestamp.
+
+    Returns the updated config (same shape as get_airtable_component_config),
+    or None if the link is unknown / not an airtable widget.
+    """
+    component = _airtable_component_by_link(db, link)
+    if component is None:
+        return None
+
+    try:
+        # RAW: this reads the blob in order to write it back. Reading the
+        # sanitised view would drop the stored `pat` from `data` and so
+        # delete the token whenever any OTHER field is updated.
+        data = dict(_raw_component_data(db, component))
+
+        if source_url is not _UNSET:
+            data["sourceUrl"] = (source_url or "").strip()
+
+        if personalize_enabled is not _UNSET:
+            data["personalizeEnabled"] = bool(personalize_enabled)
+
+        if personalize_column is not _UNSET:
+            data["personalizeColumn"] = (personalize_column or "").strip() or None
+
+        if pat is not _UNSET:
+            if pat is None:
+                data.pop("pat", None)
+                data.pop("patUpdatedAt", None)
+            elif str(pat).strip():
+                new_pat = str(pat).strip()
+                # Only stamp when the token actually CHANGES. The client may
+                # resend the same value (it still round-trips in the widget
+                # blob until the read-side strip lands), and bumping the
+                # timestamp on every save would turn "when was this token last
+                # rotated" into "when was this widget last saved" — destroying
+                # the one signal that makes a write-only PAT auditable.
+                if new_pat != data.get("pat"):
+                    data["pat"] = new_pat
+                    data["patUpdatedAt"] = _utc_now().isoformat()
+
+        if access_control is not _UNSET:
+            component.access_control = access_control
+
+        _write_component_data(db, component, data)
+        db.commit()
+
+        return get_airtable_component_config(db, link)
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _get_gridstack_ancestor_chain(db: Session, gridstack: GridstackV2) -> list[str]:
@@ -999,12 +1284,30 @@ def update_tab_content_v2(
                     existing = candidate
 
             if existing is not None:
+                # Read the stored blob BEFORE mutating `existing.type` below:
+                # _resolve_component_data branches on the component's type, so
+                # a type change would otherwise make it unwrap the wrong shape.
+                # RAW, not the sanitised view: the sanitised one has `pat`
+                # removed, so preserving from it would delete the stored token
+                # on every canvas save.
+                stored_data = (
+                    _raw_component_data(db, existing)
+                    if widget_type == AIRTABLE_WIDGET_TYPE
+                    else None
+                )
+
                 existing.type = widget_type
                 existing.x = layout_entry.get("x", existing.x)
                 existing.y = layout_entry.get("y", existing.y)
                 existing.width = layout_entry.get("w", existing.width)
                 existing.height = layout_entry.get("h", existing.height)
-                existing.access_control = access_control
+                # An airtable widget's access_control is protected — see
+                # AIRTABLE_PROTECTED_DATA_FIELDS. This save path is
+                # unauthenticated, so letting it clear the AC would defeat the
+                # check on GET /data/airtable/component/{link}/rows. Changing
+                # it goes through the authenticated config endpoint instead.
+                if widget_type != AIRTABLE_WIDGET_TYPE:
+                    existing.access_control = access_control
                 existing.title = title
                 existing.description = description
 
@@ -1015,7 +1318,10 @@ def update_tab_content_v2(
                 existing.props = {**(existing.props or {}), **structural_props}
 
                 if widget_type != MIRROR_WIDGET_TYPE:
-                    _write_component_data(db, existing, widget_data if isinstance(widget_data, dict) else {})
+                    data_to_write = widget_data if isinstance(widget_data, dict) else {}
+                    if widget_type == AIRTABLE_WIDGET_TYPE:
+                        data_to_write = _apply_airtable_protection(stored_data, data_to_write)
+                    _write_component_data(db, existing, data_to_write)
             else:
                 new_component = ComponentV2(
                     link=_generate_id(),
@@ -1023,7 +1329,13 @@ def update_tab_content_v2(
                     title=title,
                     description=description,
                     props=structural_props,
-                    access_control=access_control,
+                    # A brand-new airtable widget gets no access_control here
+                    # (protected — see AIRTABLE_PROTECTED_DATA_FIELDS); the
+                    # frontend sets it via the authenticated config endpoint
+                    # right after this save assigns the component its `link`.
+                    access_control=(
+                        None if widget_type == AIRTABLE_WIDGET_TYPE else access_control
+                    ),
                     x=layout_entry.get("x", 0),
                     y=layout_entry.get("y", 0),
                     width=layout_entry.get("w", 6),
@@ -1035,7 +1347,12 @@ def update_tab_content_v2(
                 db.add(new_component)
                 if widget_type != MIRROR_WIDGET_TYPE:
                     db.flush()
-                    _write_component_data(db, new_component, widget_data if isinstance(widget_data, dict) else {})
+                    data_to_write = widget_data if isinstance(widget_data, dict) else {}
+                    if widget_type == AIRTABLE_WIDGET_TYPE:
+                        # Nothing stored yet, so this drops every protected
+                        # field rather than trusting the unauthenticated body.
+                        data_to_write = _apply_airtable_protection(None, data_to_write)
+                    _write_component_data(db, new_component, data_to_write)
 
         # Persist the Super GridStack tab-bar config. It rides in the canvas
         # `content` (content.sgs) but is stored on the gridstack's own

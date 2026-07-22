@@ -18,7 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from email.utils import parseaddr
+from typing import Any
 from urllib.parse import parse_qs
+
+from sqlalchemy.orm import Session
 
 from fastapi import (
     APIRouter,
@@ -33,6 +36,7 @@ from fastapi import (
 )
 
 from app.config import get_settings
+from app.db_v2.database import get_db_v2
 from app.dependencies import (
     get_airtable_service,
     get_current_user,
@@ -44,7 +48,12 @@ from app.helpers.slack import (
     verify_slack_signature,
 )
 from app.models.airtable import (
+    AirtableComponentConfigResponse,
+    AirtableComponentConfigUpdate,
+    AirtableEditorPreviewRequest,
+    AirtableEditorPreviewResponse,
     AirtablePreviewResponse,
+    AirtableWidgetRowsResponse,
     AirtableRecord,
     AirtableUserIdResponse,
     ActiveProgramItem,
@@ -137,6 +146,13 @@ from app.models.airtable import (
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.gemini_service import GeminiService
+from app.services.gridstack_service import (
+    get_airtable_component_config,
+    get_airtable_component_data,
+    get_airtable_pat_for_component,
+    update_airtable_component_config,
+)
+from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
 
 logger = logging.getLogger(__name__)
 
@@ -144,21 +160,39 @@ router = APIRouter(prefix="/data", tags=["Data"])
 
 
 # ══════════════════════════════════════════════════════════════════════
-#   Generic Airtable preview (dashboard Airtable widget)
+#   DEPRECATED — generic Airtable preview
+#
+#   Superseded by the two per-component endpoints above. Nothing in either
+#   repo calls this any more: both former callers (AirtableWidget's view
+#   fetch and the Property Panel's column discovery) moved to
+#   `/airtable/component/{link}/rows` and `/airtable/component/preview`
+#   when the PAT stopped being sent to browsers.
+#
+#   Kept only long enough to prove it is unused. It takes a caller-supplied
+#   token and an arbitrary base/table, so it is a bring-your-own-credential
+#   proxy: it grants no access the caller does not already have, but it is a
+#   convenient tool for anyone holding a leaked token, and there is no reason
+#   for it to exist now.
+#
+#   REMOVAL CRITERION: if `airtable.preview.deprecated_call` does not appear
+#   in the logs after a full usage cycle in production, delete this endpoint
+#   and `AirtableService.preview_from_url` with it. Logged rather than
+#   deleted outright because an out-of-repo consumer cannot be ruled out
+#   from here — the same reasoning that kept the tabs endpoints open.
 # ══════════════════════════════════════════════════════════════════════
 @router.get(
     "/airtable/preview",
     response_model=AirtablePreviewResponse,
-    summary="Read-only preview of an arbitrary Airtable table/view by share URL",
+    summary="[DEPRECATED] Read-only preview of an arbitrary Airtable table by share URL",
+    deprecated=True,
     description="""
-Resolves a pasted Airtable share URL (containing an app... base id and a
-tbl... table id, optionally a viw... view id) to a capped, read-only set
-of rows.
+**Deprecated.** Use `/data/airtable/component/{link}/rows` (viewers) or
+`/data/airtable/component/preview` (editors) instead. Those build the
+Airtable formula server-side and never require a token in the browser.
 
-Unlike every other endpoint in this router, this is not tied to a fixed
-business table/schema — it's used by the dashboard's Airtable widget to
-display an arbitrary table the user points it at. Capped at 100 rows,
-no write-back.
+Resolves a pasted Airtable share URL to a capped, read-only set of rows,
+using a token supplied by the caller. Capped at 100 rows, no write-back.
+Scheduled for removal once logs confirm it has no remaining callers.
 """,
 )
 async def get_airtable_preview(
@@ -178,8 +212,266 @@ async def get_airtable_preview(
     _user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    # Deliberately logs WHO called, so a surviving consumer can be identified
+    # and migrated rather than merely counted. No token or formula is logged.
+    logger.warning(
+        "airtable.preview.deprecated_call caller=%s url=%s",
+        getattr(_user, "email", "unknown"),
+        url[:120],
+    )
     return await airtable_service.preview_from_url(
         url, fields=fields, formula=formula, api_key=x_airtable_pat
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Airtable widget protected configuration
+#
+#   The only authenticated way to read/write an airtable widget's PAT,
+#   source URL, personalize settings and access control. The canvas save
+#   (PUT /v2/tabs/{id}/content) deliberately ignores those fields — see
+#   AIRTABLE_PROTECTED_DATA_FIELDS in gridstack_service.py.
+# ══════════════════════════════════════════════════════════════════════
+@router.get(
+    "/airtable/component/{link}/config",
+    response_model=AirtableComponentConfigResponse,
+    summary="Read a dashboard Airtable widget's configuration (never the PAT)",
+)
+def get_airtable_component_config_endpoint(
+    link: str = Path(..., description="The component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    _user: UserInfo = Depends(get_current_user),
+):
+    config = get_airtable_component_config(db, link)
+    if config is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+    return config
+
+
+@router.put(
+    "/airtable/component/{link}/config",
+    response_model=AirtableComponentConfigResponse,
+    summary="Update a dashboard Airtable widget's protected configuration",
+    description="""
+Partial update — only the fields present in the request body are applied.
+
+`pat` is three-way: omit it (or send an empty string) to keep the stored
+token, send a non-empty string to replace it, or send an explicit `null`
+to clear it. The token is never returned; use `hasPat` / `patHint`.
+""",
+)
+def update_airtable_component_config_endpoint(
+    link: str = Path(..., description="The component's stable `link`."),
+    body: AirtableComponentConfigUpdate = Body(...),
+    db: Session = Depends(get_db_v2),
+    _user: UserInfo = Depends(get_current_user),
+):
+    # `model_fields_set` distinguishes "absent" from "explicitly null" —
+    # which is the difference between preserving and clearing the PAT.
+    provided = body.model_fields_set
+    updates: dict[str, Any] = {}
+    if "sourceUrl" in provided:
+        updates["source_url"] = body.sourceUrl
+    if "pat" in provided:
+        updates["pat"] = body.pat
+    if "personalizeEnabled" in provided:
+        updates["personalize_enabled"] = body.personalizeEnabled
+    if "personalizeColumn" in provided:
+        updates["personalize_column"] = body.personalizeColumn
+    if "access_control" in provided:
+        updates["access_control"] = body.access_control
+
+    config = update_airtable_component_config(db, link, **updates)
+    if config is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+    return config
+
+
+@router.get(
+    "/airtable/component/{link}/rows",
+    response_model=AirtableWidgetRowsResponse,
+    summary="Rows for a dashboard Airtable widget, filtered server-side",
+    description="""
+Returns one page (max 100 rows) of the widget's data, fetched by the server
+under the widget's stored token.
+
+The caller supplies only a page `cursor`. The Airtable formula is built
+server-side from the widget's stored filters plus — when personalization is
+on — the caller's own authenticated email, so a viewer cannot widen what
+they are shown by tampering with the request.
+
+If personalization is enabled but cannot be applied, the response is empty
+with `personalize_blocked: true`; it never falls back to unfiltered rows.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_rows(
+    link: str = Path(..., description="The component's stable `link`."),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque next-page cursor from a previous response.",
+    ),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    config = get_airtable_component_config(db, link)
+    if config is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    roles = list(user.roles)
+
+    # Access control, matching the existing (deliberately narrow) pattern in
+    # tab_service.filter_widget_content_for_user: Hub Admins bypass, and only
+    # a widget's OWN explicit access_control is enforced. A widget with no
+    # explicit AC is readable by any authenticated caller here — it inherits
+    # from its tab, which nothing enforces server-side today. That residual
+    # gap is documented in
+    # AI Docs/plan_airtable_personalize_backend_enforcement.md.
+    widget_ac = config.get("access_control")
+    if widget_ac and HUB_ADMIN_ROLE not in roles:
+        if not _user_can_view_widget(widget_ac, user.email, roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this widget",
+            )
+
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = get_airtable_pat_for_component(db, link)
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    stored = get_airtable_component_data(db, link) or {}
+
+    return await airtable_service.fetch_widget_rows(
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        selected_columns=stored.get("selectedColumns") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
+        cursor=cursor,
+    )
+
+
+@router.post(
+    "/airtable/component/preview",
+    response_model=AirtableEditorPreviewResponse,
+    summary="Preview an Airtable widget's in-progress settings (Property Panel)",
+    description="""
+Preview settings that have not been saved yet — used by the Property Panel's
+column dropdowns and the in-canvas edit preview.
+
+Send **either** your own `pat` + `sourceUrl` (nothing is borrowed), **or** a
+`link` alone (token and source URL both come from storage, and the widget's
+access control applies). Sending a `sourceUrl` that differs from the stored
+one while relying on the stored token is rejected: a different table needs
+its own token.
+
+`fields` is computed without personalization so the dropdowns populate even
+when your own row set is empty; `rows` reflects what you would actually see.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def preview_airtable_component(
+    body: AirtableEditorPreviewRequest = Body(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    body_pat = (body.pat or "").strip()
+    body_url = (body.sourceUrl or "").strip()
+    link = (body.link or "").strip()
+
+    if body_pat:
+        # Own-token shape: the caller already holds this credential, so there
+        # is nothing to borrow and no widget to authorise against.
+        if not body_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="sourceUrl is required when supplying a pat",
+            )
+        url, api_key = body_url, body_pat
+
+    elif link:
+        config = get_airtable_component_config(db, link)
+        if config is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Airtable component not found",
+            )
+
+        roles = list(user.roles)
+        widget_ac = config.get("access_control")
+        if widget_ac and HUB_ADMIN_ROLE not in roles:
+            if not _user_can_view_widget(widget_ac, user.email, roles):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have access to this widget",
+                )
+
+        stored_url = (config.get("sourceUrl") or "").strip()
+
+        # The stored token is only ever usable against the STORED url.
+        # Without this, a caller who cannot read the token could still point
+        # it at any other table in the same Airtable workspace.
+        if body_url and body_url != stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Enter the access token for the new source URL — the "
+                    "stored token is only valid for the stored URL."
+                ),
+            )
+
+        if not stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Airtable widget has no source URL configured",
+            )
+
+        stored_pat = get_airtable_pat_for_component(db, link)
+        if not stored_pat:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Airtable widget has no access token configured",
+            )
+
+        url, api_key = stored_url, stored_pat
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either a link, or a pat with a sourceUrl",
+        )
+
+    return await airtable_service.preview_widget_config(
+        url=url,
+        api_key=api_key,
+        caller_email=user.email,
+        selected_columns=body.selectedColumns or None,
+        filters=body.filters or None,
+        personalize_enabled=bool(body.personalizeEnabled),
+        personalize_column=body.personalizeColumn,
     )
 
 
