@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 
+from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build, Resource
 from google_auth_oauthlib.flow import Flow
@@ -27,6 +28,10 @@ OAUTH_SCOPES = [
 ]
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+# Read/write events only — NOT the full `calendar` scope, which would also
+# permit deleting calendars and rewriting sharing ACLs.
+CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 
 
 def build_oauth_flow(settings: Settings) -> Flow:
@@ -65,3 +70,34 @@ def build_drive_service(settings: Settings) -> Resource:
             scopes=DRIVE_SCOPES,
         )
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def build_calendar_service(settings: Settings) -> Resource:
+    """
+    Return an authenticated Google Calendar API v3 service acting *as* the
+    shared events account (GOOGLE_CALENDAR_ID).
+
+    Unlike the Drive client, this uses **user** credentials (an OAuth refresh
+    token the events account granted once), not a service account. That is
+    deliberate: a service account cannot add attendees to an event without
+    domain-wide delegation, whereas a real user account can. The refresh token
+    keeps the blast radius to this one account instead of the whole domain.
+
+    The access token is minted lazily and auto-refreshed by the client on
+    expiry; only the long-lived refresh token is stored.
+    """
+    if not settings.GOOGLE_CALENDAR_REFRESH_TOKEN:
+        raise RuntimeError(
+            "GOOGLE_CALENDAR_REFRESH_TOKEN is not set. Run "
+            "scripts/get_calendar_refresh_token.py and add the token to the "
+            "environment."
+        )
+    credentials = UserCredentials(
+        token=None,
+        refresh_token=settings.GOOGLE_CALENDAR_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.GOOGLE_CLIENT_ID,
+        client_secret=settings.GOOGLE_CLIENT_SECRET,
+        scopes=CALENDAR_SCOPES,
+    )
+    return build("calendar", "v3", credentials=credentials, cache_discovery=False)
