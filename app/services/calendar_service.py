@@ -55,6 +55,27 @@ def _is_all_day(node: dict[str, Any] | None) -> bool:
     return bool(node) and "date" in node and "dateTime" not in node
 
 
+def _meeting_from(event: dict[str, Any]) -> tuple[str | None, str | None]:
+    """
+    Return ``(join_url, provider_label)`` for the event's video conference.
+
+    Prefers structured ``conferenceData`` — populated for Zoom, Meet, Teams and
+    Webex added through Google's conferencing UI (e.g. the Zoom for Google
+    Workspace add-on) — and picks the ``video`` entry point. Falls back to the
+    Meet-only ``hangoutLink`` field. Returns ``(None, None)`` when the event has
+    no attached conference.
+    """
+    conf = event.get("conferenceData") or {}
+    label = (conf.get("conferenceSolution") or {}).get("name")
+    for entry in conf.get("entryPoints", []) or []:
+        if entry.get("entryPointType") == "video" and entry.get("uri"):
+            return entry["uri"], label
+    hangout = event.get("hangoutLink")
+    if hangout:
+        return hangout, label or "Google Meet"
+    return None, None
+
+
 class CalendarService:
     """Thin wrapper around the Google Calendar v3 API for one shared calendar."""
 
@@ -164,6 +185,8 @@ class CalendarService:
             (a.get("email", "").lower() == viewer_email.lower()) for a in attendees
         )
 
+        meeting_link, meeting_label = _meeting_from(master)
+
         return CalendarEvent(
             id=event_id,
             summary=master.get("summary", ""),
@@ -173,7 +196,8 @@ class CalendarService:
             location=master.get("location"),
             description=master.get("description"),
             html_link=master.get("htmlLink"),
-            hangout_link=master.get("hangoutLink"),
+            meeting_link=meeting_link,
+            meeting_label=meeting_label,
             recurring=recurring,
             attending=attending,
         )

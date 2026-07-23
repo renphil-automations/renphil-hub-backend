@@ -35,8 +35,17 @@ class CalendarEvent(BaseModel):
     html_link: str | None = Field(
         default=None, description="Link back to the canonical event in Google Calendar."
     )
-    hangout_link: str | None = Field(
-        default=None, description="Google Meet link, when the event has one."
+    meeting_link: str | None = Field(
+        default=None,
+        description=(
+            "Video conferencing join URL, when the event has one. Sourced from "
+            "conferenceData (Zoom / Meet / Teams / Webex added via Google's "
+            "conferencing UI), falling back to the Google Meet hangoutLink."
+        ),
+    )
+    meeting_label: str | None = Field(
+        default=None,
+        description="Conferencing provider name, e.g. 'Zoom' or 'Google Meet'.",
     )
     recurring: bool = False
     attending: bool = Field(
