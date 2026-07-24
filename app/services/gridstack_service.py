@@ -717,8 +717,14 @@ def create_tab_variant_v2(
         if is_first_variant:
             _migrate_root_content_to_variant(db, parent_gridstack, new_gridstack, new_tab)
 
+        affected_component_ids = _component_ids_for_gridstack_tree(db, new_gridstack)
         db.commit()
-        return _format_tab_summary(db, new_gridstack)
+        response = _format_tab_summary(db, new_gridstack)
+        response["search_updates"] = [
+            {"component_id": component_id, "action": "upsert"}
+            for component_id in affected_component_ids
+        ]
+        return response
 
     except Exception:
         db.rollback()
@@ -759,6 +765,8 @@ def reorder_tab_variants_v2(
                 variant_gridstack.position = index
 
         db.commit()
+        # Position is UI-only. Component ingestion does not store variant
+        # order, so reordering must not create a Qdrant update job.
         return get_tab_variants_v2(db, parent_document_id)
 
     except Exception:
@@ -848,7 +856,7 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
 
 def _cascade_gridstack_id_to_sbn_descendants(
     db: Session, component_id: int, new_gridstack_id: int
-) -> None:
+) -> list[int]:
     """When a Super Block Note's top-level widget is re-parented into a
     different gridstack (see the by-`link` re-parenting branch in
     `update_tab_content_v2`), every descendant (`super_blocknote_id` chain)
@@ -859,10 +867,88 @@ def _cascade_gridstack_id_to_sbn_descendants(
     this: without this cascade, deleting the gridstack the root moved into
     finds only the root, not its children, which still reference it via
     `super_blocknote_id` — a foreign key violation."""
+    changed_ids: list[int] = []
     children = db.query(ComponentV2).filter(ComponentV2.super_blocknote_id == component_id).all()
     for child in children:
         child.gridstack_id = new_gridstack_id
-        _cascade_gridstack_id_to_sbn_descendants(db, child.id, new_gridstack_id)
+        changed_ids.append(child.id)
+        changed_ids.extend(
+            _cascade_gridstack_id_to_sbn_descendants(db, child.id, new_gridstack_id)
+        )
+    return changed_ids
+
+
+def _component_persistence_signature(db: Session, component: ComponentV2) -> dict[str, Any]:
+    """Return only database state that can affect this component's index.
+
+    Comparing the committed representation here is more reliable than a
+    frontend event registry: widget editors can emit multiple equivalent
+    objects, while this signature changes only when persisted component
+    state actually changes.
+    """
+    page_content: Any = None
+    if component.page_content_id is not None:
+        stored = (
+            db.query(PageContentV2)
+            .filter(PageContentV2.id == component.page_content_id)
+            .first()
+        )
+        page_content = stored.content if stored is not None else None
+    return {
+        "type": component.type,
+        "title": component.title,
+        "description": component.description,
+        "x": component.x,
+        "y": component.y,
+        "width": component.width,
+        "height": component.height,
+        "props": component.props,
+        "access_control": component.access_control,
+        "gridstack_id": component.gridstack_id,
+        "super_blocknote_id": component.super_blocknote_id,
+        "current_grid_id": component.current_grid_id,
+        "page_content": page_content,
+    }
+
+
+def _search_update_receipts(updates: dict[int, str]) -> list[dict[str, Any]]:
+    return [
+        {"component_id": component_id, "action": action}
+        for component_id, action in updates.items()
+    ]
+
+
+def _component_ids_for_gridstack_tree(
+    db: Session,
+    gridstack: GridstackV2,
+    *,
+    include_variants: bool = False,
+) -> list[int]:
+    """Return every component whose searchable metadata owns this path."""
+    gridstack_ids = [gridstack.id, *get_descendant_gridstack_ids(db, gridstack.id)]
+    if include_variants and _is_root(gridstack):
+        tab = _get_root_tab(db, gridstack)
+        if tab is not None:
+            variants = db.query(TabV2).filter(TabV2.parent_tab_id == tab.id).all()
+            for variant in variants:
+                variant_gridstack = (
+                    db.query(GridstackV2)
+                    .filter(GridstackV2.document_id == variant.document_id)
+                    .first()
+                )
+                if variant_gridstack is not None:
+                    gridstack_ids.extend(
+                        [
+                            variant_gridstack.id,
+                            *get_descendant_gridstack_ids(db, variant_gridstack.id),
+                        ]
+                    )
+    rows = (
+        db.query(ComponentV2.id)
+        .filter(ComponentV2.gridstack_id.in_(set(gridstack_ids)))
+        .all()
+    )
+    return [row[0] for row in rows]
 
 
 def update_tab_content_v2(
@@ -875,6 +961,7 @@ def update_tab_content_v2(
         if gridstack is None:
             return None
 
+        search_updates: dict[int, str] = {}
         incoming = content if isinstance(content, dict) else {}
         incoming_layout = {entry.get("id"): entry for entry in (incoming.get("layout") or [])}
         incoming_widgets = incoming.get("widgets") or {}
@@ -902,6 +989,7 @@ def update_tab_content_v2(
         # Delete components removed from the canvas.
         for existing_id, component in list(existing_components.items()):
             if existing_id not in incoming_ids:
+                search_updates[component.id] = "delete"
                 if component.page_content_id is not None:
                     page_content = (
                         db.query(PageContentV2)
@@ -965,6 +1053,11 @@ def update_tab_content_v2(
             description = widget_entry.get("description")
 
             existing = existing_components.get(widget_id)
+            before_signature = (
+                _component_persistence_signature(db, existing)
+                if existing is not None
+                else None
+            )
             if existing is None:
                 link = widget_entry.get("link")
                 candidate = components_by_link.get(link) if link else None
@@ -973,8 +1066,12 @@ def update_tab_content_v2(
                     and candidate.gridstack_id != gridstack.id
                     and candidate.super_blocknote_id is None
                 ):
+                    before_signature = _component_persistence_signature(db, candidate)
                     candidate.gridstack_id = gridstack.id
-                    _cascade_gridstack_id_to_sbn_descendants(db, candidate.id, gridstack.id)
+                    for descendant_id in _cascade_gridstack_id_to_sbn_descendants(
+                        db, candidate.id, gridstack.id
+                    ):
+                        search_updates[descendant_id] = "upsert"
                     existing = candidate
 
             if existing is not None:
@@ -983,7 +1080,18 @@ def update_tab_content_v2(
                 existing.y = layout_entry.get("y", existing.y)
                 existing.width = layout_entry.get("w", existing.width)
                 existing.height = layout_entry.get("h", existing.height)
-                existing.access_control = access_control
+                # The serializer intentionally omits an empty access object.
+                # Absence therefore means "preserve", not "overwrite with
+                # null". Treating it as null made every empty-access sibling
+                # look modified on an otherwise one-widget content save.
+                # Mirrors are a second special case: their serialized access
+                # is derived from the target for read filtering, not the
+                # mirror row's own persisted access.
+                if (
+                    widget_type != MIRROR_WIDGET_TYPE
+                    and "access_control" in widget_entry
+                ):
+                    existing.access_control = access_control
                 existing.title = title
                 existing.description = description
 
@@ -995,6 +1103,9 @@ def update_tab_content_v2(
 
                 if widget_type != MIRROR_WIDGET_TYPE:
                     _write_component_data(db, existing, widget_data if isinstance(widget_data, dict) else {})
+                db.flush()
+                if before_signature != _component_persistence_signature(db, existing):
+                    search_updates[existing.id] = "upsert"
             else:
                 new_component = ComponentV2(
                     link=_generate_id(),
@@ -1012,9 +1123,10 @@ def update_tab_content_v2(
                     current_grid_id=None,
                 )
                 db.add(new_component)
+                db.flush()
                 if widget_type != MIRROR_WIDGET_TYPE:
-                    db.flush()
                     _write_component_data(db, new_component, widget_data if isinstance(widget_data, dict) else {})
+                search_updates[new_component.id] = "upsert"
 
         # Persist the Super GridStack tab-bar config. It rides in the canvas
         # `content` (content.sgs) but is stored on the gridstack's own
@@ -1049,11 +1161,19 @@ def update_tab_content_v2(
                     .first()
                 )
                 if gridstack_component is not None:
+                    representation_before = _component_persistence_signature(
+                        db, gridstack_component
+                    )
                     new_sgs = settings.get("sgs")
                     gridstack_component.type = (
                         SUPER_GRIDSTACK_WIDGET_TYPE if new_sgs else GRIDSTACK_WIDGET_TYPE
                     )
                     gridstack_component.props = {"sgs": new_sgs} if new_sgs else None
+                    db.flush()
+                    if representation_before != _component_persistence_signature(
+                        db, gridstack_component
+                    ):
+                        search_updates[gridstack_component.id] = "upsert"
 
         if _is_root(gridstack):
             tab = _get_root_tab(db, gridstack)
@@ -1062,7 +1182,9 @@ def update_tab_content_v2(
 
         db.commit()
 
-        return _format_page_content(db, gridstack)
+        response = _format_page_content(db, gridstack)
+        response["search_updates"] = _search_update_receipts(search_updates)
+        return response
 
     except Exception:
         db.rollback()
@@ -1117,6 +1239,7 @@ def create_tab_v2(
 
         now = _utc_now()
 
+        created_gridstack_component: ComponentV2
         if parent_gridstack is None:
             if _root_tab_exists_by_title(db, title) is not None:
                 raise ValueError("A tab with this title already exists under the same parent")
@@ -1144,7 +1267,7 @@ def create_tab_v2(
             )
             db.add(new_gridstack)
             db.flush()
-            _create_gridstack_component(db, new_gridstack)
+            created_gridstack_component = _create_gridstack_component(db, new_gridstack)
         else:
             existing = _gridstack_exists_under_parent(
                 db, title, parent_tab_id=parent_gridstack.parent_tab_id, parent_id=parent_gridstack.id
@@ -1162,14 +1285,24 @@ def create_tab_v2(
             )
             db.add(new_gridstack)
             db.flush()
-            _create_gridstack_component(db, new_gridstack)
+            created_gridstack_component = _create_gridstack_component(db, new_gridstack)
 
+        content_receipts: list[dict[str, Any]] = []
         if content:
-            update_tab_content_v2(db, new_gridstack.document_id, content)
+            content_result = update_tab_content_v2(db, new_gridstack.document_id, content)
+            if content_result is not None:
+                content_receipts = list(content_result.get("search_updates") or [])
 
         db.commit()
 
-        return _format_tab_summary(db, new_gridstack)
+        response = _format_tab_summary(db, new_gridstack)
+        receipts: dict[int, str] = {
+            created_gridstack_component.id: "upsert"
+        }
+        for item in content_receipts:
+            receipts[int(item["component_id"])] = str(item["action"])
+        response["search_updates"] = _search_update_receipts(receipts)
+        return response
 
     except Exception:
         db.rollback()
@@ -1274,8 +1407,29 @@ def update_tab_by_document_id_v2(
                     "Locking is only supported for top-level tabs in this schema version"
                 )
 
+        # The indexed component payload reads the owning root/variant title
+        # and access control, but never the visual order. A nested gridstack's
+        # own title/access settings are resolved live by component-link
+        # navigation and are likewise absent from the Qdrant document.
+        should_refresh_index = _is_root(gridstack) and any(
+            value is not None for value in (title, access_control)
+        )
+        affected_component_ids = (
+            _component_ids_for_gridstack_tree(
+                db,
+                gridstack,
+            )
+            if should_refresh_index
+            else []
+        )
         db.commit()
-        return get_tab_workspace_v2(db, document_id)
+        response = get_tab_workspace_v2(db, document_id)
+        if response is not None and affected_component_ids:
+            response["search_updates"] = [
+                {"component_id": component_id, "action": "upsert"}
+                for component_id in affected_component_ids
+            ]
+        return response
 
     except Exception:
         db.rollback()
@@ -1409,8 +1563,15 @@ def move_tab_by_document_id_v2(
         if order is not None:
             gridstack.position = order
 
+        affected_component_ids = _component_ids_for_gridstack_tree(db, gridstack)
         db.commit()
-        return get_tab_workspace_v2(db, document_id)
+        response = get_tab_workspace_v2(db, document_id)
+        if response is not None:
+            response["search_updates"] = [
+                {"component_id": component_id, "action": "upsert"}
+                for component_id in affected_component_ids
+            ]
+        return response
 
     except Exception:
         db.rollback()
@@ -1456,12 +1617,17 @@ def reorder_tabs_by_document_id_v2(db: Session, items: list[dict[str, Any]]) -> 
         db.commit()
 
         if parent_id is None:
-            return get_root_tabs_v2(db)
+            response = get_root_tabs_v2(db)
+        else:
+            parent = db.query(GridstackV2).filter(GridstackV2.id == parent_id).first()
+            if parent is None:
+                return []
+            response = get_tab_children_v2(db, parent.document_id) or []
 
-        parent = db.query(GridstackV2).filter(GridstackV2.id == parent_id).first()
-        if parent is None:
-            return []
-        return get_tab_children_v2(db, parent.document_id) or []
+        # Reorder changes only the UI position. None of the fields fetched by
+        # component ingestion changes, so response-model defaults intentionally
+        # leave search_updates empty.
+        return response
 
     except Exception:
         db.rollback()
@@ -1475,6 +1641,7 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
             return None
 
         deleted_tabs: list[dict[str, Any]] = []
+        deleted_component_ids: list[int] = []
 
         # A root tab may own tab variants (TabV2.parent_tab_id) — a wholly
         # separate nesting axis from GridstackV2.parent_id below. Each
@@ -1497,6 +1664,10 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
                     variant_result = delete_tab_subtree_by_document_id_v2(db, variant_tab.document_id)
                     if variant_result:
                         deleted_tabs.extend(variant_result.get("deleted_tabs", []))
+                        deleted_component_ids.extend(
+                            int(item["component_id"])
+                            for item in variant_result.get("search_updates", [])
+                        )
 
         # get_descendant_gridstack_ids returns a pre-order walk (each node
         # appears before its own descendants) — reversing it alone already
@@ -1528,6 +1699,7 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
                 .all()
             )
             for component in components:
+                deleted_component_ids.append(component.id)
                 if component.page_content_id is not None:
                     page_content = (
                         db.query(PageContentV2)
@@ -1565,6 +1737,10 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
             "message": "Tab subtree deleted successfully",
             "deleted_count": len(deleted_tabs),
             "deleted_tabs": deleted_tabs,
+            "search_updates": [
+                {"component_id": component_id, "action": "delete"}
+                for component_id in deleted_component_ids
+            ],
         }
 
     except Exception:
