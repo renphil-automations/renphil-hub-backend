@@ -220,6 +220,20 @@ def _get_root_tab(db: Session, gridstack: GridstackV2) -> TabV2 | None:
     return db.query(TabV2).filter(TabV2.id == gridstack.parent_tab_id).first()
 
 
+# Sentinel for the optional `root_tab` param on `_safe_locked_pair` /
+# `_safe_access_control_for_gridstack` below — distinguishes "caller hasn't
+# fetched the root tab, look it up yourself" from "caller already fetched it
+# and it's genuinely None" (no matching TabV2 row), so a `None` result never
+# triggers a wasted duplicate re-query. Profiling against live Neon found
+# `_format_tab_summary`/`get_tab_workspace_v2` each fetching the SAME TabV2
+# row 3 times (once directly, once via each of these two helpers) — at
+# ~165ms/round-trip to the DB, that's ~330ms of pure duplicate work on every
+# root-tab summary/workspace call. Callers that already have the tab (both
+# functions above fetch it once up front when the gridstack is root) pass it
+# through instead of letting these helpers re-fetch it.
+_ROOT_TAB_NOT_FETCHED: Any = object()
+
+
 def _get_gridstack_component(db: Session, gridstack_id: int) -> ComponentV2 | None:
     """The ComponentV2 row that represents `gridstack_id` itself (see
     current_grid_id on the model) — the sub-tab access_control migration's
@@ -249,9 +263,13 @@ def _has_content(db: Session, gridstack_id: int) -> bool:
     )
 
 
-def _safe_access_control_for_gridstack(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
+def _safe_access_control_for_gridstack(
+    db: Session,
+    gridstack: GridstackV2,
+    root_tab: TabV2 | None = _ROOT_TAB_NOT_FETCHED,
+) -> dict[str, Any]:
     if _is_root(gridstack):
-        tab = _get_root_tab(db, gridstack)
+        tab = root_tab if root_tab is not _ROOT_TAB_NOT_FETCHED else _get_root_tab(db, gridstack)
         return _access_control_or_default(tab.access_control if tab else None)
 
     # A sub-tab's access_control lives on its own representation component
@@ -263,9 +281,13 @@ def _safe_access_control_for_gridstack(db: Session, gridstack: GridstackV2) -> d
     return _access_control_or_default(component.access_control if component else None)
 
 
-def _safe_locked_pair(db: Session, gridstack: GridstackV2) -> tuple[bool, str]:
+def _safe_locked_pair(
+    db: Session,
+    gridstack: GridstackV2,
+    root_tab: TabV2 | None = _ROOT_TAB_NOT_FETCHED,
+) -> tuple[bool, str]:
     if _is_root(gridstack):
-        tab = _get_root_tab(db, gridstack)
+        tab = root_tab if root_tab is not _ROOT_TAB_NOT_FETCHED else _get_root_tab(db, gridstack)
         if tab is None:
             return False, ""
         return bool(tab.locked), (tab.locked_by or "")
@@ -279,17 +301,22 @@ def _has_variants(db: Session, tab_id: int) -> bool:
 
 
 def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
-    locked, locked_by = _safe_locked_pair(db, gridstack)
-    node_id = gridstack.parent_tab_id if _is_root(gridstack) else gridstack.id
+    is_root = _is_root(gridstack)
+    # Fetched once here (only when root — non-root gridstacks never had this
+    # query) and threaded into both helpers below instead of each re-fetching
+    # the identical TabV2 row — see `_ROOT_TAB_NOT_FETCHED`'s doc comment.
+    root_tab = _get_root_tab(db, gridstack) if is_root else None
+
+    locked, locked_by = _safe_locked_pair(db, gridstack, root_tab)
+    node_id = gridstack.parent_tab_id if is_root else gridstack.id
     title = None
     order = gridstack.position if gridstack.position is not None else 0
     has_variants = False
 
-    if _is_root(gridstack):
-        tab = _get_root_tab(db, gridstack)
-        title = tab.title if tab else gridstack.name
-        order = tab.order if tab and tab.order is not None else order
-        has_variants = _has_variants(db, tab.id) if tab is not None else False
+    if is_root:
+        title = root_tab.title if root_tab else gridstack.name
+        order = root_tab.order if root_tab and root_tab.order is not None else order
+        has_variants = _has_variants(db, root_tab.id) if root_tab is not None else False
     else:
         title = gridstack.name
 
@@ -303,7 +330,7 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "has_children": _has_children(db, gridstack.id),
         "has_content": _has_content(db, gridstack.id),
         "has_variants": has_variants,
-        "access_control": _safe_access_control_for_gridstack(db, gridstack),
+        "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
         "apiVersion": "v2",
     }
 
@@ -312,7 +339,11 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
 # Content serialization: ComponentV2 rows <-> GridCanvasContent
 # ---------------------------------------------------------
 
-def _raw_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
+def _raw_component_data(
+    db: Session,
+    component: ComponentV2,
+    preloaded_page_content: dict[int, Any] | None = None,
+) -> dict[str, Any]:
     """The component's `data` blob EXACTLY as stored, secrets included.
 
     Server-internal only. Every client-facing path must go through
@@ -340,17 +371,32 @@ def _raw_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
     `page_content_id` yet) fall back to reading `props` — purely transitional;
     any subsequent save through `update_tab_content_v2`/`_write_component_data`
     moves that row onto `page_content` for good.
+
+    `preloaded_page_content` (keyed by `PageContentV2.id`) is an optional
+    batch-fetched map — see `_serialize_gridstack_content`, which fetches
+    every top-level component's page_content in ONE round trip instead of
+    this function querying it individually per component (confirmed via
+    profiling against live Neon to cost ~165ms/component). A miss (the id
+    isn't in the map — e.g. a mirror's TARGET, which may live outside the
+    batch that was built for the mirror's own gridstack) falls back to the
+    original single-row query, so this is purely an optimization, never a
+    correctness requirement — every caller that doesn't pass it (the single-
+    component call sites: mirror-target/by-link resolution, Airtable config
+    read/write) behaves exactly as before.
     """
     if component.type == MIRROR_WIDGET_TYPE:
         return {}
 
     if component.page_content_id is not None:
-        page_content = (
-            db.query(PageContentV2)
-            .filter(PageContentV2.id == component.page_content_id)
-            .first()
-        )
-        stored = page_content.content if page_content else None
+        if preloaded_page_content is not None and component.page_content_id in preloaded_page_content:
+            stored = preloaded_page_content[component.page_content_id]
+        else:
+            page_content = (
+                db.query(PageContentV2)
+                .filter(PageContentV2.id == component.page_content_id)
+                .first()
+            )
+            stored = page_content.content if page_content else None
         if component.type == "block_note":
             return {"content": stored if stored is not None else []}
         return stored if isinstance(stored, dict) else {}
@@ -364,7 +410,11 @@ def _raw_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
     return legacy_data
 
 
-def _resolve_component_data(db: Session, component: ComponentV2) -> dict[str, Any]:
+def _resolve_component_data(
+    db: Session,
+    component: ComponentV2,
+    preloaded_page_content: dict[int, Any] | None = None,
+) -> dict[str, Any]:
     """The CLIENT-FACING `data` blob for one component — shared by the normal
     serializer path, a mirror's resolution of its target, and the by-link
     lookup endpoint, so all three agree on what a client is allowed to see.
@@ -378,8 +428,11 @@ def _resolve_component_data(db: Session, component: ComponentV2) -> dict[str, An
 
     `hasPat` is computed on every read and never persisted — see
     `_write_component_data`, which drops it again on the way back in.
+
+    `preloaded_page_content` — see `_raw_component_data`'s doc comment; passed
+    straight through.
     """
-    data = _raw_component_data(db, component)
+    data = _raw_component_data(db, component, preloaded_page_content)
 
     if component.type == AIRTABLE_WIDGET_TYPE:
         pat = data.get("pat")
@@ -474,9 +527,17 @@ def _pat_hint(pat: Any) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
-def _serialize_component(db: Session, component: ComponentV2) -> tuple[dict[str, Any], dict[str, Any]]:
+def _serialize_component(
+    db: Session,
+    component: ComponentV2,
+    preloaded_page_content: dict[int, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Returns (layout_entry, widget_entry) for one component, matching
-    gridContent.ts's GridWidgetLayout / GridWidgetEntry shapes."""
+    gridContent.ts's GridWidgetLayout / GridWidgetEntry shapes.
+
+    `preloaded_page_content` — see `_raw_component_data`'s doc comment; passed
+    straight through to whichever `_resolve_component_data` call applies (the
+    component itself, or a mirror's target)."""
 
     props = component.props or {}
 
@@ -517,7 +578,7 @@ def _serialize_component(db: Session, component: ComponentV2) -> tuple[dict[str,
                 "data": {
                     "targetLink": target_link,
                     "mirroredType": target.type,
-                    "mirroredData": _resolve_component_data(db, target),
+                    "mirroredData": _resolve_component_data(db, target, preloaded_page_content),
                 },
             }
             # Key simplification: substitute the TARGET's own access_control
@@ -534,7 +595,7 @@ def _serialize_component(db: Session, component: ComponentV2) -> tuple[dict[str,
 
         return layout_entry, widget_entry
 
-    data = _resolve_component_data(db, component)
+    data = _resolve_component_data(db, component, preloaded_page_content)
 
     # Every widget entry carries its own stable `link` (not just mirrors) —
     # this is how the mirror target picker learns what to reference; the
@@ -571,11 +632,28 @@ def _serialize_gridstack_content(db: Session, gridstack: GridstackV2) -> dict[st
         .all()
     )
 
+    # Batch-fetch every top-level component's page_content in ONE round trip
+    # instead of `_raw_component_data` querying it individually per component
+    # — confirmed via profiling against live Neon: each such query costs
+    # ~165ms regardless of complexity (remote-DB round-trip latency, not
+    # query cost), so this was the dominant per-widget cost on any
+    # multi-widget canvas. A mirror's target may fall outside this batch (a
+    # different gridstack) — `_raw_component_data` falls back to its own
+    # single query in that case, so this is a pure optimization, not a
+    # correctness dependency.
+    page_content_ids = [c.page_content_id for c in components if c.page_content_id is not None]
+    preloaded_page_content: dict[int, Any] = {}
+    if page_content_ids:
+        preloaded_page_content = {
+            row.id: row.content
+            for row in db.query(PageContentV2).filter(PageContentV2.id.in_(page_content_ids)).all()
+        }
+
     layout: list[dict[str, Any]] = []
     widgets: dict[str, Any] = {}
 
     for component in components:
-        layout_entry, widget_entry = _serialize_component(db, component)
+        layout_entry, widget_entry = _serialize_component(db, component, preloaded_page_content)
         layout.append(layout_entry)
         widgets[str(component.id)] = widget_entry
 
@@ -1099,13 +1177,19 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
     if gridstack is None:
         return None
 
+    is_root = _is_root(gridstack)
+    # Fetched once here (only when root) and threaded into both
+    # `_safe_locked_pair`/`_safe_access_control_for_gridstack` calls below
+    # instead of each re-fetching the identical TabV2 row — see
+    # `_ROOT_TAB_NOT_FETCHED`'s doc comment.
+    root_tab = _get_root_tab(db, gridstack) if is_root else None
+
     has_variants = False
-    if _is_root(gridstack):
-        tab = _get_root_tab(db, gridstack)
-        node_id = tab.id if tab else None
-        title = tab.title if tab else gridstack.name
-        order = tab.order if tab and tab.order is not None else (gridstack.position or 0)
-        has_variants = _has_variants(db, tab.id) if tab is not None else False
+    if is_root:
+        node_id = root_tab.id if root_tab else None
+        title = root_tab.title if root_tab else gridstack.name
+        order = root_tab.order if root_tab and root_tab.order is not None else (gridstack.position or 0)
+        has_variants = _has_variants(db, root_tab.id) if root_tab is not None else False
     else:
         node_id = gridstack.id
         title = gridstack.name
@@ -1130,7 +1214,7 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
     child_summaries = [_format_tab_summary(db, c) for c in children]
     child_summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
 
-    locked, locked_by = _safe_locked_pair(db, gridstack)
+    locked, locked_by = _safe_locked_pair(db, gridstack, root_tab)
 
     return {
         "id": node_id,
@@ -1139,7 +1223,7 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         "order": order,
         "parent": parent,
         "page_content": _format_page_content(db, gridstack),
-        "access_control": _safe_access_control_for_gridstack(db, gridstack),
+        "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
         "locked": locked,
         "locked_by": locked_by,
         "children": child_summaries,
