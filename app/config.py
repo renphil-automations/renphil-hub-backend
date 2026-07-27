@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     GOOGLE_SERVICE_ACCOUNT_JSON: str | None = None
     GOOGLE_SERVICE_ACCOUNT_FILE: str = "service_account.json"
 
+    # ── Google Calendar (shared events account) ────────────────────────
+    # The calendar widget reads events from, and RSVPs viewers onto, a single
+    # shared calendar owned by GOOGLE_CALENDAR_ID (e.g. cal@renphil.org). The
+    # backend acts *as* that account using a refresh token it granted once via
+    # scripts/get_calendar_refresh_token.py — deliberately NOT domain-wide
+    # delegation, so a leaked token can touch only this one account's events.
+    GOOGLE_CALENDAR_ID: str | None = None
+    GOOGLE_CALENDAR_REFRESH_TOKEN: str | None = None
+    # Passed as `sendUpdates` on attendee changes. "all" emails guests, "none"
+    # adds/removes silently (the event still lands on the user's calendar).
+    # Flip to "none" if "all" proves noisy on large events.
+    GOOGLE_CALENDAR_SEND_UPDATES: str = "all"
+
     # ── Dify.ai ────────────────────────────────────────────────────────
     DIFY_API_BASE_URL: str = "https://api.dify.ai/v1"
     DIFY_API_KEY: str

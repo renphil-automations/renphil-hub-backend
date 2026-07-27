@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_optional_user
+from app.dependencies import get_current_user
 from app.models.auth import UserInfo
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
@@ -36,7 +36,7 @@ from app.services.tab_service import (
     delete_tab_subtree_by_document_id,
 )
 
-router = APIRouter(prefix="/tabs", tags=["Tabs"])
+router = APIRouter(prefix="/tabs", tags=["Tabs"], dependencies=[Depends(get_current_user)])
 
 
 # ---------------------------------------------------------
@@ -197,7 +197,7 @@ using the child documentId.
 def get_workspace(
     document_id: str,
     db: Session = Depends(get_db),
-    user: UserInfo | None = Depends(get_optional_user),
+    user: UserInfo = Depends(get_current_user),
 ):
     validate_document_id(document_id)
 
@@ -206,23 +206,20 @@ def get_workspace(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
 
-    # Filter per-widget access control for authenticated users.
-    # Unauthenticated callers (no Authorization header) receive full data —
-    # this matches existing behaviour for internal tooling that doesn't carry a token.
-    if user is not None:
-        page_content = workspace.get("page_content")
-        if isinstance(page_content, dict):
-            raw_content = page_content.get("content")
-            filtered = filter_widget_content_for_user(
-                raw_content,
-                user.email,
-                list(user.roles),
-            )
-            if filtered is not raw_content:
-                workspace = {
-                    **workspace,
-                    "page_content": {**page_content, "content": filtered},
-                }
+    # Filter per-widget access control.
+    page_content = workspace.get("page_content")
+    if isinstance(page_content, dict):
+        raw_content = page_content.get("content")
+        filtered = filter_widget_content_for_user(
+            raw_content,
+            user.email,
+            list(user.roles),
+        )
+        if filtered is not raw_content:
+            workspace = {
+                **workspace,
+                "page_content": {**page_content, "content": filtered},
+            }
 
     return {
         "data": workspace

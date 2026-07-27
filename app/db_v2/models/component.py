@@ -23,10 +23,19 @@ class ComponentV2(BaseV2):
     comment on delete_tab_subtree_by_document_id_v2 for why, when deleting
     self-referential rows without a relationship()).
 
-    current_grid_id is reserved for a not-yet-built mechanism where a
-    sub-tab could itself be represented as a component row — always NULL
-    for now, no sub-tab-as-component rows are created by the Phase 2
-    migration.
+    current_grid_id (self-referential FK to gridstacks) points a component at
+    the gridstack it represents itself, rather than at a real widget — every
+    gridstack gets exactly one such row, created alongside it (see
+    _create_gridstack_component in gridstack_service.py). Its `type`/`props`
+    mirror the gridstack's own settings.sgs (gridstack vs. super_gridstack,
+    kept in sync by update_tab_content_v2). For a sub-tab gridstack — never a
+    root or tab variant, whose own access_control lives on their TabV2 row
+    instead — this row's `access_control` IS the sub-tab's own access
+    control (see migrate_subtab_access_control_to_components.py, which
+    relocated it off gridstacks.settings). A component with current_grid_id
+    set is never a pickable/renderable widget — every query over "real"
+    canvas components excludes both representation types
+    (GRIDSTACK_REPRESENTATION_TYPES).
     """
 
     __tablename__ = "components"

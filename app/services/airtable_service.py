@@ -238,6 +238,212 @@ class AirtableService:
             view_match.group(0) if view_match else None
         )
 
+    _WIDGET_PAGE_SIZE = 100
+
+    async def fetch_widget_rows(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        selected_columns: list[str] | None = None,
+        filters: list[dict[str, Any]] | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+        cursor: str | None = None,
+    ):
+        """One page of rows for a dashboard Airtable widget, filtered
+        server-side under the app's own identity.
+
+        The caller supplies only a page cursor — never a formula, columns,
+        URL or token. Everything else comes from the widget's stored config
+        and the caller's authenticated email, so a viewer cannot widen what
+        they are shown.
+
+        FAILS CLOSED: if personalization is enabled but could not be applied
+        (no email, no column, unusable column name), this returns an EMPTY
+        page rather than the unfiltered table. See
+        `airtable_formulas.widget_formula`'s `allowed` flag.
+        """
+        from app.models.airtable import AirtableWidgetRowsResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        formula, allowed = af.widget_formula(
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        )
+
+        if not allowed:
+            logger.warning(
+                "Airtable widget fetch refused: personalization enabled but not "
+                "applicable (base=%s table=%s) — returning no rows",
+                base_id,
+                table_id,
+            )
+            return AirtableWidgetRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=list(selected_columns or []),
+                rows=[],
+                next_cursor=None,
+                personalize_blocked=True,
+            )
+
+        options: dict[str, Any] = {"page_size": self._WIDGET_PAGE_SIZE}
+        if view_id:
+            options["view"] = view_id
+        if selected_columns:
+            options["fields"] = list(selected_columns)
+        if formula:
+            options["formula"] = formula
+        if cursor:
+            options["offset"] = cursor
+
+        # `table.all()` / `.iterate()` both swallow the response's `offset`,
+        # so neither can hand back a next-page cursor. Drop to the raw
+        # request, which returns `records` and `offset` together.
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
+        try:
+            payload = await asyncio.to_thread(
+                api.request, "get", table.urls.records, options=options
+            )
+        except RequestException as exc:
+            logger.error("Airtable widget row fetch failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during widget row fetch")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        records = payload.get("records", []) or []
+        rows: list[dict[str, Any]] = []
+        seen_fields: list[str] = []
+        seen: set[str] = set()
+        for record in records:
+            record_fields = record.get("fields", {}) or {}
+            for key in record_fields:
+                if key not in seen:
+                    seen.add(key)
+                    seen_fields.append(key)
+            rows.append({"id": record.get("id"), **record_fields})
+
+        # Prefer the admin's stored column selection over what this page
+        # happened to contain: deriving `fields` from the returned records
+        # makes headers appear and disappear between pages whenever a column
+        # is empty on one page and populated on another.
+        fields = list(selected_columns) if selected_columns else seen_fields
+
+        return AirtableWidgetRowsResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=fields,
+            rows=rows,
+            next_cursor=payload.get("offset"),
+            personalize_blocked=False,
+        )
+
+    async def preview_widget_config(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        selected_columns: list[str] | None = None,
+        filters: list[dict[str, Any]] | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+    ):
+        """Editor preview for the Property Panel.
+
+        Returns `fields` computed WITHOUT personalization and `rows` computed
+        WITH it. The split matters: an admin configuring a widget must be
+        able to populate the column dropdowns even when their OWN row set is
+        empty — otherwise picking a personalize column becomes impossible for
+        anyone whose email does not appear in the table.
+
+        Also returns `unpersonalized_row_count`, so the panel can tell
+        "personalize is working and you have no rows" apart from "the
+        personalize column is the wrong type and matches nothing" — which are
+        otherwise indistinguishable and both look like a broken widget.
+
+        Costs up to two Airtable calls, which is acceptable at edit
+        frequency (and one when personalization is off).
+        """
+        from app.models.airtable import AirtableEditorPreviewResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        filters_formula, _ = af.widget_formula(filters=filters)
+
+        base_options: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
+        if view_id:
+            base_options["view"] = view_id
+        if selected_columns:
+            base_options["fields"] = list(selected_columns)
+
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
+
+        async def run(formula: str | None) -> list[dict[str, Any]]:
+            options = dict(base_options)
+            if formula:
+                options["formula"] = formula
+            try:
+                payload = await asyncio.to_thread(
+                    api.request, "get", table.urls.records, options=options
+                )
+            except RequestException as exc:
+                logger.error("Airtable editor preview failed: %s", exc)
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception("Unexpected Airtable error during editor preview")
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            return payload.get("records", []) or []
+
+        unpersonalized = await run(filters_formula)
+
+        seen_fields: list[str] = []
+        seen: set[str] = set()
+        for record in unpersonalized:
+            for key in (record.get("fields", {}) or {}):
+                if key not in seen:
+                    seen.add(key)
+                    seen_fields.append(key)
+
+        personalize_blocked = False
+        if personalize_enabled:
+            formula, allowed = af.widget_formula(
+                filters=filters,
+                personalize_enabled=True,
+                personalize_column=personalize_column,
+                email=caller_email,
+            )
+            if allowed:
+                records = await run(formula)
+            else:
+                records, personalize_blocked = [], True
+        else:
+            records = unpersonalized
+
+        rows = [
+            {"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records
+        ]
+
+        return AirtableEditorPreviewResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=seen_fields,
+            rows=rows,
+            personalize_blocked=personalize_blocked,
+            unpersonalized_row_count=len(unpersonalized),
+        )
+
     async def preview_from_url(
         self,
         url: str,

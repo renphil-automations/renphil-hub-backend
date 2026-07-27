@@ -2,12 +2,13 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.services.relation_service import (
     get_relation_diagnostics,
     repair_missing_content
 )
 
-router = APIRouter(prefix="/diagnostics", tags=["Diagnostics"])
+router = APIRouter(prefix="/diagnostics", tags=["Diagnostics"], dependencies=[Depends(get_current_user)])
 
 
 @router.get(

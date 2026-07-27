@@ -39,6 +39,16 @@ class GoogleDriveError(HTTPException):
         )
 
 
+class GoogleCalendarError(HTTPException):
+    """Raised when interacting with the Google Calendar API fails."""
+
+    def __init__(self, detail: str = "Failed to reach Google Calendar.") -> None:
+        super().__init__(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=detail,
+        )
+
+
 class DifyError(HTTPException):
     """Raised when the Dify.ai API call fails."""
 

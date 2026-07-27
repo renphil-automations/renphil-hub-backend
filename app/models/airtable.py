@@ -34,6 +34,154 @@ class AirtablePreviewResponse(BaseModel):
     )
 
 
+class AirtableWidgetRowsResponse(BaseModel):
+    """One page of rows for a dashboard Airtable widget, fetched server-side.
+
+    Unlike `AirtablePreviewResponse` this is cursor-paginated and carries no
+    caller-supplied query: the formula is built on the server from the
+    widget's stored config plus the authenticated caller's email.
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    fields: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Column names for this widget, in the admin's configured order "
+            "when one is set. Stable across pages."
+        ),
+    )
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    next_cursor: str | None = Field(
+        default=None,
+        description=(
+            "Opaque cursor for the next page, or null on the last page. Pass "
+            "it back as `cursor`. Airtable expires these after a while — on "
+            "an error, restart from the first page."
+        ),
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description=(
+            "True when personalization is enabled but could not be applied, "
+            "so NO rows were returned. Distinguishes 'you legitimately have "
+            "no rows' from 'the filter could not run' — the response is empty "
+            "either way, because falling back to unfiltered rows would defeat "
+            "the point."
+        ),
+    )
+
+
+class AirtableEditorPreviewRequest(BaseModel):
+    """Property Panel preview of an Airtable widget's in-progress settings.
+
+    Two shapes, distinguished by whether the body carries its own token:
+
+    * **Own token** — `pat` + `sourceUrl` supplied. Nothing is borrowed from
+      storage, so any authenticated caller may do this: they already hold the
+      credential they are sending.
+    * **Stored token** — `link` only. The token AND the source URL both come
+      from storage, and the caller must satisfy the widget's access control.
+
+    The combination "stored token + caller-supplied `sourceUrl`" is REJECTED.
+    Allowing it would let anyone holding a widget link aim that widget's
+    workspace-scoped token at any other table in the workspace — a token they
+    cannot even read. A different table needs its own token, supplied
+    explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    link: str | None = None
+    sourceUrl: str | None = None
+    pat: str | None = None
+    selectedColumns: list[str] | None = None
+    filters: list[dict[str, Any]] | None = None
+    personalizeEnabled: bool = False
+    personalizeColumn: str | None = None
+
+
+class AirtableEditorPreviewResponse(BaseModel):
+    """Editor preview: columns discovered WITHOUT personalization, rows WITH."""
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    fields: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Column names, computed WITHOUT personalization so the dropdowns "
+            "populate even when the admin's own row set is empty."
+        ),
+    )
+    rows: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Rows as the admin themselves would see them.",
+    )
+    personalize_blocked: bool = False
+    unpersonalized_row_count: int = Field(
+        default=0,
+        description=(
+            "Rows matching the filters before personalization. Lets the panel "
+            "distinguish 'personalize works, you have no rows' from 'the "
+            "personalize column matches nothing' — both look identical "
+            "otherwise."
+        ),
+    )
+
+
+class AirtableComponentConfigResponse(BaseModel):
+    """Non-secret view of a dashboard Airtable widget's stored configuration.
+
+    Deliberately never carries the PAT: `hasPat` reports whether one is
+    stored, and `patHint` identifies which token it is (the `pat<id>` prefix
+    Airtable's own token UI shows) so an admin can match a widget against a
+    token they are about to revoke.
+    """
+
+    link: str
+    sourceUrl: str = ""
+    personalizeEnabled: bool = False
+    personalizeColumn: str | None = None
+    hasPat: bool = False
+    patHint: str | None = Field(
+        default=None,
+        description=(
+            "Non-secret identifier of the stored token (its `pat<id>` prefix, "
+            "or a short digest if the token's shape is unrecognised). Null "
+            "when no PAT is stored."
+        ),
+    )
+    patUpdatedAt: str | None = Field(
+        default=None,
+        description="ISO-8601 timestamp of the last PAT change, if any.",
+    )
+    access_control: dict[str, Any] | None = None
+
+
+class AirtableComponentConfigUpdate(BaseModel):
+    """Partial update of an Airtable widget's protected configuration.
+
+    Every field is optional; only the ones actually present in the request
+    body are applied (the router reads `model_fields_set`), so a caller can
+    change one setting without resending the others — which matters because
+    the client can never read the PAT back to resend it.
+
+    `pat` is three-way: omit it (or send `""`) to preserve the stored token,
+    send a non-empty string to replace it, or send an explicit `null` to
+    clear it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sourceUrl: str | None = None
+    pat: str | None = None
+    personalizeEnabled: bool | None = None
+    personalizeColumn: str | None = None
+    access_control: dict[str, Any] | None = None
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 class _TypedAirtableRecord(BaseModel):
     """
