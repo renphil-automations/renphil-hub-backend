@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
+from app.dependencies import get_current_user
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
@@ -38,7 +39,7 @@ from app.services.super_blocknote_service import (
     update_sbn_node,
 )
 
-router = APIRouter(prefix="/v2/sbn", tags=["Super Block Note V2"])
+router = APIRouter(prefix="/v2/sbn", tags=["Super Block Note V2"], dependencies=[Depends(get_current_user)])
 
 
 COMMON_BAD_REQUEST_RESPONSE = {400: {"description": "Bad request"}}

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_optional_user
+from app.dependencies import get_current_user
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
@@ -50,7 +50,7 @@ from app.services.gridstack_service import (
 )
 from app.services.tab_service import filter_widget_content_for_user
 
-router = APIRouter(prefix="/v2/tabs", tags=["Tabs V2"])
+router = APIRouter(prefix="/v2/tabs", tags=["Tabs V2"], dependencies=[Depends(get_current_user)])
 
 
 COMMON_BAD_REQUEST_RESPONSE = {400: {"description": "Bad request"}}
@@ -128,7 +128,7 @@ def get_component_location(link: str, db: Session = Depends(get_db_v2)):
 def get_workspace(
     document_id: str,
     db: Session = Depends(get_db_v2),
-    user: UserInfo | None = Depends(get_optional_user),
+    user: UserInfo = Depends(get_current_user),
 ):
     validate_document_id(document_id)
 
@@ -136,13 +136,12 @@ def get_workspace(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
 
-    if user is not None:
-        page_content = workspace.get("page_content")
-        if isinstance(page_content, dict):
-            raw_content = page_content.get("content")
-            filtered = filter_widget_content_for_user(raw_content, user.email, list(user.roles))
-            if filtered is not raw_content:
-                workspace = {**workspace, "page_content": {**page_content, "content": filtered}}
+    page_content = workspace.get("page_content")
+    if isinstance(page_content, dict):
+        raw_content = page_content.get("content")
+        filtered = filter_widget_content_for_user(raw_content, user.email, list(user.roles))
+        if filtered is not raw_content:
+            workspace = {**workspace, "page_content": {**page_content, "content": filtered}}
 
     return {"data": workspace}
 
