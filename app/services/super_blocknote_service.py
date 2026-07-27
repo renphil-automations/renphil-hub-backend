@@ -215,19 +215,32 @@ def update_sbn_content(
         )
         block_content = content.get("content") if isinstance(content, dict) else content
         if is_childless_root and block_content:
-            _create_overview_leaf(db, component, block_content, order=0)
+            overview = _create_overview_leaf(db, component, block_content, order=0)
             _drop_root_content(db, component)
             db.commit()
             # The root is now an empty container; its content lives in the
             # freshly-created "Overview" child (surfaced via /workspace).
-            return get_sbn_content(db, link)
+            response = get_sbn_content(db, link)
+            if response is not None:
+                response["search_updates"] = [
+                    {"component_id": component.id, "action": "upsert"},
+                    {"component_id": overview.id, "action": "upsert"},
+                ]
+            return response
+
+        before_content = (_resolve_component_data(db, component).get("content") or [])
 
         # Every SBN node's content is a plain BlockNote doc (Block[]) — the
         # user's confirmed scope narrowing (no rich per-sub-tab canvas yet).
         _write_component_data(db, component, {"content": content})
         db.commit()
 
-        return get_sbn_content(db, link)
+        response = get_sbn_content(db, link)
+        if response is not None and before_content != (content or []):
+            response["search_updates"] = [
+                {"component_id": component.id, "action": "upsert"}
+            ]
+        return response
 
     except Exception:
         db.rollback()
@@ -264,11 +277,14 @@ def create_sbn_node(
         # instead of being silently stranded on the inert root.
         is_root = parent.super_blocknote_id is None and parent.type == SBN_ROOT_TYPE
         inserted_root_content = False
+        overview_component: ComponentV2 | None = None
         if is_root and parent.page_content_id is not None and not _has_sbn_children(db, parent.id):
             root_data = _resolve_component_data(db, parent)
             root_content = root_data.get("content") or []
             if root_content:
-                _create_overview_leaf(db, parent, root_content, order=0)
+                overview_component = _create_overview_leaf(
+                    db, parent, root_content, order=0
+                )
                 _drop_root_content(db, parent)
                 inserted_root_content = True
 
@@ -299,7 +315,15 @@ def create_sbn_node(
         _write_component_data(db, new_component, {"content": content or []})
 
         db.commit()
-        return _format_sbn_summary(db, new_component)
+        response = _format_sbn_summary(db, new_component)
+        receipts = [{"component_id": new_component.id, "action": "upsert"}]
+        if overview_component is not None:
+            receipts.insert(
+                0,
+                {"component_id": overview_component.id, "action": "upsert"},
+            )
+        response["search_updates"] = receipts
+        return response
 
     except Exception:
         db.rollback()
@@ -329,7 +353,13 @@ def update_sbn_node(
             component.props = {**_sbn_props(component), "order": order}
 
         db.commit()
-        return get_sbn_workspace(db, link)
+        response = get_sbn_workspace(db, link)
+        # SBN order is UI-only. Title and component access are indexed.
+        if response is not None and (title is not None or access_control is not None):
+            response["search_updates"] = [
+                {"component_id": component.id, "action": "upsert"}
+            ]
+        return response
 
     except Exception:
         db.rollback()
@@ -424,6 +454,7 @@ def reorder_sbn_siblings(db: Session, items: list[dict[str, Any]]) -> list[dict[
         parent_component = db.query(ComponentV2).filter(ComponentV2.id == parent_id).first()
         if parent_component is None:
             return []
+        # Sibling order is not part of an indexed SBN document.
         return get_sbn_children(db, parent_component.link) or []
 
     except Exception:
@@ -484,6 +515,10 @@ def delete_sbn_subtree(db: Session, link: str) -> dict[str, Any] | None:
             "message": "SBN subtree deleted successfully",
             "deleted_count": len(deleted),
             "deleted_tabs": deleted,
+            "search_updates": [
+                {"component_id": item["id"], "action": "delete"}
+                for item in deleted
+            ],
         }
 
     except Exception:

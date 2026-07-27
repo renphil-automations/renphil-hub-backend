@@ -1,6 +1,13 @@
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+
+
+class SearchUpdateReceipt(BaseModel):
+    """A committed component change that RenPhil Knowledge must apply."""
+
+    component_id: StrictInt
+    action: Literal["upsert", "delete"]
 
 
 class PageContentWorkspaceResponse(BaseModel):
@@ -11,6 +18,11 @@ class PageContentWorkspaceResponse(BaseModel):
     # Main editor/body content.
     # It can be a JSON object, list of blocks, or null depending on the stored data.
     content: dict[str, Any] | list[Any] | None = None
+
+    # Populated only by mutation responses. Reads return an empty receipt.
+    # The database transaction remains authoritative; the frontend queues
+    # exactly these committed component changes after the request succeeds.
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
 
 class PageContentAPIResponse(BaseModel):
