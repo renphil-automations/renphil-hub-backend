@@ -529,30 +529,38 @@ class OfficeSpaceRecord(BaseModel):
 class OfficeSpaceCreate(BaseModel):
     """Payload to create a new Office Spaces record."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    branch: str = Field(description="Branch name (required).")
-    address: str = Field(description="Office address (required).")
+    branch: str = Field(..., alias="Branch", description="Branch name (required).")
+    address: str = Field(
+        ..., alias="Address", description="Office address (required)."
+    )
     details: str | None = Field(
-        default=None, description="Optional free-form details about the office."
+        default=None,
+        alias="Details",
+        description="Optional free-form details about the office.",
     )
     phone_number: str | None = Field(
-        default=None, description="Optional office phone number."
+        default=None, alias="Phone Number", description="Optional office phone number."
     )
     wifi: str | None = Field(
-        default=None, description="Optional WiFi details."
+        default=None, alias="WiFi", description="Optional WiFi details."
     )
     conference_rooms: str | None = Field(
-        default=None, description="Optional conference room details."
+        default=None,
+        alias="Conference Rooms",
+        description="Optional conference room details.",
     )
     access_to_office: str | None = Field(
-        default=None, description="Optional access-to-office details."
+        default=None,
+        alias="Access to Office",
+        description="Optional access-to-office details.",
     )
     need_help: str | None = Field(
-        default=None, description="Optional 'Need Help?' details."
+        default=None, alias="Need Help?", description="Optional 'Need Help?' details."
     )
     relevant_contacts: str | None = Field(
-        default=None, description="Optional relevant contacts."
+        default=None, alias="Relevant Contacts", description="Optional relevant contacts."
     )
 
 
@@ -564,17 +572,17 @@ class OfficeSpaceUpdate(BaseModel):
     clear it.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    branch: str | None = None
-    address: str | None = None
-    details: str | None = None
-    phone_number: str | None = None
-    wifi: str | None = None
-    conference_rooms: str | None = None
-    access_to_office: str | None = None
-    need_help: str | None = None
-    relevant_contacts: str | None = None
+    branch: str | None = Field(default=None, alias="Branch")
+    address: str | None = Field(default=None, alias="Address")
+    details: str | None = Field(default=None, alias="Details")
+    phone_number: str | None = Field(default=None, alias="Phone Number")
+    wifi: str | None = Field(default=None, alias="WiFi")
+    conference_rooms: str | None = Field(default=None, alias="Conference Rooms")
+    access_to_office: str | None = Field(default=None, alias="Access to Office")
+    need_help: str | None = Field(default=None, alias="Need Help?")
+    relevant_contacts: str | None = Field(default=None, alias="Relevant Contacts")
 
 
 # ── Google Docs Tabs ───────────────────────────────────────────────────
