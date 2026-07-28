@@ -518,6 +518,12 @@ class OfficeSpaceRecord(BaseModel):
     branch: str | None = Field(default=None, alias="Branch")
     address: str | None = Field(default=None, alias="Address")
     details: str | None = Field(default=None, alias="Details")
+    phone_number: str | None = Field(default=None, alias="Phone Number")
+    wifi: str | None = Field(default=None, alias="WiFi")
+    conference_rooms: str | None = Field(default=None, alias="Conference Rooms")
+    access_to_office: str | None = Field(default=None, alias="Access to Office")
+    need_help: str | None = Field(default=None, alias="Need Help?")
+    relevant_contacts: str | None = Field(default=None, alias="Relevant Contacts")
 
 
 class OfficeSpaceCreate(BaseModel):
@@ -529,6 +535,24 @@ class OfficeSpaceCreate(BaseModel):
     address: str = Field(description="Office address (required).")
     details: str | None = Field(
         default=None, description="Optional free-form details about the office."
+    )
+    phone_number: str | None = Field(
+        default=None, description="Optional office phone number."
+    )
+    wifi: str | None = Field(
+        default=None, description="Optional WiFi details."
+    )
+    conference_rooms: str | None = Field(
+        default=None, description="Optional conference room details."
+    )
+    access_to_office: str | None = Field(
+        default=None, description="Optional access-to-office details."
+    )
+    need_help: str | None = Field(
+        default=None, description="Optional 'Need Help?' details."
+    )
+    relevant_contacts: str | None = Field(
+        default=None, description="Optional relevant contacts."
     )
 
 
@@ -545,6 +569,12 @@ class OfficeSpaceUpdate(BaseModel):
     branch: str | None = None
     address: str | None = None
     details: str | None = None
+    phone_number: str | None = None
+    wifi: str | None = None
+    conference_rooms: str | None = None
+    access_to_office: str | None = None
+    need_help: str | None = None
+    relevant_contacts: str | None = None
 
 
 # ── Google Docs Tabs ───────────────────────────────────────────────────
