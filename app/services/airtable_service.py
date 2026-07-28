@@ -2850,11 +2850,23 @@ class AirtableService:
     _F_OS_BRANCH = _S.AT_F_OS_BRANCH
     _F_OS_ADDRESS = _S.AT_F_OS_ADDRESS
     _F_OS_DETAILS = _S.AT_F_OS_DETAILS
+    _F_OS_PHONE_NUMBER = _S.AT_F_OS_PHONE_NUMBER
+    _F_OS_WIFI = _S.AT_F_OS_WIFI
+    _F_OS_CONFERENCE_ROOMS = _S.AT_F_OS_CONFERENCE_ROOMS
+    _F_OS_ACCESS_TO_OFFICE = _S.AT_F_OS_ACCESS_TO_OFFICE
+    _F_OS_NEED_HELP = _S.AT_F_OS_NEED_HELP
+    _F_OS_RELEVANT_CONTACTS = _S.AT_F_OS_RELEVANT_CONTACTS
 
     _OS_FIELD_MAP = {
         "branch": _F_OS_BRANCH,
         "address": _F_OS_ADDRESS,
         "details": _F_OS_DETAILS,
+        "phone_number": _F_OS_PHONE_NUMBER,
+        "wifi": _F_OS_WIFI,
+        "conference_rooms": _F_OS_CONFERENCE_ROOMS,
+        "access_to_office": _F_OS_ACCESS_TO_OFFICE,
+        "need_help": _F_OS_NEED_HELP,
+        "relevant_contacts": _F_OS_RELEVANT_CONTACTS,
     }
 
     def _office_spaces_table(self):

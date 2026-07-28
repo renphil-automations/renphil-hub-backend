@@ -1031,7 +1031,11 @@ async def update_finance_link(
 @router.get(
     "/office_spaces",
     response_model=list[OfficeSpaceRecord],
-    summary="List rows from the Office Spaces table (Id, Branch, Address, Details).",
+    summary=(
+        "List rows from the Office Spaces table (Id, Branch, Address, "
+        "Details, Phone Number, WiFi, Conference Rooms, Access to Office, "
+        "Need Help?, Relevant Contacts)."
+    ),
 )
 @airtable_cache(table="OFFICE_SPACES_TABLE")
 async def get_office_spaces(
