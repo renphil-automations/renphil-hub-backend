@@ -527,6 +527,39 @@ def _pat_hint(pat: Any) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
+def _sbn_node_info(db: Session, component: ComponentV2) -> dict[str, Any] | None:
+    """Derived descriptor for a component that is a Super Block Note SUB-TAB
+    (an ordinary `ComponentV2` carrying `super_blocknote_id` — see
+    super_blocknote_service.py) rather than a top-level canvas widget.
+    `None` for everything else, which is every component that could be a
+    mirror target before sub-tabs became pickable.
+
+    Exists because both kinds serialize under the same `type`
+    (`"block_note"`), so a client cannot otherwise tell them apart — and a
+    mirror must, since a sub-tab with its own nested sub-tabs has to render
+    as a Super Block Note scoped to that node (sidebar + content pane); a
+    bare text pane would silently hide those children.
+
+    Never persisted — recomputed on every read, exactly like the
+    `mirroredType`/`mirroredData` it sits beside (a mirror's only stored
+    state is `props.target_link`; see `update_tab_content_v2`). Costs one
+    extra existence query, and only for a target that IS an SBN sub-tab.
+
+    Deliberately duplicates super_blocknote_service's `_has_sbn_children`
+    rather than importing it: that module imports from this one, so the
+    dependency only runs in that direction.
+    """
+    if component.super_blocknote_id is None:
+        return None
+    has_children = (
+        db.query(ComponentV2.id)
+        .filter(ComponentV2.super_blocknote_id == component.id)
+        .first()
+        is not None
+    )
+    return {"hasChildren": has_children}
+
+
 def _serialize_component(
     db: Session,
     component: ComponentV2,
@@ -569,7 +602,12 @@ def _serialize_component(
             widget_entry = {
                 "type": MIRROR_WIDGET_TYPE,
                 "link": component.link,
-                "data": {"targetLink": target_link, "mirroredType": None, "mirroredData": None},
+                "data": {
+                    "targetLink": target_link,
+                    "mirroredType": None,
+                    "mirroredData": None,
+                    "mirroredSbn": None,
+                },
             }
         else:
             widget_entry = {
@@ -579,6 +617,9 @@ def _serialize_component(
                     "targetLink": target_link,
                     "mirroredType": target.type,
                     "mirroredData": _resolve_component_data(db, target, preloaded_page_content),
+                    # Non-null only when the target is a Super Block Note
+                    # sub-tab — see `_sbn_node_info`.
+                    "mirroredSbn": _sbn_node_info(db, target),
                 },
             }
             # Key simplification: substitute the TARGET's own access_control
@@ -693,6 +734,10 @@ def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
         "type": component.type,
         "title": component.title,
         "data": _resolve_component_data(db, component),
+        # Lets a pasted link to a Super Block Note sub-tab render the same
+        # way a browsed one does, immediately, before the first save round
+        # trip re-resolves it — see `_sbn_node_info`.
+        "sbn": _sbn_node_info(db, component),
     }
 
 
