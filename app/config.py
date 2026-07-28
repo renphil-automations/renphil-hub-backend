@@ -228,7 +228,8 @@ class Settings(BaseSettings):
     # ── Office Spaces fields ──────────────────────────────────────────
     AT_F_OS_BRANCH: str
     AT_F_OS_ADDRESS: str
-    AT_F_OS_DETAILS: str    AT_F_OS_PHONE_NUMBER: str
+    AT_F_OS_DETAILS: str    
+    AT_F_OS_PHONE_NUMBER: str
     AT_F_OS_WIFI: str
     AT_F_OS_CONFERENCE_ROOMS: str
     AT_F_OS_ACCESS_TO_OFFICE: str
