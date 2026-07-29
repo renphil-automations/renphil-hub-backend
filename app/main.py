@@ -21,6 +21,7 @@ from app.routers import (
     calendar,
     dify,
     drive,
+    nav_tabs,
     super_blocknote_v2,
     tabs,
     tabs_v2,
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
 
     app.include_router(tabs.router, prefix=api_prefix)
     app.include_router(tabs_v2.router, prefix=api_prefix)
+    app.include_router(nav_tabs.router, prefix=api_prefix)
     app.include_router(super_blocknote_v2.router, prefix=api_prefix)
     app.include_router(diagnostics.router, prefix=api_prefix)
 

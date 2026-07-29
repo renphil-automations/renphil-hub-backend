@@ -16,6 +16,8 @@ carries the same document_id as its TabV2, see create_tab_v2).
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from typing import Any
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -26,6 +28,7 @@ from app.db_v2.models.tab import TabV2
 from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
+from app.db_v2.models.nav_tab import NavTabV2
 
 from app.services.tab_service import (
     DEFAULT_ACCESS_CONTROL,
@@ -114,6 +117,25 @@ AIRTABLE_COMPUTED_DATA_FIELDS = ("hasPat",)
 # ---------------------------------------------------------
 # Small validation / generation helpers
 # ---------------------------------------------------------
+
+def _slugify_title(title: str) -> str:
+    """Mirrors the frontend's slugifyTitle (DashboardV2Page.tsx), which is
+    what turns a tab title into its URL segment.
+
+    Lives in this module rather than nav_tab_service so both slug namespaces
+    share one implementation: nav-tab slugs (stored, via _resolve_nav_slug)
+    and root-tab slugs (derived at render time, enforced here by
+    _root_tab_with_conflicting_slug). Import direction is one-way —
+    nav_tab_service imports from here, never the reverse — so this is the
+    only place the two can share it.
+    """
+    value = (title or "").lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = value.strip("-")
+    return value[:80]
+
 
 def _validate_title(title: str | None) -> str | None:
     if title is None:
@@ -312,11 +334,20 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
     title = None
     order = gridstack.position if gridstack.position is not None else 0
     has_variants = False
+    nav_tab_document_id = None
+    nav_tab_title = None
 
     if is_root:
         title = root_tab.title if root_tab else gridstack.name
         order = root_tab.order if root_tab and root_tab.order is not None else order
         has_variants = _has_variants(db, root_tab.id) if root_tab is not None else False
+        # Lets the mirror picker group roots by dashboard, and disambiguates
+        # two roots that share a title across different nav tabs.
+        if root_tab is not None and root_tab.nav_tab_id is not None:
+            nav_tab = db.query(NavTabV2).filter(NavTabV2.id == root_tab.nav_tab_id).first()
+            if nav_tab is not None:
+                nav_tab_document_id = nav_tab.document_id
+                nav_tab_title = nav_tab.title
     else:
         title = gridstack.name
 
@@ -331,6 +362,8 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "has_content": _has_content(db, gridstack.id),
         "has_variants": has_variants,
         "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
+        "navTabDocumentId": nav_tab_document_id,
+        "navTabTitle": nav_tab_title,
         "apiVersion": "v2",
     }
 
@@ -527,6 +560,39 @@ def _pat_hint(pat: Any) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
+def _sbn_node_info(db: Session, component: ComponentV2) -> dict[str, Any] | None:
+    """Derived descriptor for a component that is a Super Block Note SUB-TAB
+    (an ordinary `ComponentV2` carrying `super_blocknote_id` — see
+    super_blocknote_service.py) rather than a top-level canvas widget.
+    `None` for everything else, which is every component that could be a
+    mirror target before sub-tabs became pickable.
+
+    Exists because both kinds serialize under the same `type`
+    (`"block_note"`), so a client cannot otherwise tell them apart — and a
+    mirror must, since a sub-tab with its own nested sub-tabs has to render
+    as a Super Block Note scoped to that node (sidebar + content pane); a
+    bare text pane would silently hide those children.
+
+    Never persisted — recomputed on every read, exactly like the
+    `mirroredType`/`mirroredData` it sits beside (a mirror's only stored
+    state is `props.target_link`; see `update_tab_content_v2`). Costs one
+    extra existence query, and only for a target that IS an SBN sub-tab.
+
+    Deliberately duplicates super_blocknote_service's `_has_sbn_children`
+    rather than importing it: that module imports from this one, so the
+    dependency only runs in that direction.
+    """
+    if component.super_blocknote_id is None:
+        return None
+    has_children = (
+        db.query(ComponentV2.id)
+        .filter(ComponentV2.super_blocknote_id == component.id)
+        .first()
+        is not None
+    )
+    return {"hasChildren": has_children}
+
+
 def _serialize_component(
     db: Session,
     component: ComponentV2,
@@ -569,7 +635,12 @@ def _serialize_component(
             widget_entry = {
                 "type": MIRROR_WIDGET_TYPE,
                 "link": component.link,
-                "data": {"targetLink": target_link, "mirroredType": None, "mirroredData": None},
+                "data": {
+                    "targetLink": target_link,
+                    "mirroredType": None,
+                    "mirroredData": None,
+                    "mirroredSbn": None,
+                },
             }
         else:
             widget_entry = {
@@ -579,6 +650,9 @@ def _serialize_component(
                     "targetLink": target_link,
                     "mirroredType": target.type,
                     "mirroredData": _resolve_component_data(db, target, preloaded_page_content),
+                    # Non-null only when the target is a Super Block Note
+                    # sub-tab — see `_sbn_node_info`.
+                    "mirroredSbn": _sbn_node_info(db, target),
                 },
             }
             # Key simplification: substitute the TARGET's own access_control
@@ -693,6 +767,10 @@ def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
         "type": component.type,
         "title": component.title,
         "data": _resolve_component_data(db, component),
+        # Lets a pasted link to a Super Block Note sub-tab render the same
+        # way a browsed one does, immediately, before the first save round
+        # trip re-resolves it — see `_sbn_node_info`.
+        "sbn": _sbn_node_info(db, component),
     }
 
 
@@ -915,8 +993,35 @@ def resolve_component_location_v2(db: Session, link: str) -> dict[str, Any] | No
     if root_tab is None:
         return None
 
+    # A tab VARIANT is itself a TabV2 with parent_tab_id set (see
+    # create_tab_variant_v2), and it owns its own root gridstack — so for a
+    # component living inside a variant, `_get_root_tab` returns the VARIANT
+    # row, not the tab shown in the tab bar. Report the two separately: the
+    # real root to switch to, and the variant to select once there.
+    #
+    # Collapsing them (returning only the variant) is what made
+    # cross-variant navigation land on the wrong canvas: the frontend looks
+    # `rootTabDocumentId` up in its root-tab list, which excludes variants,
+    # finds nothing, gives up, and leaves the user on whichever variant is
+    # active by default — the first one. That silently *looks* correct
+    # whenever the target happens to live in the first variant.
+    variant_document_id = None
+    if root_tab.parent_tab_id is not None:
+        variant_document_id = root_tab.document_id
+        parent_tab = db.query(TabV2).filter(TabV2.id == root_tab.parent_tab_id).first()
+        if parent_tab is None:
+            return None
+        root_tab = parent_tab
+
+    nav_tab_document_id = None
+    if root_tab.nav_tab_id is not None:
+        nav_tab = db.query(NavTabV2).filter(NavTabV2.id == root_tab.nav_tab_id).first()
+        nav_tab_document_id = nav_tab.document_id if nav_tab is not None else None
+
     return {
         "rootTabDocumentId": root_tab.document_id,
+        "variantDocumentId": variant_document_id,
+        "navTabDocumentId": nav_tab_document_id,
         "gridstackPath": _get_gridstack_ancestor_chain(db, gridstack),
         "sbnPath": sbn_path,
         "componentLink": component.link,
@@ -927,16 +1032,23 @@ def resolve_component_location_v2(db: Session, link: str) -> dict[str, Any] | No
 # Read API
 # ---------------------------------------------------------
 
-def get_root_tabs_v2(db: Session) -> list[dict[str, Any]]:
+def get_root_tabs_v2(db: Session, nav_tab_id: int | None = None) -> list[dict[str, Any]]:
     # A root gridstack whose owning TabV2 itself has parent_tab_id set is a
     # tab variant, not a top-level tab — it must only ever surface via
     # get_tab_variants_v2, never duplicated into the main tab bar.
-    root_gridstacks = (
+    #
+    # `nav_tab_id` defaults to None, which preserves the historical unscoped
+    # behaviour — every root across every nav tab. GET /v2/tabs/root and the
+    # mirror picker rely on that default; only the scoped
+    # GET /v2/nav-tabs/{document_id}/tabs endpoint passes a value.
+    query = (
         db.query(GridstackV2)
         .join(TabV2, GridstackV2.parent_tab_id == TabV2.id)
         .filter(GridstackV2.parent_id.is_(None), TabV2.parent_tab_id.is_(None))
-        .all()
     )
+    if nav_tab_id is not None:
+        query = query.filter(TabV2.nav_tab_id == nav_tab_id)
+    root_gridstacks = query.all()
     summaries = [_format_tab_summary(db, g) for g in root_gridstacks]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
@@ -1077,6 +1189,9 @@ def create_tab_variant_v2(
             locked=False,
             locked_by="",
             parent_tab_id=parent_tab.id,
+            # A variant carries the same nav_tab_id as its parent tab — it is
+            # not an independent placement (see NavTabV2's docstring).
+            nav_tab_id=parent_tab.nav_tab_id,
             created_at=now,
             updated_at=now,
         )
@@ -1639,9 +1754,54 @@ def _gridstack_exists_under_parent(
     )
 
 
-def _root_tab_exists_by_title(db: Session, title: str) -> TabV2 | None:
+def _root_tab_with_conflicting_slug(
+    db: Session, title: str, nav_tab_id: int | None, exclude_tab_id: int | None = None
+) -> TabV2 | None:
+    """The root tab in `nav_tab_id` whose title addresses the same URL as
+    `title`, or None.
+
+    Compares SLUGS, not raw titles. A root tab's URL segment is derived from
+    its title at render time (slugifyTitle, DashboardV2Page.tsx) rather than
+    stored, so the slug — not the title — is what actually has to be unique.
+    An exact `TabV2.title == title` match is case- and punctuation-sensitive,
+    so it let "home" sit beside "Home": both slugify to `home`, both claim
+    `/<nav>/home`, and `resolveTabByPath` takes the first `.find()` hit —
+    silently making the other unreachable by URL, with no error anywhere.
+
+    Scoped per nav tab, and to roots only via parent_tab_id.is_(None) — a
+    variant's title does not block a root's (fixing a latent bug where the
+    previously unscoped query let a *variant* named "Home" block creating a
+    root named "Home"). Variants are excluded on purpose: they are selected
+    by a pill, never addressed by their own URL segment.
+
+    Slugification is a Python-side transform (NFKD + combining-mark
+    stripping) with no SQL equivalent, so this filters in the database on
+    what it can and compares slugs in memory. The candidate set is one nav
+    tab's root tabs — tens of rows, not thousands.
+    """
     title = _validate_title(title)
-    return db.query(TabV2).filter(TabV2.title == title).first()
+    slug = _slugify_title(title)
+
+    query = db.query(TabV2).filter(
+        TabV2.nav_tab_id == nav_tab_id,
+        TabV2.parent_tab_id.is_(None),
+    )
+    if exclude_tab_id is not None:
+        query = query.filter(TabV2.id != exclude_tab_id)
+
+    for candidate in query.all():
+        if not slug:
+            # An all-punctuation/emoji title slugifies to "" and has no
+            # usable URL either way (pathSegmentsForTab bails on an empty
+            # segment). Comparing on "" would make every such title collide
+            # with every other, reporting "already exists" for two titles
+            # that plainly differ — so fall back to the exact-title rule.
+            if candidate.title == title:
+                return candidate
+            continue
+        if _slugify_title(candidate.title or "") == slug:
+            return candidate
+    return None
 
 
 def create_tab_v2(
@@ -1651,6 +1811,7 @@ def create_tab_v2(
     content: dict[str, Any] | list[Any] | None = None,
     order: int | None = None,
     access_control: dict[str, Any] | None = None,
+    nav_tab_id: int | None = None,
 ) -> dict[str, Any]:
     try:
         title = _validate_title(title)
@@ -1667,8 +1828,13 @@ def create_tab_v2(
 
         created_gridstack_component: ComponentV2
         if parent_gridstack is None:
-            if _root_tab_exists_by_title(db, title) is not None:
-                raise ValueError("A tab with this title already exists under the same parent")
+            conflict = _root_tab_with_conflicting_slug(db, title, nav_tab_id)
+            if conflict is not None:
+                raise ValueError(
+                    f'A tab addressed as "{_slugify_title(title)}" already exists here '
+                    f'("{conflict.title}"). Titles differing only in capitalisation or '
+                    f"punctuation share one URL, so pick a more distinct name."
+                )
 
             new_tab = TabV2(
                 document_id=_generate_id(),
@@ -1677,6 +1843,7 @@ def create_tab_v2(
                 access_control=access_control or DEFAULT_ACCESS_CONTROL,
                 locked=False,
                 locked_by="",
+                nav_tab_id=nav_tab_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -1760,6 +1927,26 @@ def update_tab_by_document_id_v2(
             tab = _get_root_tab(db, gridstack)
             if tab is None:
                 return None
+
+            # Renaming into another root's slug orphans one of them from the
+            # URL exactly as creating a duplicate would — and this path had
+            # NO uniqueness check at all, so it walked straight around the
+            # create-time one. Checked first, before the access-control
+            # mutations below, so a rejection leaves nothing half-applied.
+            #
+            # Variants (parent_tab_id set) are exempt: they are selected by a
+            # pill, never addressed by their own URL segment, and they keep
+            # their own sibling-title rule in create_tab_variant_v2.
+            if title is not None and tab.parent_tab_id is None:
+                conflict = _root_tab_with_conflicting_slug(
+                    db, title, tab.nav_tab_id, exclude_tab_id=tab.id
+                )
+                if conflict is not None:
+                    raise ValueError(
+                        f'A tab addressed as "{_slugify_title(title)}" already exists here '
+                        f'("{conflict.title}"). Titles differing only in capitalisation or '
+                        f"punctuation share one URL, so pick a more distinct name."
+                    )
 
             if access_control is not None:
                 if tab.parent_tab_id is not None:
@@ -2038,6 +2225,21 @@ def reorder_tabs_by_document_id_v2(db: Session, items: list[dict[str, Any]]) -> 
             raise ValueError("All reordered tabs must belong to the same parent level")
 
         parent_id = next(iter(parent_ids))
+
+        # Every root gridstack in this schema has parent_id None regardless
+        # of which nav tab it belongs to, so the parent_id check above alone
+        # would let a batch mix roots from two different nav tabs. Reject
+        # that here too — dead from the frontend today (root order is
+        # actually persisted per-tab via updateTabV2), but this endpoint is
+        # reachable directly.
+        if parent_id is None:
+            owning_tab_ids = {g.parent_tab_id for g in gridstacks}
+            owning_tabs = (
+                db.query(TabV2).filter(TabV2.id.in_(owning_tab_ids)).all()
+            )
+            nav_tab_ids = {t.nav_tab_id for t in owning_tabs}
+            if len(nav_tab_ids) != 1:
+                raise ValueError("All reordered tabs must belong to the same nav tab")
 
         for document_id, order in zip(document_ids, orders):
             gridstack = by_document_id[document_id]

@@ -24,6 +24,7 @@ Thumbs.db
 
 NOTES!!.txt
 generate_jwt_key.py
+tests/
 
 # Logs
 logs/
