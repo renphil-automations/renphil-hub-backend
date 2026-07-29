@@ -109,6 +109,12 @@ class TabSummaryResponse(BaseModel):
     # without an extra fetch; omitted (None) by callers that don't need it.
     access_control: AccessControlResponse | dict[str, Any] | None = None
 
+    # Populated for root tabs only (v2). Lets the mirror picker group roots
+    # by dashboard and disambiguates two roots that share a title across
+    # different nav tabs. None for sub-tabs, variants, and v1 tabs.
+    navTabDocumentId: StrictStr | None = None
+    navTabTitle: StrictStr | None = None
+
     # Which backend/schema this tab lives in — 'v1' (default, the original
     # schema) or 'v2' (the normalized tabs/gridstacks/components schema).
     # Tells the frontend which API base path (/tabs vs /v2/tabs) to use for
@@ -152,6 +158,29 @@ class BreadcrumbItemResponse(BaseModel):
     documentId: StrictStr | None = None
     title: StrictStr | None = None
     order: int = 0
+
+
+# ---------------------------------------------------------
+# Nav tab response schemas
+# ---------------------------------------------------------
+
+class NavTabResponse(BaseModel):
+    id: int | None = None
+    documentId: StrictStr | None = None
+    slug: StrictStr | None = None
+    title: StrictStr | None = None
+    order: int = 0
+
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    protected: StrictBool = False
+
+    # Empty for reads; populated by mutations after their DB commit.
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
+
+
+class NavTabListAPIResponse(BaseModel):
+    data: list[NavTabResponse] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------
@@ -200,6 +229,17 @@ class CreateTabRequest(StrictRequestModel):
     # The frontend sends inherited access_control when creating a tab.
     # Without this field, FastAPI rejects the request with 422.
     access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    # Which nav tab a new ROOT tab belongs to. Ignored for a sub-tab create
+    # (parentDocumentId set) — sub-tabs have no nav_tab_id of their own. When
+    # absent for a root create, the router falls back to the Dashboard nav
+    # tab so any existing caller keeps working unchanged.
+    navTabDocumentId: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=CLEAN_DOCUMENT_ID_PATTERN,
+    )
 
     @field_validator("order", mode="before")
     @classmethod
@@ -330,3 +370,62 @@ class UnlockTabRequest(StrictRequestModel):
     )
 
     force: StrictBool = False
+
+
+# ---------------------------------------------------------
+# Nav tab request schemas
+# ---------------------------------------------------------
+
+class CreateNavTabRequest(StrictRequestModel):
+    title: StrictStr = Field(
+        min_length=1,
+        max_length=255,
+        pattern=CLEAN_TEXT_PATTERN,
+    )
+
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    order: int | None = Field(
+        default=None,
+        ge=MIN_ORDER_VALUE,
+        le=MAX_ORDER_VALUE,
+    )
+
+    @field_validator("order", mode="before")
+    @classmethod
+    def validate_order(cls, value: Any) -> Any:
+        return validate_order_not_bool(value)
+
+
+class UpdateNavTabRequest(StrictRequestModel):
+    title: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=CLEAN_TEXT_PATTERN,
+    )
+
+    order: int | None = Field(
+        default=None,
+        ge=MIN_ORDER_VALUE,
+        le=MAX_ORDER_VALUE,
+    )
+
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    @field_validator("order", mode="before")
+    @classmethod
+    def validate_order(cls, value: Any) -> Any:
+        return validate_order_not_bool(value)
+
+
+class ReorderNavTabsRequest(StrictRequestModel):
+    orderedDocumentIds: list[StrictStr] = Field(default_factory=list)
+
+
+class MoveTabToNavTabRequest(StrictRequestModel):
+    navTabDocumentId: StrictStr = Field(
+        min_length=1,
+        max_length=255,
+        pattern=CLEAN_DOCUMENT_ID_PATTERN,
+    )

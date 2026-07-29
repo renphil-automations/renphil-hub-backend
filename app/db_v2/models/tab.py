@@ -39,5 +39,13 @@ class TabV2(BaseV2):
 
     parent_tab_id = Column(Integer, ForeignKey("tabs.id"), nullable=True, index=True)
 
+    # The nav tab (parent layer above root tabs, see NavTabV2) this tab
+    # belongs to. Nullable so the migration can add the column before
+    # backfilling with no NOT NULL window; after the backfill a NULL is an
+    # anomaly the service layer never produces. A variant carries the same
+    # nav_tab_id as its parent tab (create_tab_variant_v2) — it is not an
+    # independent placement.
+    nav_tab_id = Column(Integer, ForeignKey("nav_tabs.id"), nullable=True, index=True)
+
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True)

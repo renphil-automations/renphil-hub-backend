@@ -8,7 +8,7 @@ Provides:
 
 from __future__ import annotations
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import get_settings
@@ -19,6 +19,7 @@ from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
+from app.services.tab_service import HUB_ADMIN_ROLE
 
 _bearer_scheme = HTTPBearer()
 
@@ -80,3 +81,13 @@ async def get_current_user(
 ) -> UserInfo:
     """Extract and validate the JWT from the Authorization header."""
     return auth_service.decode_access_token(credentials.credentials)
+
+
+# ── Hub Admin authorization dependency ─────────────────────────────────
+async def require_hub_admin(user: UserInfo = Depends(get_current_user)) -> UserInfo:
+    """The first authorization check on any tab-family endpoint (nav tabs,
+    phase 1) — JWT-based, so it costs no Airtable round-trip. Phase 2 swaps
+    this body for the `hub` object's editor check; call sites are unaffected."""
+    if HUB_ADMIN_ROLE not in user.roles:
+        raise HTTPException(status_code=403, detail="Hub Admin role required")
+    return user

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_hub_admin
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
@@ -19,6 +19,7 @@ from app.schemas.tab import (
     CreateTabVariantRequest,
     LockTabRequest,
     MoveTabRequest,
+    MoveTabToNavTabRequest,
     ReorderTabsRequest,
     ReorderTabVariantsRequest,
     TabSummaryListAPIResponse,
@@ -47,6 +48,11 @@ from app.services.gridstack_service import (
     unlock_tab_by_document_id_v2,
     update_tab_by_document_id_v2,
     update_tab_content_v2,
+)
+from app.services.nav_tab_service import (
+    get_dashboard_nav_tab,
+    get_nav_tab_by_document_id,
+    move_tab_to_nav_tab_v2,
 )
 from app.services.tab_service import filter_widget_content_for_user
 
@@ -281,6 +287,21 @@ def create_new_tab(request: CreateTabRequest, db: Session = Depends(get_db_v2)):
             else request.access_control
         )
 
+        # navTabDocumentId only means anything for a ROOT create
+        # (parentDocumentId absent) — a sub-tab gridstack has no nav_tab_id
+        # of its own. When absent for a root create, fall back to the
+        # Dashboard nav tab so any existing caller keeps working unchanged.
+        nav_tab_id: int | None = None
+        if request.parentDocumentId is None:
+            if request.navTabDocumentId is not None:
+                nav_tab = get_nav_tab_by_document_id(db, request.navTabDocumentId)
+                if nav_tab is None:
+                    raise ValueError("Nav tab does not exist")
+                nav_tab_id = nav_tab.id
+            else:
+                dashboard = get_dashboard_nav_tab(db)
+                nav_tab_id = dashboard.id if dashboard is not None else None
+
         return create_tab_v2(
             db=db,
             title=request.title,
@@ -288,6 +309,7 @@ def create_new_tab(request: CreateTabRequest, db: Session = Depends(get_db_v2)):
             content=request.content,
             order=request.order,
             access_control=access_control,
+            nav_tab_id=nav_tab_id,
         )
     except ValueError as e:
         raise value_error_to_http_exception(e)
@@ -407,6 +429,34 @@ def move_tab(document_id: str, request: MoveTabRequest, db: Session = Depends(ge
             document_id=document_id,
             new_parent_document_id=request.newParentDocumentId,
             order=request.order,
+        )
+        if moved_workspace is None:
+            raise HTTPException(status_code=404, detail="Tab not found")
+        return {"data": moved_workspace}
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+@router.put(
+    "/{document_id}/nav-tab",
+    response_model=TabWorkspaceAPIResponse,
+    summary="Move a root tab to a different nav tab",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        403: {"description": "Hub Admin role required"},
+    },
+    dependencies=[Depends(require_hub_admin)],
+)
+def move_tab_to_nav_tab(document_id: str, request: MoveTabToNavTabRequest, db: Session = Depends(get_db_v2)):
+    validate_document_id(document_id)
+
+    try:
+        moved_workspace = move_tab_to_nav_tab_v2(
+            db=db,
+            tab_document_id=document_id,
+            nav_tab_document_id=request.navTabDocumentId,
         )
         if moved_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
