@@ -359,13 +359,6 @@ class Settings(BaseSettings):
     AT_F_CQL_URL: str = "URL"
     AT_F_CQL_EMAIL: str = "Email"
 
-    # ── HR Quick Links fields ────────────────────────────────────
-    AT_F_HRQL_ID: str = "ID"
-    AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
-    AT_F_HRQL_TYPE: str = "Type"
-    AT_F_HRQL_URL: str = "URL"
-    AT_F_HRQL_EMAIL: str = "Email"
-
     # RenPhil Agent API (server-to-server only)
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # The Hub backend proxies knowledge-update requests so SYNC_TOKEN is
