@@ -30,23 +30,19 @@ from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.nav_tab import NavTabV2
 
-from app.services.tab_service import (
-    DEFAULT_ACCESS_CONTROL,
-    access_control_is_subset,
-    intersect_access_control,
+from app.services.access_control_service import (
+    NodeRef,
+    apply_reparent_repair,
+    apply_write,
+    describe_write_plan,
+    node_summary,
+    plan_write,
+    principal_from_payload,
+    purge_principal,
+    reset_to_inherited,
+    resolved_ac_for_gridstack,
 )
-
-
-class AccessControlCascadeRequired(Exception):
-    """Raised by update_tab_by_document_id_v2 when tightening a tab's own
-    access_control would make one or more existing tab variants
-    noncompliant, and the caller has not yet confirmed the cascade. Carries
-    enough info for the router to return a 409 the frontend can render a
-    confirmation modal from."""
-
-    def __init__(self, affected_variants: list[dict[str, Any]]) -> None:
-        self.affected_variants = affected_variants
-        super().__init__("Access control change requires cascade confirmation")
+from app.services.tab_service import DEFAULT_ACCESS_CONTROL, access_control_subset_violation
 
 
 # ---------------------------------------------------------
@@ -1161,8 +1157,6 @@ def create_tab_variant_v2(
 
         parent_ac = _access_control_or_default(parent_tab.access_control)
         effective_ac = access_control if access_control is not None else parent_ac
-        if not access_control_is_subset(effective_ac, parent_ac):
-            raise ValueError("A tab variant's access control cannot be broader than its parent's")
 
         existing = (
             db.query(TabV2)
@@ -1185,7 +1179,10 @@ def create_tab_variant_v2(
             document_id=_generate_id(),
             title=title,
             order=order,
-            access_control=effective_ac,
+            # Materialized below via apply_write, after the content
+            # migration (is_first_variant) so any re-parented descendants
+            # are already in this variant's subtree when it propagates.
+            access_control=None,
             locked=False,
             locked_by="",
             parent_tab_id=parent_tab.id,
@@ -1215,6 +1212,8 @@ def create_tab_variant_v2(
 
         if is_first_variant:
             _migrate_root_content_to_variant(db, parent_gridstack, new_gridstack, new_tab)
+
+        apply_write(db, NodeRef("tab", new_tab.id), effective_ac)
 
         affected_component_ids = _component_ids_for_gridstack_tree(db, new_gridstack)
         db.commit()
@@ -1347,6 +1346,14 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         "parent": parent,
         "page_content": _format_page_content(db, gridstack),
         "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
+        # The effective (NULL-skipping resolved, landmine-14) AC of THIS
+        # node itself -- also, not coincidentally, the exact ceiling
+        # update_tab_content_v2 already validates each widget on this
+        # canvas against (§3.4). Exposed on read so the frontend's
+        # parent-scoped component picker (plan §6.1's last bullet, commit
+        # 8) has one source for that ceiling instead of re-implementing the
+        # walk-up in TypeScript.
+        "resolved_access_control": resolved_ac_for_gridstack(db, gridstack),
         "locked": locked,
         "locked_by": locked_by,
         "children": child_summaries,
@@ -1466,6 +1473,18 @@ def update_tab_content_v2(
         if gridstack is None:
             return None
 
+        # Component subset rule (§3.4) — a widget's access_control may only
+        # narrow the gridstack's own resolved ceiling, never widen it. This is
+        # a BULK path (one save carries every widget on the canvas), so the
+        # ceiling is resolved once, lazily, rather than once per widget.
+        _widget_ac_ceiling: dict[str, Any] | None = None
+
+        def _resolved_widget_ac_ceiling() -> dict[str, Any]:
+            nonlocal _widget_ac_ceiling
+            if _widget_ac_ceiling is None:
+                _widget_ac_ceiling = resolved_ac_for_gridstack(db, gridstack)
+            return _widget_ac_ceiling
+
         search_updates: dict[int, str] = {}
         incoming = content if isinstance(content, dict) else {}
         incoming_layout = {entry.get("id"): entry for entry in (incoming.get("layout") or [])}
@@ -1556,6 +1575,23 @@ def update_tab_content_v2(
             access_control = widget_entry.get("access_control")
             title = widget_entry.get("title")
             description = widget_entry.get("description")
+
+            # NULL means inherit (§3.4) — nothing to check. Airtable's is
+            # protected (never actually written from this unauthenticated
+            # path — see AIRTABLE_PROTECTED_DATA_FIELDS above) and a
+            # mirror's stored value is inert (serialized access is derived
+            # from the mirror's target, never its own column) — validating
+            # either would reject values that are never actually enforced.
+            if (
+                access_control
+                and widget_type != AIRTABLE_WIDGET_TYPE
+                and widget_type != MIRROR_WIDGET_TYPE
+            ):
+                violation = access_control_subset_violation(
+                    access_control, _resolved_widget_ac_ceiling()
+                )
+                if violation is not None:
+                    raise ValueError(f"Widget '{widget_id}': {violation}")
 
             existing = existing_components.get(widget_id)
             before_signature = (
@@ -1836,11 +1872,22 @@ def create_tab_v2(
                     f"punctuation share one URL, so pick a more distinct name."
                 )
 
+            nav_tab_row = (
+                db.query(NavTabV2).filter(NavTabV2.id == nav_tab_id).first()
+                if nav_tab_id is not None
+                else None
+            )
+            parent_ac = _access_control_or_default(
+                nav_tab_row.access_control if nav_tab_row else None
+            )
+            effective_ac = access_control if access_control is not None else parent_ac
+
             new_tab = TabV2(
                 document_id=_generate_id(),
                 title=title,
                 order=order,
-                access_control=access_control or DEFAULT_ACCESS_CONTROL,
+                # Materialized below via apply_write.
+                access_control=None,
                 locked=False,
                 locked_by="",
                 nav_tab_id=nav_tab_id,
@@ -1861,12 +1908,21 @@ def create_tab_v2(
             db.add(new_gridstack)
             db.flush()
             created_gridstack_component = _create_gridstack_component(db, new_gridstack)
+
+            apply_write(db, NodeRef("tab", new_tab.id), effective_ac)
         else:
             existing = _gridstack_exists_under_parent(
                 db, title, parent_tab_id=parent_gridstack.parent_tab_id, parent_id=parent_gridstack.id
             )
             if existing is not None:
                 raise ValueError("A tab with this title already exists under the same parent")
+
+            # "The parent's" AC (§5.2) — the owning TabV2's AC for a "top"
+            # sub-tab directly on a root/variant's own canvas, or the parent
+            # sub-tab's own AC for a nested one; _safe_access_control_for_
+            # gridstack already implements exactly that distinction.
+            parent_ac = _safe_access_control_for_gridstack(db, parent_gridstack)
+            effective_ac = access_control if access_control is not None else parent_ac
 
             new_gridstack = GridstackV2(
                 document_id=_generate_id(),
@@ -1878,9 +1934,10 @@ def create_tab_v2(
             )
             db.add(new_gridstack)
             db.flush()
-            created_gridstack_component = _create_gridstack_component(
-                db, new_gridstack, access_control=access_control or DEFAULT_ACCESS_CONTROL
-            )
+            # Materialized below via apply_write.
+            created_gridstack_component = _create_gridstack_component(db, new_gridstack)
+
+            apply_write(db, NodeRef("gridstack", new_gridstack.id), effective_ac)
 
         content_receipts: list[dict[str, Any]] = []
         if content:
@@ -1912,7 +1969,6 @@ def update_tab_by_document_id_v2(
     access_control: dict[str, Any] | None = None,
     locked: bool | None = None,
     locked_by: str | None = None,
-    cascade_confirmed: bool = False,
 ) -> dict[str, Any] | None:
     try:
         title = _validate_title(title)
@@ -1948,53 +2004,6 @@ def update_tab_by_document_id_v2(
                         f"punctuation share one URL, so pick a more distinct name."
                     )
 
-            if access_control is not None:
-                if tab.parent_tab_id is not None:
-                    # This tab is itself a variant — a direct attempt to
-                    # broaden its own AC beyond its parent's is a hard
-                    # reject, never a cascade case (cascade only flows
-                    # parent -> children, see the else branch below).
-                    grandparent_tab = (
-                        db.query(TabV2).filter(TabV2.id == tab.parent_tab_id).first()
-                    )
-                    parent_ac = _access_control_or_default(
-                        grandparent_tab.access_control if grandparent_tab else None
-                    )
-                    if not access_control_is_subset(access_control, parent_ac):
-                        raise ValueError(
-                            "A tab variant's access control cannot be broader than its parent tab's"
-                        )
-                else:
-                    # This tab may itself have variants — tightening its AC
-                    # can make an existing variant noncompliant. Requires
-                    # explicit confirmation before anything is written.
-                    variant_tabs = (
-                        db.query(TabV2).filter(TabV2.parent_tab_id == tab.id).all()
-                    )
-                    affected = [
-                        v
-                        for v in variant_tabs
-                        if not access_control_is_subset(
-                            _access_control_or_default(v.access_control), access_control
-                        )
-                    ]
-                    if affected and not cascade_confirmed:
-                        raise AccessControlCascadeRequired(
-                            [
-                                {
-                                    "documentId": v.document_id,
-                                    "title": v.title,
-                                    "access_control": _access_control_or_default(v.access_control),
-                                }
-                                for v in affected
-                            ]
-                        )
-                    for v in affected:
-                        v.access_control = intersect_access_control(
-                            _access_control_or_default(v.access_control), access_control
-                        )
-                        v.updated_at = _utc_now()
-
             if title is not None:
                 tab.title = title
                 gridstack.name = title
@@ -2002,7 +2011,11 @@ def update_tab_by_document_id_v2(
                 tab.order = order
                 gridstack.position = order
             if access_control is not None:
-                tab.access_control = access_control
+                # apply_write materializes the change through the whole
+                # propagation engine (§3.2) — this covers both a root tab
+                # and a variant uniformly; there is no longer a separate
+                # subset/cascade rule for variants (§5.2, §10 commit 3).
+                apply_write(db, NodeRef("tab", tab.id), access_control)
             if locked is not None:
                 tab.locked = locked
             if locked_by is not None:
@@ -2014,14 +2027,10 @@ def update_tab_by_document_id_v2(
             if order is not None:
                 gridstack.position = order
             if access_control is not None:
-                component = _get_gridstack_component(db, gridstack.id)
-                if component is None:
-                    # Sub-tab gridstack created before the current_grid_id
-                    # backfill (migrate_subtab_access_control_to_components.py)
-                    # — create its representation component now rather than
-                    # falling back to gridstacks.settings.
-                    component = _create_gridstack_component(db, gridstack)
-                component.access_control = access_control
+                # write_ac's gridstack branch creates the representation
+                # component on demand (same fallback this call used to do
+                # by hand for a pre-backfill sub-tab gridstack).
+                apply_write(db, NodeRef("gridstack", gridstack.id), access_control)
             if locked is not None or locked_by is not None:
                 raise ValueError(
                     "Locking is only supported for top-level tabs in this schema version"
@@ -2177,6 +2186,13 @@ def move_tab_by_document_id_v2(
                 descendant = db.query(GridstackV2).filter(GridstackV2.id == descendant_id).first()
                 if descendant is not None:
                     descendant.parent_tab_id = new_parent.parent_tab_id
+
+            # This reparents a sub-tab gridstack exactly like
+            # nav_tab_service.move_tab_to_nav_tab_v2 reparents a root tab —
+            # same landmine 3 shape (both invariants can break in one
+            # write), just not analyzed by the plan text. Same repair.
+            db.flush()
+            apply_reparent_repair(db, NodeRef("gridstack", gridstack.id))
         else:
             raise ValueError("Moving a sub-tab to root is not supported in this schema version")
 
@@ -2378,6 +2394,100 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
             ],
         }
 
+    except Exception:
+        db.rollback()
+        raise
+
+
+# ---------------------------------------------------------
+# Preview / purge / reset (§5.4, §6.3, §6.4) — for a tab-family node (root,
+# variant, or sub-tab gridstack) addressed by its document_id. Resolves to
+# the same NodeRef("tab", ...) / NodeRef("gridstack", ...) split
+# update_tab_by_document_id_v2 already makes; factored out here since these
+# three new functions and that existing one all need it.
+# ---------------------------------------------------------
+
+
+def resolve_tab_ref_by_document_id_v2(db: Session, document_id: str) -> NodeRef | None:
+    gridstack = get_gridstack_by_document_id(db, document_id)
+    if gridstack is None:
+        return None
+    if _is_root(gridstack):
+        tab = _get_root_tab(db, gridstack)
+        if tab is None:
+            return None
+        return NodeRef("tab", tab.id)
+    return NodeRef("gridstack", gridstack.id)
+
+
+def preview_tab_access_v2(
+    db: Session, document_id: str, access_control: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Read-only — backs the preview modal. Never writes."""
+    ref = resolve_tab_ref_by_document_id_v2(db, document_id)
+    if ref is None:
+        return None
+    plan = plan_write(db, ref, access_control)
+    return describe_write_plan(db, plan)
+
+
+def _refresh_index_for_touched(db: Session, touched: list[NodeRef]) -> list[dict[str, Any]]:
+    """Purge/reset can touch many nodes across the tree in one call — but,
+    matching update_tab_by_document_id_v2's own comment, only a ROOT/variant
+    TabV2's access_control is embedded in the indexed component payload; a
+    sub-tab's is resolved live by component-link navigation and was never
+    indexed. So only the "tab" kind entries among `touched` (root or
+    variant) need their component subtrees reindexed."""
+    search_updates: list[dict[str, Any]] = []
+    for ref in touched:
+        if ref.kind != "tab":
+            continue
+        tab = db.query(TabV2).filter(TabV2.id == ref.id).first()
+        if tab is None or tab.document_id is None:
+            continue
+        gridstack = get_gridstack_by_document_id(db, tab.document_id)
+        if gridstack is None:
+            continue
+        for component_id in _component_ids_for_gridstack_tree(db, gridstack):
+            search_updates.append({"component_id": component_id, "action": "upsert"})
+    return search_updates
+
+
+def purge_tab_principal_v2(
+    db: Session, document_id: str, principal_payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    try:
+        ref = resolve_tab_ref_by_document_id_v2(db, document_id)
+        if ref is None:
+            return None
+        principal = principal_from_payload(principal_payload)
+        touched = purge_principal(db, ref, principal)
+        search_updates = _refresh_index_for_touched(db, touched)
+        db.commit()
+        return {
+            "touched": [node_summary(db, r) for r in touched],
+            "search_updates": search_updates,
+        }
+    except Exception:
+        db.rollback()
+        raise
+
+
+def reset_tab_access_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+    """Discards this node's own access_control and re-derives it from its
+    resolved parent (§6.4's "match the parent again" — the drift-repair
+    tool for landmine 2)."""
+    try:
+        ref = resolve_tab_ref_by_document_id_v2(db, document_id)
+        if ref is None:
+            return None
+        touched = reset_to_inherited(db, ref)
+        search_updates = _refresh_index_for_touched(db, touched)
+        db.commit()
+        return {
+            "touched": [node_summary(db, r) for r in touched],
+            "search_updates": search_updates,
+        }
     except Exception:
         db.rollback()
         raise

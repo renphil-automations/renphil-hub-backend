@@ -10,8 +10,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, require_hub_admin
+from app.dependencies import get_current_user
 from app.models.auth import UserInfo
+from app.services import access_control_service
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
@@ -20,6 +21,8 @@ from app.schemas.tab import (
     LockTabRequest,
     MoveTabRequest,
     MoveTabToNavTabRequest,
+    PreviewAccessWriteRequest,
+    PurgePrincipalRequest,
     ReorderTabsRequest,
     ReorderTabVariantsRequest,
     TabSummaryListAPIResponse,
@@ -30,7 +33,6 @@ from app.schemas.tab import (
     UpdateTabRequest,
 )
 from app.services.gridstack_service import (
-    AccessControlCascadeRequired,
     create_tab_v2,
     create_tab_variant_v2,
     delete_tab_subtree_by_document_id_v2,
@@ -42,8 +44,11 @@ from app.services.gridstack_service import (
     get_tab_workspace_v2,
     lock_tab_by_document_id_v2,
     move_tab_by_document_id_v2,
+    preview_tab_access_v2,
+    purge_tab_principal_v2,
     reorder_tab_variants_v2,
     reorder_tabs_by_document_id_v2,
+    reset_tab_access_v2,
     resolve_component_location_v2,
     unlock_tab_by_document_id_v2,
     update_tab_by_document_id_v2,
@@ -53,6 +58,7 @@ from app.services.nav_tab_service import (
     get_dashboard_nav_tab,
     get_nav_tab_by_document_id,
     move_tab_to_nav_tab_v2,
+    resolve_move_authorization_targets,
 )
 from app.services.tab_service import filter_widget_content_for_user
 
@@ -397,19 +403,10 @@ def update_tab_metadata(document_id: str, request: UpdateTabRequest, db: Session
             access_control=access_control,
             locked=request.locked,
             locked_by=request.locked_by,
-            cascade_confirmed=request.cascade_confirmed,
         )
         if updated_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": updated_workspace}
-    except AccessControlCascadeRequired as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "needsCascadeConfirmation": True,
-                "affectedVariants": e.affected_variants,
-            },
-        )
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -445,12 +442,30 @@ def move_tab(document_id: str, request: MoveTabRequest, db: Session = Depends(ge
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
         **COMMON_CONFLICT_RESPONSE,
-        403: {"description": "Hub Admin role required"},
+        403: {"description": "Editor access required on the tab and the destination nav tab"},
     },
-    dependencies=[Depends(require_hub_admin)],
+    # No blanket `Depends` here (plan §5.3, §9.9c) — this writes to BOTH the
+    # root tab and the destination nav tab, and the destination is only
+    # known from the request body, which a per-node path-param dependency
+    # can't see. Checked inline below instead.
 )
-def move_tab_to_nav_tab(document_id: str, request: MoveTabToNavTabRequest, db: Session = Depends(get_db_v2)):
+def move_tab_to_nav_tab(
+    document_id: str,
+    request: MoveTabToNavTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
     validate_document_id(document_id)
+
+    tab, dest_nav_tab = resolve_move_authorization_targets(db, document_id, request.navTabDocumentId)
+    if tab is None:
+        raise HTTPException(status_code=404, detail="Tab not found")
+    if not access_control_service.can_edit(tab.access_control, user.email, list(user.roles)):
+        raise HTTPException(status_code=403, detail="Cannot edit this tab")
+    if dest_nav_tab is None:
+        raise HTTPException(status_code=404, detail="Destination nav tab does not exist")
+    if not access_control_service.can_edit(dest_nav_tab.access_control, user.email, list(user.roles)):
+        raise HTTPException(status_code=403, detail="Cannot edit the destination nav tab")
 
     try:
         moved_workspace = move_tab_to_nav_tab_v2(
@@ -478,5 +493,64 @@ def delete_tab(document_id: str, db: Session = Depends(get_db_v2)):
         if delete_result is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": delete_result}
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+# No additional gate on the three endpoints below, matching every other
+# mutating endpoint on this router (update/move/delete) — landmine 6,
+# explicitly out of phase-2 scope: "any authenticated user can do anything
+# to a tab" is a pre-existing gap this phase never closes, not one these
+# introduce.
+@router.post(
+    "/{document_id}/access/preview",
+    summary="Preview the blast radius of a tab access-control write (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+)
+def preview_tab_access(
+    document_id: str, request: PreviewAccessWriteRequest, db: Session = Depends(get_db_v2)
+):
+    validate_document_id(document_id)
+    access_control = (
+        request.access_control.model_dump()
+        if hasattr(request.access_control, "model_dump")
+        else request.access_control
+    )
+    preview = preview_tab_access_v2(db, document_id, access_control)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Tab not found")
+    return preview
+
+
+@router.post(
+    "/{document_id}/access/purge",
+    summary="Purge a principal from a tab and its entire subtree (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+)
+def purge_tab_principal(
+    document_id: str, request: PurgePrincipalRequest, db: Session = Depends(get_db_v2)
+):
+    validate_document_id(document_id)
+    try:
+        result = purge_tab_principal_v2(db, document_id, request.principal.model_dump())
+        if result is None:
+            raise HTTPException(status_code=404, detail="Tab not found")
+        return result
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+@router.post(
+    "/{document_id}/access/reset",
+    summary="Reset a tab's access control to inherit from its resolved parent (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+)
+def reset_tab_access(document_id: str, db: Session = Depends(get_db_v2)):
+    validate_document_id(document_id)
+    try:
+        result = reset_tab_access_v2(db, document_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Tab not found")
+        return result
     except ValueError as e:
         raise value_error_to_http_exception(e)

@@ -7,6 +7,7 @@ from pydantic import (
     StrictBool,
     StrictStr,
     field_validator,
+    model_validator,
 )
 
 from app.schemas.page_content import PageContentWorkspaceResponse, SearchUpdateReceipt
@@ -135,10 +136,33 @@ class TabWorkspaceResponse(BaseModel):
     parent: TabParentResponse | None = None
     page_content: PageContentWorkspaceResponse | None = None
 
-    # Allows normalized DB rows that may return a plain dict.
-    access_control: AccessControlResponse | dict[str, Any] = Field(
+    # Allows normalized DB rows that may return a plain dict. Nullable: a
+    # v2 SBN node's access_control is None on the wire whenever it means
+    # "inherit" (§3.4/§5.2's NULL-through fix, get_sbn_workspace) rather
+    # than a manufactured default -- this field being non-nullable was a
+    # latent bug (pre-existing, session 6) that 500'd this response model
+    # for exactly that case; no test caught it because the engine-level
+    # test called get_sbn_workspace directly, bypassing response
+    # validation. Found while adding resolved_parent_access_control (commit
+    # 8a) and its test, which is the first thing to exercise this through
+    # the actual HTTP router.
+    access_control: AccessControlResponse | dict[str, Any] | None = Field(
         default_factory=AccessControlResponse
     )
+
+    # Populated by get_tab_workspace_v2 (v2 root/variant/sub-tab reads): this
+    # node's own EFFECTIVE access_control, resolved past any NULL ancestors
+    # (landmine 14) -- also the exact ceiling a canvas widget sitting on
+    # this node is validated against (§3.4). None for v1 / callers that
+    # don't resolve it.
+    resolved_access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    # Populated by get_sbn_workspace (v2 SBN node reads) only: the ceiling
+    # THIS node's own access_control is validated against on write (§3.4) --
+    # its resolved PARENT's effective AC, not its own. None for every other
+    # caller of this shape (a tab/sub-tab is a propagating tab-family node,
+    # not itself subset-constrained, so it has no such ceiling).
+    resolved_parent_access_control: AccessControlResponse | dict[str, Any] | None = None
 
     locked: StrictBool = False
     locked_by: StrictStr = ""
@@ -270,12 +294,6 @@ class UpdateTabRequest(StrictRequestModel):
         max_length=255,
         pattern=CLEAN_TEXT_PATTERN,
     )
-
-    # When a v2 tab's own access_control is tightened and it has tab
-    # variants that would become noncompliant, the server rejects the
-    # change with 409 unless this is set — the frontend re-sends the same
-    # request with cascade_confirmed=True after the user confirms.
-    cascade_confirmed: StrictBool = False
 
     @field_validator("order", mode="before")
     @classmethod
@@ -429,3 +447,58 @@ class MoveTabToNavTabRequest(StrictRequestModel):
         max_length=255,
         pattern=CLEAN_DOCUMENT_ID_PATTERN,
     )
+
+
+# ---------------------------------------------------------
+# Hub schemas (phase 2, §5.4) — one row, no title/slug of its own.
+# ---------------------------------------------------------
+
+class HubResponse(BaseModel):
+    documentId: StrictStr | None = None
+    title: StrictStr = "Hub"
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+
+class HubAPIResponse(BaseModel):
+    data: HubResponse
+
+
+class UpdateHubRequest(StrictRequestModel):
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------
+# Preview / purge / reset schemas (§5.4, §5.5, §6.3, §6.4) — shared across
+# the hub, nav-tab, and tab routers; none of the three surfaces need their
+# own request shape beyond "which access_control would be written" or
+# "which principal to strip".
+# ---------------------------------------------------------
+
+class PreviewAccessWriteRequest(StrictRequestModel):
+    """Backs POST .../access/preview on all three routers (hub, nav tab,
+    tab). Read-only — plan_write is never applied from this request."""
+    access_control: AccessControlResponse | dict[str, Any] | None = None
+
+
+class PrincipalRequest(StrictRequestModel):
+    """A user or a role, named by type rather than by which group (admins
+    vs viewers) it currently sits in — purge strips a principal from both,
+    wherever it's found."""
+    type: Literal["user", "role"]
+    email: StrictStr | None = None
+    name: StrictStr | None = None
+    scope: StrictStr = ""
+    program: StrictStr = ""
+    function: StrictStr = ""
+
+    @model_validator(mode="after")
+    def _check_required_field(self) -> "PrincipalRequest":
+        if self.type == "user" and not self.email:
+            raise ValueError("email is required when type is 'user'")
+        if self.type == "role" and not self.name:
+            raise ValueError("name is required when type is 'role'")
+        return self
+
+
+class PurgePrincipalRequest(StrictRequestModel):
+    principal: PrincipalRequest
