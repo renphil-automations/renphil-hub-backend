@@ -5435,10 +5435,8 @@ class AirtableService:
         )
 
     # Feedback field name constants (loaded from settings/.env)
-    _F_FEEDBACK_ID = _S.AT_F_FEEDBACK_ID
     _F_FEEDBACK_FROM = _S.AT_F_FEEDBACK_FROM
     _F_FEEDBACK_MESSAGE = _S.AT_F_FEEDBACK_MESSAGE
-    _F_FEEDBACK_DATETIME = _S.AT_F_FEEDBACK_DATETIME
 
     async def create_feedback(self, payload: FeedbackCreate) -> FeedbackRecord:
         """Create a new feedback record.

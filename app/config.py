@@ -200,10 +200,8 @@ class Settings(BaseSettings):
     AT_F_ANN_APPROVED_BY: str
 
     # â”€â”€ Feedbacks fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    AT_F_FEEDBACK_ID: str
     AT_F_FEEDBACK_FROM: str
     AT_F_FEEDBACK_MESSAGE: str
-    AT_F_FEEDBACK_DATETIME: str
 
     # â”€â”€ Tickets fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     AT_F_TICKET_ID: str
