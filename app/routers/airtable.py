@@ -61,6 +61,8 @@ from app.models.airtable import (
     AnnouncementCreate,
     AnnouncementRecord,
     AnnouncementUpdate,
+    FeedbackCreate,
+    FeedbackRecord,
     AwardedOpportunityRecord,
     AccessControlAssign,
     AccessControlRecord,
@@ -2469,6 +2471,20 @@ async def create_announcement(
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     return await airtable_service.create_announcement(payload)
+
+
+@router.post(
+    "/feedbacks",
+    response_model=FeedbackRecord,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit a new feedback (Date & Time set server-side)",
+)
+async def create_feedback(
+    payload: FeedbackCreate = Body(...),
+    _user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    return await airtable_service.create_feedback(payload)
 
 
 @router.patch(
