@@ -21,6 +21,13 @@ MAX_ORDER_VALUE = 2147483647
 CLEAN_TEXT_PATTERN = r"^[^\x00-\x20\x7F][^\x00-\x1F\x7F]*$"
 CLEAN_DOCUMENT_ID_PATTERN = r"^[^\x00-\x20\x7F]+$"
 
+# A lucide-react icon name (e.g. "layout-grid") — a lookup key only, never
+# checked against the icon library itself. Deliberately not an allowlist of
+# every registered name: that would need a generated constant kept in sync
+# with every lucide-react bump, and buys nothing, since an unknown name just
+# degrades to the fallback icon client-side (see NavTabV2.icon's docstring).
+ICON_NAME_PATTERN = r"^[a-z0-9]+(-[a-z0-9]+)*$"
+
 
 # ---------------------------------------------------------
 # Base config helpers
@@ -198,6 +205,8 @@ class NavTabResponse(BaseModel):
     access_control: AccessControlResponse | dict[str, Any] | None = None
 
     protected: StrictBool = False
+
+    icon: StrictStr | None = None
 
     # Empty for reads; populated by mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
@@ -409,6 +418,8 @@ class CreateNavTabRequest(StrictRequestModel):
         le=MAX_ORDER_VALUE,
     )
 
+    icon: StrictStr | None = Field(default=None, max_length=64, pattern=ICON_NAME_PATTERN)
+
     @field_validator("order", mode="before")
     @classmethod
     def validate_order(cls, value: Any) -> Any:
@@ -430,6 +441,11 @@ class UpdateNavTabRequest(StrictRequestModel):
     )
 
     access_control: AccessControlResponse | dict[str, Any] | None = None
+
+    # Three-way, like the airtable `pat` field: omitted (leave alone, checked
+    # via model_fields_set at the router) vs. present-and-a-string (set) vs.
+    # present-and-null (clear to the default icon — §3.4's "Use default").
+    icon: StrictStr | None = Field(default=None, max_length=64, pattern=ICON_NAME_PATTERN)
 
     @field_validator("order", mode="before")
     @classmethod

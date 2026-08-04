@@ -103,6 +103,7 @@ def create_nav_tab(request: CreateNavTabRequest, db: Session = Depends(get_db_v2
             title=request.title,
             access_control=access_control,
             order=request.order,
+            icon=request.icon,
         )
     except ValueError as e:
         raise value_error_to_http_exception(e)
@@ -143,12 +144,18 @@ def update_nav_tab(document_id: str, request: UpdateNavTabRequest, db: Session =
             if hasattr(request.access_control, "model_dump")
             else request.access_control
         )
+        # model_fields_set distinguishes "icon absent" (leave alone) from
+        # "icon explicitly null" (clear to the default icon) — the same
+        # three-way the airtable `pat` field already needs for its own
+        # omit/set/clear distinction.
+        icon_kwargs = {"icon": request.icon} if "icon" in request.model_fields_set else {}
         updated = update_nav_tab_v2(
             db=db,
             document_id=document_id,
             title=request.title,
             order=request.order,
             access_control=access_control,
+            **icon_kwargs,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="Nav tab not found")

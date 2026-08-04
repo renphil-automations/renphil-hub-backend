@@ -33,6 +33,7 @@ from app.services.access_control_service import (
     reset_to_inherited,
 )
 from app.services.gridstack_service import (
+    _UNSET,
     _access_control_or_default,
     _component_ids_for_gridstack_tree,
     _generate_id,
@@ -117,6 +118,7 @@ def _format_nav_tab(nav_tab: NavTabV2) -> dict[str, Any]:
         "order": nav_tab.order if nav_tab.order is not None else 0,
         "access_control": _access_control_or_default(nav_tab.access_control),
         "protected": bool(nav_tab.protected),
+        "icon": nav_tab.icon,
     }
 
 
@@ -166,6 +168,7 @@ def create_nav_tab_v2(
     title: str,
     access_control: dict[str, Any] | None = None,
     order: int | None = None,
+    icon: str | None = None,
 ) -> dict[str, Any]:
     try:
         title = _validate_title(title)
@@ -196,6 +199,7 @@ def create_nav_tab_v2(
             # propagates correctly (harmless no-op for the common case).
             access_control=None,
             protected=False,
+            icon=icon,
             created_at=now,
             updated_at=now,
         )
@@ -223,6 +227,7 @@ def update_nav_tab_v2(
     title: str | None = None,
     order: int | None = None,
     access_control: dict[str, Any] | None = None,
+    icon: Any = _UNSET,
 ) -> dict[str, Any] | None:
     try:
         nav_tab = get_nav_tab_by_document_id(db, document_id)
@@ -245,6 +250,18 @@ def update_nav_tab_v2(
 
         if access_control is not None:
             apply_write(db, NodeRef("nav_tab", nav_tab.id), access_control)
+
+        # `_UNSET` (not `None`) is the "leave alone" sentinel here, unlike
+        # title/order/access_control above — icon needs a real three-way:
+        # omitted (leave alone), a string (set), or explicit `None` (clear to
+        # the default icon, §3.4's "Use default"). Matches the same
+        # model_fields_set-driven pattern the airtable `pat` field already
+        # uses for its own omit/set/clear distinction. No protected-row
+        # guard, unlike the title branch above — an icon has no coupling to
+        # `slug`/URL stability, so the Dashboard row can have its icon
+        # changed like any other nav tab (§3.3).
+        if icon is not _UNSET:
+            nav_tab.icon = icon
 
         nav_tab.updated_at = _utc_now()
 
