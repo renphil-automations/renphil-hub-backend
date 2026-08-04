@@ -1390,6 +1390,32 @@ def _cascade_gridstack_id_to_sbn_descendants(
     return changed_ids
 
 
+def _collect_sbn_descendant_ids(db: Session, component_id: int) -> list[int]:
+    """Every component reachable from `component_id` via the `super_blocknote_id`
+    chain, at any depth. When a Super Block Note's top-level widget is removed
+    from a canvas (see the delete branch in `update_tab_content_v2`), these
+    must be deleted before `component_id` itself — they still reference it via
+    that self-referential FK, and deleting only the top-level row is a
+    foreign key violation (the same reasoning `_cascade_gridstack_id_to_sbn_
+    descendants` above documents for the re-parent case)."""
+    ids: list[int] = []
+    children = db.query(ComponentV2.id).filter(ComponentV2.super_blocknote_id == component_id).all()
+    for (child_id,) in children:
+        ids.append(child_id)
+        ids.extend(_collect_sbn_descendant_ids(db, child_id))
+    return ids
+
+
+def _delete_component_and_page_content(db: Session, component: ComponentV2) -> None:
+    if component.page_content_id is not None:
+        page_content = (
+            db.query(PageContentV2).filter(PageContentV2.id == component.page_content_id).first()
+        )
+        if page_content is not None:
+            db.delete(page_content)
+    db.delete(component)
+
+
 def _component_persistence_signature(db: Session, component: ComponentV2) -> dict[str, Any]:
     """Return only database state that can affect this component's index.
 
@@ -1510,19 +1536,33 @@ def update_tab_content_v2(
 
         incoming_ids = set(incoming_widgets.keys())
 
-        # Delete components removed from the canvas.
+        # Delete components removed from the canvas. A removed component may
+        # be a Super Block Note's top-level widget, in which case its whole
+        # descendant tree (`super_blocknote_id` chain) must go first — those
+        # rows still reference it via that self-referential FK, and deleting
+        # only the top-level row is a foreign key violation. Descendant ids
+        # are always strictly higher than their SBN parent's (a child can't
+        # reference a parent that doesn't exist yet), so deleting in
+        # descending-id order is child-before-parent; flushing each delete
+        # forces SQLAlchemy to execute them in that order rather than batching
+        # same-table deletes into one arbitrary-order executemany (same
+        # reasoning as delete_tab_subtree_by_document_id_v2's per-node flush).
         for existing_id, component in list(existing_components.items()):
             if existing_id not in incoming_ids:
                 search_updates[component.id] = "delete"
-                if component.page_content_id is not None:
-                    page_content = (
-                        db.query(PageContentV2)
-                        .filter(PageContentV2.id == component.page_content_id)
-                        .first()
+                descendant_ids = sorted(
+                    _collect_sbn_descendant_ids(db, component.id), reverse=True
+                )
+                for descendant_id in descendant_ids:
+                    descendant = (
+                        db.query(ComponentV2).filter(ComponentV2.id == descendant_id).first()
                     )
-                    if page_content is not None:
-                        db.delete(page_content)
-                db.delete(component)
+                    if descendant is None:
+                        continue
+                    _delete_component_and_page_content(db, descendant)
+                    db.flush()
+                _delete_component_and_page_content(db, component)
+                db.flush()
                 del existing_components[existing_id]
 
         # A widget entry can legitimately arrive here still carrying its OLD,
