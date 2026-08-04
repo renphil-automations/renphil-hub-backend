@@ -5441,11 +5441,13 @@ class AirtableService:
     _F_FEEDBACK_DATETIME = _S.AT_F_FEEDBACK_DATETIME
 
     async def create_feedback(self, payload: FeedbackCreate) -> FeedbackRecord:
-        """Create a new feedback record with 'Date & Time' set to now (UTC)."""
+        """Create a new feedback record.
+
+        'Date & Time' is a computed Airtable field, so it is not written here.
+        """
         fields: dict[str, Any] = {
             self._F_FEEDBACK_FROM: str(payload.from_email),
             self._F_FEEDBACK_MESSAGE: payload.message,
-            self._F_FEEDBACK_DATETIME: self._iso(datetime.utcnow()),
         }
 
         table = self._feedbacks_table()
