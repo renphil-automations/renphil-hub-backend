@@ -1624,8 +1624,8 @@ class AnnouncementRecord(_TypedAirtableRecord):
 class FeedbackCreate(BaseModel):
     """Payload to submit a new piece of user feedback.
 
-    Stored in the Feedbacks table. ``Date & Time`` is set server-side to
-    the current UTC time.
+    Stored in the Feedbacks table. ``Date & Time`` is a computed Airtable
+    field and is populated automatically on create.
     """
 
     from_email: EmailStr = Field(description="Email of the person giving feedback.")
