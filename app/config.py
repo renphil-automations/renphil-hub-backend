@@ -1,4 +1,4 @@
-﻿"""
+"""
 Centralised application settings loaded from environment variables.
 Uses pydantic-settings so every value is validated at startup.
 """
@@ -14,56 +14,69 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # â”€â”€ App â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── App ────────────────────────────────────────────────────────────
     APP_NAME: str = "RenPhil Hub API"
     DEBUG: bool = False
     # Loaded strictly from the ALLOWED_ORIGINS environment variable (JSON list)
     ALLOWED_ORIGINS: list[str]
     # Comma-separated emails granted "Hub Admin" without an Access Control
-    # record. Only takes effect when DEBUG=true â€” local testing convenience,
+    # record. Only takes effect when DEBUG=true — local testing convenience,
     # never honored in production.
     # DEV_ADMIN_OVERRIDE_EMAILS: str = ""
 
-    # â”€â”€ Google OAuth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Google OAuth ───────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str
     GOOGLE_CLIENT_SECRET: str
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
     ALLOWED_EMAIL_DOMAIN: str = "renphil.org"
 
-    # â”€â”€ JWT Tokens (issued after OAuth) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── JWT Tokens (issued after OAuth) ────────────────────────────────
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
-    # â”€â”€ Google Drive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Google Drive ───────────────────────────────────────────────────
     GOOGLE_DRIVE_FOLDER_ID: str
     # Production: store the entire service-account JSON as a string in this var.
     # Local dev fallback: path to the JSON key file.
     GOOGLE_SERVICE_ACCOUNT_JSON: str | None = None
     GOOGLE_SERVICE_ACCOUNT_FILE: str = "service_account.json"
 
-    # â”€â”€ Dify.ai â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Google Calendar (shared events account) ────────────────────────
+    # The calendar widget reads events from, and RSVPs viewers onto, a single
+    # shared calendar owned by GOOGLE_CALENDAR_ID (e.g. cal@renphil.org). The
+    # backend acts *as* that account using a refresh token it granted once via
+    # scripts/get_calendar_refresh_token.py — deliberately NOT domain-wide
+    # delegation, so a leaked token can touch only this one account's events.
+    GOOGLE_CALENDAR_ID: str | None = None
+    GOOGLE_CALENDAR_REFRESH_TOKEN: str | None = None
+    # Passed as `sendUpdates` on attendee changes. "all" emails guests, "none"
+    # adds/removes silently (the event still lands on the user's calendar).
+    # Flip to "none" if "all" proves noisy on large events.
+    GOOGLE_CALENDAR_SEND_UPDATES: str = "all"
+
+    # ── Dify.ai ────────────────────────────────────────────────────────
     DIFY_API_BASE_URL: str = "https://api.dify.ai/v1"
     DIFY_API_KEY: str
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # Airtable
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # All Airtable base ids, table ids, personal access tokens and
-    # field names are loaded strictly from the environment â€” no
+    # field names are loaded strictly from the environment — no
     # in-code defaults are provided. Update the ``.env`` file to
     # change any of them.
     # ------------------------------------------------------------------
 
-    # â”€â”€ Personal access token â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Personal access token ─────────────────────────────────────────
     AIRTABLE_API_KEY: str
 
-    # â”€â”€ Base ids â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Base ids ──────────────────────────────────────────────────────
     AIRTABLE_FUNDRAISING_BASE_ID: str
     AIRTABLE_FUND_PROGRAM_BASE_ID: str
     RENPHIL_HUB_BASE_ID: str
 
-    # â”€â”€ Table ids / names â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Table ids / names ─────────────────────────────────────────────
     # Fundraising base
     TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME: str
     # Fund & Program Tracker base
@@ -105,11 +118,13 @@ class Settings(BaseSettings):
     POLICY_LINKS_TABLE: str | None = None
     EVENTS_QUICK_LINKS_TABLE: str | None = None
     FINANCE_QUICK_LINKS_TABLE: str | None = None
+    COMMS_QUICK_LINKS_TABLE: str
+    HR_QUICK_LINKS_TABLE: str
     RENPHIL_DUE_DILIGENCE_LINKS_TABLE: str | None = None
     BOARD_MEMBER_LIST_TABLE: str | None = None
     ORGANIZATION_INFO_TABLE: str | None = None
 
-    # â”€â”€ Field names â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Field names ───────────────────────────────────────────────────
     # Admins / Access Control
     ADMINS_EMAIL_FIELD: str
     ACCESS_CONTROL_USER_EMAIL_FIELD: str
@@ -150,13 +165,13 @@ class Settings(BaseSettings):
     PERMISSIONS_NAME_FIELD: str
     PERMISSIONS_DESCRIPTION_FIELD: str
 
-    # â”€â”€ Fundraising (Total Moved & Deployed) fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Fundraising (Total Moved & Deployed) fields ───────────────────
     AT_F_AMOUNT: str
     AT_F_FISCAL_YEAR: str
     AT_F_OPP_REC_TYPE: str
     AT_F_ACCOUNT_NAME: str
 
-    # â”€â”€ Fund & Program Tracker fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Fund & Program Tracker fields ─────────────────────────────────
     AT_F_EXCLUDE_FROM_LISTS: str
     AT_F_EXCLUDE_FROM_REPORTING: str
     AT_F_STATUS: str
@@ -178,13 +193,14 @@ class Settings(BaseSettings):
     AT_F_CHECKIN_HISTORY: str
     AT_F_CHECKIN_REPORTING_PERIOD: str
     AT_F_CLUSTER: str
+    AT_F_CLUSTER_NAME: str = "Name"
     AT_F_DASHBOARD_DISPLAY: str
     AT_F_FOLLOWUP_INDICATED: str
     AT_F_DEADLINE: str
     AT_F_REVIEW_UNTIL: str
     AT_F_PERIOD: str
 
-    # â”€â”€ Announcements fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Announcements fields ──────────────────────────────────────────
     AT_F_ANN_ID: str
     AT_F_ANN_TITLE: str
     AT_F_ANN_CONTENT: str
@@ -199,11 +215,7 @@ class Settings(BaseSettings):
     AT_F_ANN_EXPIRATION_TIME: str
     AT_F_ANN_APPROVED_BY: str
 
-    # â”€â”€ Feedbacks fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    AT_F_FEEDBACK_FROM: str
-    AT_F_FEEDBACK_MESSAGE: str
-
-    # â”€â”€ Tickets fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Tickets fields ────────────────────────────────────────────────
     AT_F_TICKET_ID: str
     AT_F_TICKET_TITLE: str
     AT_F_TICKET_DESCRIPTION: str
@@ -218,7 +230,7 @@ class Settings(BaseSettings):
     AT_F_TICKET_COMMENTS: str
     AT_F_TICKET_PARENT_LINK: str
 
-    # â”€â”€ Grant Application Resources fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Grant Application Resources fields ────────────────────────────
     AT_F_GAR_ID: str | None = None
     AT_F_GAR_DOCUMENT: str | None = None
     AT_F_GAR_DOCUMENT_URL: str | None = None
@@ -226,44 +238,44 @@ class Settings(BaseSettings):
     AT_F_GAR_ENTITY: str | None = None
     AT_F_GAR_TABS: str | None = None
 
-    # â”€â”€ Finance Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Finance Links fields ──────────────────────────────────────────
     AT_F_FL_ID: str
     AT_F_FL_DOCUMENT: str
     AT_F_FL_DOCUMENT_URL: str
 
-    # â”€â”€ Office Spaces fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Office Spaces fields ──────────────────────────────────────────
     AT_F_OS_BRANCH: str
     AT_F_OS_ADDRESS: str
     AT_F_OS_DETAILS: str
 
-    # â”€â”€ Google Docs Tabs fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
 
-    # â”€â”€ Meeting Cadence fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Meeting Cadence fields ────────────────────────────────────────
     AT_F_MC_MEETING_TITLE: str
     AT_F_MC_DESCRIPTION: str
     AT_F_MC_ATTACHMENT_URL: str
 
-    # â”€â”€ Useful Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Useful Links fields ───────────────────────────────────────────
     AT_F_UL_DOCUMENT: str
     AT_F_UL_DOCUMENT_URL: str
     AT_F_UL_DESCRIPTION: str
 
-    # â”€â”€ HR & Benefits fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── HR & Benefits fields ──────────────────────────────────────────
     AT_F_HR_DOCUMENT: str
     AT_F_HR_DOCUMENT_URL: str
     AT_F_HR_DESCRIPTION: str
 
-    # â”€â”€ Onboarding fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Onboarding fields ─────────────────────────────────────────────
     AT_F_OB_DOCUMENT: str
     AT_F_OB_DOCUMENT_URL: str
     AT_F_OB_NOTES: str
 
-    # â”€â”€ Onboarding Calls fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Onboarding Calls fields ───────────────────────────────────────
     AT_F_OBC_DATE: str
     AT_F_OBC_NOTES: str
 
-    # â”€â”€ Quick Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Quick Links fields ────────────────────────────────────────────
     AT_F_QL_ID: str
     AT_F_QL_ANCHOR_TEXT: str
     AT_F_QL_URL: str
@@ -271,22 +283,23 @@ class Settings(BaseSettings):
     AT_F_QL_ACTION: str
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
-    # â”€â”€ Quick Actions fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Quick Actions fields ──────────────────────────────────────────
+    AT_F_QA_ID: str = "ID"
     AT_F_QA_ACTION: str
 
-    # â”€â”€ Partnerships Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Partnerships Links fields ─────────────────────────────────────
     AT_F_PL_ID: str
     AT_F_PL_TEXT: str
     AT_F_PL_LINK: str
     AT_F_PL_CATEGORY: str
     AT_F_PL_TYPE: str
 
-    # â”€â”€ Policy Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Policy Links fields ───────────────────────────────────────────
     AT_F_POL_ID: str | None = None
     AT_F_POL_TEXT: str | None = None
     AT_F_POL_URL: str | None = None
 
-    # â”€â”€ Events Quick Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Events Quick Links fields ───────────────────────────────────
     AT_F_EQL_ID: str | None = None
     AT_F_EQL_TITLE: str | None = None
     AT_F_EQL_ANCHOR_TEXT: str | None = None
@@ -294,21 +307,35 @@ class Settings(BaseSettings):
     AT_F_EQL_URL: str | None = None
     AT_F_EQL_EMAIL: str | None = None
 
-    # â”€â”€ Finance Quick Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Finance Quick Links fields ──────────────────────────────────
     AT_F_FQL_ID: str | None = None
     AT_F_FQL_ANCHOR_TEXT: str | None = None
     AT_F_FQL_URL: str | None = None
     AT_F_FQL_ENTITY: str | None = None
     AT_F_FQL_TABS: str | None = None
 
-    # â”€â”€ RenPhil Due Diligence Links fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Comms Quick Links fields ────────────────────────────────────
+    AT_F_CQL_ID: str = "ID"
+    AT_F_CQL_ANCHOR_TEXT: str = "Anchor Text"
+    AT_F_CQL_TYPE: str = "Type"
+    AT_F_CQL_URL: str = "URL"
+    AT_F_CQL_EMAIL: str = "Email"
+
+    # ── HR Quick Links fields ───────────────────────────────────────
+    AT_F_HRQL_ID: str = "ID"
+    AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
+    AT_F_HRQL_TYPE: str = "Type"
+    AT_F_HRQL_URL: str = "URL"
+    AT_F_HRQL_EMAIL: str = "Email"
+
+    # ── RenPhil Due Diligence Links fields ────────────────────────
     AT_F_DDL_ID: str | None = None
     AT_F_DDL_ANCHOR_TEXT: str | None = None
     AT_F_DDL_URL: str | None = None
     AT_F_DDL_ENTITY: str | None = None
     AT_F_DDL_TABS: str | None = None
 
-    # â”€â”€ Board Member List fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Board Member List fields ─────────────────────────────────────
     AT_F_BM_ID: str | None = None
     AT_F_BM_TITLE: str | None = None
     AT_F_BM_FULL_NAME: str | None = None
@@ -317,16 +344,16 @@ class Settings(BaseSettings):
     AT_F_BM_CONTACT: str | None = None
     AT_F_BM_ENTITY: str | None = None
     AT_F_BM_TABS: str | None = None
-    # â”€â”€ Organization Info fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Organization Info fields ────────────────────────────────
     AT_F_OI_ID: str | None = None
     AT_F_OI_TITLE: str | None = None
     AT_F_OI_CONTENT: str | None = None
     AT_F_OI_ENTITY: str | None = None
-    AT_F_OI_TABS: str | None = None    # â”€â”€ Onboarding Checklist fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    AT_F_OI_TABS: str | None = None    # ── Onboarding Checklist fields ──────────────────────────────────
     AT_F_OC_MASTER_LIST_FUNDS_SUBPROGRAMS: str
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # Slack webhook
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # Signing secret used to verify Slack request signatures
     # (X-Slack-Signature + X-Slack-Request-Timestamp).
     SLACK_SIGNING_SECRET: str | None = None
@@ -336,15 +363,15 @@ class Settings(BaseSettings):
     # the ``assigned_by`` email from the Slack ``user_name`` field.
     ORG_DOMAIN: str | None = None
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # Gemini (Google Generative AI)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.5-flash"
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # Cache (Upstash Redis over REST)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # When either URL or TOKEN is missing, the endpoint cache is disabled
     # and every GET goes straight to Airtable (no error is raised).
     UPSTASH_REDIS_REST_URL: str | None = None
@@ -352,7 +379,7 @@ class Settings(BaseSettings):
     # Bumping this rotates the cache namespace and effectively wipes it.
     CACHE_VERSION: str = "v1"
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # ── Additional Airtable field mappings ───────────────────────
     AT_F_CLUSTER_NAME: str = "Name"
     AT_F_QA_ID: str = "ID"
@@ -372,7 +399,7 @@ class Settings(BaseSettings):
     AT_F_HRQL_EMAIL: str = "Email"
 
     # RenPhil Agent API (server-to-server only)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════
     # The Hub backend proxies knowledge-update requests so SYNC_TOKEN is
     # never shipped to browser JavaScript.
     AGENT_API_URL: str | None = None
