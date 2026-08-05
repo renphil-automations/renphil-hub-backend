@@ -215,6 +215,10 @@ class Settings(BaseSettings):
     AT_F_ANN_EXPIRATION_TIME: str
     AT_F_ANN_APPROVED_BY: str
 
+    # ── Feedbacks fields ───────────────────────────────────────────────
+    AT_F_FEEDBACK_FROM: str
+    AT_F_FEEDBACK_MESSAGE: str
+
     # ── Tickets fields ────────────────────────────────────────────────
     AT_F_TICKET_ID: str
     AT_F_TICKET_TITLE: str
