@@ -436,11 +436,17 @@ class AirtableService:
             {"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records
         ]
 
+        # Prefer the admin's explicit column order over discovery order — see
+        # the matching comment in fetch_widget_rows. Without this, the editor
+        # preview would silently ignore the admin's custom column ordering
+        # even though the saved widget honors it once persisted.
+        fields = list(selected_columns) if selected_columns else seen_fields
+
         return AirtableEditorPreviewResponse(
             base_id=base_id,
             table_id=table_id,
             view_id=view_id,
-            fields=seen_fields,
+            fields=fields,
             rows=rows,
             personalize_blocked=personalize_blocked,
             unpersonalized_row_count=len(unpersonalized),
