@@ -36,6 +36,7 @@ from app.services.gridstack_service import (
     create_tab_v2,
     create_tab_variant_v2,
     delete_tab_subtree_by_document_id_v2,
+    get_component_by_link_for_access_check_v2,
     get_component_by_link_v2,
     get_root_tabs_v2,
     get_tab_children_v2,
@@ -117,14 +118,41 @@ def get_component_by_link(link: str, db: Session = Depends(get_db_v2)):
 @router.get(
     "/components/by-link/{link}/location",
     summary="Resolve a component's navigable location by its stable link (v2)",
-    description="Backs the mirror widget's 'jump to original' affordance — "
-    "resolves the root tab, the ordered chain of ancestor sub-tab "
-    "`document_id`s, and (if the component is a Super Block Note "
-    "descendant) the ordered chain of ancestor SBN component `link`s, so "
-    "the frontend can navigate there and highlight the component.",
-    responses={**COMMON_NOT_FOUND_RESPONSE},
+    description="Backs the mirror widget's 'jump to original' affordance and "
+    "the external component deep-link feature — resolves the root tab, the "
+    "ordered chain of ancestor sub-tab `document_id`s, and (if the "
+    "component is a Super Block Note descendant) the ordered chain of "
+    "ancestor SBN component `link`s, so the frontend can navigate there "
+    "and highlight the component. Fails closed (403) if the caller cannot "
+    "see the target component — this endpoint is reachable via links "
+    "shared outside the app (email, chat), not just from within an "
+    "already-authorized canvas.",
+    responses={
+        **COMMON_NOT_FOUND_RESPONSE,
+        403: {"description": "Caller cannot view this component"},
+    },
 )
-def get_component_location(link: str, db: Session = Depends(get_db_v2)):
+def get_component_location(
+    link: str,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    component = get_component_by_link_for_access_check_v2(db, link)
+    if component is None:
+        raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
+    # The nearest ancestor with a non-NULL access_control (§3.4) — a
+    # component with no explicit AC inherits it, and an explicit AC is
+    # always subset-constrained against it, so this one check covers both
+    # widget-level and tab-level restriction. Same primitive
+    # `filter_widget_content_for_user` uses server-side to redact a
+    # restricted widget from a workspace response; this is that same rule
+    # applied to the one endpoint that hands out a component's location
+    # instead of its content.
+    effective_ac = component.access_control or access_control_service.resolved_parent_ac(
+        db, component
+    )
+    if not access_control_service.can_view(effective_ac, user.email, list(user.roles)):
+        raise HTTPException(status_code=403, detail="You don't have access to this component")
     result = resolve_component_location_v2(db, link)
     if result is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be located")

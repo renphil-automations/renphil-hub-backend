@@ -956,12 +956,40 @@ def _get_sbn_ancestor_chain(db: Session, component: ComponentV2) -> list[str]:
     return chain
 
 
+def get_component_by_link_for_access_check_v2(db: Session, link: str) -> ComponentV2 | None:
+    """Returns the raw component row for `link` — None for an unknown link,
+    or one that points at a mirror (same cycle-prevention convention as
+    `resolve_component_location_v2`, which this is meant to be called
+    alongside: a mirror is never a navigable "original", so it's never a
+    visibility-checkable target either).
+
+    Lets a caller (the `.../location` router) run its own
+    `access_control_service.can_view` check against the component's own
+    `access_control` (falling back to `resolved_parent_ac` when unset)
+    BEFORE calling `resolve_component_location_v2` — keeping the
+    permission decision in the router, matching this codebase's existing
+    convention (see `move_tab_to_nav_tab`'s own `can_edit` checks) rather
+    than teaching the resolver itself about the caller's identity."""
+    link = (link or "").strip()
+    if not link:
+        return None
+    component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
+    if component is None or component.type == MIRROR_WIDGET_TYPE:
+        return None
+    return component
+
+
 def resolve_component_location_v2(db: Session, link: str) -> dict[str, Any] | None:
     """Resolves a component's `link` into the full path needed to navigate
     to and locate it in the UI — backs the mirror widget's "jump to
     original" affordance. Returns None for an unknown link, or one that
     points at a mirror itself (same cycle-prevention convention as
-    `get_component_by_link_v2` — a mirror is never a navigable "original")."""
+    `get_component_by_link_v2` — a mirror is never a navigable "original").
+
+    Callers reachable from outside the app (the `.../location` router) must
+    run their own visibility check first, via
+    `get_component_by_link_for_access_check_v2` — this function performs
+    none itself, matching `get_component_by_link_v2`'s existing contract."""
     link = (link or "").strip()
     if not link:
         return None
