@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class AirtableRecord(BaseModel):
@@ -1618,6 +1618,27 @@ class AnnouncementRecord(_TypedAirtableRecord):
         if value is None or isinstance(value, list):
             return value
         return [value]
+
+
+# ── Feedbacks ──────────────────────────────────────────────────────────
+class FeedbackCreate(BaseModel):
+    """Payload to submit a new piece of user feedback.
+
+    Stored in the Feedbacks table. ``Date & Time`` is a computed Airtable
+    field and is populated automatically on create.
+    """
+
+    from_email: EmailStr = Field(description="Email of the person giving feedback.")
+    message: str = Field(min_length=1, description="The feedback message body.")
+
+
+class FeedbackRecord(_TypedAirtableRecord):
+    """A feedback record as returned to clients."""
+
+    feedback_id: Any = Field(default=None, alias="Id")
+    from_email: str | None = Field(default=None, alias="From")
+    message: str | None = Field(default=None, alias="Message")
+    date_time: str | None = Field(default=None, alias="Date & Time")
 
 
 # ── Access Control ────────────────────────────────────────────────────

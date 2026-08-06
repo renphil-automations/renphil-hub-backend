@@ -36,6 +36,8 @@ from app.models.airtable import (
     TicketCreate,
     TicketRecord,
     TicketUpdate,
+    FeedbackCreate,
+    FeedbackRecord,
     SlackTicketWebhookPayload,
     EmailTicketWebhookPayload,
     CheckinReportingPeriodRecord,
@@ -5426,6 +5428,40 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════════
     # Tickets (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
+    def _feedbacks_table(self):
+        return self._api.table(
+            self._settings.RENPHIL_HUB_BASE_ID,
+            self._settings.FEEDBACKS_TABLE,
+        )
+
+    # Feedback field name constants (loaded from settings/.env)
+    _F_FEEDBACK_FROM = _S.AT_F_FEEDBACK_FROM
+    _F_FEEDBACK_MESSAGE = _S.AT_F_FEEDBACK_MESSAGE
+
+    async def create_feedback(self, payload: FeedbackCreate) -> FeedbackRecord:
+        """Create a new feedback record.
+
+        'Date & Time' is a computed Airtable field, so it is not written here.
+        """
+        fields: dict[str, Any] = {
+            self._F_FEEDBACK_FROM: str(payload.from_email),
+            self._F_FEEDBACK_MESSAGE: payload.message,
+        }
+
+        table = self._feedbacks_table()
+        try:
+            created = await asyncio.to_thread(table.create, fields, typecast=True)
+        except RequestException as exc:
+            logger.error("Airtable create feedback failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during feedback create")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return FeedbackRecord.model_validate(
+            {"id": created["id"], **created.get("fields", {})}
+        )
+
     def _tickets_table(self):
         return self._api.table(
             self._settings.RENPHIL_HUB_BASE_ID,

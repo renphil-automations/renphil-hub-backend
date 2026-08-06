@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
+    FEEDBACKS_TABLE: str
     GRANT_APPLICATION_RESOURCES_TABLE: str | None = None
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
@@ -213,6 +214,10 @@ class Settings(BaseSettings):
     AT_F_ANN_PUBLISH_TIME: str
     AT_F_ANN_EXPIRATION_TIME: str
     AT_F_ANN_APPROVED_BY: str
+
+    # ── Feedbacks fields ───────────────────────────────────────────────
+    AT_F_FEEDBACK_FROM: str
+    AT_F_FEEDBACK_MESSAGE: str
 
     # ── Tickets fields ────────────────────────────────────────────────
     AT_F_TICKET_ID: str
