@@ -383,6 +383,21 @@ class Settings(BaseSettings):
     # Bumping this rotates the cache namespace and effectively wipes it.
     CACHE_VERSION: str = "v1"
 
+    # ── Airtable widget row cache (plan_airtable_widget_caching_2026-08-06.md) ──
+    # TTL is deliberately several multiples of the refresh interval — it is a
+    # garbage collector for abandoned keys, not the freshness mechanism (a
+    # scheduled refresh call is). See the plan's §4.3 / landmine L1.
+    AIRTABLE_CACHE_TTL_SECONDS: int = 1800
+    # Guards below AIRTABLE_CACHE_MAX_ROWS/_BYTES are checked while walking a
+    # widget's full result set; a breach means the table is served live
+    # through the original per-page path instead of being cached — never
+    # silently truncated. See the plan's §5.4.
+    AIRTABLE_CACHE_MAX_ROWS: int = 10_000
+    AIRTABLE_CACHE_MAX_BYTES: int = 5_000_000
+    # Shared secret for POST /data/airtable/cache/refresh — same shape as
+    # AGENT_SYNC_TOKEN below, sent as X-Sync-Token. Unset ⇒ 503.
+    CACHE_REFRESH_TOKEN: str | None = None
+
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)
     # ══════════════════════════════════════════════════════════════════

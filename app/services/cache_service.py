@@ -112,12 +112,46 @@ class CacheService:
             logger.warning("Cache GET: failed to decode JSON for key=%s", key)
             return None
 
-    async def set(self, key: str, value: Any) -> None:
+    async def set(self, key: str, value: Any, *, ttl_seconds: int | None = None) -> None:
+        """Store ``value`` at ``key``. ``ttl_seconds`` is optional and additive —
+        existing callers that omit it keep today's no-expiry behavior; only a
+        caller that opts in (the airtable widget row cache) gets an
+        expiring key.
+        """
         client = self._redis()
         if client is None:
             return
         payload = json.dumps(value, separators=(",", ":"), default=str)
-        await client.set(key, payload)
+        if ttl_seconds is not None:
+            await client.set(key, payload, ex=ttl_seconds)
+        else:
+            await client.set(key, payload)
+
+    # ── single-flight lock ────────────────────────────────────────────
+    async def acquire_lock(self, key: str, *, ttl_seconds: int = 120) -> bool:
+        """Best-effort ``SET key 1 NX EX ttl_seconds``. Returns True iff this
+        call won the lock. When the cache is disabled, returns True — every
+        caller "wins" and just does the work directly, matching the
+        fail-open behavior of the rest of this service.
+        """
+        client = self._redis()
+        if client is None:
+            return True
+        try:
+            result = await client.set(key, "1", nx=True, ex=ttl_seconds)
+        except Exception:
+            logger.warning("Cache lock acquire failed for key=%s", key, exc_info=True)
+            return True
+        return bool(result)
+
+    async def release_lock(self, key: str) -> None:
+        client = self._redis()
+        if client is None:
+            return
+        try:
+            await client.delete(key)
+        except Exception:
+            logger.warning("Cache lock release failed for key=%s", key, exc_info=True)
 
     # ── invalidation ───────────────────────────────────────────────────
     async def invalidate_prefixes(self, endpoint_names: list[str]) -> int:

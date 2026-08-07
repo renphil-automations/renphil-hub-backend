@@ -16,7 +16,9 @@ When ``opportunity_rec_type`` is a list, an ``OR`` (IN) match is used.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import time
 from email.utils import parseaddr
 from typing import Any
 from urllib.parse import parse_qs
@@ -152,6 +154,7 @@ from app.services.gridstack_service import (
     get_airtable_component_config,
     get_airtable_component_data,
     get_airtable_pat_for_component,
+    list_airtable_component_links,
     update_airtable_component_config,
 )
 from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
@@ -363,7 +366,11 @@ async def get_airtable_component_rows(
 
     stored = get_airtable_component_data(db, link) or {}
 
-    return await airtable_service.fetch_widget_rows(
+    # Cache sits strictly BELOW the access-control check above — never
+    # decorate this handler with @airtable_cache, which would serve a
+    # cached hit before that check ever ran (plan §3.1).
+    return await airtable_service.fetch_widget_rows_cached(
+        link=link,
         url=source_url,
         api_key=pat,
         caller_email=user.email,
@@ -373,6 +380,101 @@ async def get_airtable_component_rows(
         personalize_column=config.get("personalizeColumn"),
         cursor=cursor,
     )
+
+
+def _check_cache_refresh_token(x_sync_token: str | None) -> None:
+    """Shared-secret auth for the cache-refresh endpoint — same shape as
+    `knowledge._agent_config`'s `AGENT_SYNC_TOKEN` / `X-Sync-Token` (that
+    endpoint sends it outbound to the Agent API; here it's the inbound
+    check on the receiving end). Unset ⇒ 503, matching that precedent.
+    """
+    expected = (get_settings().CACHE_REFRESH_TOKEN or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Airtable cache refresh is not configured.",
+        )
+    if not x_sync_token or not hmac.compare_digest(x_sync_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing sync token.",
+        )
+
+
+@router.post(
+    "/airtable/cache/refresh",
+    summary="[Server-to-server] Re-warm every airtable widget's row cache",
+    description="""
+Walks every airtable widget's full (unpersonalized, filters-only) row set and
+writes it to the cache with a fresh TTL — the scheduled-refresh half of the
+widget row cache (server-side; intended to be called by a periodic job, not
+a browser). Authenticated by a shared secret (`X-Sync-Token`), not a user
+session.
+
+Runs synchronously and returns a summary so the caller's own exit code is a
+real signal. Per-widget failures are logged and counted, never abort the
+run — one bad token or misconfigured widget must not blank the cache for
+every other widget.
+""",
+    responses={
+        401: {"description": "Missing or invalid X-Sync-Token"},
+        503: {"description": "CACHE_REFRESH_TOKEN is not configured on the server"},
+    },
+)
+async def refresh_airtable_widget_cache(
+    x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    _check_cache_refresh_token(x_sync_token)
+
+    started = time.monotonic()
+    refreshed = 0
+    skipped = 0
+    failed = 0
+
+    for link in list_airtable_component_links(db):
+        try:
+            config = get_airtable_component_config(db, link)
+            if config is None:
+                skipped += 1
+                continue
+
+            source_url = (config.get("sourceUrl") or "").strip()
+            pat = get_airtable_pat_for_component(db, link)
+            if not source_url or not pat:
+                # Same 400 condition the read path enforces — nothing to
+                # warm for a widget that isn't configured yet.
+                skipped += 1
+                continue
+
+            stored = get_airtable_component_data(db, link) or {}
+            result = await airtable_service.warm_widget_cache(
+                link=link,
+                url=source_url,
+                api_key=pat,
+                selected_columns=stored.get("selectedColumns") or None,
+                filters=stored.get("filters") or None,
+                personalize_enabled=bool(config.get("personalizeEnabled")),
+                personalize_column=config.get("personalizeColumn"),
+            )
+            if result == "refreshed":
+                refreshed += 1
+            else:
+                # "oversized" — never cached, already logged by the walk.
+                failed += 1
+        except Exception:
+            logger.exception(
+                "Airtable cache refresh: widget link=%s failed", link
+            )
+            failed += 1
+
+    return {
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "failed": failed,
+        "elapsed_seconds": round(time.monotonic() - started, 1),
+    }
 
 
 @router.post(

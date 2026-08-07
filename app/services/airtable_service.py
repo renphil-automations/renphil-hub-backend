@@ -10,10 +10,12 @@ worker thread to remain compatible with FastAPI's async event loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from pyairtable import Api
@@ -22,7 +24,9 @@ from fastapi import HTTPException, status as _http_status
 
 from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
+from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
+from app.services.cache_service import get_cache_service
 from app.models.airtable import (
     AccessControlAssign,
     AccessControlRecord,
@@ -348,6 +352,420 @@ class AirtableService:
             next_cursor=payload.get("offset"),
             personalize_blocked=False,
         )
+
+    # ── Widget row cache (plan_airtable_widget_caching_2026-08-06.md) ───
+    #
+    # `fetch_widget_rows` above stays completely unmodified — it is both the
+    # oversized-table fallback (§5.4) and the implementation the preview
+    # endpoint keeps using. Everything below is additive.
+
+    # ~4 req/sec per base — headroom under Airtable's documented 5/sec limit.
+    # Pages are inherently sequential (each offset is only known after the
+    # previous response), so this is a plain minimum-interval throttle.
+    _WALK_THROTTLE_SECONDS = 0.25
+    _IDX_CURSOR_RE = re.compile(r"^idx:(\d+)$")
+
+    @classmethod
+    def _parse_synthetic_cursor(cls, cursor: str | None) -> int:
+        """Parse an `idx:<offset>` cursor into a start index. Anything that
+        doesn't match that exact shape — no cursor, or a real Airtable
+        offset a browser held across the deploy that introduced this cache —
+        restarts at index 0 rather than erroring (plan §5.3)."""
+        if not cursor:
+            return 0
+        match = cls._IDX_CURSOR_RE.fullmatch(cursor)
+        return int(match.group(1)) if match else 0
+
+    @staticmethod
+    def _make_synthetic_cursor(next_index: int) -> str:
+        return f"idx:{next_index}"
+
+    async def _walk_full_table(
+        self,
+        *,
+        api: Api,
+        table: Any,
+        view_id: str | None,
+        fetch_fields: list[str] | None,
+        formula: str | None,
+    ) -> tuple[list[dict[str, Any]], list[str], bool]:
+        """Walk every page of `table` matching `formula`, feeding each
+        response's `offset` back as the next page's request, throttled to
+        `_WALK_THROTTLE_SECONDS`. Reuses the given `api`/`table` across every
+        page rather than rebuilding per page (plan landmine L7).
+
+        Returns `(rows, seen_fields, oversized)`. `oversized=True` means the
+        walk was aborted after crossing `AIRTABLE_CACHE_MAX_ROWS` or
+        `AIRTABLE_CACHE_MAX_BYTES` — the caller must NOT cache a partial
+        result in that case (plan §5.4: never silently truncate).
+        """
+        max_rows = self._settings.AIRTABLE_CACHE_MAX_ROWS
+        max_bytes = self._settings.AIRTABLE_CACHE_MAX_BYTES
+
+        options: dict[str, Any] = {"page_size": self._WIDGET_PAGE_SIZE}
+        if view_id:
+            options["view"] = view_id
+        if fetch_fields:
+            options["fields"] = list(fetch_fields)
+        if formula:
+            options["formula"] = formula
+
+        rows: list[dict[str, Any]] = []
+        seen_fields: list[str] = []
+        seen: set[str] = set()
+        last_request_at: float | None = None
+
+        while True:
+            if last_request_at is not None:
+                remaining = self._WALK_THROTTLE_SECONDS - (
+                    time.monotonic() - last_request_at
+                )
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            last_request_at = time.monotonic()
+
+            try:
+                payload = await asyncio.to_thread(
+                    api.request, "get", table.urls.records, options=options
+                )
+            except RequestException as exc:
+                logger.error("Airtable widget cache walk failed: %s", exc)
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception("Unexpected Airtable error during widget cache walk")
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+
+            for record in payload.get("records", []) or []:
+                record_fields = record.get("fields", {}) or {}
+                for key in record_fields:
+                    if key not in seen:
+                        seen.add(key)
+                        seen_fields.append(key)
+                rows.append({"id": record.get("id"), **record_fields})
+
+            if len(rows) > max_rows:
+                return rows, seen_fields, True
+            encoded_len = len(json.dumps(rows, separators=(",", ":"), default=str))
+            if encoded_len > max_bytes:
+                return rows, seen_fields, True
+
+            next_offset = payload.get("offset")
+            if not next_offset:
+                break
+            options["offset"] = next_offset
+
+        return rows, seen_fields, False
+
+    async def _build_widget_cache_envelope(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        selected_columns: list[str] | None,
+        filters: list[dict[str, Any]] | None,
+        personalize_enabled: bool,
+        personalize_column: str | None,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Walk the widget's FULL, unpersonalized (filters-only) row set and
+        shape it into the envelope stored in the cache. Returns
+        `(envelope, oversized)`; `envelope` is None when `oversized=True`.
+        """
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        # Personalize is NEVER baked into the cached formula — only the
+        # stored filters are (plan §6.1). Same call shape as
+        # `preview_widget_config`'s own filters-only formula build.
+        formula, _ = af.widget_formula(filters=filters)
+
+        fetch_fields = list(selected_columns) if selected_columns else None
+        if (
+            personalize_enabled
+            and personalize_column
+            and fetch_fields is not None
+            and personalize_column not in fetch_fields
+        ):
+            # The projection trap (plan §6.3): Python needs the personalize
+            # column's VALUE to match against even when the admin never
+            # selected it for display. Appended to the Airtable request
+            # only — `fields` below stays exactly what was fetched, and the
+            # serving step (`fetch_widget_rows_cached`) is what actually
+            # keeps it out of what a client sees.
+            fetch_fields = fetch_fields + [personalize_column]
+
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
+
+        rows, seen_fields, oversized = await self._walk_full_table(
+            api=api, table=table, view_id=view_id, fetch_fields=fetch_fields, formula=formula,
+        )
+        if oversized:
+            return None, True
+
+        envelope = {
+            "endpoint": "widget_rows",
+            "base_id": base_id,
+            "table_id": table_id,
+            "view_id": view_id,
+            # Exactly what was fetched — may still include an
+            # auto-appended personalize column. NOT the client-facing field
+            # list; `fetch_widget_rows_cached` derives that from the
+            # caller's own `selected_columns`, which is never wider than
+            # this.
+            "fields": fetch_fields if fetch_fields is not None else seen_fields,
+            "rows": rows,
+            "row_count": len(rows),
+            "last_updated_date": datetime.now(timezone.utc).isoformat(),
+        }
+        return envelope, False
+
+    async def _get_or_warm_widget_cache(
+        self,
+        *,
+        cache_key: str,
+        url: str,
+        api_key: str,
+        selected_columns: list[str] | None,
+        filters: list[dict[str, Any]] | None,
+        personalize_enabled: bool,
+        personalize_column: str | None,
+    ) -> dict[str, Any] | None:
+        """Returns the cached envelope, warming it on a miss. Returns None
+        when the table turned out to be oversized (never cached) or when
+        this call gave up waiting on another request's warm with nothing to
+        show for it — either way the caller falls back to the live,
+        uncached path (`fetch_widget_rows`)."""
+        cache = get_cache_service()
+
+        cached = await cache.get(cache_key)
+        if isinstance(cached, dict) and "rows" in cached:
+            return cached
+
+        lock_key = f"{cache_key}:lock"
+        acquired = await cache.acquire_lock(lock_key, ttl_seconds=120)
+        if not acquired:
+            # Someone else is warming this exact key. Wait briefly rather
+            # than starting a second concurrent full-table walk — the whole
+            # point of the lock (plan §4.4): without it, a cold key plus a
+            # burst of viewers would each start their own walk and breach
+            # Airtable's per-base rate limit.
+            for _ in range(4):
+                await asyncio.sleep(1.5)
+                cached = await cache.get(cache_key)
+                if isinstance(cached, dict) and "rows" in cached:
+                    return cached
+            return None
+
+        try:
+            envelope, oversized = await self._build_widget_cache_envelope(
+                url=url,
+                api_key=api_key,
+                selected_columns=selected_columns,
+                filters=filters,
+                personalize_enabled=personalize_enabled,
+                personalize_column=personalize_column,
+            )
+            if oversized:
+                logger.warning(
+                    "Airtable widget cache: table too large to cache "
+                    "(url=%s) — serving live instead, never truncated",
+                    url,
+                )
+                return None
+            await cache.set(
+                cache_key, envelope, ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS
+            )
+            return envelope
+        finally:
+            await cache.release_lock(lock_key)
+
+    async def fetch_widget_rows_cached(
+        self,
+        *,
+        link: str,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        selected_columns: list[str] | None = None,
+        filters: list[dict[str, Any]] | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+        cursor: str | None = None,
+    ):
+        """Cache-aware sibling of `fetch_widget_rows` — same contract, same
+        response shape, backing `GET /airtable/component/{link}/rows` once
+        the cache is wired in below the endpoint's access-control check
+        (plan §3.1, §4).
+
+        Personalization is applied in Python against an unpersonalized,
+        filters-only cached row set (§6) rather than baked into the
+        Airtable formula, and pagination is served from synthetic
+        `idx:<offset>` cursors over that cached set (§5.3) instead of real
+        Airtable offsets.
+
+        FAILS CLOSED exactly like `fetch_widget_rows`: if personalization is
+        on but not applicable, this returns empty with
+        `personalize_blocked=True` and — critically — never even reads the
+        cache (§6.2), let alone writes to it.
+        """
+        from app.models.airtable import AirtableWidgetRowsResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            logger.warning(
+                "Airtable widget cache fetch refused: personalization enabled but not "
+                "applicable (base=%s table=%s) — returning no rows",
+                base_id,
+                table_id,
+            )
+            return AirtableWidgetRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=list(selected_columns or []),
+                rows=[],
+                next_cursor=None,
+                personalize_blocked=True,
+            )
+
+        cache = get_cache_service()
+        fingerprint = {
+            "link": link,
+            "sourceUrl": url,
+            "selectedColumns": list(selected_columns or []),
+            "filters": filters or [],
+            "personalizeEnabled": bool(personalize_enabled),
+            "personalizeColumn": personalize_column or None,
+        }
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope = await self._get_or_warm_widget_cache(
+            cache_key=cache_key,
+            url=url,
+            api_key=api_key,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
+
+        if envelope is None:
+            # Oversized table, or nothing to show after waiting on another
+            # warmer — degrade to today's live, uncached, single-page path.
+            # A stale `idx:`-style cursor means nothing to the real
+            # Airtable API, so it's treated the same as no cursor; any
+            # other value (including a genuine Airtable offset returned by
+            # this very fallback on a previous page) is passed through
+            # untouched — same code path as before this feature existed
+            # (plan §5.4).
+            live_cursor = (
+                None if (cursor and self._IDX_CURSOR_RE.fullmatch(cursor)) else cursor
+            )
+            return await self.fetch_widget_rows(
+                url=url,
+                api_key=api_key,
+                caller_email=caller_email,
+                selected_columns=selected_columns,
+                filters=filters,
+                personalize_enabled=personalize_enabled,
+                personalize_column=personalize_column,
+                cursor=live_cursor,
+            )
+
+        rows = envelope["rows"]
+        if personalize_enabled:
+            rows = [
+                row
+                for row in rows
+                if ap.personalize_match(row.get(personalize_column), caller_email)
+            ]
+
+        # Client-facing field list: exactly the admin's own selection when
+        # set (never wider than the envelope's own `fields`, which may
+        # additionally carry an auto-appended personalize column — see
+        # `_build_widget_cache_envelope`), else the envelope's discovery
+        # order. Deliberately NOT recomputed from `rows` per page — same
+        # "stable across pages" reasoning as `fetch_widget_rows`.
+        response_fields = list(selected_columns) if selected_columns else envelope["fields"]
+        field_set = set(response_fields)
+
+        start = self._parse_synthetic_cursor(cursor)
+        page = rows[start : start + self._WIDGET_PAGE_SIZE]
+        projected_rows = [
+            {k: v for k, v in row.items() if k == "id" or k in field_set} for row in page
+        ]
+        next_index = start + len(page)
+        next_cursor = (
+            self._make_synthetic_cursor(next_index) if next_index < len(rows) else None
+        )
+
+        return AirtableWidgetRowsResponse(
+            base_id=envelope["base_id"],
+            table_id=envelope["table_id"],
+            view_id=envelope.get("view_id"),
+            fields=response_fields,
+            rows=projected_rows,
+            next_cursor=next_cursor,
+            personalize_blocked=False,
+        )
+
+    async def warm_widget_cache(
+        self,
+        *,
+        link: str,
+        url: str,
+        api_key: str,
+        selected_columns: list[str] | None,
+        filters: list[dict[str, Any]] | None,
+        personalize_enabled: bool,
+        personalize_column: str | None,
+    ) -> str:
+        """Used by `POST /airtable/cache/refresh` (the scheduled-refresh
+        endpoint). Builds the same fingerprint/key a real viewer's request
+        would use and unconditionally (re)warms it, ignoring whatever TTL
+        remains — this IS the refresh mechanism, not a read-through, so it
+        does not take the single-flight lock: the endpoint is meant to run
+        as a single non-overlapping cron invocation (plan §7.3), and a race
+        against an ordinary reader's own warm is harmless — both would
+        write the same fingerprint's key to the same (correct) result.
+
+        Returns `"refreshed"` or `"oversized"` (never cached; already
+        logged by the walk itself).
+        """
+        cache = get_cache_service()
+        fingerprint = {
+            "link": link,
+            "sourceUrl": url,
+            "selectedColumns": list(selected_columns or []),
+            "filters": filters or [],
+            "personalizeEnabled": bool(personalize_enabled),
+            "personalizeColumn": personalize_column or None,
+        }
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope, oversized = await self._build_widget_cache_envelope(
+            url=url,
+            api_key=api_key,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
+        if oversized:
+            logger.warning(
+                "Airtable cache refresh: widget link=%s is too large to cache — skipped",
+                link,
+            )
+            return "oversized"
+
+        await cache.set(
+            cache_key, envelope, ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS
+        )
+        return "refreshed"
 
     async def preview_widget_config(
         self,

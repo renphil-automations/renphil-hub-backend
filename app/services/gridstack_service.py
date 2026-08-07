@@ -791,6 +791,20 @@ def _airtable_component_by_link(db: Session, link: str) -> ComponentV2 | None:
     return component
 
 
+def list_airtable_component_links(db: Session) -> list[str]:
+    """Every airtable widget's `link`, for cache warming
+    (`POST /airtable/cache/refresh` — plan_airtable_widget_caching_2026-08-06.md
+    §7.1). Server-internal. Widgets with a null/blank link can't be looked
+    up by `_airtable_component_by_link` anyway, so they're excluded here.
+    """
+    rows = (
+        db.query(ComponentV2.link)
+        .filter(ComponentV2.type == AIRTABLE_WIDGET_TYPE)
+        .all()
+    )
+    return [link for (link,) in rows if link and link.strip()]
+
+
 def get_airtable_component_config(db: Session, link: str) -> dict[str, Any] | None:
     """Non-secret view of one airtable widget's stored configuration.
 
