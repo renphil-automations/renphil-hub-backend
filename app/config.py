@@ -384,24 +384,6 @@ class Settings(BaseSettings):
     CACHE_VERSION: str = "v1"
 
     # ══════════════════════════════════════════════════════════════════
-    # ── Additional Airtable field mappings ───────────────────────
-    AT_F_CLUSTER_NAME: str = "Name"
-    AT_F_QA_ID: str = "ID"
-
-    # ── Comms Quick Links fields ─────────────────────────────────
-    AT_F_CQL_ID: str = "ID"
-    AT_F_CQL_ANCHOR_TEXT: str = "Anchor Text"
-    AT_F_CQL_TYPE: str = "Type"
-    AT_F_CQL_URL: str = "URL"
-    AT_F_CQL_EMAIL: str = "Email"
-
-    # ── HR Quick Links fields ────────────────────────────────────
-    AT_F_HRQL_ID: str = "ID"
-    AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
-    AT_F_HRQL_TYPE: str = "Type"
-    AT_F_HRQL_URL: str = "URL"
-    AT_F_HRQL_EMAIL: str = "Email"
-
     # RenPhil Agent API (server-to-server only)
     # ══════════════════════════════════════════════════════════════════
     # The Hub backend proxies knowledge-update requests so SYNC_TOKEN is

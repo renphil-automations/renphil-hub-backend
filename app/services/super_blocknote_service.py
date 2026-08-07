@@ -25,8 +25,8 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
+from app.services.access_control_service import resolved_parent_ac
 from app.services.gridstack_service import (
-    _access_control_or_default,
     _generate_id,
     _resolve_component_data,
     _validate_document_id_value,
@@ -35,6 +35,7 @@ from app.services.gridstack_service import (
     _validate_title,
     _write_component_data,
 )
+from app.services.tab_service import access_control_subset_violation
 
 SBN_ROOT_TYPE = "super_block_note"
 SBN_LEAF_TYPE = "block_note"
@@ -131,7 +132,20 @@ def get_sbn_workspace(db: Session, link: str) -> dict[str, Any] | None:
         "order": props.get("order", 0),
         "parent": parent,
         "page_content": {"documentId": component.link, "content": data.get("content")},
-        "access_control": _access_control_or_default(component.access_control),
+        # NULL means "inherit" (§3.4/§5.2) -- pass it through as NULL rather
+        # than manufacturing DEFAULT_ACCESS_CONTROL. Load-bearing: the SBN
+        # child filter's only consumer is canViewTab (frontend, landmine 12),
+        # which must treat an absent access_control as viewable -- ships in
+        # the same deploy as this change (plan §10 commit 6's ordering
+        # constraint).
+        "access_control": component.access_control,
+        # The ceiling THIS node's own access_control is checked against on
+        # write (§3.4, access_control_subset_violation's caller in
+        # update_sbn_node) -- exposed on read too so the frontend's
+        # parent-scoped component picker (plan §6.1's last bullet, commit 8)
+        # has one source for it instead of re-implementing landmine 14's
+        # NULL-skipping walk-up in TypeScript.
+        "resolved_parent_access_control": resolved_parent_ac(db, component),
         "locked": bool(props.get("locked", False)),
         "locked_by": props.get("locked_by", "") or "",
         "children": child_summaries,
@@ -160,7 +174,10 @@ def _create_overview_leaf(
         type=SBN_LEAF_TYPE,
         title=OVERVIEW_TITLE,
         props={"locked": False, "locked_by": "", "order": order},
-        access_control=root.access_control or _access_control_or_default(None),
+        # NULL through: a leaf under a NULL root is itself NULL (§5.2),
+        # not a manufactured default -- it inherits the same way the root
+        # itself does.
+        access_control=root.access_control,
         x=0,
         y=0,
         width=6,
@@ -300,7 +317,10 @@ def create_sbn_node(
             type=SBN_LEAF_TYPE,
             title=title,
             props={"locked": False, "locked_by": "", "order": order},
-            access_control=access_control or _access_control_or_default(None),
+            # Store what was passed, NULL included (§5.2) -- NULL means
+            # inherit, exactly like a canvas widget's own AC (§3.4). No
+            # fallback to a manufactured default.
+            access_control=access_control,
             x=0,
             y=0,
             width=6,
@@ -348,6 +368,17 @@ def update_sbn_node(
         if title is not None:
             component.title = title
         if access_control is not None:
+            # Component subset rule (§3.4) — an SBN node's access_control may
+            # only narrow its resolved parent's, never widen it. Resolves
+            # past a NULL parent chain up to the nearest explicit ancestor
+            # (landmine 14) rather than comparing against the immediate
+            # parent, which would pass vacuously whenever that parent is
+            # itself NULL.
+            violation = access_control_subset_violation(
+                access_control, resolved_parent_ac(db, component)
+            )
+            if violation is not None:
+                raise ValueError(f"SBN node '{link}': {violation}")
             component.access_control = access_control
         if order is not None:
             component.props = {**_sbn_props(component), "order": order}
