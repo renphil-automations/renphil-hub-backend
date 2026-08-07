@@ -226,6 +226,54 @@ def intersect_access_control(child_ac: dict[str, Any], parent_ac: dict[str, Any]
     }
 
 
+def _group_disallowed_principals(
+    child_group: dict[str, Any], parent_group: dict[str, Any]
+) -> list[str]:
+    """Principals `child_group` admits that `parent_group` would not — empty
+    when `child_group` is already a subset. Only used to name culprits in a
+    rejection message; `_group_is_subset` (via `access_control_is_subset`) is
+    the actual check."""
+    parent_users = {(u.get("email") or "").strip().lower() for u in parent_group.get("users") or []}
+    parent_roles = {_role_identity(r) for r in parent_group.get("roles") or []}
+    if not parent_users and not parent_roles:
+        return []  # parent open to everyone — nothing can be disallowed
+
+    child_users: list[dict[str, Any]] = child_group.get("users") or []
+    child_roles: list[dict[str, Any]] = child_group.get("roles") or []
+    if not child_users and not child_roles:
+        return ["everyone (open access)"]
+
+    disallowed = [
+        (u.get("email") or "").strip().lower()
+        for u in child_users
+        if (u.get("email") or "").strip().lower() not in parent_users
+    ]
+    disallowed += [
+        r.get("name") or "unnamed role" for r in child_roles if _role_identity(r) not in parent_roles
+    ]
+    return disallowed
+
+
+def access_control_subset_violation(
+    child_ac: dict[str, Any], parent_ac: dict[str, Any]
+) -> str | None:
+    """None when `child_ac` is a valid subset of `parent_ac` (§3.4); otherwise
+    a message naming the principals `child_ac` admits that `parent_ac` does
+    not — for the component-write rejection in
+    `gridstack_service.update_tab_content_v2` and
+    `super_blocknote_service.update_sbn_node`."""
+    if access_control_is_subset(child_ac, parent_ac):
+        return None
+    culprits = sorted(
+        set(
+            _group_disallowed_principals(child_ac.get("viewers") or {}, parent_ac.get("viewers") or {})
+            + _group_disallowed_principals(child_ac.get("admins") or {}, parent_ac.get("admins") or {})
+        )
+    )
+    names = ", ".join(culprits) if culprits else "principals its parent does not permit"
+    return f"access_control admits {names}, which its parent's access_control does not permit"
+
+
 # ---------------------------------------------------------
 # Validation constants
 # ---------------------------------------------------------

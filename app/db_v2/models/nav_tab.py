@@ -27,6 +27,12 @@ class NavTabV2(BaseV2):
     present now so phase 2 (access-control propagation, the `hub` object)
     needs no second migration.
 
+    `icon` is a lucide-react icon name (kebab-case, e.g. "layout-grid"),
+    looked up client-side via `lucide-react/dynamic`'s `DynamicIcon` — never
+    validated against the icon library itself, just a lookup key. NULL means
+    "no icon chosen", which renders the existing default (`LayoutGrid`). No
+    backfill, no uniqueness constraint.
+
     No relationship() here, matching every other model in db_v2/ — traversal
     is always a plain query."""
 
@@ -43,6 +49,8 @@ class NavTabV2(BaseV2):
     access_control = Column(JSONB, nullable=True)
 
     protected = Column(Boolean, nullable=False, default=False)
+
+    icon = Column(String(64), nullable=True)
 
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True)
