@@ -2643,6 +2643,72 @@ class AirtableService:
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
+    async def _find_role_id_by_name(self, role_name: str) -> str | None:
+        """Return the Airtable record id of the Role matching ``role_name``."""
+        name_field = self._settings.ROLES_NAME_FIELD
+        normalized = (role_name or "").strip().lower()
+        if not normalized:
+            return None
+        formula = f"LOWER({{{name_field}}}) = '{self._escape(normalized)}'"
+        table = self._roles_table()
+        try:
+            records = await asyncio.to_thread(
+                table.all, formula=formula, max_records=1
+            )
+        except RequestException as exc:
+            logger.error("Airtable role lookup failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error during role lookup")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        return records[0]["id"] if records else None
+
+    async def ensure_access_control_member(self, email: str) -> None:
+        """Ensure ``email`` has an Access Control record.
+
+        No-op when the user already exists in the Access Control table.
+        Otherwise creates a record with the user's email and the linked
+        ``Hub Member`` role resolved from the Roles table.
+        """
+        if not email:
+            return
+
+        existing = await self._find_access_control_by_email(email)
+        if existing is not None:
+            return
+
+        default_role = self._settings.DEFAULT_MEMBER_ROLE
+        role_id = await self._find_role_id_by_name(default_role)
+        if role_id is None:
+            logger.error(
+                "Cannot auto-provision access control for %s: role '%s' not found",
+                email,
+                default_role,
+            )
+            return
+
+        s = self._settings
+        fields = {
+            s.ACCESS_CONTROL_USER_EMAIL_FIELD: email.strip(),
+            s.ACCESS_CONTROL_ROLES_FIELD: [role_id],
+        }
+        table = self._access_control_table()
+        try:
+            await asyncio.to_thread(table.create, fields)
+            logger.info(
+                "Auto-provisioned access control for %s with role '%s'",
+                email,
+                default_role,
+            )
+        except RequestException as exc:
+            logger.error("Airtable access-control auto-provision failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected Airtable error during access-control auto-provision"
+            )
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
     async def upsert_access_control(
         self, payload: AccessControlAssign
     ) -> AccessControlRecord:

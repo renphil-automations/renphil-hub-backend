@@ -124,6 +124,9 @@ class AuthService:
         # Enforce domain
         self._enforce_domain(email)
 
+        # Auto-provision a Hub Member Access Control record for first-time users
+        await airtable_service.ensure_access_control_member(email)
+
         # Resolve roles from the Airtable Access Control table
         roles: list[str] = await airtable_service.get_user_roles(email)
 
