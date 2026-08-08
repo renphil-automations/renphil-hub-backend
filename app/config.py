@@ -165,6 +165,9 @@ class Settings(BaseSettings):
     PERMISSIONS_NAME_FIELD: str
     PERMISSIONS_DESCRIPTION_FIELD: str
 
+    # Role auto-assigned to first-time authenticated users.
+    DEFAULT_MEMBER_ROLE: str = "Hub Member"
+
     # ── Fundraising (Total Moved & Deployed) fields ───────────────────
     AT_F_AMOUNT: str
     AT_F_FISCAL_YEAR: str
