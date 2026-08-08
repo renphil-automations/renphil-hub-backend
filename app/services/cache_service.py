@@ -24,6 +24,8 @@ the app keeps working even if the cache is misconfigured.
 
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import json
 import logging
@@ -37,6 +39,40 @@ logger = logging.getLogger(__name__)
 
 _HASH_LEN = 32  # truncated sha256 hex — 128 bits of entropy
 _SCAN_COUNT = 200
+
+# Marker prefixing a gzip+base64 payload. Compression is OPT-IN per call site
+# (`set(..., compress=True)`), because this service is shared with the 123
+# `@airtable_cache`-decorated endpoints whose already-stored entries carry no
+# marker and must keep decoding unchanged
+# (plan_airtable_cache_scaling_2026-08-08.md §4.3, landmine L2).
+#
+# The marker cannot collide with a legacy entry: every legacy value is
+# `json.dumps(...)` output, which always begins with `{`, `[`, `"`, `-`, a
+# digit, or one of `true`/`false`/`null` — never `g`. So "starts with the
+# marker" is a sound discriminator rather than a heuristic.
+_GZIP_MARKER = "gz:"
+
+
+def _encode(value: Any, *, compress: bool) -> str:
+    """JSON-encode `value`, optionally gzip+base64 behind `_GZIP_MARKER`.
+    Measured ~4.8x on realistic Airtable row shapes — a saving on stored
+    bytes AND on every read's transfer."""
+    payload = json.dumps(value, separators=(",", ":"), default=str)
+    if not compress:
+        return payload
+    # mtime=0 keeps the output deterministic — the gzip header would
+    # otherwise embed a timestamp and make identical data encode differently
+    # on every write.
+    packed = gzip.compress(payload.encode("utf-8"), mtime=0)
+    return _GZIP_MARKER + base64.b64encode(packed).decode("ascii")
+
+
+def _decode(raw: Any) -> Any:
+    """Inverse of `_encode`, for marked AND unmarked payloads alike."""
+    if isinstance(raw, str) and raw.startswith(_GZIP_MARKER):
+        packed = base64.b64decode(raw[len(_GZIP_MARKER):])
+        raw = gzip.decompress(packed).decode("utf-8")
+    return json.loads(raw)
 
 
 def _cache_root(version: str) -> str:
@@ -100,32 +136,57 @@ class CacheService:
 
     # ── read / write ───────────────────────────────────────────────────
     async def get(self, key: str) -> Any | None:
+        """Returns None on ANY failure — a miss, a decode error, or Upstash
+        being unreachable. A cache is an optimization: an outage must degrade
+        callers to their live path, never surface as a 500. `acquire_lock` /
+        `release_lock` already fail open this way, and the `@airtable_cache`
+        decorator wraps its own call (`helpers/cache.py:161-167`); the widget
+        row path does not, so without this an Upstash outage 500s every
+        Airtable widget (plan_airtable_cache_scaling_2026-08-08.md §4.5.1).
+        """
         client = self._redis()
         if client is None:
             return None
-        raw = await client.get(key)
+        try:
+            raw = await client.get(key)
+        except Exception:
+            logger.warning("Cache GET failed for key=%s", key, exc_info=True)
+            return None
         if raw is None:
             return None
         try:
-            return json.loads(raw)
+            return _decode(raw)
         except Exception:
-            logger.warning("Cache GET: failed to decode JSON for key=%s", key)
+            logger.warning("Cache GET: failed to decode value for key=%s", key)
             return None
 
-    async def set(self, key: str, value: Any, *, ttl_seconds: int | None = None) -> None:
-        """Store ``value`` at ``key``. ``ttl_seconds`` is optional and additive —
-        existing callers that omit it keep today's no-expiry behavior; only a
-        caller that opts in (the airtable widget row cache) gets an
-        expiring key.
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        *,
+        ttl_seconds: int | None = None,
+        compress: bool = False,
+    ) -> None:
+        """Store ``value`` at ``key``. ``ttl_seconds`` and ``compress`` are
+        both optional and additive — existing callers that omit them keep
+        today's no-expiry, uncompressed behavior; only a caller that opts in
+        (the airtable widget row cache) gets an expiring, gzipped key.
         """
         client = self._redis()
         if client is None:
             return
-        payload = json.dumps(value, separators=(",", ":"), default=str)
-        if ttl_seconds is not None:
-            await client.set(key, payload, ex=ttl_seconds)
-        else:
-            await client.set(key, payload)
+        payload = _encode(value, compress=compress)
+        # Swallow write failures for the same reason `get` swallows read
+        # failures (§4.5.1): a cache that cannot be written is a cache miss
+        # next time, not a request that should fail now.
+        try:
+            if ttl_seconds is not None:
+                await client.set(key, payload, ex=ttl_seconds)
+            else:
+                await client.set(key, payload)
+        except Exception:
+            logger.warning("Cache SET failed for key=%s", key, exc_info=True)
 
     # ── single-flight lock ────────────────────────────────────────────
     async def acquire_lock(self, key: str, *, ttl_seconds: int = 120) -> bool:

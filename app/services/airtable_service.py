@@ -380,6 +380,15 @@ class AirtableService:
     def _make_synthetic_cursor(next_index: int) -> str:
         return f"idx:{next_index}"
 
+    @classmethod
+    def _live_cursor(cls, cursor: str | None) -> str | None:
+        """Translate a cursor for the LIVE (uncached) path. A synthetic
+        `idx:` cursor means nothing to the real Airtable API, so it is
+        dropped to `None` (restart at page 1); any other value — including a
+        genuine Airtable offset this very fallback returned on a previous
+        page — is passed through untouched."""
+        return None if (cursor and cls._IDX_CURSOR_RE.fullmatch(cursor)) else cursor
+
     async def _walk_full_table(
         self,
         *,
@@ -414,6 +423,14 @@ class AirtableService:
         seen_fields: list[str] = []
         seen: set[str] = set()
         last_request_at: float | None = None
+        # Running length of the encoded row list's BODY — everything between
+        # the outer `[` and `]`. Kept incrementally because re-encoding the
+        # whole accumulated list once per page is quadratic: ~1.8 s of pure
+        # waste at 150 pages, ~22 s at 500
+        # (plan_airtable_cache_scaling_2026-08-08.md §4.1). The total below is
+        # byte-for-byte what `json.dumps(rows, separators=(",", ":"))` would
+        # return, so the guard's threshold is unchanged.
+        body_len = 0
 
         while True:
             if last_request_at is not None:
@@ -435,18 +452,31 @@ class AirtableService:
                 logger.exception("Unexpected Airtable error during widget cache walk")
                 raise AirtableError(f"Airtable API error: {exc}") from exc
 
+            page_rows: list[dict[str, Any]] = []
             for record in payload.get("records", []) or []:
                 record_fields = record.get("fields", {}) or {}
                 for key in record_fields:
                     if key not in seen:
                         seen.add(key)
                         seen_fields.append(key)
-                rows.append({"id": record.get("id"), **record_fields})
+                page_rows.append({"id": record.get("id"), **record_fields})
+
+            rows.extend(page_rows)
 
             if len(rows) > max_rows:
                 return rows, seen_fields, True
-            encoded_len = len(json.dumps(rows, separators=(",", ":"), default=str))
-            if encoded_len > max_bytes:
+
+            if page_rows:
+                # Encode ONLY the page just appended. `json.dumps` of a list
+                # is `[` + body + `]`, so dropping 2 chars leaves this page's
+                # body, and joining it to a non-empty accumulation costs
+                # exactly one comma.
+                page_body_len = (
+                    len(json.dumps(page_rows, separators=(",", ":"), default=str)) - 2
+                )
+                body_len += page_body_len if body_len == 0 else 1 + page_body_len
+
+            if body_len + 2 > max_bytes:
                 return rows, seen_fields, True
 
             next_offset = payload.get("offset")
@@ -572,7 +602,13 @@ class AirtableService:
                 )
                 return None
             await cache.set(
-                cache_key, envelope, ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS
+                cache_key,
+                envelope,
+                ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
+                # ~4.8x smaller stored AND transferred, on a payload that is
+                # by far the largest thing in this cache (§4.3). Opt-in, so
+                # the decorator-cached endpoints are untouched.
+                compress=True,
             )
             return envelope
         finally:
@@ -633,6 +669,27 @@ class AirtableService:
             )
 
         cache = get_cache_service()
+
+        # No cache configured ⇒ behave exactly as this endpoint did before the
+        # cache existed. Without this, a disabled cache still costs a FULL
+        # table walk on every single request (`get`→None, `acquire_lock`→True
+        # by fail-open design, walk, `set` no-op) — strictly slower than the
+        # single-page live path it replaced
+        # (plan_airtable_cache_scaling_2026-08-08.md §4.5.2). Placed BELOW the
+        # fail-closed personalize gate above, which stays above everything
+        # (landmine L6).
+        if not cache.enabled:
+            return await self.fetch_widget_rows(
+                url=url,
+                api_key=api_key,
+                caller_email=caller_email,
+                selected_columns=selected_columns,
+                filters=filters,
+                personalize_enabled=personalize_enabled,
+                personalize_column=personalize_column,
+                cursor=self._live_cursor(cursor),
+            )
+
         fingerprint = {
             "link": link,
             "sourceUrl": url,
@@ -655,16 +712,9 @@ class AirtableService:
 
         if envelope is None:
             # Oversized table, or nothing to show after waiting on another
-            # warmer — degrade to today's live, uncached, single-page path.
-            # A stale `idx:`-style cursor means nothing to the real
-            # Airtable API, so it's treated the same as no cursor; any
-            # other value (including a genuine Airtable offset returned by
-            # this very fallback on a previous page) is passed through
-            # untouched — same code path as before this feature existed
-            # (plan §5.4).
-            live_cursor = (
-                None if (cursor and self._IDX_CURSOR_RE.fullmatch(cursor)) else cursor
-            )
+            # warmer — degrade to today's live, uncached, single-page path,
+            # exactly as before this feature existed (plan §5.4). Cursor
+            # translation is `_live_cursor`'s job.
             return await self.fetch_widget_rows(
                 url=url,
                 api_key=api_key,
@@ -673,7 +723,7 @@ class AirtableService:
                 filters=filters,
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
-                cursor=live_cursor,
+                cursor=self._live_cursor(cursor),
             )
 
         rows = envelope["rows"]
@@ -726,17 +776,33 @@ class AirtableService:
     ) -> str:
         """Used by `POST /airtable/cache/refresh` (the scheduled-refresh
         endpoint). Builds the same fingerprint/key a real viewer's request
-        would use and unconditionally (re)warms it, ignoring whatever TTL
-        remains — this IS the refresh mechanism, not a read-through, so it
-        does not take the single-flight lock: the endpoint is meant to run
-        as a single non-overlapping cron invocation (plan §7.3), and a race
-        against an ordinary reader's own warm is harmless — both would
-        write the same fingerprint's key to the same (correct) result.
+        would use and re-warms it, ignoring whatever TTL remains.
 
-        Returns `"refreshed"` or `"oversized"` (never cached; already
-        logged by the walk itself).
+        Takes the SAME single-flight lock the read path uses
+        (plan_airtable_cache_scaling_2026-08-08.md §4.4). The original
+        no-lock design assumed cron runs never overlap; one 40-second table
+        makes that false, and two concurrent walks of the same base means
+        Airtable 429s. A run that cannot get the lock skips — that is an
+        expected outcome, NOT a failure (landmine L9).
+
+        Also skips a widget whose cached entry is younger than
+        `AIRTABLE_CACHE_MIN_REFRESH_SECONDS`, so a duplicate run costs one
+        GET rather than a full walk.
+
+        Returns one of:
+          * ``"refreshed"``  — walked and written;
+          * ``"oversized"``  — too large to cache, served live (already
+            logged by the walk itself);
+          * ``"fresh"``      — cached entry is younger than the guard;
+          * ``"locked"``     — another run/reader holds the lock;
+          * ``"disabled"``   — no cache configured, so there is nothing to
+            warm and a walk would be pure waste.
+        `"fresh"`, `"locked"` and `"disabled"` are all *skips*.
         """
         cache = get_cache_service()
+        if not cache.enabled:
+            return "disabled"
+
         fingerprint = {
             "link": link,
             "sourceUrl": url,
@@ -747,25 +813,76 @@ class AirtableService:
         }
         cache_key = cache.build_key("widget_rows", fingerprint)
 
-        envelope, oversized = await self._build_widget_cache_envelope(
-            url=url,
-            api_key=api_key,
-            selected_columns=selected_columns,
-            filters=filters,
-            personalize_enabled=personalize_enabled,
-            personalize_column=personalize_column,
+        min_age = self._settings.AIRTABLE_CACHE_MIN_REFRESH_SECONDS
+        if min_age > 0:
+            existing = await cache.get(cache_key)
+            if isinstance(existing, dict):
+                age = self._envelope_age_seconds(existing)
+                if age is not None and age < min_age:
+                    logger.info(
+                        "Airtable cache refresh: widget link=%s is %.0fs old "
+                        "(< %ds) — skipping re-walk",
+                        link,
+                        age,
+                        min_age,
+                    )
+                    return "fresh"
+
+        lock_key = f"{cache_key}:lock"
+        acquired = await cache.acquire_lock(
+            lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
         )
-        if oversized:
-            logger.warning(
-                "Airtable cache refresh: widget link=%s is too large to cache — skipped",
+        if not acquired:
+            logger.info(
+                "Airtable cache refresh: widget link=%s is already being "
+                "warmed elsewhere — skipping",
                 link,
             )
-            return "oversized"
+            return "locked"
 
-        await cache.set(
-            cache_key, envelope, ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS
-        )
-        return "refreshed"
+        try:
+            envelope, oversized = await self._build_widget_cache_envelope(
+                url=url,
+                api_key=api_key,
+                selected_columns=selected_columns,
+                filters=filters,
+                personalize_enabled=personalize_enabled,
+                personalize_column=personalize_column,
+            )
+            if oversized:
+                logger.warning(
+                    "Airtable cache refresh: widget link=%s is too large to cache — skipped",
+                    link,
+                )
+                return "oversized"
+
+            await cache.set(
+                cache_key,
+                envelope,
+                ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
+                # Same entry the read path warms — must be written the same
+                # way (§4.3).
+                compress=True,
+            )
+            return "refreshed"
+        finally:
+            await cache.release_lock(lock_key)
+
+    @staticmethod
+    def _envelope_age_seconds(envelope: dict[str, Any]) -> float | None:
+        """Seconds since `envelope` was written, or None if its timestamp is
+        missing or unparseable — in which case the caller must treat the
+        entry as stale and refresh it, never as fresh."""
+        stamp = envelope.get("last_updated_date")
+        if not isinstance(stamp, str):
+            return None
+        try:
+            written = datetime.fromisoformat(stamp)
+        except ValueError:
+            return None
+        if written.tzinfo is None:
+            written = written.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - written).total_seconds()
 
     async def preview_widget_config(
         self,

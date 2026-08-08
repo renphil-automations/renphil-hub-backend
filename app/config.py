@@ -395,11 +395,40 @@ class Settings(BaseSettings):
     # widget's full result set; a breach means the table is served live
     # through the original per-page path instead of being cached — never
     # silently truncated. See the plan's §5.4.
-    AIRTABLE_CACHE_MAX_ROWS: int = 10_000
+    #
+    # MAX_ROWS is a sanity ceiling ONLY — it has no relationship to any
+    # Upstash limit, and at 10,000 it was the thing actually deciding what
+    # got cached: a 15,000-row table was rejected purely by this counter
+    # while sitting inside every real limit (measured — the 5 MB byte guard
+    # would not trigger until ~19,000 rows of a realistic 8-column shape).
+    # Raised to 50,000 per plan_airtable_cache_scaling_2026-08-08.md §4.2.
+    # Safe only because §4.1 made the walk's byte accounting incremental —
+    # the old per-page re-encode of the whole accumulated list was quadratic
+    # and would have made every warm dramatically slower here (landmine L10).
+    AIRTABLE_CACHE_MAX_ROWS: int = 50_000
+    # A real, well-chosen guard: Upstash hard-rejects requests over 10 MiB
+    # ("ERR max request size exceeded. Limit: 10485760 bytes"), so this is a
+    # deliberate ~48% margin. Deliberately NOT raised. Note it is measured
+    # against the UNCOMPRESSED payload, which is the conservative direction —
+    # §4.3's gzip lands ~4.8x below it on the wire.
     AIRTABLE_CACHE_MAX_BYTES: int = 5_000_000
     # Shared secret for POST /data/airtable/cache/refresh — same shape as
     # AGENT_SYNC_TOKEN below, sent as X-Sync-Token. Unset ⇒ 503.
     CACHE_REFRESH_TOKEN: str | None = None
+    # A scheduled refresh will NOT re-walk a widget whose cached entry is
+    # younger than this (plan_airtable_cache_scaling_2026-08-08.md §4.4).
+    #
+    # Deliberately just UNDER the intended 5-minute cron cadence: a normal
+    # tick still refreshes every widget, so data freshness is unchanged, but
+    # a duplicate/overlapping run — or a widget a reader's own read-through
+    # warmed moments ago — costs one GET instead of a full Airtable walk.
+    # Raising this above the cron interval trades freshness for less Airtable
+    # traffic; that is a deliberate policy change, not the default.
+    AIRTABLE_CACHE_MIN_REFRESH_SECONDS: int = 240
+    # Lock TTL held by a scheduled refresh. Longer than the read path's 120 s
+    # because a refresh walks the FULL table; sized under the cron interval so
+    # a crashed run self-heals by the next tick rather than wedging the widget.
+    AIRTABLE_CACHE_REFRESH_LOCK_SECONDS: int = 300
 
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)

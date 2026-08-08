@@ -151,9 +151,8 @@ from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.gemini_service import GeminiService
 from app.services.gridstack_service import (
+    get_airtable_component_bundle,
     get_airtable_component_config,
-    get_airtable_component_data,
-    get_airtable_pat_for_component,
     list_airtable_component_links,
     update_airtable_component_config,
 )
@@ -326,12 +325,18 @@ async def get_airtable_component_rows(
     user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    config = get_airtable_component_config(db, link)
-    if config is None:
+    # ONE bundle instead of three independent accessors: config + pat + data
+    # each used to re-query the same ComponentV2 and PageContentV2 rows, so
+    # this endpoint issued 6 queries to read 2 rows on EVERY request — cache
+    # hit, cache miss and live oversized fallback alike
+    # (plan_airtable_cache_scaling_2026-08-08.md §4.7).
+    bundle = get_airtable_component_bundle(db, link)
+    if bundle is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
+    config = bundle.config
 
     roles = list(user.roles)
 
@@ -357,14 +362,16 @@ async def get_airtable_component_rows(
             detail="This Airtable widget has no source URL configured",
         )
 
-    pat = get_airtable_pat_for_component(db, link)
+    # `.pat` is the ONLY place the token is read, and it goes straight to the
+    # outbound Airtable call below — never into a response (L12).
+    pat = bundle.pat
     if not pat:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This Airtable widget has no access token configured",
         )
 
-    stored = get_airtable_component_data(db, link) or {}
+    stored = bundle.data or {}
 
     # Cache sits strictly BELOW the access-control check above — never
     # decorate this handler with @airtable_cache, which would serve a
@@ -415,6 +422,11 @@ Runs synchronously and returns a summary so the caller's own exit code is a
 real signal. Per-widget failures are logged and counted, never abort the
 run — one bad token or misconfigured widget must not blank the cache for
 every other widget.
+
+The summary separates outcomes so only `failed` is a warning signal:
+`refreshed` (walked and cached), `skipped` (nothing to warm, already fresh,
+or another run holds the lock), `oversized` (too large to cache — served
+live, which is expected behavior, not an error) and `failed`.
 """,
     responses={
         401: {"description": "Missing or invalid X-Sync-Token"},
@@ -432,23 +444,33 @@ async def refresh_airtable_widget_cache(
     refreshed = 0
     skipped = 0
     failed = 0
+    # Oversized is EXPECTED behavior (the table is served live instead of
+    # cached), not a failure. It used to be counted as `failed`, which the
+    # cron reads as a warning signal — so a correctly-working large widget
+    # would have alarmed on every tick
+    # (plan_airtable_cache_scaling_2026-08-08.md §4.6, landmine L9).
+    oversized = 0
 
     for link in list_airtable_component_links(db):
         try:
-            config = get_airtable_component_config(db, link)
-            if config is None:
+            # One bundle per widget rather than three accessors INSIDE the
+            # loop — 6N queries to 2N across the whole sweep, which directly
+            # widens the time budget this synchronous walk runs in (§4.7).
+            bundle = get_airtable_component_bundle(db, link)
+            if bundle is None:
                 skipped += 1
                 continue
+            config = bundle.config
 
             source_url = (config.get("sourceUrl") or "").strip()
-            pat = get_airtable_pat_for_component(db, link)
+            pat = bundle.pat
             if not source_url or not pat:
                 # Same 400 condition the read path enforces — nothing to
                 # warm for a widget that isn't configured yet.
                 skipped += 1
                 continue
 
-            stored = get_airtable_component_data(db, link) or {}
+            stored = bundle.data or {}
             result = await airtable_service.warm_widget_cache(
                 link=link,
                 url=source_url,
@@ -460,8 +482,15 @@ async def refresh_airtable_widget_cache(
             )
             if result == "refreshed":
                 refreshed += 1
+            elif result == "oversized":
+                # Never cached, already logged by the walk. Served live.
+                oversized += 1
+            elif result in ("fresh", "locked", "disabled"):
+                # Expected skips, never failures (§4.4, landmine L9): the
+                # entry was already fresh, another run/reader holds the
+                # single-flight lock, or no cache is configured at all.
+                skipped += 1
             else:
-                # "oversized" — never cached, already logged by the walk.
                 failed += 1
         except Exception:
             logger.exception(
@@ -472,6 +501,7 @@ async def refresh_airtable_widget_cache(
     return {
         "refreshed": refreshed,
         "skipped": skipped,
+        "oversized": oversized,
         "failed": failed,
         "elapsed_seconds": round(time.monotonic() - started, 1),
     }
@@ -517,12 +547,14 @@ async def preview_airtable_component(
         url, api_key = body_url, body_pat
 
     elif link:
-        config = get_airtable_component_config(db, link)
-        if config is None:
+        # config + pat from one resolve rather than two (§4.7).
+        bundle = get_airtable_component_bundle(db, link)
+        if bundle is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Airtable component not found",
             )
+        config = bundle.config
 
         roles = list(user.roles)
         widget_ac = config.get("access_control")
@@ -553,7 +585,7 @@ async def preview_airtable_component(
                 detail="This Airtable widget has no source URL configured",
             )
 
-        stored_pat = get_airtable_pat_for_component(db, link)
+        stored_pat = bundle.pat
         if not stored_pat:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
