@@ -29,6 +29,7 @@ import gzip
 import hashlib
 import json
 import logging
+import uuid
 from typing import Any
 
 from upstash_redis.asyncio import Redis
@@ -51,6 +52,19 @@ _SCAN_COUNT = 200
 # digit, or one of `true`/`false`/`null` — never `g`. So "starts with the
 # marker" is a sound discriminator rather than a heuristic.
 _GZIP_MARKER = "gz:"
+
+# Compare-and-delete: only removes `key` if it still holds `token`. A bare
+# `DEL` in `release_lock` cannot tell "my lock" from "the lock" — once a
+# holder's TTL lapses and a new caller acquires the same key, the ORIGINAL
+# holder's `finally` block would delete the NEW holder's lock out from under
+# them. This closes that gap (plan_airtable_cache_scaling_2026-08-08.md,
+# lock-ownership finding). `EVAL` is a supported Upstash REST command, so
+# the check-then-delete is a single atomic round trip rather than a
+# GET-then-DEL race.
+_RELEASE_IF_OWNER_SCRIPT = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
 
 
 def _encode(value: Any, *, compress: bool) -> str:
@@ -189,28 +203,44 @@ class CacheService:
             logger.warning("Cache SET failed for key=%s", key, exc_info=True)
 
     # ── single-flight lock ────────────────────────────────────────────
-    async def acquire_lock(self, key: str, *, ttl_seconds: int = 120) -> bool:
-        """Best-effort ``SET key 1 NX EX ttl_seconds``. Returns True iff this
-        call won the lock. When the cache is disabled, returns True — every
-        caller "wins" and just does the work directly, matching the
-        fail-open behavior of the rest of this service.
+    async def acquire_lock(self, key: str, *, ttl_seconds: int = 120) -> str | None:
+        """Best-effort ``SET key <token> NX EX ttl_seconds``. Returns a
+        random ownership token if this call won the lock, or None if
+        another holder already has it. The token must be passed back to
+        `release_lock` — see that method for why a bare key is not enough.
+
+        When the cache is disabled (or Upstash errors), returns a token as
+        if the lock were won — every caller "wins" and just does the work
+        directly, matching the fail-open behavior of the rest of this
+        service. `release_lock` no-ops in the disabled case, so the token
+        is generated but never actually redeemed against Redis.
         """
+        token = uuid.uuid4().hex
         client = self._redis()
         if client is None:
-            return True
+            return token
         try:
-            result = await client.set(key, "1", nx=True, ex=ttl_seconds)
+            result = await client.set(key, token, nx=True, ex=ttl_seconds)
         except Exception:
             logger.warning("Cache lock acquire failed for key=%s", key, exc_info=True)
-            return True
-        return bool(result)
+            return token
+        return token if result else None
 
-    async def release_lock(self, key: str) -> None:
+    async def release_lock(self, key: str, token: str) -> None:
+        """Release `key` only if it still holds `token` (atomic
+        compare-and-delete via `EVAL`).
+
+        A plain `DEL` cannot distinguish "my lock" from "the lock": if this
+        holder's walk outlives `ttl_seconds`, Redis expires the key and a
+        new caller can acquire it before this one reaches its own
+        `finally`. An unconditional `DEL` at that point would delete the
+        NEW holder's lock, defeating the single-flight guarantee entirely.
+        """
         client = self._redis()
         if client is None:
             return
         try:
-            await client.delete(key)
+            await client.eval(_RELEASE_IF_OWNER_SCRIPT, [key], [token])
         except Exception:
             logger.warning("Cache lock release failed for key=%s", key, exc_info=True)
 

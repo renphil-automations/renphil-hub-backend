@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Body,
     Depends,
     Header,
@@ -38,7 +39,7 @@ from fastapi import (
 )
 
 from app.config import get_settings
-from app.db_v2.database import get_db_v2
+from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.dependencies import (
     get_airtable_service,
     get_current_user,
@@ -270,6 +271,7 @@ to clear it. The token is never returned; use `hasPat` / `patHint`.
 def update_airtable_component_config_endpoint(
     link: str = Path(..., description="The component's stable `link`."),
     body: AirtableComponentConfigUpdate = Body(...),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_v2),
     _user: UserInfo = Depends(get_current_user),
 ):
@@ -294,7 +296,58 @@ def update_airtable_component_config_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
+
+    # Warm-on-save: an admin just changed the fields that decide the row
+    # cache's fingerprint (sourceUrl / personalize settings), so the OLD
+    # cached entry (if any) no longer matches what a viewer would build.
+    # Without this, the very first viewer after a save pays the full,
+    # throttled table walk themselves. Scheduled as a background task so
+    # the save's own response returns immediately rather than waiting on a
+    # walk that can take well over a minute on a large table.
+    background_tasks.add_task(_warm_after_config_save, link)
+
     return config
+
+
+async def _warm_after_config_save(link: str) -> None:
+    """Fire-and-forget cache warm, scheduled right after an admin saves an
+    Airtable widget's config (see `update_airtable_component_config_endpoint`).
+
+    Runs its OWN database session rather than reusing the request's: a
+    FastAPI background task executes after the response has been sent, by
+    which point the request's own `db` dependency may already be torn
+    down — reusing it here is the exact footgun FastAPI's own docs warn
+    about for background tasks plus request-scoped sessions.
+
+    Mirrors `_refresh_one`'s body (same bundle lookup, same guard, same
+    `warm_widget_cache` call) but must never raise: a warm failure here is
+    just a missed optimization on an already-successful save, never an
+    error the admin should see.
+    """
+    db = SessionLocalV2()
+    try:
+        bundle = get_airtable_component_bundle(db, link)
+        if bundle is None:
+            return  # deleted/renamed between the save committing and this running
+        config = bundle.config
+        source_url = (config.get("sourceUrl") or "").strip()
+        if not source_url or not bundle.pat:
+            return  # nothing to fetch yet — same guard `_refresh_one` uses
+        stored = bundle.data or {}
+        outcome = await get_airtable_service().warm_widget_cache(
+            link=link,
+            url=source_url,
+            api_key=bundle.pat,
+            selected_columns=stored.get("selectedColumns") or None,
+            filters=stored.get("filters") or None,
+            personalize_enabled=bool(config.get("personalizeEnabled")),
+            personalize_column=config.get("personalizeColumn"),
+        )
+        logger.info("Airtable warm-on-save: link=%s -> %s", link, outcome)
+    except Exception:
+        logger.exception("Airtable warm-on-save failed for link=%s", link)
+    finally:
+        db.close()
 
 
 @router.get(

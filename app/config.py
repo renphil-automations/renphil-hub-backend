@@ -425,10 +425,28 @@ class Settings(BaseSettings):
     # Raising this above the cron interval trades freshness for less Airtable
     # traffic; that is a deliberate policy change, not the default.
     AIRTABLE_CACHE_MIN_REFRESH_SECONDS: int = 240
-    # Lock TTL held by a scheduled refresh. Longer than the read path's 120 s
-    # because a refresh walks the FULL table; sized under the cron interval so
-    # a crashed run self-heals by the next tick rather than wedging the widget.
+    # Single-flight lock TTL, shared by BOTH the scheduled refresh and the
+    # read path's own warm-on-miss — both do the exact same full-table walk,
+    # so both need a TTL that can outlive it. (Originally the read path used
+    # a separate, shorter, hardcoded 120s; that let a walk near
+    # AIRTABLE_CACHE_MAX_ROWS outlive its own lock — at 500 pages the
+    # throttle alone is ~125s, and real request time pushes it further. A
+    # lock whose holder is still working when the TTL expires lets a second
+    # caller acquire the same key and start a second concurrent walk of the
+    # same base, which is exactly what the lock exists to prevent.) Sized
+    # under the cron interval so a crashed run self-heals by the next tick
+    # rather than wedging the widget.
     AIRTABLE_CACHE_REFRESH_LOCK_SECONDS: int = 300
+    # TTL for the negative-cache marker written when a warm attempt
+    # confirms a widget is oversized or when the walk itself fails (e.g. an
+    # Airtable 429 or transport error). Without this, EVERY request against
+    # a known-bad widget repeats the full walk just to rediscover the same
+    # outcome — up to AIRTABLE_CACHE_MAX_ROWS/MAX_BYTES worth of throttled
+    # Airtable calls, thrown away, on every single request. Deliberately
+    # short: long enough to damp a request burst, short enough that a
+    # transient failure (a single 429) or a since-shrunk table recovers
+    # quickly on its own without waiting for a scheduled refresh.
+    AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS: int = 60
 
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)

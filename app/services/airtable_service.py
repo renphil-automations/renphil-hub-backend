@@ -26,7 +26,7 @@ from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
 from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
-from app.services.cache_service import get_cache_service
+from app.services.cache_service import CacheService, get_cache_service
 from app.models.airtable import (
     AccessControlAssign,
     AccessControlRecord,
@@ -548,6 +548,27 @@ class AirtableService:
         }
         return envelope, False
 
+    # Suffix for the negative-cache marker written when a warm attempt
+    # confirms a widget is oversized or its walk fails outright. Lives at a
+    # DIFFERENT key from the envelope itself — never overwrites a good
+    # envelope, and a stale marker left behind after a later success is
+    # simply never consulted again (the envelope check above it always
+    # short-circuits first).
+    _NEGATIVE_CACHE_SUFFIX = ":negative"
+
+    async def _mark_walk_unwarmable(
+        self, cache: CacheService, cache_key: str, *, reason: str
+    ) -> None:
+        """Records that `cache_key` was just confirmed oversized or failing,
+        so the NEXT request in the next `AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS`
+        skips straight to the live fallback instead of repeating the same
+        full walk only to rediscover the same outcome (finding #3)."""
+        await cache.set(
+            f"{cache_key}{self._NEGATIVE_CACHE_SUFFIX}",
+            {"reason": reason, "checked_at": datetime.now(timezone.utc).isoformat()},
+            ttl_seconds=self._settings.AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS,
+        )
+
     async def _get_or_warm_widget_cache(
         self,
         *,
@@ -560,19 +581,31 @@ class AirtableService:
         personalize_column: str | None,
     ) -> dict[str, Any] | None:
         """Returns the cached envelope, warming it on a miss. Returns None
-        when the table turned out to be oversized (never cached) or when
-        this call gave up waiting on another request's warm with nothing to
-        show for it — either way the caller falls back to the live,
-        uncached path (`fetch_widget_rows`)."""
+        when the table turned out to be oversized (never cached), the walk
+        itself failed, or this call gave up waiting on another request's
+        warm with nothing to show for it — either way the caller falls back
+        to the live, uncached path (`fetch_widget_rows`)."""
         cache = get_cache_service()
 
         cached = await cache.get(cache_key)
         if isinstance(cached, dict) and "rows" in cached:
             return cached
 
+        # A widget recently confirmed oversized or failing — skip the walk
+        # (and the lock contention around it) entirely rather than paying
+        # for the same negative result again (finding #3).
+        if await cache.get(f"{cache_key}{self._NEGATIVE_CACHE_SUFFIX}") is not None:
+            return None
+
         lock_key = f"{cache_key}:lock"
-        acquired = await cache.acquire_lock(lock_key, ttl_seconds=120)
-        if not acquired:
+        # Shares the refresh path's TTL: this call does the exact same
+        # full-table walk, so it needs a lock that can outlive the walk too
+        # (finding #1 — the old hardcoded 120s could not, once
+        # AIRTABLE_CACHE_MAX_ROWS was raised).
+        lock_token = await cache.acquire_lock(
+            lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
+        )
+        if not lock_token:
             # Someone else is warming this exact key. Wait briefly rather
             # than starting a second concurrent full-table walk — the whole
             # point of the lock (plan §4.4): without it, a cold key plus a
@@ -586,20 +619,36 @@ class AirtableService:
             return None
 
         try:
-            envelope, oversized = await self._build_widget_cache_envelope(
-                url=url,
-                api_key=api_key,
-                selected_columns=selected_columns,
-                filters=filters,
-                personalize_enabled=personalize_enabled,
-                personalize_column=personalize_column,
-            )
+            try:
+                envelope, oversized = await self._build_widget_cache_envelope(
+                    url=url,
+                    api_key=api_key,
+                    selected_columns=selected_columns,
+                    filters=filters,
+                    personalize_enabled=personalize_enabled,
+                    personalize_column=personalize_column,
+                )
+            except AirtableError:
+                # Every OTHER miss-path exit degrades to the live fallback;
+                # a walk failure (e.g. an Airtable 429 mid-walk) must too,
+                # rather than propagating as a 502 to the caller (finding
+                # #2) — the failure rate scales with table size now that a
+                # miss makes N Airtable requests instead of 1.
+                logger.warning(
+                    "Airtable widget cache: walk failed (url=%s) — "
+                    "serving live instead",
+                    url,
+                    exc_info=True,
+                )
+                await self._mark_walk_unwarmable(cache, cache_key, reason="walk_failed")
+                return None
             if oversized:
                 logger.warning(
                     "Airtable widget cache: table too large to cache "
                     "(url=%s) — serving live instead, never truncated",
                     url,
                 )
+                await self._mark_walk_unwarmable(cache, cache_key, reason="oversized")
                 return None
             await cache.set(
                 cache_key,
@@ -612,7 +661,7 @@ class AirtableService:
             )
             return envelope
         finally:
-            await cache.release_lock(lock_key)
+            await cache.release_lock(lock_key, lock_token)
 
     async def fetch_widget_rows_cached(
         self,
@@ -829,10 +878,10 @@ class AirtableService:
                     return "fresh"
 
         lock_key = f"{cache_key}:lock"
-        acquired = await cache.acquire_lock(
+        lock_token = await cache.acquire_lock(
             lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
         )
-        if not acquired:
+        if not lock_token:
             logger.info(
                 "Airtable cache refresh: widget link=%s is already being "
                 "warmed elsewhere — skipping",
@@ -866,7 +915,7 @@ class AirtableService:
             )
             return "refreshed"
         finally:
-            await cache.release_lock(lock_key)
+            await cache.release_lock(lock_key, lock_token)
 
     @staticmethod
     def _envelope_age_seconds(envelope: dict[str, Any]) -> float | None:
