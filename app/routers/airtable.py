@@ -408,15 +408,99 @@ def _check_cache_refresh_token(x_sync_token: str | None) -> None:
         )
 
 
+# Summary counters, in response order. `oversized` is deliberately its own
+# bucket: a table too large to cache is EXPECTED behavior (it is served live),
+# not a failure, and the cron treats a non-zero `failed` as a warning signal —
+# so counting it as failed would alarm on a correctly-working widget
+_REFRESH_COUNTERS = ("refreshed", "skipped", "oversized", "failed")
+
+# `warm_widget_cache`'s outcome -> the counter it belongs to. Defined ONCE so
+# the sweep and the per-widget path cannot drift apart. Anything not listed
+# here counts as a failure, which is the safe direction for an unrecognised
+# outcome.
+_REFRESH_OUTCOME_COUNTER = {
+    "refreshed": "refreshed",
+    "oversized": "oversized",
+    # Expected skips: the entry was already fresh, another run or reader
+    # holds the single-flight lock, or no cache is configured at all (§4.4).
+    "fresh": "skipped",
+    "locked": "skipped",
+    "disabled": "skipped",
+}
+
+
+async def _refresh_one(
+    db: Session, airtable_service: AirtableService, link: str
+) -> str:
+    """Re-warm ONE widget's row cache. Returns the summary counter it belongs
+    to — one of `_REFRESH_COUNTERS`.
+
+    Never raises: a per-widget failure is logged and counted so that one bad
+    token or misconfigured widget cannot abort a sweep over every other
+    widget. Shared by both the sweep and the single-widget path.
+    """
+    try:
+        # One bundle rather than three accessors — 6 queries to 2 per widget,
+        # which across a sweep is 6N to 2N and directly widens the time
+        # budget this synchronous walk runs in (§4.7).
+        bundle = get_airtable_component_bundle(db, link)
+        if bundle is None:
+            # Unknown link, not an airtable widget, or deleted between
+            # discovery and refresh. Expected, never a failure.
+            return "skipped"
+
+        config = bundle.config
+        source_url = (config.get("sourceUrl") or "").strip()
+        pat = bundle.pat
+        if not source_url or not pat:
+            # Same 400 condition the read path enforces — nothing to warm
+            # for a widget that isn't configured yet.
+            return "skipped"
+
+        stored = bundle.data or {}
+        outcome = await airtable_service.warm_widget_cache(
+            link=link,
+            url=source_url,
+            api_key=pat,
+            selected_columns=stored.get("selectedColumns") or None,
+            filters=stored.get("filters") or None,
+            personalize_enabled=bool(config.get("personalizeEnabled")),
+            personalize_column=config.get("personalizeColumn"),
+        )
+        counter = _REFRESH_OUTCOME_COUNTER.get(outcome)
+        if counter is None:
+            logger.error(
+                "Airtable cache refresh: widget link=%s returned unrecognised "
+                "outcome %r — counting as failed",
+                link,
+                outcome,
+            )
+            return "failed"
+        return counter
+    except Exception:
+        logger.exception("Airtable cache refresh: widget link=%s failed", link)
+        return "failed"
+
+
 @router.post(
     "/airtable/cache/refresh",
-    summary="[Server-to-server] Re-warm every airtable widget's row cache",
+    summary="[Server-to-server] Re-warm airtable widget row caches",
     description="""
-Walks every airtable widget's full (unpersonalized, filters-only) row set and
+Walks an airtable widget's full (unpersonalized, filters-only) row set and
 writes it to the cache with a fresh TTL — the scheduled-refresh half of the
 widget row cache (server-side; intended to be called by a periodic job, not
 a browser). Authenticated by a shared secret (`X-Sync-Token`), not a user
 session.
+
+Pass `link` to refresh a **single** widget; omit it to sweep **every**
+widget. Prefer per-widget calls from a scheduler: the sweep shares one
+request's time budget across every widget, so one large table can starve the
+rest, and an overrun loses the whole run's summary. Per-widget calls give
+each widget its own budget and isolate failures. Both forms return the same
+summary shape, so a caller can sum them.
+
+An unknown `link` — including a widget deleted between discovery and
+refresh — counts as `skipped`, not an error.
 
 Runs synchronously and returns a summary so the caller's own exit code is a
 real signal. Per-widget failures are logged and counted, never abort the
@@ -434,6 +518,13 @@ live, which is expected behavior, not an error) and `failed`.
     },
 )
 async def refresh_airtable_widget_cache(
+    link: str | None = Query(
+        default=None,
+        description=(
+            "Refresh only this widget. Omit to refresh every widget "
+            "(the original sweep behavior)."
+        ),
+    ),
     x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
     db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -441,70 +532,42 @@ async def refresh_airtable_widget_cache(
     _check_cache_refresh_token(x_sync_token)
 
     started = time.monotonic()
-    refreshed = 0
-    skipped = 0
-    failed = 0
-    # Oversized is EXPECTED behavior (the table is served live instead of
-    # cached), not a failure. It used to be counted as `failed`, which the
-    # cron reads as a warning signal — so a correctly-working large widget
-    # would have alarmed on every tick
-    # (plan_airtable_cache_scaling_2026-08-08.md §4.6, landmine L9).
-    oversized = 0
+    counts = {name: 0 for name in _REFRESH_COUNTERS}
 
-    for link in list_airtable_component_links(db):
-        try:
-            # One bundle per widget rather than three accessors INSIDE the
-            # loop — 6N queries to 2N across the whole sweep, which directly
-            # widens the time budget this synchronous walk runs in (§4.7).
-            bundle = get_airtable_component_bundle(db, link)
-            if bundle is None:
-                skipped += 1
-                continue
-            config = bundle.config
+    # A single `link` is the ONLY difference between the two modes — the
+    # per-widget work itself is identical, so both go through `_refresh_one`
 
-            source_url = (config.get("sourceUrl") or "").strip()
-            pat = bundle.pat
-            if not source_url or not pat:
-                # Same 400 condition the read path enforces — nothing to
-                # warm for a widget that isn't configured yet.
-                skipped += 1
-                continue
+    links = [link] if link is not None else list_airtable_component_links(db)
 
-            stored = bundle.data or {}
-            result = await airtable_service.warm_widget_cache(
-                link=link,
-                url=source_url,
-                api_key=pat,
-                selected_columns=stored.get("selectedColumns") or None,
-                filters=stored.get("filters") or None,
-                personalize_enabled=bool(config.get("personalizeEnabled")),
-                personalize_column=config.get("personalizeColumn"),
-            )
-            if result == "refreshed":
-                refreshed += 1
-            elif result == "oversized":
-                # Never cached, already logged by the walk. Served live.
-                oversized += 1
-            elif result in ("fresh", "locked", "disabled"):
-                # Expected skips, never failures (§4.4, landmine L9): the
-                # entry was already fresh, another run/reader holds the
-                # single-flight lock, or no cache is configured at all.
-                skipped += 1
-            else:
-                failed += 1
-        except Exception:
-            logger.exception(
-                "Airtable cache refresh: widget link=%s failed", link
-            )
-            failed += 1
+    for target in links:
+        counts[await _refresh_one(db, airtable_service, target)] += 1
 
-    return {
-        "refreshed": refreshed,
-        "skipped": skipped,
-        "oversized": oversized,
-        "failed": failed,
-        "elapsed_seconds": round(time.monotonic() - started, 1),
-    }
+    return {**counts, "elapsed_seconds": round(time.monotonic() - started, 1)}
+
+
+@router.get(
+    "/airtable/cache/widgets",
+    summary="[Server-to-server] Every airtable widget's link, for refresh targeting",
+    description="""
+Lists the `link` of every airtable widget, so a scheduled job can refresh
+them one at a time instead of in a single sweep.
+
+Same shared-secret auth as the refresh endpoint (`X-Sync-Token`), not a user
+session. Returns only opaque component links — no configuration, no source
+URLs and no tokens.
+""",
+    responses={
+        401: {"description": "Missing or invalid X-Sync-Token"},
+        503: {"description": "CACHE_REFRESH_TOKEN is not configured on the server"},
+    },
+)
+def list_airtable_cache_widgets(
+    x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
+    db: Session = Depends(get_db_v2),
+):
+    _check_cache_refresh_token(x_sync_token)
+    links = list_airtable_component_links(db)
+    return {"links": links, "count": len(links)}
 
 
 @router.post(
@@ -547,7 +610,7 @@ async def preview_airtable_component(
         url, api_key = body_url, body_pat
 
     elif link:
-        # config + pat from one resolve rather than two (§4.7).
+        # config + pat from one resolve rather than two.
         bundle = get_airtable_component_bundle(db, link)
         if bundle is None:
             raise HTTPException(
