@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from pyairtable import Api
+from pyairtable import retry_strategy as _pyairtable_retry_strategy
 from requests.exceptions import RequestException
 from fastapi import HTTPException, status as _http_status
 
@@ -26,7 +27,7 @@ from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
 from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
-from app.services.cache_service import CacheService, get_cache_service
+from app.services.cache_service import CacheService, encoded_length, get_cache_service
 from app.models.airtable import (
     AccessControlAssign,
     AccessControlRecord,
@@ -197,6 +198,26 @@ _ML_LOOKUP_PROJECT_FIELDS = [
 # server-side into the full Deliverables records.
 _UPCOMING_DELIVERABLES_FIELD = "Upcoming Deliverables"
 
+# `Api(api_key)` with no `retry_strategy=` already wraps its session in a
+# urllib3 Retry (pyairtable's own default — `retrying.retry_strategy()`,
+# confirmed by reading pyairtable/api/retrying.py, not assumed): up to 5
+# retries with exponential backoff, honoring a `Retry-After` header, for
+# BOTH connection-level errors (timeout/reset — urllib3's `connect`/`read`
+# sub-budgets fall back to `total` when left unset) AND status 429. So the
+# "429 retry-with-backoff" finding in
+# plan_airtable_cache_scaling_2026-08-08.md was already half-solved by the
+# library's own default. The one real gap: `status_forcelist` defaults to
+# `(429,)` only — a single transient Airtable 5xx aborts the whole walk and
+# discards every page fetched so far, with zero retry. Widening the
+# forcelist closes that gap without hand-rolling a retry loop.
+#
+# A `Retry` instance is an immutable template (`.increment()` returns a NEW
+# instance rather than mutating `self`), so one module-level object is safe
+# to share across every `Api(...)` construction and concurrent request.
+_WIDGET_RETRY_STRATEGY = _pyairtable_retry_strategy(
+    status_forcelist=(429, 500, 502, 503, 504)
+)
+
 
 class AirtableService:
     """Async-friendly wrapper around ``pyairtable``."""
@@ -312,7 +333,7 @@ class AirtableService:
         # `table.all()` / `.iterate()` both swallow the response's `offset`,
         # so neither can hand back a next-page cursor. Drop to the raw
         # request, which returns `records` and `offset` together.
-        api = Api(api_key.strip())
+        api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
         table = api.table(base_id, table_id)
         try:
             payload = await asyncio.to_thread(
@@ -363,6 +384,19 @@ class AirtableService:
     # Pages are inherently sequential (each offset is only known after the
     # previous response), so this is a plain minimum-interval throttle.
     _WALK_THROTTLE_SECONDS = 0.25
+
+    # Once the walk's cheap RAW running total first crosses AIRTABLE_CACHE_
+    # MAX_BYTES, a real gzip measurement (finding #4) is re-checked every
+    # this many additional RAW bytes of growth — not on every single page.
+    # Re-compressing the WHOLE accumulated row list is the accurate check,
+    # but doing it every page would reintroduce the exact quadratic cost
+    # §4.1 removed (gzip is more CPU-expensive per byte than json.dumps).
+    # Bounded instead: for the benchmarked 8-column shape, a full 50,000-row
+    # walk (~13 MB raw) only ever ESCALATES past the original 5 MB raw cap,
+    # so this interval is paid at most roughly (13MB-5MB)/interval times —
+    # about a dozen checks, a few hundred ms total, against a walk that
+    # already spends 100+ s in throttled Airtable I/O either way.
+    _COMPRESSED_SIZE_CHECK_RAW_INTERVAL_BYTES = 500_000
     _IDX_CURSOR_RE = re.compile(r"^idx:(\d+)$")
 
     @classmethod
@@ -407,6 +441,13 @@ class AirtableService:
         walk was aborted after crossing `AIRTABLE_CACHE_MAX_ROWS` or
         `AIRTABLE_CACHE_MAX_BYTES` — the caller must NOT cache a partial
         result in that case (plan §5.4: never silently truncate).
+
+        `AIRTABLE_CACHE_MAX_BYTES` is checked against the REAL, compressed
+        on-the-wire size (finding #4) — not the raw JSON size, which is
+        ~4.8x larger and made the guard ~9x more conservative than the
+        Upstash limit it protects (a 15,000-row table was rejected purely
+        by this counter while sitting inside every real limit). See
+        `_oversized_by_compressed_size` below for how that's kept cheap.
         """
         max_rows = self._settings.AIRTABLE_CACHE_MAX_ROWS
         max_bytes = self._settings.AIRTABLE_CACHE_MAX_BYTES
@@ -426,11 +467,40 @@ class AirtableService:
         # Running length of the encoded row list's BODY — everything between
         # the outer `[` and `]`. Kept incrementally because re-encoding the
         # whole accumulated list once per page is quadratic: ~1.8 s of pure
-        # waste at 150 pages, ~22 s at 500
-        # (plan_airtable_cache_scaling_2026-08-08.md §4.1). The total below is
-        # byte-for-byte what `json.dumps(rows, separators=(",", ":"))` would
-        # return, so the guard's threshold is unchanged.
+        # waste at 150 pages, ~22 s at 500 (plan §4.1). Still the byte-for-
+        # byte RAW json.dumps length — used as the cheap trigger for WHEN to
+        # pay for a real compressed measurement below, not as the guard's
+        # threshold itself anymore.
         body_len = 0
+        raw_total = 0
+        # RAW total at the last REAL (gzip) size check, or None before the
+        # first one. Compression can only shrink further (compressed <=
+        # raw), so below max_bytes on the raw total alone already proves
+        # the compressed size is fine too — this stays None for every
+        # table that never crosses the raw cap, which is the common case
+        # (both live widgets today are 3 rows) and costs nothing extra.
+        last_compressed_check_raw: int | None = None
+
+        def _oversized_by_compressed_size(*, force: bool) -> bool:
+            """True if `rows`' REAL encoded size exceeds `max_bytes`. Only
+            actually re-compresses when `force` is set or the raw total has
+            grown by `_COMPRESSED_SIZE_CHECK_RAW_INTERVAL_BYTES` since the
+            last real check — re-compressing the WHOLE accumulated list on
+            every single page (gzip is more CPU-expensive per byte than
+            json.dumps) would reintroduce the exact quadratic cost §4.1
+            removed. `force=True` is used once, after the walk's last page,
+            to guarantee the FINAL verdict is always a real measurement —
+            never a stale one left over from an earlier checkpoint."""
+            nonlocal last_compressed_check_raw
+            due = (
+                last_compressed_check_raw is None
+                or raw_total - last_compressed_check_raw
+                >= self._COMPRESSED_SIZE_CHECK_RAW_INTERVAL_BYTES
+            )
+            if not (force or due):
+                return False
+            last_compressed_check_raw = raw_total
+            return encoded_length(rows, compress=True) > max_bytes
 
         while True:
             if last_request_at is not None:
@@ -475,8 +545,9 @@ class AirtableService:
                     len(json.dumps(page_rows, separators=(",", ":"), default=str)) - 2
                 )
                 body_len += page_body_len if body_len == 0 else 1 + page_body_len
+            raw_total = body_len + 2
 
-            if body_len + 2 > max_bytes:
+            if raw_total > max_bytes and _oversized_by_compressed_size(force=False):
                 return rows, seen_fields, True
 
             next_offset = payload.get("offset")
@@ -484,21 +555,37 @@ class AirtableService:
                 break
             options["offset"] = next_offset
 
+        # The walk finished normally. If it ever escalated past the raw
+        # cap, the last page's growth may not have landed on a checkpoint —
+        # force one final real measurement so the returned `oversized=False`
+        # is never a stale verdict from an earlier, smaller checkpoint.
+        if raw_total > max_bytes and _oversized_by_compressed_size(force=True):
+            return rows, seen_fields, True
+
         return rows, seen_fields, False
 
     async def _build_widget_cache_envelope(
         self,
         *,
+        cache: CacheService,
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
         filters: list[dict[str, Any]] | None,
         personalize_enabled: bool,
         personalize_column: str | None,
-    ) -> tuple[dict[str, Any] | None, bool]:
+    ) -> tuple[dict[str, Any] | None, str]:
         """Walk the widget's FULL, unpersonalized (filters-only) row set and
         shape it into the envelope stored in the cache. Returns
-        `(envelope, oversized)`; `envelope` is None when `oversized=True`.
+        `(envelope, status)`, `status` one of:
+
+          * ``"ok"``       — `envelope` is the built payload;
+          * ``"oversized"`` — `envelope` is None, table crossed the cap;
+          * ``"locked"``   — `envelope` is None, the walk was never even
+            attempted because another widget on the SAME base is already
+            walking (see the base-level lock below). Distinct from
+            `"oversized"` so callers don't mistake contention for a
+            confirmed bad table and negative-cache it.
         """
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
 
@@ -522,14 +609,39 @@ class AirtableService:
             # keeps it out of what a client sees.
             fetch_fields = fetch_fields + [personalize_column]
 
-        api = Api(api_key.strip())
+        api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
         table = api.table(base_id, table_id)
 
-        rows, seen_fields, oversized = await self._walk_full_table(
-            api=api, table=table, view_id=view_id, fetch_fields=fetch_fields, formula=formula,
+        # Second, base-scoped lock (finding #6,
+        # plan_airtable_cache_scaling_2026-08-08.md §3.4.2/handoff
+        # 2026-08-10 §3): the per-fingerprint lock the CALLER already holds
+        # only stops the SAME widget from being walked twice at once. Two
+        # DIFFERENT widgets sharing a base — e.g. a reader's cold-cache warm
+        # on widget A racing the cron's refresh of widget B — each hold
+        # their OWN fingerprint lock and would happily walk concurrently,
+        # together exceeding Airtable's 5 req/s/base limit (each walk alone
+        # already uses ~4 req/s by design, `_WALK_THROTTLE_SECONDS`).
+        # Scoped tightly around just the walk, not formula-building — the
+        # only part that actually calls Airtable. Non-blocking: unlike the
+        # fingerprint lock's read-path caller, there is nothing to poll for
+        # here (a different widget's walk will never populate THIS
+        # fingerprint's cache key), so a loser returns immediately.
+        base_lock_key = f"airtable:{cache.version}:widget_base_lock:{base_id}"
+        base_lock_token = await cache.acquire_lock(
+            base_lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
         )
+        if not base_lock_token:
+            return None, "locked"
+
+        try:
+            rows, seen_fields, oversized = await self._walk_full_table(
+                api=api, table=table, view_id=view_id, fetch_fields=fetch_fields, formula=formula,
+            )
+        finally:
+            await cache.release_lock(base_lock_key, base_lock_token)
+
         if oversized:
-            return None, True
+            return None, "oversized"
 
         envelope = {
             "endpoint": "widget_rows",
@@ -546,7 +658,7 @@ class AirtableService:
             "row_count": len(rows),
             "last_updated_date": datetime.now(timezone.utc).isoformat(),
         }
-        return envelope, False
+        return envelope, "ok"
 
     # Suffix for the negative-cache marker written when a warm attempt
     # confirms a widget is oversized or its walk fails outright. Lives at a
@@ -557,16 +669,37 @@ class AirtableService:
     _NEGATIVE_CACHE_SUFFIX = ":negative"
 
     async def _mark_walk_unwarmable(
-        self, cache: CacheService, cache_key: str, *, reason: str
+        self,
+        cache: CacheService,
+        cache_key: str,
+        *,
+        reason: str,
+        ttl_seconds: int | None = None,
     ) -> None:
         """Records that `cache_key` was just confirmed oversized or failing,
-        so the NEXT request in the next `AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS`
-        skips straight to the live fallback instead of repeating the same
-        full walk only to rediscover the same outcome (finding #3)."""
+        so the NEXT request in the next `ttl_seconds` skips straight to the
+        live fallback instead of repeating the same full walk only to
+        rediscover the same outcome (finding #3).
+
+        `ttl_seconds` defaults to `AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS` — the
+        read path's short, "recover within a request or two" window. The
+        scheduled refresh (`warm_widget_cache`) passes a much longer TTL
+        explicitly: it ticks on its own fixed cadence regardless, so a short
+        marker would always have lapsed by the next tick and never actually
+        stop a persistently-bad widget from being re-walked to the cap
+        every single time (see `AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS`
+        in config.py). Both paths write the SAME key, so whichever's TTL is
+        currently active covers both — a reader arriving while the cron's
+        longer marker is live benefits from it too, for free.
+        """
         await cache.set(
             f"{cache_key}{self._NEGATIVE_CACHE_SUFFIX}",
             {"reason": reason, "checked_at": datetime.now(timezone.utc).isoformat()},
-            ttl_seconds=self._settings.AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS,
+            ttl_seconds=(
+                ttl_seconds
+                if ttl_seconds is not None
+                else self._settings.AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS
+            ),
         )
 
     async def _get_or_warm_widget_cache(
@@ -620,7 +753,8 @@ class AirtableService:
 
         try:
             try:
-                envelope, oversized = await self._build_widget_cache_envelope(
+                envelope, status = await self._build_widget_cache_envelope(
+                    cache=cache,
                     url=url,
                     api_key=api_key,
                     selected_columns=selected_columns,
@@ -642,7 +776,15 @@ class AirtableService:
                 )
                 await self._mark_walk_unwarmable(cache, cache_key, reason="walk_failed")
                 return None
-            if oversized:
+            if status == "locked":
+                # A DIFFERENT widget on the same base is walking right now
+                # (finding #6) — not a confirmed bad table, just contention,
+                # so no negative marker. And unlike the fingerprint-lock
+                # wait above, there is nothing to poll for: another widget's
+                # walk will never populate THIS cache key. Degrade to live
+                # immediately.
+                return None
+            if status == "oversized":
                 logger.warning(
                     "Airtable widget cache: table too large to cache "
                     "(url=%s) — serving live instead, never truncated",
@@ -836,17 +978,35 @@ class AirtableService:
 
         Also skips a widget whose cached entry is younger than
         `AIRTABLE_CACHE_MIN_REFRESH_SECONDS`, so a duplicate run costs one
-        GET rather than a full walk.
+        GET rather than a full walk. Same treatment for a widget already
+        confirmed oversized/failing by EITHER this method or the read path
+        (handoff 2026-08-10 §3, finding "cron re-walks an oversized widget
+        every tick"): without this, the cron previously never consulted the
+        negative marker at all, so a persistently oversized table paid a
+        full throttled walk to the cap on every 5-minute tick, forever,
+        discarding it every time.
 
         Returns one of:
-          * ``"refreshed"``  — walked and written;
-          * ``"oversized"``  — too large to cache, served live (already
-            logged by the walk itself);
-          * ``"fresh"``      — cached entry is younger than the guard;
-          * ``"locked"``     — another run/reader holds the lock;
-          * ``"disabled"``   — no cache configured, so there is nothing to
+          * ``"refreshed"``   — walked and written;
+          * ``"oversized"``   — just confirmed too large to cache this call;
+            served live, and (unlike before this fix) a negative marker is
+            now written so the NEXT tick doesn't repeat the discovery;
+          * ``"walk_failed"`` — the walk itself raised (e.g. an Airtable
+            429/5xx that outlasted the transport-level retry); same
+            negative-marker treatment as oversized;
+          * ``"damped"``      — a negative marker from a PRIOR oversized or
+            walk_failed confirmation (by this method or the read path) is
+            still fresh — skipped without attempting a walk at all;
+          * ``"fresh"``       — cached entry is younger than the guard;
+          * ``"locked"``      — another run/reader holds the per-fingerprint
+            lock, OR a DIFFERENT widget on the same base holds the
+            base-level lock (finding #6) — either way, contention, not a
+            confirmed bad table;
+          * ``"disabled"``    — no cache configured, so there is nothing to
             warm and a walk would be pure waste.
-        `"fresh"`, `"locked"` and `"disabled"` are all *skips*.
+        Every outcome except ``"refreshed"`` is a *skip*, and
+        `_REFRESH_OUTCOME_COUNTER` in routers/airtable.py is the one place
+        that maps each to its summary counter.
         """
         cache = get_cache_service()
         if not cache.enabled:
@@ -861,6 +1021,18 @@ class AirtableService:
             "personalizeColumn": personalize_column or None,
         }
         cache_key = cache.build_key("widget_rows", fingerprint)
+
+        # Checked before both the freshness lookup and lock acquisition, so
+        # a confirmed-bad widget skips ALL of that too, not just the walk
+        # (same "before lock acquisition" reasoning finding #3 already
+        # applied on the read path).
+        if await cache.get(f"{cache_key}{self._NEGATIVE_CACHE_SUFFIX}") is not None:
+            logger.info(
+                "Airtable cache refresh: widget link=%s is negative-cached "
+                "(oversized or recently failing) — skipping re-walk",
+                link,
+            )
+            return "damped"
 
         min_age = self._settings.AIRTABLE_CACHE_MIN_REFRESH_SECONDS
         if min_age > 0:
@@ -890,18 +1062,63 @@ class AirtableService:
             return "locked"
 
         try:
-            envelope, oversized = await self._build_widget_cache_envelope(
-                url=url,
-                api_key=api_key,
-                selected_columns=selected_columns,
-                filters=filters,
-                personalize_enabled=personalize_enabled,
-                personalize_column=personalize_column,
-            )
-            if oversized:
+            try:
+                envelope, status = await self._build_widget_cache_envelope(
+                    cache=cache,
+                    url=url,
+                    api_key=api_key,
+                    selected_columns=selected_columns,
+                    filters=filters,
+                    personalize_enabled=personalize_enabled,
+                    personalize_column=personalize_column,
+                )
+            except AirtableError:
+                # Mirrors the read path's finding #2 handling: a walk
+                # failure must not blow up the whole sweep for every OTHER
+                # widget (the router's own except-Exception around
+                # `_refresh_one` already caught this before, but silently,
+                # with no negative marker written — this is the fix for
+                # that gap, finding "C" above).
+                logger.warning(
+                    "Airtable cache refresh: widget link=%s walk failed — skipped",
+                    link,
+                    exc_info=True,
+                )
+                await self._mark_walk_unwarmable(
+                    cache,
+                    cache_key,
+                    reason="walk_failed",
+                    ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS,
+                )
+                return "walk_failed"
+
+            if status == "locked":
+                # A different widget on the same base is walking right now
+                # (finding #6) — contention, not a confirmed bad table, so
+                # no negative marker. Same "locked" outcome the per-
+                # fingerprint lock already uses above; the router's counter
+                # mapping doesn't need to distinguish the two causes.
+                logger.info(
+                    "Airtable cache refresh: widget link=%s's base is "
+                    "already being walked by another widget — skipping",
+                    link,
+                )
+                return "locked"
+
+            if status == "oversized":
                 logger.warning(
                     "Airtable cache refresh: widget link=%s is too large to cache — skipped",
                     link,
+                )
+                # Previously NOT written from this path — an oversized
+                # widget was re-walked to the cap on every single tick,
+                # forever, discarding the result each time (finding "C").
+                # Long TTL: see AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS.
+                await self._mark_walk_unwarmable(
+                    cache,
+                    cache_key,
+                    reason="oversized",
+                    ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS,
                 )
                 return "oversized"
 

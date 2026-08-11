@@ -89,6 +89,23 @@ def _decode(raw: Any) -> Any:
     return json.loads(raw)
 
 
+def encoded_length(value: Any, *, compress: bool) -> int:
+    """Byte length `CacheService.set(..., compress=compress)` would actually
+    write for `value`, without performing any I/O.
+
+    Lets a caller size a candidate payload against a byte budget using its
+    REAL on-the-wire size, rather than the raw (larger, for a compressed
+    entry) `json.dumps` encoding — the fix for finding #4 in
+    plan_airtable_cache_scaling_2026-08-08.md: `AIRTABLE_CACHE_MAX_BYTES`
+    was being checked against the walk's uncompressed size even though
+    §4.3 stores compressed, making the guard ~4.8x more conservative than
+    the real Upstash limit it exists to protect. Also the right primitive
+    for Tier 2's chunk sizing (§5.2), which needs the same "measure, never
+    fail-and-retry" operation for chunk boundaries.
+    """
+    return len(_encode(value, compress=compress))
+
+
 def _cache_root(version: str) -> str:
     return f"airtable:{version}"
 

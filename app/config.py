@@ -447,6 +447,22 @@ class Settings(BaseSettings):
     # transient failure (a single 429) or a since-shrunk table recovers
     # quickly on its own without waiting for a scheduled refresh.
     AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS: int = 60
+    # TTL for the SAME negative-cache marker, but as written by the
+    # scheduled refresh (`warm_widget_cache`) rather than a live reader.
+    # Deliberately much longer than AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS above
+    # (plan_airtable_cache_scaling_2026-08-08.md, finding #3's cron-side
+    # gap): a live reader wants "recovers within a request or two", but the
+    # cron ticks every ~5 minutes regardless (AIRTABLE_CACHE_MIN_REFRESH_
+    # SECONDS's own cadence) — reusing the 60s TTL there would mean a
+    # persistently oversized/failing widget gets re-walked to the cap on
+    # EVERY tick, forever, since 60s always lapses before the next one.
+    # 900s (3 ticks) keeps that from happening while still self-healing
+    # within ~15 minutes if the table shrinks back down or the failure was
+    # transient — far short of needing a new ticket. A live reader arriving
+    # while THIS longer marker is active still benefits from it (same key,
+    # same check in `_get_or_warm_widget_cache`) — a free side effect of
+    # sharing one marker between both paths.
+    AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS: int = 900
 
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)

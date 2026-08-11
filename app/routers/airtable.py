@@ -474,11 +474,19 @@ _REFRESH_COUNTERS = ("refreshed", "skipped", "oversized", "failed")
 _REFRESH_OUTCOME_COUNTER = {
     "refreshed": "refreshed",
     "oversized": "oversized",
+    # A walk that raised (e.g. an Airtable 429/5xx outlasting the transport
+    # retry) is a real failure, same bucket an unrecognised outcome already
+    # falls into below — but named explicitly so it isn't logged as one.
+    "walk_failed": "failed",
     # Expected skips: the entry was already fresh, another run or reader
-    # holds the single-flight lock, or no cache is configured at all (§4.4).
+    # holds the single-flight lock (per-fingerprint OR the base-level lock,
+    # finding #6), no cache is configured at all (§4.4), or a fresh
+    # negative marker from a prior oversized/walk_failed confirmation
+    # short-circuited this run entirely (2026-08-10 handoff finding "C").
     "fresh": "skipped",
     "locked": "skipped",
     "disabled": "skipped",
+    "damped": "skipped",
 }
 
 
