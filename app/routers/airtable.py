@@ -326,7 +326,9 @@ async def _warm_after_config_save(link: str) -> None:
     """
     db = SessionLocalV2()
     try:
-        bundle = get_airtable_component_bundle(db, link)
+        # Plain sync SQLAlchemy — off the event loop, same as every other
+        # call site of this accessor (finding #8).
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
         if bundle is None:
             return  # deleted/renamed between the save committing and this running
         config = bundle.config
@@ -383,7 +385,11 @@ async def get_airtable_component_rows(
     # this endpoint issued 6 queries to read 2 rows on EVERY request — cache
     # hit, cache miss and live oversized fallback alike
     # (plan_airtable_cache_scaling_2026-08-08.md §4.7).
-    bundle = get_airtable_component_bundle(db, link)
+    #
+    # Plain sync SQLAlchemy (finding #8) — off the event loop via to_thread
+    # so this ~165ms Neon round trip doesn't stall every other in-flight
+    # request on the shared asyncio loop.
+    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
     if bundle is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -454,7 +460,14 @@ def _check_cache_refresh_token(x_sync_token: str | None) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Airtable cache refresh is not configured.",
         )
-    if not x_sync_token or not hmac.compare_digest(x_sync_token, expected):
+    # Encode to bytes before comparing: hmac.compare_digest raises TypeError
+    # (uncaught -> 500) on a `str` argument containing non-ASCII characters,
+    # and an attacker-controlled header can contain anything. Encoding a
+    # `str` to UTF-8 never raises, so a malformed token now falls through to
+    # the intended 401 instead of a 500.
+    if not x_sync_token or not hmac.compare_digest(
+        x_sync_token.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing sync token.",
@@ -504,7 +517,12 @@ async def _refresh_one(
         # One bundle rather than three accessors — 6 queries to 2 per widget,
         # which across a sweep is 6N to 2N and directly widens the time
         # budget this synchronous walk runs in (§4.7).
-        bundle = get_airtable_component_bundle(db, link)
+        #
+        # Plain sync SQLAlchemy (finding #8) — off the event loop via
+        # to_thread; this function runs inside the async request handler for
+        # both the single-widget and full-sweep forms, so a blocking call
+        # here stalls every other in-flight request for the round trip.
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
         if bundle is None:
             # Unknown link, not an airtable widget, or deleted between
             # discovery and refresh. Expected, never a failure.
@@ -598,7 +616,14 @@ async def refresh_airtable_widget_cache(
     # A single `link` is the ONLY difference between the two modes — the
     # per-widget work itself is identical, so both go through `_refresh_one`
 
-    links = [link] if link is not None else list_airtable_component_links(db)
+    # Same sync-SQLAlchemy-off-the-event-loop reasoning as the bundle calls
+    # below (finding #8) — only reached in sweep mode, but still a blocking
+    # DB round trip inside an async handler.
+    links = (
+        [link]
+        if link is not None
+        else await asyncio.to_thread(list_airtable_component_links, db)
+    )
 
     for target in links:
         counts[await _refresh_one(db, airtable_service, target)] += 1
@@ -672,7 +697,9 @@ async def preview_airtable_component(
 
     elif link:
         # config + pat from one resolve rather than two.
-        bundle = get_airtable_component_bundle(db, link)
+        # Plain sync SQLAlchemy (finding #8) — off the event loop via
+        # to_thread, same as every other call site of this accessor.
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
         if bundle is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
