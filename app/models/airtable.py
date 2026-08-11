@@ -75,6 +75,40 @@ class AirtableWidgetRowsResponse(BaseModel):
     )
 
 
+class AirtableWidgetMetricResponse(BaseModel):
+    """Single-number Count/Sum aggregation for a dashboard Airtable Metric
+    widget, computed server-side over the SAME cached row set the Table
+    widget's `/rows` endpoint uses (see `AirtableService.fetch_widget_metric_cached`).
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    aggregation: str = Field(description="'count' or 'sum', echoed back for the caller's own bookkeeping.")
+    value: float | int | None = Field(
+        default=None,
+        description="The computed count/sum, or null when unavailable/blocked.",
+    )
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the underlying table is too large to cache (or the "
+            "cache walk itself failed) — deliberately never falls back to a "
+            "live partial fetch for an aggregate, since a count/sum over "
+            "only some rows would be silently wrong, not just incomplete."
+        ),
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description=(
+            "True when personalization is enabled but could not be applied, "
+            "so no value was computed. Distinguishes 'the filter could not "
+            "run' from 'the table is too large to cache' — both leave "
+            "`value` null, for different reasons."
+        ),
+    )
+
+
 class AirtableEditorPreviewRequest(BaseModel):
     """Property Panel preview of an Airtable widget's in-progress settings.
 

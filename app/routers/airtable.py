@@ -56,6 +56,7 @@ from app.models.airtable import (
     AirtableEditorPreviewRequest,
     AirtableEditorPreviewResponse,
     AirtablePreviewResponse,
+    AirtableWidgetMetricResponse,
     AirtableWidgetRowsResponse,
     AirtableRecord,
     AirtableUserIdResponse,
@@ -445,6 +446,84 @@ async def get_airtable_component_rows(
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
         cursor=cursor,
+    )
+
+
+@router.get(
+    "/airtable/component/{link}/metric",
+    response_model=AirtableWidgetMetricResponse,
+    summary="Count/Sum aggregation for a dashboard Airtable Metric widget",
+    description="""
+Returns a single computed value (Count of matching records, or Sum of one
+field across them) for a Metric widget, fetched server-side under the
+widget's stored token.
+
+The aggregation choice and (for Sum) the field name are read from the
+widget's OWN stored configuration — never from the request — same
+"caller cannot widen what they're shown" contract as
+`/airtable/component/{link}/rows`. When personalization is enabled, the
+value is computed over just the caller's own matching rows.
+
+Computed over the SAME cached full row set the Table widget's `/rows`
+endpoint uses. A table too large to cache reports `available: false` rather
+than an approximate value — there is no partial-fetch equivalent for an
+aggregate.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_metric(
+    link: str = Path(..., description="The component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    # Same bundle/AC/source-url/pat shape as get_airtable_component_rows —
+    # see the comments there. Plain sync SQLAlchemy off the event loop
+    # (finding #8), same reasoning.
+    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+    config = bundle.config
+
+    roles = list(user.roles)
+    widget_ac = config.get("access_control")
+    if widget_ac and HUB_ADMIN_ROLE not in roles:
+        if not _user_can_view_widget(widget_ac, user.email, roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this widget",
+            )
+
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = bundle.pat
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    stored = bundle.data or {}
+    aggregation = stored.get("aggregation") or "count"
+
+    return await airtable_service.fetch_widget_metric_cached(
+        link=link,
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        aggregation=aggregation,
+        sum_field=stored.get("sumField") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
     )
 
 

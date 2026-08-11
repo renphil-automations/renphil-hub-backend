@@ -954,6 +954,180 @@ class AirtableService:
             personalize_blocked=False,
         )
 
+    @staticmethod
+    def _coerce_numeric(value: Any) -> float | None:
+        """Best-effort numeric coercion for one Airtable field value, used by
+        the Metric widget's Sum aggregation. Returns None (skip this value
+        entirely, rather than treating it as 0) for anything that isn't
+        sensibly a number — missing/blank, a checkbox bool (counting
+        True/False as 1/0 would be a silent surprise, not a real sum), or
+        free text that doesn't parse.
+
+        A rollup/lookup field can return a LIST of values (e.g. summing a
+        linked record's own numeric field) — its own numeric entries are
+        added together; a list with no numeric entries contributes nothing.
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "").replace("$", "")
+            if not cleaned:
+                return None
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
+        if isinstance(value, list):
+            total = 0.0
+            found_any = False
+            for item in value:
+                coerced = AirtableService._coerce_numeric(item)
+                if coerced is not None:
+                    total += coerced
+                    found_any = True
+            return total if found_any else None
+        return None
+
+    async def fetch_widget_metric_cached(
+        self,
+        *,
+        link: str,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        aggregation: str,
+        sum_field: str | None = None,
+        filters: list[dict[str, Any]] | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+    ):
+        """Count/Sum aggregation for a dashboard Airtable Metric widget.
+
+        Shares the EXACT SAME `widget_rows` cache envelope
+        `fetch_widget_rows_cached` uses — same fingerprint shape, same TTL,
+        same cron refresh, same negative-cache/base-lock protections. No new
+        caching mechanism: this widget's own `link` already makes the cache
+        key unique, so a Metric widget never collides with (or shares stale
+        data from) a Table widget's entry even against the same base/table.
+        `selected_columns` is always omitted here (a Metric widget has no
+        column-display picker), so the walk fetches every field — which is
+        exactly what's needed to sum an arbitrary `sum_field` without a
+        second, differently-projected cache entry per widget.
+
+        Deliberately does NOT fall back to a live, uncached walk when the
+        table is too large to cache (`available=False` instead). Unlike the
+        row-list endpoint, there is no "first page" equivalent for an
+        aggregate — a count/sum over a partial fetch would be silently
+        WRONG, not just incomplete, which is worse than reporting nothing.
+
+        Personalize is applied in Python against the shared, unpersonalized
+        envelope, exactly like `fetch_widget_rows_cached` — same fail-closed
+        gate, checked before the cache is even touched, so Count/Sum can be
+        computed per-viewer without a second cache entry per viewer.
+        """
+        from app.models.airtable import AirtableWidgetMetricResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            logger.warning(
+                "Airtable widget metric refused: personalization enabled but "
+                "not applicable (base=%s table=%s) — no value computed",
+                base_id,
+                table_id,
+            )
+            return AirtableWidgetMetricResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                value=None,
+                available=True,
+                personalize_blocked=True,
+            )
+
+        if aggregation == "sum" and not sum_field:
+            # Not yet configured — nothing to compute. The frontend already
+            # knows `sumField` locally (it's part of the widget's own
+            # unprotected data blob) and should avoid calling this endpoint
+            # in this state at all; this is a defensive fallback, not the
+            # primary path.
+            return AirtableWidgetMetricResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                value=None,
+                available=False,
+                personalize_blocked=False,
+            )
+
+        cache = get_cache_service()
+        fingerprint = {
+            "link": link,
+            "sourceUrl": url,
+            "selectedColumns": [],
+            "filters": filters or [],
+            "personalizeEnabled": False,
+            "personalizeColumn": None,
+        }
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope = await self._get_or_warm_widget_cache(
+            cache_key=cache_key,
+            url=url,
+            api_key=api_key,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
+
+        if envelope is None:
+            return AirtableWidgetMetricResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                value=None,
+                available=False,
+                personalize_blocked=False,
+            )
+
+        rows = envelope["rows"]
+        if personalize_enabled:
+            rows = [
+                row
+                for row in rows
+                if ap.personalize_match(row.get(personalize_column), caller_email)
+            ]
+
+        if aggregation == "sum":
+            total = 0.0
+            for row in rows:
+                coerced = self._coerce_numeric(row.get(sum_field))
+                if coerced is not None:
+                    total += coerced
+            value: float | int = total
+        else:
+            value = len(rows)
+
+        return AirtableWidgetMetricResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            aggregation=aggregation,
+            value=value,
+            available=True,
+            personalize_blocked=False,
+        )
+
     async def warm_widget_cache(
         self,
         *,
