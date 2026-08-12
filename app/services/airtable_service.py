@@ -218,6 +218,24 @@ _WIDGET_RETRY_STRATEGY = _pyairtable_retry_strategy(
     status_forcelist=(429, 500, 502, 503, 504)
 )
 
+# ── Field-type hints for the viewer Filter/Sort/Group/Search toolbar ───────
+# (plan_airtable_widget_viewer_controls_2026-08-12.md §2.2). Deliberately
+# narrow: a field type not in this map renders as plain text, same as today.
+#
+# `multipleRecordLinks` and `multipleLookupValues` are EXCLUDED on purpose. A
+# linked record's raw row value is an array of unresolved `recXXXXXXXXXXXXXX`
+# ids — bubbling those looks more broken than today's plain text, and this
+# codebase's own `Tabs.tsx` already hides raw record ids outright
+# (`isAirtableRecordId`). A lookup field's resolved type is unpredictable
+# (text, number, or another link). Both keep plain-text rendering.
+_FIELD_TYPE_HINTS: dict[str, str] = {
+    "url": "url",
+    "button": "url",
+    "singleSelect": "select",
+    "multipleSelects": "select",
+    "multipleCollaborators": "select",
+}
+
 
 class AirtableService:
     """Async-friendly wrapper around ``pyairtable``."""
@@ -702,6 +720,168 @@ class AirtableService:
             ),
         )
 
+    # Suffix for the field-type schema cache's negative marker. Deliberately
+    # DISTINCT from `_NEGATIVE_CACHE_SUFFIX` above: that suffix means "this
+    # widget's ROW WALK is known-bad" — what `warm_widget_cache` consults to
+    # damp the cron, what `_get_or_warm_widget_cache` consults to skip a
+    # walk, and what several tests assert on by name
+    # (`k.endswith(":negative")`). A schema-scope failure says nothing about
+    # the row walk — conflating them would make one 403 on the Metadata API
+    # suppress row caching entirely.
+    _SCHEMA_NEGATIVE_CACHE_SUFFIX = ":schema_negative"
+
+    async def fetch_table_field_hints(
+        self, *, base_id: str, table_id: str, api_key: str
+    ) -> dict[str, str]:
+        """Best-effort Airtable field-type → render-hint map, cached separately
+        from the row cache (schema churns far less than rows).
+
+        Requires the PAT to hold Airtable's `schema.bases:read` scope. ANY
+        failure degrades to {} — today's plain-text rendering — never raises,
+        never blocks the widget. The admin is told separately
+        (`fetch_table_field_hints_with_status`); this method stays silent by
+        design.
+
+        No lock: one GET, not a multi-page walk. Deliberately does NOT reuse
+        the row cache's stampede lock — a schema fetch is not worth
+        serializing, and taking that lock here would let a schema call block
+        a row walk.
+        """
+        hints, _available = await self._fetch_table_field_hints_impl(
+            base_id=base_id, table_id=table_id, api_key=api_key
+        )
+        return hints
+
+    # Known, accepted: the schema cache key is {base_id, table_id} only — not
+    # the PAT. Two widgets on the same table share one entry, which is
+    # correct (schema is schema). Edge case: if widget A's PAT lacks the
+    # scope, the negative marker briefly blocks widget B whose PAT has it.
+    # Self-heals in AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS (60s). Not worth
+    # keying on the token, which would multiply the entry per widget. Largely
+    # moot once the PAT is rotated to hold `schema.bases:read`.
+    async def _mark_schema_unavailable(
+        self, cache: CacheService, cache_key: str, *, reason: str
+    ) -> None:
+        await cache.set(
+            f"{cache_key}{self._SCHEMA_NEGATIVE_CACHE_SUFFIX}",
+            {"reason": reason, "checked_at": datetime.now(timezone.utc).isoformat()},
+            ttl_seconds=self._settings.AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS,
+        )
+
+    async def fetch_table_field_hints_with_status(
+        self, *, base_id: str, table_id: str, api_key: str
+    ) -> tuple[dict[str, str], bool]:
+        """`fetch_table_field_hints` plus an `available` flag, for the admin
+        preview only. A table with no URL/select columns legitimately returns
+        ({}, True); a PAT without `schema.bases:read` returns ({}, False). The
+        two are indistinguishable from the hints alone, and the Property
+        Panel needs to say something different for each.
+
+        Not used by the viewer-facing `/rows` and `/rows/full` paths — a
+        viewer can do nothing about a missing scope, and carrying the flag
+        there would leak configuration state into the read path for no
+        benefit.
+
+        Always checks live against Airtable with THIS `api_key` — never trusts
+        the shared `{base_id, table_id}` cache to answer `available`. That
+        cache is deliberately PAT-agnostic for the read paths (schema is a
+        fact about the table, correctly shared across every widget on it,
+        same principle as the row cache) — but `available` answers a
+        different, requester-specific question: does THIS token hold
+        `schema.bases:read`. Trusting the shared cache for it would let a
+        token that has `data.records:read` but NOT `schema.bases:read` ride a
+        different, more-privileged token's cached success for up to
+        `AIRTABLE_SCHEMA_CACHE_TTL_SECONDS` (6h) — confirmed in review: an
+        admin testing a `data.records:read`-only PAT was able to enable the
+        Property Panel's viewer-controls toggle this way. Still WRITES the
+        shared cache on both success and failure exactly as before, so
+        `/rows` and `/rows/full` keep benefiting from it — only the READ side
+        (and the `cache.enabled` bypass, low-stakes for a debounced,
+        human-triggered preview) is skipped here.
+        """
+        return await self._fetch_table_field_hints_impl(
+            base_id=base_id, table_id=table_id, api_key=api_key, force_live=True,
+        )
+
+    async def _fetch_table_field_hints_impl(
+        self, *, base_id: str, table_id: str, api_key: str, force_live: bool = False,
+    ) -> tuple[dict[str, str], bool]:
+        """Shared worker `fetch_table_field_hints` and
+        `fetch_table_field_hints_with_status` both project from — one code
+        path, so `available` is derived directly from the control flow that
+        actually decided it rather than reconstructed afterward from a
+        second, redundant cache read.
+
+        `force_live=True` (only `fetch_table_field_hints_with_status` passes
+        it) skips every READ shortcut below — the `cache.enabled` bypass, the
+        positive-cache hit, and the negative-marker hit — so the function
+        always falls through to a live Airtable call using THIS `api_key`.
+        The WRITES at the bottom stay unconditional either way.
+        """
+        cache = get_cache_service()
+        cache_key = cache.build_key(
+            "widget_schema", {"base_id": base_id, "table_id": table_id}
+        )
+
+        if not force_live:
+            # Same reasoning as `fetch_widget_rows_cached`'s own guard (:872):
+            # with no cache, `get` returns None and `set` is a no-op —
+            # INCLUDING the negative marker below. Without this line every
+            # /rows request fires a live, undampened schema request, which
+            # doubles Airtable calls on exactly the degraded path that can
+            # least afford it. A disabled cache is a global infra condition,
+            # not something rotating the PAT would fix — `available=True`
+            # avoids blaming the token for it. (The admin-preview path
+            # doesn't get this bypass — see `force_live`'s own docstring —
+            # but that path is one debounced call per human keystroke, not
+            # per-viewer traffic, so paying for a live call while the cache
+            # is down is cheap here.)
+            if not cache.enabled:
+                return {}, True
+
+            cached = await cache.get(cache_key)
+            if isinstance(cached, dict):
+                return cached, True
+            if await cache.get(f"{cache_key}{self._SCHEMA_NEGATIVE_CACHE_SUFFIX}") is not None:
+                return {}, False
+
+        try:
+            api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
+            table_schema = await asyncio.to_thread(
+                lambda: api.base(base_id).schema().table(table_id)
+            )
+        except RequestException as exc:
+            # PAT lacks `schema.bases:read` → 403, until the token is rotated.
+            logger.warning(
+                "Airtable schema fetch failed (base=%s table=%s): %s — no type hints",
+                base_id, table_id, exc,
+            )
+            await self._mark_schema_unavailable(cache, cache_key, reason="fetch_failed")
+            return {}, False
+        except Exception:
+            # `BaseSchema.table(id)` raises a bare KeyError (NOT
+            # RequestException) for a stale/renamed table_id — `_find` ends
+            # in a dict subscript, pyairtable/models/schema.py:115. Must be
+            # caught separately or one bad widget 500s every viewer.
+            logger.exception(
+                "Unexpected error building Airtable field hints (base=%s table=%s)",
+                base_id, table_id,
+            )
+            await self._mark_schema_unavailable(cache, cache_key, reason="unexpected_error")
+            return {}, False
+
+        hints = {
+            f.name: hint
+            for f in table_schema.fields
+            if (hint := _FIELD_TYPE_HINTS.get(f.type))
+        }
+        await cache.set(
+            cache_key,
+            hints,
+            ttl_seconds=self._settings.AIRTABLE_SCHEMA_CACHE_TTL_SECONDS,
+        )
+        return hints, True
+
     async def _get_or_warm_widget_cache(
         self,
         *,
@@ -944,6 +1124,13 @@ class AirtableService:
             self._make_synthetic_cursor(next_index) if next_index < len(rows) else None
         )
 
+        # Typed-cell hints apply to the ordinary paginated widget too — asks
+        # #2/#3 (URL buttons, select bubbles) were never scoped as opt-in
+        # (plan_airtable_widget_viewer_controls_2026-08-12.md §2.5).
+        field_types = await self.fetch_table_field_hints(
+            base_id=envelope["base_id"], table_id=envelope["table_id"], api_key=api_key
+        )
+
         return AirtableWidgetRowsResponse(
             base_id=envelope["base_id"],
             table_id=envelope["table_id"],
@@ -952,6 +1139,186 @@ class AirtableService:
             rows=projected_rows,
             next_cursor=next_cursor,
             personalize_blocked=False,
+            field_types=field_types,
+        )
+
+    async def fetch_widget_full_rows_cached(
+        self,
+        *,
+        link: str,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        selected_columns: list[str] | None = None,
+        filters: list[dict[str, Any]] | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+    ):
+        """Whole-table view backing the viewer Filter/Sort/Group/Search
+        toolbar (plan_airtable_widget_viewer_controls_2026-08-12.md §2.4).
+
+        Reuses the EXACT cache entry `fetch_widget_rows_cached` warms — same
+        fingerprint — so no second walk and no new caching mechanism.
+
+        `available=False` when the table was not cacheable at all, when the
+        cache is disabled, or when the personalize-filtered result exceeds
+        `AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS`. The caller falls back to the
+        paginated `/rows` view rather than erroring: some browsable data
+        beats none. (Deliberately UNLIKE `fetch_widget_metric_cached`'s "no
+        partial number" stance — a partial aggregate is silently WRONG, a
+        partial row list is merely incomplete.)
+
+        The `viewerControlsEnabled` toggle gate is the ROUTER's job (product
+        control, not a security boundary — see the router docstring), not
+        this method's: everything below is exactly as safe to call as
+        `fetch_widget_rows_cached` is.
+        """
+        from app.models.airtable import AirtableWidgetFullRowsResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+        page_size = self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE
+
+        # 1. Fail-closed personalize gate FIRST, before the cache is touched
+        # at all — identical to fetch_widget_rows_cached. `available=True`
+        # here: the gate is about WHO may see rows, not about cacheability.
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            logger.warning(
+                "Airtable widget full-rows fetch refused: personalization enabled "
+                "but not applicable (base=%s table=%s) — returning no rows",
+                base_id,
+                table_id,
+            )
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=list(selected_columns or []),
+                field_types={},
+                rows=[],
+                personalize_blocked=True,
+                available=True,
+                page_size=page_size,
+            )
+
+        cache = get_cache_service()
+
+        # 2. No cache configured ⇒ available=False (L3, rev-2 defect #10).
+        # Without this, a disabled cache walks the ENTIRE table live on
+        # every single request before shipping up to
+        # AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS rows — the exact defect
+        # `fetch_widget_rows_cached`'s own guard (:872 area) fixed for the
+        # paginated path, reintroduced here on a path that ships far more
+        # rows per request.
+        if not cache.enabled:
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=[],
+                field_types={},
+                rows=[],
+                personalize_blocked=False,
+                available=False,
+                page_size=page_size,
+            )
+
+        # 3. Fingerprint built BYTE-IDENTICALLY to fetch_widget_rows_cached's
+        # own fingerprint (L1) — a mismatch silently doubles the Airtable
+        # walk and the cache storage, with no visible symptom. Do NOT copy
+        # fetch_widget_metric_cached's deliberately-different fingerprint —
+        # that one is specific to the Metric widget's no-column-picker case.
+        fingerprint = {
+            "link": link,
+            "sourceUrl": url,
+            "selectedColumns": list(selected_columns or []),
+            "filters": filters or [],
+            "personalizeEnabled": bool(personalize_enabled),
+            "personalizeColumn": personalize_column or None,
+        }
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope = await self._get_or_warm_widget_cache(
+            cache_key=cache_key,
+            url=url,
+            api_key=api_key,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
+
+        if envelope is None:
+            # Oversized / locked / walk failed — no live fallback here
+            # (unlike the paginated path): shipping up to 10,000 rows live,
+            # uncached, on every request would be far worse than the
+            # paginated live fallback's single page. The caller degrades to
+            # the paginated `/rows` view instead.
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=[],
+                field_types={},
+                rows=[],
+                personalize_blocked=False,
+                available=False,
+                page_size=page_size,
+            )
+
+        # 5. Personalize-filter in Python, THEN project to response_fields,
+        # THEN check the cap — order matters twice over: a 50,000-row table
+        # personalized down to 12 rows for one viewer must not be reported
+        # unavailable, and the projection is what stops the auto-appended
+        # personalize column from reaching the client (L2).
+        rows = envelope["rows"]
+        if personalize_enabled:
+            rows = [
+                row
+                for row in rows
+                if ap.personalize_match(row.get(personalize_column), caller_email)
+            ]
+
+        # Exact same projection expression as fetch_widget_rows_cached
+        # (:934-941 area) — reused verbatim so the auto-appended
+        # personalize column (when not in the admin's own selectedColumns)
+        # never leaks to a viewer here either (L2).
+        response_fields = list(selected_columns) if selected_columns else envelope["fields"]
+        field_set = set(response_fields)
+        projected_rows = [
+            {k: v for k, v in row.items() if k == "id" or k in field_set} for row in rows
+        ]
+
+        if len(projected_rows) > self._settings.AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS:
+            return AirtableWidgetFullRowsResponse(
+                base_id=envelope["base_id"],
+                table_id=envelope["table_id"],
+                view_id=envelope.get("view_id"),
+                fields=response_fields,
+                field_types={},
+                rows=[],
+                personalize_blocked=False,
+                available=False,
+                page_size=page_size,
+            )
+
+        field_types = await self.fetch_table_field_hints(
+            base_id=envelope["base_id"], table_id=envelope["table_id"], api_key=api_key
+        )
+
+        return AirtableWidgetFullRowsResponse(
+            base_id=envelope["base_id"],
+            table_id=envelope["table_id"],
+            view_id=envelope.get("view_id"),
+            fields=response_fields,
+            field_types=field_types,
+            rows=projected_rows,
+            personalize_blocked=False,
+            available=True,
+            page_size=page_size,
         )
 
     @staticmethod
@@ -1417,6 +1784,10 @@ class AirtableService:
         # even though the saved widget honors it once persisted.
         fields = list(selected_columns) if selected_columns else seen_fields
 
+        field_types, field_types_available = await self.fetch_table_field_hints_with_status(
+            base_id=base_id, table_id=table_id, api_key=api_key
+        )
+
         return AirtableEditorPreviewResponse(
             base_id=base_id,
             table_id=table_id,
@@ -1425,6 +1796,8 @@ class AirtableService:
             rows=rows,
             personalize_blocked=personalize_blocked,
             unpersonalized_row_count=len(unpersonalized),
+            field_types=field_types,
+            field_types_available=field_types_available,
         )
 
     async def preview_from_url(

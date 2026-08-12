@@ -464,6 +464,29 @@ class Settings(BaseSettings):
     # sharing one marker between both paths.
     AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS: int = 900
 
+    # ── Airtable widget viewer controls (plan_airtable_widget_viewer_controls_2026-08-12.md) ──
+    # Schema churns far less than rows, so it gets its own, much longer TTL
+    # rather than riding the row cache's 30-minute one.
+    AIRTABLE_SCHEMA_CACHE_TTL_SECONDS: int = 21_600   # 6h
+
+    # Hard cap on rows shipped in ONE /rows/full response, checked AFTER
+    # personalization and projection (§2.4). Past it the endpoint reports
+    # available=False and the widget falls back to the paginated view.
+    #
+    # Sized against transfer, not DOM: the client-side pager (§4.6) bounds
+    # rendered nodes to one page regardless of table size, so this number only
+    # governs payload and the cost of one in-memory filter pass. At the
+    # benchmarked 8-column shape (~260 B/row raw, plan_airtable_cache_scaling
+    # §"measured facts") 10,000 rows is ~2.6 MB uncompressed — there is no gzip
+    # middleware on this app (main.py:63). Deliberately BELOW
+    # AIRTABLE_CACHE_MAX_ROWS (50,000): a table between the two is cached and
+    # pageable but has no toolbar.
+    AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS: int = 10_000
+
+    # Client-side page size once the whole table is in the browser (§4.6).
+    # Matches today's server page size so visual density is unchanged.
+    AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE: int = 100
+
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)
     # ══════════════════════════════════════════════════════════════════

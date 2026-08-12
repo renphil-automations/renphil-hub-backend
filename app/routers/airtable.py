@@ -56,6 +56,7 @@ from app.models.airtable import (
     AirtableEditorPreviewRequest,
     AirtableEditorPreviewResponse,
     AirtablePreviewResponse,
+    AirtableWidgetFullRowsResponse,
     AirtableWidgetMetricResponse,
     AirtableWidgetRowsResponse,
     AirtableRecord,
@@ -521,6 +522,108 @@ async def get_airtable_component_metric(
         caller_email=user.email,
         aggregation=aggregation,
         sum_field=stored.get("sumField") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
+    )
+
+
+@router.get(
+    "/airtable/component/{link}/rows/full",
+    response_model=AirtableWidgetFullRowsResponse,
+    summary="Whole-table rows for a dashboard Airtable Table widget's viewer toolbar",
+    description="""
+Returns the widget's ENTIRE cached row set in one response, for the viewer
+Filter/Sort/Group/Search toolbar to run client-side over. Reads the same
+Upstash-cached table `/rows` warms — no second Airtable walk.
+
+Gated on the widget's own `viewerControlsEnabled` toggle (admin opt-in,
+off by default): when the toggle is off, `available: false` is returned
+rather than 403/404, so a stale client degrades to the paginated `/rows`
+view instead of erroring.
+
+**This gate is a product control, not a security boundary.**
+`viewerControlsEnabled` rides the ordinary canvas save, which requires login
+but no per-widget authorization, so a determined caller could flip it. That
+is acceptable only because the gate does not widen what anyone may see:
+access control, the fail-closed personalize gate, and the `selectedColumns`
+projection all run below it, unchanged, and every row this endpoint can
+return is a row the same caller could already reach by paging `/rows`. It
+bounds per-request amplification (one response instead of N) and honours the
+admin's display choice; it is not what keeps data safe.
+
+`available: false` also covers: the cache is disabled, the table was never
+cacheable at all (too large — see `/rows`'s own oversized handling), or the
+personalize-filtered result exceeds `AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS`.
+Every case falls back to the paginated `/rows` view rather than erroring.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_rows_full(
+    link: str = Path(..., description="The component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    # Same bundle/AC/source-url/pat shape as get_airtable_component_rows and
+    # get_airtable_component_metric — see the comments there.
+    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+    config = bundle.config
+
+    roles = list(user.roles)
+    widget_ac = config.get("access_control")
+    if widget_ac and HUB_ADMIN_ROLE not in roles:
+        if not _user_can_view_widget(widget_ac, user.email, roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this widget",
+            )
+
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = bundle.pat
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    stored = bundle.data or {}
+
+    # Product-control gate (see docstring above), enforced HERE rather than
+    # in the service — everything below this point is exactly as safe to
+    # call as fetch_widget_rows_cached is, toggle or no toggle.
+    if not bool(stored.get("viewerControlsEnabled")):
+        settings = get_settings()
+        base_id, table_id, view_id = AirtableService._parse_airtable_share_url(source_url)
+        return AirtableWidgetFullRowsResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=[],
+            field_types={},
+            rows=[],
+            personalize_blocked=False,
+            available=False,
+            page_size=settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+        )
+
+    return await airtable_service.fetch_widget_full_rows_cached(
+        link=link,
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        selected_columns=stored.get("selectedColumns") or None,
         filters=stored.get("filters") or None,
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
