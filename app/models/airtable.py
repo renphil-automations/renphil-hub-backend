@@ -73,6 +73,90 @@ class AirtableWidgetRowsResponse(BaseModel):
             "the point."
         ),
     )
+    field_types: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Best-effort Airtable field-type hint per column ('url' or "
+            "'select'), for typed cell rendering. A column absent here "
+            "renders as plain text — either its type has no special "
+            "rendering, or the widget's token lacks the schema.bases:read "
+            "scope needed to discover it."
+        ),
+    )
+
+
+class AirtableWidgetFullRowsResponse(BaseModel):
+    """Whole-table view backing the viewer Filter/Sort/Group/Search toolbar
+    (plan_airtable_widget_viewer_controls_2026-08-12.md §2.4, §3.1). Reads
+    the SAME cached entry `AirtableWidgetRowsResponse`'s `/rows` endpoint
+    warms — no second walk, no new caching mechanism.
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    fields: list[str] = Field(
+        default_factory=list,
+        description="Column names, same ordering rule as the paginated /rows endpoint.",
+    )
+    field_types: dict[str, str] = Field(default_factory=dict)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    personalize_blocked: bool = Field(
+        default=False,
+        description="Same fail-closed meaning as the paginated /rows endpoint.",
+    )
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the table was not cacheable at all, the cache is "
+            "disabled, the viewer-controls toggle is off, or the "
+            "personalize-filtered result exceeds "
+            "AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS. The caller falls back to "
+            "the paginated /rows view rather than erroring."
+        ),
+    )
+    page_size: int = Field(
+        description=(
+            "Client-side page size for the toolbar's own pager "
+            "(AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE) — the single authority "
+            "for this number lives on the server, same as the paginated "
+            "widget's own page size."
+        ),
+    )
+
+
+class AirtableWidgetMetricResponse(BaseModel):
+    """Single-number Count/Sum aggregation for a dashboard Airtable Metric
+    widget, computed server-side over the SAME cached row set the Table
+    widget's `/rows` endpoint uses (see `AirtableService.fetch_widget_metric_cached`).
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    aggregation: str = Field(description="'count' or 'sum', echoed back for the caller's own bookkeeping.")
+    value: float | int | None = Field(
+        default=None,
+        description="The computed count/sum, or null when unavailable/blocked.",
+    )
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the underlying table is too large to cache (or the "
+            "cache walk itself failed) — deliberately never falls back to a "
+            "live partial fetch for an aggregate, since a count/sum over "
+            "only some rows would be silently wrong, not just incomplete."
+        ),
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description=(
+            "True when personalization is enabled but could not be applied, "
+            "so no value was computed. Distinguishes 'the filter could not "
+            "run' from 'the table is too large to cache' — both leave "
+            "`value` null, for different reasons."
+        ),
+    )
 
 
 class AirtableEditorPreviewRequest(BaseModel):
@@ -129,6 +213,16 @@ class AirtableEditorPreviewResponse(BaseModel):
             "distinguish 'personalize works, you have no rows' from 'the "
             "personalize column matches nothing' — both look identical "
             "otherwise."
+        ),
+    )
+    field_types: dict[str, str] = Field(default_factory=dict)
+    field_types_available: bool = Field(
+        default=True,
+        description=(
+            "False when the schema fetch itself failed (e.g. the widget's "
+            "token lacks the schema.bases:read scope) — distinct from a "
+            "table that legitimately has no URL/select columns, which "
+            "returns field_types={} with this still True."
         ),
     )
 

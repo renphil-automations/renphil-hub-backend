@@ -73,18 +73,38 @@ GRIDSTACK_REPRESENTATION_TYPES = (GRIDSTACK_WIDGET_TYPE, SUPER_GRIDSTACK_WIDGET_
 
 AIRTABLE_WIDGET_TYPE = "airtable"
 
-# Keys on an `airtable` widget's data blob that decide WHO sees WHICH rows,
+# A second airtable-backed widget type (single-number Count/Sum card, see
+# AI Docs — Airtable Metric Component). Structurally identical to the table
+# widget for every concern in this module: it holds its own PAT/sourceUrl
+# (+ optional Personalize Results, same as the table widget), needs the
+# exact same protected-field stripping, and must be discoverable by the
+# cache-refresh sweep. AIRTABLE_LIKE_WIDGET_TYPES is the membership check
+# used everywhere the old code compared a component/widget type against
+# AIRTABLE_WIDGET_TYPE for one of those reasons — there is currently no
+# genuinely table-specific check in this file that needs to stay narrow.
+AIRTABLE_METRIC_WIDGET_TYPE = "airtable_metric"
+AIRTABLE_LIKE_WIDGET_TYPES = (AIRTABLE_WIDGET_TYPE, AIRTABLE_METRIC_WIDGET_TYPE)
+
+# Keys on an `airtable`/`airtable_metric` widget's data blob that decide WHO sees WHICH rows,
 # name the data source, or hold the credential used to fetch it.
 #
 # `PUT /v2/tabs/{document_id}/content` — the canvas save that lands in
-# update_tab_content_v2 below — has NO auth dependency, so anything writable
-# through it is writable by anyone who can reach the API. Without this list,
-# an attacker who can no longer *read* the PAT (it is stripped on the way
-# out) could still neutralise the personalize filter around it and have the
-# server fetch every row under the stored token. These keys are therefore
-# read back from storage on every canvas save and the incoming values
-# discarded; the only way to change them is the authenticated
-# `PUT /data/airtable/component/{link}/config` endpoint.
+# update_tab_content_v2 below — requires a valid login (tabs_v2.py's router-
+# level `Depends(get_current_user)`), but that dependency is authentication
+# only: it decodes the JWT and returns whoever is logged in, with no per-tab
+# or per-widget authorization check — the exact same shallow gate the
+# "authenticated" config endpoint below uses. So anything writable through
+# the canvas save is writable by any logged-in user, not just someone
+# entitled to edit THIS widget. Without this list, an attacker who can no
+# longer *read* the PAT (it is stripped on the way out) could still
+# neutralise the personalize filter around it and have the server fetch
+# every row under the stored token. These keys are therefore read back from
+# storage on every canvas save and the incoming values discarded; the only
+# way to change them is the authenticated
+# `PUT /data/airtable/component/{link}/config` endpoint — not because that
+# endpoint is held to a higher authorization bar (it isn't), but because it
+# is the only code path this module ever lets write them, so a routine
+# drag/resize save can never touch them as a side effect.
 #
 # The component's own `access_control` COLUMN is protected the same way (it
 # is absent from this tuple only because it is a column, not blob data) —
@@ -478,11 +498,12 @@ def _sanitised_component_data(
     """Pure derivation half of `_resolve_component_data` — no DB access.
 
     Given a component and its already-fetched raw blob, returns the
-    client-facing view. Only `airtable` widgets differ from their raw form;
-    every other type's raw blob already IS the client-facing view and is
-    returned unchanged, exactly as before this split.
+    client-facing view. Only `airtable`/`airtable_metric` widgets differ
+    from their raw form; every other type's raw blob already IS the
+    client-facing view and is returned unchanged, exactly as before this
+    split.
     """
-    if component.type != AIRTABLE_WIDGET_TYPE:
+    if component.type not in AIRTABLE_LIKE_WIDGET_TYPES:
         return raw
 
     pat = raw.get("pat")
@@ -505,7 +526,7 @@ def _write_component_data(db: Session, component: ComponentV2, data: dict[str, A
     makes it impossible for a caller to forget."""
     stored = (data or {}).get("content", []) if component.type == "block_note" else (data or {})
 
-    if component.type == AIRTABLE_WIDGET_TYPE and isinstance(stored, dict):
+    if component.type in AIRTABLE_LIKE_WIDGET_TYPES and isinstance(stored, dict):
         stored = {k: v for k, v in stored.items() if k not in AIRTABLE_COMPUTED_DATA_FIELDS}
 
     if component.page_content_id is not None:
@@ -533,11 +554,12 @@ def _apply_airtable_protection(
     back to its stored value, dropping the key entirely when nothing is
     stored yet.
 
-    Called on the canvas-save path only, which is unauthenticated — see
-    AIRTABLE_PROTECTED_DATA_FIELDS for why. A brand-new airtable widget
-    therefore lands with none of its protected fields set; the frontend
-    follows the content save with a `PUT /data/airtable/component/{link}/config`
-    call (which IS authenticated) to populate them.
+    Called on the canvas-save path only, which requires login but no
+    per-widget authorization — see AIRTABLE_PROTECTED_DATA_FIELDS for why
+    that's still not enough. A brand-new airtable widget therefore lands
+    with none of its protected fields set; the frontend follows the content
+    save with a `PUT /data/airtable/component/{link}/config` call (the only
+    path allowed to actually write them) to populate them.
     """
     incoming = incoming if isinstance(incoming, dict) else {}
     stored = stored if isinstance(stored, dict) else {}
@@ -806,20 +828,21 @@ def _airtable_component_by_link(db: Session, link: str) -> ComponentV2 | None:
     if not link:
         return None
     component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
-    if component is None or component.type != AIRTABLE_WIDGET_TYPE:
+    if component is None or component.type not in AIRTABLE_LIKE_WIDGET_TYPES:
         return None
     return component
 
 
 def list_airtable_component_links(db: Session) -> list[str]:
-    """Every airtable widget's `link`, for cache warming
-    (`POST /airtable/cache/refresh` — plan_airtable_widget_caching_2026-08-06.md
-    §7.1). Server-internal. Widgets with a null/blank link can't be looked
-    up by `_airtable_component_by_link` anyway, so they're excluded here.
+    """Every airtable-like (table OR metric) widget's `link`, for cache
+    warming (`POST /airtable/cache/refresh` —
+    plan_airtable_widget_caching_2026-08-06.md §7.1). Server-internal.
+    Widgets with a null/blank link can't be looked up by
+    `_airtable_component_by_link` anyway, so they're excluded here.
     """
     rows = (
         db.query(ComponentV2.link)
-        .filter(ComponentV2.type == AIRTABLE_WIDGET_TYPE)
+        .filter(ComponentV2.type.in_(AIRTABLE_LIKE_WIDGET_TYPES))
         .all()
     )
     return [link for (link,) in rows if link and link.strip()]
@@ -1752,14 +1775,16 @@ def update_tab_content_v2(
             description = widget_entry.get("description")
 
             # NULL means inherit (§3.4) — nothing to check. Airtable's is
-            # protected (never actually written from this unauthenticated
-            # path — see AIRTABLE_PROTECTED_DATA_FIELDS above) and a
-            # mirror's stored value is inert (serialized access is derived
-            # from the mirror's target, never its own column) — validating
-            # either would reject values that are never actually enforced.
+            # protected (never actually written from this save path — no
+            # per-widget authorization check runs here, only login, so it
+            # can't be trusted with it; see AIRTABLE_PROTECTED_DATA_FIELDS
+            # above) and a mirror's stored value is inert (serialized access
+            # is derived from the mirror's target, never its own column) —
+            # validating either would reject values that are never actually
+            # enforced.
             if (
                 access_control
-                and widget_type != AIRTABLE_WIDGET_TYPE
+                and widget_type not in AIRTABLE_LIKE_WIDGET_TYPES
                 and widget_type != MIRROR_WIDGET_TYPE
             ):
                 violation = access_control_subset_violation(
@@ -1799,7 +1824,7 @@ def update_tab_content_v2(
                 # on every canvas save.
                 stored_data = (
                     _raw_component_data(db, existing)
-                    if widget_type == AIRTABLE_WIDGET_TYPE
+                    if widget_type in AIRTABLE_LIKE_WIDGET_TYPES
                     else None
                 )
 
@@ -1810,10 +1835,13 @@ def update_tab_content_v2(
                 existing.height = layout_entry.get("h", existing.height)
                 # Three independent reasons to leave the stored AC alone.
                 # An airtable widget's access_control is protected — see
-                # AIRTABLE_PROTECTED_DATA_FIELDS. This save path is
-                # unauthenticated, so letting it clear the AC would defeat the
-                # check on GET /data/airtable/component/{link}/rows. Changing
-                # it goes through the authenticated config endpoint instead.
+                # AIRTABLE_PROTECTED_DATA_FIELDS. This save path runs no
+                # per-widget authorization check (login only), so letting it
+                # clear the AC would defeat the check on
+                # GET /data/airtable/component/{link}/rows. Changing it goes
+                # through the config endpoint instead — not because that
+                # endpoint enforces a stronger authorization, but because
+                # it's the only path allowed to write it.
                 # The serializer intentionally omits an empty access object.
                 # Absence therefore means "preserve", not "overwrite with
                 # null". Treating it as null made every empty-access sibling
@@ -1822,7 +1850,7 @@ def update_tab_content_v2(
                 # is derived from the target for read filtering, not the
                 # mirror row's own persisted access.
                 if (
-                    widget_type != AIRTABLE_WIDGET_TYPE
+                    widget_type not in AIRTABLE_LIKE_WIDGET_TYPES
                     and widget_type != MIRROR_WIDGET_TYPE
                     and "access_control" in widget_entry
                 ):
@@ -1838,7 +1866,7 @@ def update_tab_content_v2(
 
                 if widget_type != MIRROR_WIDGET_TYPE:
                     data_to_write = widget_data if isinstance(widget_data, dict) else {}
-                    if widget_type == AIRTABLE_WIDGET_TYPE:
+                    if widget_type in AIRTABLE_LIKE_WIDGET_TYPES:
                         data_to_write = _apply_airtable_protection(stored_data, data_to_write)
                     _write_component_data(db, existing, data_to_write)
                 db.flush()
@@ -1851,12 +1879,13 @@ def update_tab_content_v2(
                     title=title,
                     description=description,
                     props=structural_props,
-                    # A brand-new airtable widget gets no access_control here
-                    # (protected — see AIRTABLE_PROTECTED_DATA_FIELDS); the
-                    # frontend sets it via the authenticated config endpoint
-                    # right after this save assigns the component its `link`.
+                    # A brand-new airtable/airtable_metric widget gets no
+                    # access_control here (protected — see
+                    # AIRTABLE_PROTECTED_DATA_FIELDS); the frontend sets it via
+                    # the authenticated config endpoint right after this save
+                    # assigns the component its `link`.
                     access_control=(
-                        None if widget_type == AIRTABLE_WIDGET_TYPE else access_control
+                        None if widget_type in AIRTABLE_LIKE_WIDGET_TYPES else access_control
                     ),
                     x=layout_entry.get("x", 0),
                     y=layout_entry.get("y", 0),
@@ -1873,9 +1902,11 @@ def update_tab_content_v2(
                     # id is populated for the receipt below too) already gave
                     # new_component its id.
                     data_to_write = widget_data if isinstance(widget_data, dict) else {}
-                    if widget_type == AIRTABLE_WIDGET_TYPE:
+                    if widget_type in AIRTABLE_LIKE_WIDGET_TYPES:
                         # Nothing stored yet, so this drops every protected
-                        # field rather than trusting the unauthenticated body.
+                        # field rather than trusting the request body — this
+                        # save path checks login only, not per-widget
+                        # authorization.
                         data_to_write = _apply_airtable_protection(None, data_to_write)
                     _write_component_data(db, new_component, data_to_write)
                 search_updates[new_component.id] = "upsert"
