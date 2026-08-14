@@ -487,6 +487,18 @@ class Settings(BaseSettings):
     # Matches today's server page size so visual density is unchanged.
     AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE: int = 100
 
+    # ── Airtable Chart widget (plan_airtable_chart_widget_2026-08-13.md) ──
+    # Default number of groups a chart widget shows before the remainder is
+    # folded into a single 'Other' bucket, when the widget stores no preference.
+    AIRTABLE_CHART_DEFAULT_MAX_GROUPS: int = 10
+
+    # Hard ceiling on that number regardless of what a widget asks for. Bounds
+    # the response and the rendered DOM: a group-by on a high-cardinality field
+    # (a name, an email, a record id) would otherwise produce thousands of
+    # slices, none of them readable. The client's maxGroups is a preference
+    # clamped by this, never a ceiling of its own.
+    AIRTABLE_CHART_MAX_GROUPS: int = 50
+
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)
     # ══════════════════════════════════════════════════════════════════

@@ -83,7 +83,21 @@ AIRTABLE_WIDGET_TYPE = "airtable"
 # AIRTABLE_WIDGET_TYPE for one of those reasons — there is currently no
 # genuinely table-specific check in this file that needs to stay narrow.
 AIRTABLE_METRIC_WIDGET_TYPE = "airtable_metric"
-AIRTABLE_LIKE_WIDGET_TYPES = (AIRTABLE_WIDGET_TYPE, AIRTABLE_METRIC_WIDGET_TYPE)
+
+# A third airtable-backed widget type (grouped Count/Sum bar/line/pie, see
+# plan_airtable_chart_widget_2026-08-13.md). Same structural shape as the
+# other two — own PAT/sourceUrl/Personalize Results, same protected-field
+# stripping, same cache-refresh discoverability — so it joins
+# AIRTABLE_LIKE_WIDGET_TYPES rather than getting a parallel, narrower check.
+# This is also what makes the widget's own access_control protected against
+# the canvas save (plan §0.2/§4) — the same behaviour Table and Metric
+# widgets already have.
+AIRTABLE_CHART_WIDGET_TYPE = "chart"
+AIRTABLE_LIKE_WIDGET_TYPES = (
+    AIRTABLE_WIDGET_TYPE,
+    AIRTABLE_METRIC_WIDGET_TYPE,
+    AIRTABLE_CHART_WIDGET_TYPE,
+)
 
 # Keys on an `airtable`/`airtable_metric` widget's data blob that decide WHO sees WHICH rows,
 # name the data source, or hold the credential used to fetch it.
@@ -1041,6 +1055,27 @@ def update_airtable_component_config(
                     data["patUpdatedAt"] = _utc_now().isoformat()
 
         if access_control is not _UNSET:
+            # §4.2 (plan_airtable_chart_widget_2026-08-13.md) — this endpoint
+            # is now the ONLY place an airtable-like widget's access_control
+            # can be written (the canvas save protects it, see
+            # AIRTABLE_PROTECTED_DATA_FIELDS), so it must enforce the same
+            # ceiling the canvas save enforces on every OTHER widget's AC
+            # (:1785-1794 below) — a value may only narrow the gridstack's
+            # own resolved ceiling, never widen it. Without this, moving a
+            # chart/table/metric widget's AC onto this endpoint (§4.1) would
+            # be a net security regression, not a fix.
+            if access_control:
+                gridstack = (
+                    db.query(GridstackV2)
+                    .filter(GridstackV2.id == component.gridstack_id)
+                    .first()
+                )
+                if gridstack is not None:
+                    violation = access_control_subset_violation(
+                        access_control, resolved_ac_for_gridstack(db, gridstack)
+                    )
+                    if violation is not None:
+                        raise ValueError(violation)
             component.access_control = access_control
 
         _write_component_data(db, component, data)
