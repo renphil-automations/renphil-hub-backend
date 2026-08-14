@@ -57,8 +57,10 @@ class AirtableWidgetRowsResponse(BaseModel):
         default=None,
         description=(
             "Opaque cursor for the next page, or null on the last page. Pass "
-            "it back as `cursor`. Airtable expires these after a while — on "
-            "an error, restart from the first page."
+            "it back as `cursor`. Treat it as strictly opaque: it may be a "
+            "synthetic cache-relative cursor or a real Airtable offset "
+            "depending on whether this widget's rows are cached, either of "
+            "which can go stale — on an error, restart from the first page."
         ),
     )
     personalize_blocked: bool = Field(

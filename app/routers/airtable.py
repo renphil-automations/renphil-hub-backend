@@ -16,7 +16,9 @@ When ``opportunity_rec_type`` is a list, an ``OR`` (IN) match is used.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import time
 from email.utils import parseaddr
 from typing import Any
 from urllib.parse import parse_qs
@@ -25,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Body,
     Depends,
     Header,
@@ -36,7 +39,7 @@ from fastapi import (
 )
 
 from app.config import get_settings
-from app.db_v2.database import get_db_v2
+from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.dependencies import (
     get_airtable_service,
     get_current_user,
@@ -149,9 +152,9 @@ from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.gemini_service import GeminiService
 from app.services.gridstack_service import (
+    get_airtable_component_bundle,
     get_airtable_component_config,
-    get_airtable_component_data,
-    get_airtable_pat_for_component,
+    list_airtable_component_links,
     update_airtable_component_config,
 )
 from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
@@ -268,6 +271,7 @@ to clear it. The token is never returned; use `hasPat` / `patHint`.
 def update_airtable_component_config_endpoint(
     link: str = Path(..., description="The component's stable `link`."),
     body: AirtableComponentConfigUpdate = Body(...),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_v2),
     _user: UserInfo = Depends(get_current_user),
 ):
@@ -292,7 +296,60 @@ def update_airtable_component_config_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
+
+    # Warm-on-save: an admin just changed the fields that decide the row
+    # cache's fingerprint (sourceUrl / personalize settings), so the OLD
+    # cached entry (if any) no longer matches what a viewer would build.
+    # Without this, the very first viewer after a save pays the full,
+    # throttled table walk themselves. Scheduled as a background task so
+    # the save's own response returns immediately rather than waiting on a
+    # walk that can take well over a minute on a large table.
+    background_tasks.add_task(_warm_after_config_save, link)
+
     return config
+
+
+async def _warm_after_config_save(link: str) -> None:
+    """Fire-and-forget cache warm, scheduled right after an admin saves an
+    Airtable widget's config (see `update_airtable_component_config_endpoint`).
+
+    Runs its OWN database session rather than reusing the request's: a
+    FastAPI background task executes after the response has been sent, by
+    which point the request's own `db` dependency may already be torn
+    down — reusing it here is the exact footgun FastAPI's own docs warn
+    about for background tasks plus request-scoped sessions.
+
+    Mirrors `_refresh_one`'s body (same bundle lookup, same guard, same
+    `warm_widget_cache` call) but must never raise: a warm failure here is
+    just a missed optimization on an already-successful save, never an
+    error the admin should see.
+    """
+    db = SessionLocalV2()
+    try:
+        # Plain sync SQLAlchemy — off the event loop, same as every other
+        # call site of this accessor (finding #8).
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+        if bundle is None:
+            return  # deleted/renamed between the save committing and this running
+        config = bundle.config
+        source_url = (config.get("sourceUrl") or "").strip()
+        if not source_url or not bundle.pat:
+            return  # nothing to fetch yet — same guard `_refresh_one` uses
+        stored = bundle.data or {}
+        outcome = await get_airtable_service().warm_widget_cache(
+            link=link,
+            url=source_url,
+            api_key=bundle.pat,
+            selected_columns=stored.get("selectedColumns") or None,
+            filters=stored.get("filters") or None,
+            personalize_enabled=bool(config.get("personalizeEnabled")),
+            personalize_column=config.get("personalizeColumn"),
+        )
+        logger.info("Airtable warm-on-save: link=%s -> %s", link, outcome)
+    except Exception:
+        logger.exception("Airtable warm-on-save failed for link=%s", link)
+    finally:
+        db.close()
 
 
 @router.get(
@@ -323,12 +380,22 @@ async def get_airtable_component_rows(
     user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    config = get_airtable_component_config(db, link)
-    if config is None:
+    # ONE bundle instead of three independent accessors: config + pat + data
+    # each used to re-query the same ComponentV2 and PageContentV2 rows, so
+    # this endpoint issued 6 queries to read 2 rows on EVERY request — cache
+    # hit, cache miss and live oversized fallback alike
+    # (plan_airtable_cache_scaling_2026-08-08.md §4.7).
+    #
+    # Plain sync SQLAlchemy (finding #8) — off the event loop via to_thread
+    # so this ~165ms Neon round trip doesn't stall every other in-flight
+    # request on the shared asyncio loop.
+    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+    if bundle is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
+    config = bundle.config
 
     roles = list(user.roles)
 
@@ -354,16 +421,22 @@ async def get_airtable_component_rows(
             detail="This Airtable widget has no source URL configured",
         )
 
-    pat = get_airtable_pat_for_component(db, link)
+    # `.pat` is the ONLY place the token is read, and it goes straight to the
+    # outbound Airtable call below — never into a response (L12).
+    pat = bundle.pat
     if not pat:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This Airtable widget has no access token configured",
         )
 
-    stored = get_airtable_component_data(db, link) or {}
+    stored = bundle.data or {}
 
-    return await airtable_service.fetch_widget_rows(
+    # Cache sits strictly BELOW the access-control check above — never
+    # decorate this handler with @airtable_cache, which would serve a
+    # cached hit before that check ever ran (plan §3.1).
+    return await airtable_service.fetch_widget_rows_cached(
+        link=link,
         url=source_url,
         api_key=pat,
         caller_email=user.email,
@@ -373,6 +446,214 @@ async def get_airtable_component_rows(
         personalize_column=config.get("personalizeColumn"),
         cursor=cursor,
     )
+
+
+def _check_cache_refresh_token(x_sync_token: str | None) -> None:
+    """Shared-secret auth for the cache-refresh endpoint — same shape as
+    `knowledge._agent_config`'s `AGENT_SYNC_TOKEN` / `X-Sync-Token` (that
+    endpoint sends it outbound to the Agent API; here it's the inbound
+    check on the receiving end). Unset ⇒ 503, matching that precedent.
+    """
+    expected = (get_settings().CACHE_REFRESH_TOKEN or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Airtable cache refresh is not configured.",
+        )
+    # Encode to bytes before comparing: hmac.compare_digest raises TypeError
+    # (uncaught -> 500) on a `str` argument containing non-ASCII characters,
+    # and an attacker-controlled header can contain anything. Encoding a
+    # `str` to UTF-8 never raises, so a malformed token now falls through to
+    # the intended 401 instead of a 500.
+    if not x_sync_token or not hmac.compare_digest(
+        x_sync_token.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing sync token.",
+        )
+
+
+# Summary counters, in response order. `oversized` is deliberately its own
+# bucket: a table too large to cache is EXPECTED behavior (it is served live),
+# not a failure, and the cron treats a non-zero `failed` as a warning signal —
+# so counting it as failed would alarm on a correctly-working widget
+_REFRESH_COUNTERS = ("refreshed", "skipped", "oversized", "failed")
+
+# `warm_widget_cache`'s outcome -> the counter it belongs to. Defined ONCE so
+# the sweep and the per-widget path cannot drift apart. Anything not listed
+# here counts as a failure, which is the safe direction for an unrecognised
+# outcome.
+_REFRESH_OUTCOME_COUNTER = {
+    "refreshed": "refreshed",
+    "oversized": "oversized",
+    # A walk that raised (e.g. an Airtable 429/5xx outlasting the transport
+    # retry) is a real failure, same bucket an unrecognised outcome already
+    # falls into below — but named explicitly so it isn't logged as one.
+    "walk_failed": "failed",
+    # Expected skips: the entry was already fresh, another run or reader
+    # holds the single-flight lock (per-fingerprint OR the base-level lock,
+    # finding #6), no cache is configured at all (§4.4), or a fresh
+    # negative marker from a prior oversized/walk_failed confirmation
+    # short-circuited this run entirely (2026-08-10 handoff finding "C").
+    "fresh": "skipped",
+    "locked": "skipped",
+    "disabled": "skipped",
+    "damped": "skipped",
+}
+
+
+async def _refresh_one(
+    db: Session, airtable_service: AirtableService, link: str
+) -> str:
+    """Re-warm ONE widget's row cache. Returns the summary counter it belongs
+    to — one of `_REFRESH_COUNTERS`.
+
+    Never raises: a per-widget failure is logged and counted so that one bad
+    token or misconfigured widget cannot abort a sweep over every other
+    widget. Shared by both the sweep and the single-widget path.
+    """
+    try:
+        # One bundle rather than three accessors — 6 queries to 2 per widget,
+        # which across a sweep is 6N to 2N and directly widens the time
+        # budget this synchronous walk runs in (§4.7).
+        #
+        # Plain sync SQLAlchemy (finding #8) — off the event loop via
+        # to_thread; this function runs inside the async request handler for
+        # both the single-widget and full-sweep forms, so a blocking call
+        # here stalls every other in-flight request for the round trip.
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+        if bundle is None:
+            # Unknown link, not an airtable widget, or deleted between
+            # discovery and refresh. Expected, never a failure.
+            return "skipped"
+
+        config = bundle.config
+        source_url = (config.get("sourceUrl") or "").strip()
+        pat = bundle.pat
+        if not source_url or not pat:
+            # Same 400 condition the read path enforces — nothing to warm
+            # for a widget that isn't configured yet.
+            return "skipped"
+
+        stored = bundle.data or {}
+        outcome = await airtable_service.warm_widget_cache(
+            link=link,
+            url=source_url,
+            api_key=pat,
+            selected_columns=stored.get("selectedColumns") or None,
+            filters=stored.get("filters") or None,
+            personalize_enabled=bool(config.get("personalizeEnabled")),
+            personalize_column=config.get("personalizeColumn"),
+        )
+        counter = _REFRESH_OUTCOME_COUNTER.get(outcome)
+        if counter is None:
+            logger.error(
+                "Airtable cache refresh: widget link=%s returned unrecognised "
+                "outcome %r — counting as failed",
+                link,
+                outcome,
+            )
+            return "failed"
+        return counter
+    except Exception:
+        logger.exception("Airtable cache refresh: widget link=%s failed", link)
+        return "failed"
+
+
+@router.post(
+    "/airtable/cache/refresh",
+    summary="[Server-to-server] Re-warm airtable widget row caches",
+    description="""
+Walks an airtable widget's full (unpersonalized, filters-only) row set and
+writes it to the cache with a fresh TTL — the scheduled-refresh half of the
+widget row cache (server-side; intended to be called by a periodic job, not
+a browser). Authenticated by a shared secret (`X-Sync-Token`), not a user
+session.
+
+Pass `link` to refresh a **single** widget; omit it to sweep **every**
+widget. Prefer per-widget calls from a scheduler: the sweep shares one
+request's time budget across every widget, so one large table can starve the
+rest, and an overrun loses the whole run's summary. Per-widget calls give
+each widget its own budget and isolate failures. Both forms return the same
+summary shape, so a caller can sum them.
+
+An unknown `link` — including a widget deleted between discovery and
+refresh — counts as `skipped`, not an error.
+
+Runs synchronously and returns a summary so the caller's own exit code is a
+real signal. Per-widget failures are logged and counted, never abort the
+run — one bad token or misconfigured widget must not blank the cache for
+every other widget.
+
+The summary separates outcomes so only `failed` is a warning signal:
+`refreshed` (walked and cached), `skipped` (nothing to warm, already fresh,
+or another run holds the lock), `oversized` (too large to cache — served
+live, which is expected behavior, not an error) and `failed`.
+""",
+    responses={
+        401: {"description": "Missing or invalid X-Sync-Token"},
+        503: {"description": "CACHE_REFRESH_TOKEN is not configured on the server"},
+    },
+)
+async def refresh_airtable_widget_cache(
+    link: str | None = Query(
+        default=None,
+        description=(
+            "Refresh only this widget. Omit to refresh every widget "
+            "(the original sweep behavior)."
+        ),
+    ),
+    x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    _check_cache_refresh_token(x_sync_token)
+
+    started = time.monotonic()
+    counts = {name: 0 for name in _REFRESH_COUNTERS}
+
+    # A single `link` is the ONLY difference between the two modes — the
+    # per-widget work itself is identical, so both go through `_refresh_one`
+
+    # Same sync-SQLAlchemy-off-the-event-loop reasoning as the bundle calls
+    # below (finding #8) — only reached in sweep mode, but still a blocking
+    # DB round trip inside an async handler.
+    links = (
+        [link]
+        if link is not None
+        else await asyncio.to_thread(list_airtable_component_links, db)
+    )
+
+    for target in links:
+        counts[await _refresh_one(db, airtable_service, target)] += 1
+
+    return {**counts, "elapsed_seconds": round(time.monotonic() - started, 1)}
+
+
+@router.get(
+    "/airtable/cache/widgets",
+    summary="[Server-to-server] Every airtable widget's link, for refresh targeting",
+    description="""
+Lists the `link` of every airtable widget, so a scheduled job can refresh
+them one at a time instead of in a single sweep.
+
+Same shared-secret auth as the refresh endpoint (`X-Sync-Token`), not a user
+session. Returns only opaque component links — no configuration, no source
+URLs and no tokens.
+""",
+    responses={
+        401: {"description": "Missing or invalid X-Sync-Token"},
+        503: {"description": "CACHE_REFRESH_TOKEN is not configured on the server"},
+    },
+)
+def list_airtable_cache_widgets(
+    x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
+    db: Session = Depends(get_db_v2),
+):
+    _check_cache_refresh_token(x_sync_token)
+    links = list_airtable_component_links(db)
+    return {"links": links, "count": len(links)}
 
 
 @router.post(
@@ -415,12 +696,16 @@ async def preview_airtable_component(
         url, api_key = body_url, body_pat
 
     elif link:
-        config = get_airtable_component_config(db, link)
-        if config is None:
+        # config + pat from one resolve rather than two.
+        # Plain sync SQLAlchemy (finding #8) — off the event loop via
+        # to_thread, same as every other call site of this accessor.
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+        if bundle is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Airtable component not found",
             )
+        config = bundle.config
 
         roles = list(user.roles)
         widget_ac = config.get("access_control")
@@ -451,7 +736,7 @@ async def preview_airtable_component(
                 detail="This Airtable widget has no source URL configured",
             )
 
-        stored_pat = get_airtable_pat_for_component(db, link)
+        stored_pat = bundle.pat
         if not stored_pat:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

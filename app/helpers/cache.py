@@ -47,6 +47,11 @@ _IGNORED_PARAMS: set[str] = {
     "dify_service",
     "credentials",
     "x_webhook_secret",
+    # A SQLAlchemy Session isn't JSON-encodable and isn't part of what
+    # makes two calls "the same request" anyway. None of today's 123
+    # @airtable_cache-decorated handlers take `db`, so this has never bitten
+    # — added defensively before anything does (plan §3.3).
+    "db",
 }
 
 # Truthy values recognised by the cache-bypass query param / header.

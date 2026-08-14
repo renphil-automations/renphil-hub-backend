@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -460,15 +461,34 @@ def _resolve_component_data(
 
     `preloaded_page_content` — see `_raw_component_data`'s doc comment; passed
     straight through.
+
+    Split into a FETCH half (`_raw_component_data`) and a pure DERIVE half
+    (`_sanitised_component_data`) so a caller that already holds the raw blob
+    can derive this view without a second round trip — see
+    `get_airtable_component_bundle`. This function's own behavior is unchanged.
     """
-    data = _raw_component_data(db, component, preloaded_page_content)
+    return _sanitised_component_data(
+        component, _raw_component_data(db, component, preloaded_page_content)
+    )
 
-    if component.type == AIRTABLE_WIDGET_TYPE:
-        pat = data.get("pat")
-        data = {k: v for k, v in data.items() if k not in AIRTABLE_COMPUTED_DATA_FIELDS}
-        data.pop("pat", None)
-        data["hasPat"] = bool(isinstance(pat, str) and pat.strip())
 
+def _sanitised_component_data(
+    component: ComponentV2, raw: dict[str, Any]
+) -> dict[str, Any]:
+    """Pure derivation half of `_resolve_component_data` — no DB access.
+
+    Given a component and its already-fetched raw blob, returns the
+    client-facing view. Only `airtable` widgets differ from their raw form;
+    every other type's raw blob already IS the client-facing view and is
+    returned unchanged, exactly as before this split.
+    """
+    if component.type != AIRTABLE_WIDGET_TYPE:
+        return raw
+
+    pat = raw.get("pat")
+    data = {k: v for k, v in raw.items() if k not in AIRTABLE_COMPUTED_DATA_FIELDS}
+    data.pop("pat", None)
+    data["hasPat"] = bool(isinstance(pat, str) and pat.strip())
     return data
 
 
@@ -791,6 +811,20 @@ def _airtable_component_by_link(db: Session, link: str) -> ComponentV2 | None:
     return component
 
 
+def list_airtable_component_links(db: Session) -> list[str]:
+    """Every airtable widget's `link`, for cache warming
+    (`POST /airtable/cache/refresh` — plan_airtable_widget_caching_2026-08-06.md
+    §7.1). Server-internal. Widgets with a null/blank link can't be looked
+    up by `_airtable_component_by_link` anyway, so they're excluded here.
+    """
+    rows = (
+        db.query(ComponentV2.link)
+        .filter(ComponentV2.type == AIRTABLE_WIDGET_TYPE)
+        .all()
+    )
+    return [link for (link,) in rows if link and link.strip()]
+
+
 def get_airtable_component_config(db: Session, link: str) -> dict[str, Any] | None:
     """Non-secret view of one airtable widget's stored configuration.
 
@@ -804,19 +838,34 @@ def get_airtable_component_config(db: Session, link: str) -> dict[str, Any] | No
 
     # RAW: this function's whole job is to report ON the secret (hasPat /
     # patHint), which the sanitised view has already removed.
-    data = _raw_component_data(db, component)
-    pat = data.get("pat")
+    return _airtable_config_view(component, _raw_component_data(db, component))
 
+
+def _airtable_config_view(
+    component: ComponentV2, raw: dict[str, Any]
+) -> dict[str, Any]:
+    """Pure derivation half of `get_airtable_component_config` — no DB access.
+
+    Reports ON the secret (`hasPat`/`patHint`) but never returns it.
+    """
+    pat = raw.get("pat")
     return {
         "link": component.link,
-        "sourceUrl": data.get("sourceUrl") or "",
-        "personalizeEnabled": bool(data.get("personalizeEnabled")),
-        "personalizeColumn": data.get("personalizeColumn") or None,
+        "sourceUrl": raw.get("sourceUrl") or "",
+        "personalizeEnabled": bool(raw.get("personalizeEnabled")),
+        "personalizeColumn": raw.get("personalizeColumn") or None,
         "hasPat": bool(isinstance(pat, str) and pat.strip()),
         "patHint": _pat_hint(pat),
-        "patUpdatedAt": data.get("patUpdatedAt"),
+        "patUpdatedAt": raw.get("patUpdatedAt"),
         "access_control": component.access_control,
     }
+
+
+def _airtable_pat_view(raw: dict[str, Any]) -> str | None:
+    """Pure derivation half of `get_airtable_pat_for_component` — no DB access.
+    Returns the stored token in clear, or None when unset/blank."""
+    pat = raw.get("pat")
+    return pat.strip() if isinstance(pat, str) and pat.strip() else None
 
 
 def get_airtable_component_data(db: Session, link: str) -> dict[str, Any] | None:
@@ -846,8 +895,66 @@ def get_airtable_pat_for_component(db: Session, link: str) -> str | None:
     component = _airtable_component_by_link(db, link)
     if component is None:
         return None
-    pat = _raw_component_data(db, component).get("pat")
-    return pat.strip() if isinstance(pat, str) and pat.strip() else None
+    return _airtable_pat_view(_raw_component_data(db, component))
+
+
+@dataclass(frozen=True)
+class AirtableComponentBundle:
+    """All three views of ONE airtable widget, resolved from a single pair of
+    queries instead of three independent pairs.
+
+    SERVER-INTERNAL. Deliberately exposes ONLY the three derived views and
+    NEVER the raw blob (plan_airtable_cache_scaling_2026-08-08.md, landmine
+    L12): `_raw_component_data` returns the PAT in clear, and
+    `_resolve_component_data` exists precisely so no client-facing path ever
+    sees it. A bundle carrying both the raw and sanitised blobs would be
+    exactly the shape where a later caller returns the wrong one — so the raw
+    blob stays local to `get_airtable_component_bundle` and dies there.
+
+    Use `.data` for anything client-facing and `.pat` ONLY for the outbound
+    Airtable call.
+    """
+
+    #: Non-secret configuration — same shape as `get_airtable_component_config`.
+    config: dict[str, Any]
+    #: The stored PAT in clear, or None. Must never leave the server.
+    pat: str | None
+    #: Client-safe data blob, PAT stripped — same as `get_airtable_component_data`.
+    data: dict[str, Any]
+
+
+def get_airtable_component_bundle(
+    db: Session, link: str
+) -> AirtableComponentBundle | None:
+    """Config + PAT + client-safe data for one airtable widget, in 2 queries.
+
+    `get_airtable_component_config`, `get_airtable_pat_for_component` and
+    `get_airtable_component_data` each independently run
+    `_airtable_component_by_link` (a `ComponentV2` query) followed by
+    `_raw_component_data` (a `PageContentV2` fetch). A caller needing all
+    three therefore issued SIX queries to read the SAME TWO ROWS — measured at
+    ~165 ms per Neon round trip. This resolves them once and derives all three
+    views from that single result.
+
+    The single-view accessors above are unchanged and remain the right choice
+    for a caller that needs exactly one view.
+
+    Returns None for an unknown link or a component that is not an airtable
+    widget — same contract as the three accessors it replaces.
+    """
+    component = _airtable_component_by_link(db, link)
+    if component is None:
+        return None
+
+    # RAW, and it stays here: every field below is a DERIVED view of this
+    # blob, and the blob itself is never put on the bundle (L12).
+    raw = _raw_component_data(db, component)
+
+    return AirtableComponentBundle(
+        config=_airtable_config_view(component, raw),
+        pat=_airtable_pat_view(raw),
+        data=_sanitised_component_data(component, raw),
+    )
 
 
 def update_airtable_component_config(

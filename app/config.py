@@ -386,6 +386,84 @@ class Settings(BaseSettings):
     # Bumping this rotates the cache namespace and effectively wipes it.
     CACHE_VERSION: str = "v1"
 
+    # ── Airtable widget row cache (plan_airtable_widget_caching_2026-08-06.md) ──
+    # TTL is deliberately several multiples of the refresh interval — it is a
+    # garbage collector for abandoned keys, not the freshness mechanism (a
+    # scheduled refresh call is). See the plan's §4.3 / landmine L1.
+    AIRTABLE_CACHE_TTL_SECONDS: int = 1800
+    # Guards below AIRTABLE_CACHE_MAX_ROWS/_BYTES are checked while walking a
+    # widget's full result set; a breach means the table is served live
+    # through the original per-page path instead of being cached — never
+    # silently truncated. See the plan's §5.4.
+    #
+    # MAX_ROWS is a sanity ceiling ONLY — it has no relationship to any
+    # Upstash limit, and at 10,000 it was the thing actually deciding what
+    # got cached: a 15,000-row table was rejected purely by this counter
+    # while sitting inside every real limit (measured — the 5 MB byte guard
+    # would not trigger until ~19,000 rows of a realistic 8-column shape).
+    # Raised to 50,000 per plan_airtable_cache_scaling_2026-08-08.md §4.2.
+    # Safe only because §4.1 made the walk's byte accounting incremental —
+    # the old per-page re-encode of the whole accumulated list was quadratic
+    # and would have made every warm dramatically slower here (landmine L10).
+    AIRTABLE_CACHE_MAX_ROWS: int = 50_000
+    # A real, well-chosen guard: Upstash hard-rejects requests over 10 MiB
+    # ("ERR max request size exceeded. Limit: 10485760 bytes"), so this is a
+    # deliberate ~48% margin. Deliberately NOT raised. Note it is measured
+    # against the UNCOMPRESSED payload, which is the conservative direction —
+    # §4.3's gzip lands ~4.8x below it on the wire.
+    AIRTABLE_CACHE_MAX_BYTES: int = 5_000_000
+    # Shared secret for POST /data/airtable/cache/refresh — same shape as
+    # AGENT_SYNC_TOKEN below, sent as X-Sync-Token. Unset ⇒ 503.
+    CACHE_REFRESH_TOKEN: str | None = None
+    # A scheduled refresh will NOT re-walk a widget whose cached entry is
+    # younger than this (plan_airtable_cache_scaling_2026-08-08.md §4.4).
+    #
+    # Deliberately just UNDER the intended 5-minute cron cadence: a normal
+    # tick still refreshes every widget, so data freshness is unchanged, but
+    # a duplicate/overlapping run — or a widget a reader's own read-through
+    # warmed moments ago — costs one GET instead of a full Airtable walk.
+    # Raising this above the cron interval trades freshness for less Airtable
+    # traffic; that is a deliberate policy change, not the default.
+    AIRTABLE_CACHE_MIN_REFRESH_SECONDS: int = 240
+    # Single-flight lock TTL, shared by BOTH the scheduled refresh and the
+    # read path's own warm-on-miss — both do the exact same full-table walk,
+    # so both need a TTL that can outlive it. (Originally the read path used
+    # a separate, shorter, hardcoded 120s; that let a walk near
+    # AIRTABLE_CACHE_MAX_ROWS outlive its own lock — at 500 pages the
+    # throttle alone is ~125s, and real request time pushes it further. A
+    # lock whose holder is still working when the TTL expires lets a second
+    # caller acquire the same key and start a second concurrent walk of the
+    # same base, which is exactly what the lock exists to prevent.) Sized
+    # under the cron interval so a crashed run self-heals by the next tick
+    # rather than wedging the widget.
+    AIRTABLE_CACHE_REFRESH_LOCK_SECONDS: int = 300
+    # TTL for the negative-cache marker written when a warm attempt
+    # confirms a widget is oversized or when the walk itself fails (e.g. an
+    # Airtable 429 or transport error). Without this, EVERY request against
+    # a known-bad widget repeats the full walk just to rediscover the same
+    # outcome — up to AIRTABLE_CACHE_MAX_ROWS/MAX_BYTES worth of throttled
+    # Airtable calls, thrown away, on every single request. Deliberately
+    # short: long enough to damp a request burst, short enough that a
+    # transient failure (a single 429) or a since-shrunk table recovers
+    # quickly on its own without waiting for a scheduled refresh.
+    AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS: int = 60
+    # TTL for the SAME negative-cache marker, but as written by the
+    # scheduled refresh (`warm_widget_cache`) rather than a live reader.
+    # Deliberately much longer than AIRTABLE_CACHE_NEGATIVE_TTL_SECONDS above
+    # (plan_airtable_cache_scaling_2026-08-08.md, finding #3's cron-side
+    # gap): a live reader wants "recovers within a request or two", but the
+    # cron ticks every ~5 minutes regardless (AIRTABLE_CACHE_MIN_REFRESH_
+    # SECONDS's own cadence) — reusing the 60s TTL there would mean a
+    # persistently oversized/failing widget gets re-walked to the cap on
+    # EVERY tick, forever, since 60s always lapses before the next one.
+    # 900s (3 ticks) keeps that from happening while still self-healing
+    # within ~15 minutes if the table shrinks back down or the failure was
+    # transient — far short of needing a new ticket. A live reader arriving
+    # while THIS longer marker is active still benefits from it (same key,
+    # same check in `_get_or_warm_widget_cache`) — a free side effect of
+    # sharing one marker between both paths.
+    AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS: int = 900
+
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)
     # ══════════════════════════════════════════════════════════════════
