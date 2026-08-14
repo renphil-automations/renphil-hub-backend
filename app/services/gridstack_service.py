@@ -948,6 +948,16 @@ class AirtableComponentBundle:
     exactly the shape where a later caller returns the wrong one — so the raw
     blob stays local to `get_airtable_component_bundle` and dies there.
 
+    `widget_type` (plan_warm_key_divergence_2026-08-14.md §3.3) is `.type`
+    off the `ComponentV2` ROW, not a view of the raw data blob — it does not
+    touch L12's guarantee. It exists so `warm_widget_cache`'s two callers
+    (`_warm_after_config_save`, `_refresh_one`) can tell it which
+    `widget_rows` fingerprint shape the widget's cache entry actually uses
+    (see `AirtableService._widget_cache_fingerprint`), rather than the warm
+    path building a fingerprint blind to widget type — which is what let a
+    Metric/Chart widget's warm silently land on a key its own read path
+    never looked up.
+
     Use `.data` for anything client-facing and `.pat` ONLY for the outbound
     Airtable call.
     """
@@ -958,6 +968,8 @@ class AirtableComponentBundle:
     pat: str | None
     #: Client-safe data blob, PAT stripped — same as `get_airtable_component_data`.
     data: dict[str, Any]
+    #: One of AIRTABLE_LIKE_WIDGET_TYPES — the component ROW's own `.type`.
+    widget_type: str
 
 
 def get_airtable_component_bundle(
@@ -991,6 +1003,7 @@ def get_airtable_component_bundle(
         config=_airtable_config_view(component, raw),
         pat=_airtable_pat_view(raw),
         data=_sanitised_component_data(component, raw),
+        widget_type=component.type,
     )
 
 

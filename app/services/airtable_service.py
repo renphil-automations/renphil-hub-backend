@@ -28,6 +28,11 @@ from app.helpers import airtable_formulas as af
 from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
 from app.services.cache_service import CacheService, encoded_length, get_cache_service
+from app.services.gridstack_service import (
+    AIRTABLE_CHART_WIDGET_TYPE,
+    AIRTABLE_METRIC_WIDGET_TYPE,
+    AIRTABLE_WIDGET_TYPE,
+)
 from app.models.airtable import (
     AccessControlAssign,
     AccessControlRecord,
@@ -1002,6 +1007,66 @@ class AirtableService:
         finally:
             await cache.release_lock(lock_key, lock_token)
 
+    @staticmethod
+    def _widget_cache_fingerprint(
+        *,
+        widget_type: str,
+        link: str,
+        url: str,
+        selected_columns: list[str] | None,
+        filters: list[dict[str, Any]] | None,
+        personalize_enabled: bool,
+        personalize_column: str | None,
+    ) -> dict[str, Any]:
+        """The ONE place a `widget_rows` cache fingerprint is shaped, for
+        every widget type that caches one (Table, Metric, Chart alike).
+        plan_warm_key_divergence_2026-08-14.md §3.1.
+
+        A Table widget caches a row set projected AND personalized to the
+        admin's own settings (`fetch_widget_rows_cached`,
+        `fetch_widget_full_rows_cached`), so its fingerprint reflects
+        `selected_columns`/`personalize_enabled`/`personalize_column`
+        directly — they describe what's actually IN the cached entry.
+
+        A Metric or Chart widget instead caches ONE unprojected,
+        unpersonalized row set per widget and applies personalization
+        per-viewer in Python afterward (`fetch_widget_metric_cached`,
+        `fetch_widget_chart_cached`) — so for those two types this pins
+        `selectedColumns: []` / `personalizeEnabled: False` /
+        `personalizeColumn: None` regardless of what's passed in,
+        because THAT is what actually describes the cached bytes, not
+        the widget's own settings.
+
+        Before this method existed, `warm_widget_cache` built its
+        fingerprint straight from the widget's stored config with no
+        knowledge of widget type — so a Metric/Chart widget with
+        personalization on (or merely a stored `personalizeColumn` left
+        over from a prior save) warmed a key its own read path never
+        looks up: a wasted whole-table Upstash entry, and the widget
+        stayed cold until a real viewer's request warmed the RIGHT key
+        via `_get_or_warm_widget_cache`. This is the fix.
+
+        A caller passing a Metric/Chart `widget_type` must ALSO
+        normalize the values it feeds to the actual walk
+        (`_build_widget_cache_envelope`) the same way — seeing
+        `warm_widget_cache`'s own normalization is not optional: a
+        pinned key over a WALK that still projects columns would cache
+        rows missing a field a reader expects (the L2 projection trap,
+        in reverse).
+        """
+        if widget_type in (AIRTABLE_METRIC_WIDGET_TYPE, AIRTABLE_CHART_WIDGET_TYPE):
+            selected_columns = None
+            personalize_enabled = False
+            personalize_column = None
+        return {
+            "link": link,
+            "sourceUrl": url,
+            "selectedColumns": list(selected_columns or []),
+            "filters": filters or [],
+            "personalizeEnabled": bool(personalize_enabled),
+            "personalizeColumn": personalize_column or None,
+        }
+
     async def fetch_widget_rows_cached(
         self,
         *,
@@ -1078,14 +1143,15 @@ class AirtableService:
                 cursor=self._live_cursor(cursor),
             )
 
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": list(selected_columns or []),
-            "filters": filters or [],
-            "personalizeEnabled": bool(personalize_enabled),
-            "personalizeColumn": personalize_column or None,
-        }
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=AIRTABLE_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         envelope = await self._get_or_warm_widget_cache(
@@ -1243,19 +1309,22 @@ class AirtableService:
                 page_size=page_size,
             )
 
-        # 3. Fingerprint built BYTE-IDENTICALLY to fetch_widget_rows_cached's
-        # own fingerprint (L1) — a mismatch silently doubles the Airtable
-        # walk and the cache storage, with no visible symptom. Do NOT copy
-        # fetch_widget_metric_cached's deliberately-different fingerprint —
-        # that one is specific to the Metric widget's no-column-picker case.
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": list(selected_columns or []),
-            "filters": filters or [],
-            "personalizeEnabled": bool(personalize_enabled),
-            "personalizeColumn": personalize_column or None,
-        }
+        # 3. Fingerprint built through the SAME shared helper
+        # fetch_widget_rows_cached uses, with the same AIRTABLE_WIDGET_TYPE
+        # (L1) — a mismatch silently doubles the Airtable walk and the
+        # cache storage, with no visible symptom. Do NOT pass
+        # AIRTABLE_METRIC_WIDGET_TYPE/AIRTABLE_CHART_WIDGET_TYPE here —
+        # those pin a deliberately different, unprojected fingerprint
+        # specific to the Metric/Chart widgets' shared-cache-entry design.
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=AIRTABLE_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         envelope = await self._get_or_warm_widget_cache(
@@ -1511,14 +1580,15 @@ class AirtableService:
             )
 
         cache = get_cache_service()
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": [],
-            "filters": filters or [],
-            "personalizeEnabled": False,
-            "personalizeColumn": None,
-        }
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=AIRTABLE_METRIC_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         envelope = await self._get_or_warm_widget_cache(
@@ -1575,25 +1645,29 @@ class AirtableService:
         *, link: str, url: str, filters: list[dict[str, Any]] | None
     ) -> dict[str, Any]:
         """The `widget_rows` cache fingerprint a Chart widget's aggregation
-        reads — BYTE-IDENTICAL to `fetch_widget_metric_cached`'s own
+        reads — a thin, Chart-specific alias over the shared
+        `_widget_cache_fingerprint(widget_type=AIRTABLE_CHART_WIDGET_TYPE)`,
+        which is BYTE-IDENTICAL to `fetch_widget_metric_cached`'s own
         (`selectedColumns: []`, `personalizeEnabled: False`,
         `personalizeColumn: None`), so the walk fetches every field and a
         chart's own `link` keeps its entry from colliding with a Table or
         Metric widget's differently-projected one on the same base/table.
 
-        Factored out so `preview_widget_chart`'s read-only lookup can never
-        drift from this one (L1) — a drift has no visible symptom, it just
-        means the preview always misses the warmed entry and always reports
-        `partial=True`.
+        Kept as its own named method (rather than inlining the shared call
+        at both use sites) so `preview_widget_chart`'s read-only lookup can
+        never drift from `fetch_widget_chart_cached`'s own (L1) — a drift
+        has no visible symptom, it just means the preview always misses the
+        warmed entry and always reports `partial=True`.
         """
-        return {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": [],
-            "filters": filters or [],
-            "personalizeEnabled": False,
-            "personalizeColumn": None,
-        }
+        return AirtableService._widget_cache_fingerprint(
+            widget_type=AIRTABLE_CHART_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
 
     def _aggregate_chart_groups(
         self,
@@ -1824,6 +1898,7 @@ class AirtableService:
     async def warm_widget_cache(
         self,
         *,
+        widget_type: str,
         link: str,
         url: str,
         api_key: str,
@@ -1833,8 +1908,28 @@ class AirtableService:
         personalize_column: str | None,
     ) -> str:
         """Used by `POST /airtable/cache/refresh` (the scheduled-refresh
-        endpoint). Builds the same fingerprint/key a real viewer's request
-        would use and re-warms it, ignoring whatever TTL remains.
+        endpoint) and by `_warm_after_config_save` (warm-on-save). Builds
+        the same fingerprint/key a real viewer's request would use and
+        re-warms it, ignoring whatever TTL remains.
+
+        `widget_type` (required, not defaulted —
+        plan_warm_key_divergence_2026-08-14.md §3.2) decides whether
+        `selected_columns`/`personalize_enabled`/`personalize_column` are
+        honored as given (Table) or normalized away to the Metric/Chart
+        widgets' shared "nothing projected, nothing personalized" shape —
+        see `_widget_cache_fingerprint`'s docstring for why. That
+        normalization happens ONCE, below, before either the fingerprint is
+        built or the walk is dispatched, deliberately: pinning the key
+        alone while still walking with the widget's real projection would
+        cache rows missing a field a Metric/Chart reader expects (the L2
+        projection trap, in reverse). Before `widget_type` existed, this
+        method built its fingerprint from the widget's raw stored config
+        with no notion of widget type at all — for a Metric/Chart widget
+        with personalization on (or merely a stored `personalizeColumn`
+        left over from a prior save), that fingerprint never matched what
+        `fetch_widget_metric_cached`/`fetch_widget_chart_cached` look up:
+        the warm wrote a whole-table entry nobody ever read, and the widget
+        stayed cold until a real viewer's own request warmed the RIGHT key.
 
         Takes the SAME single-flight lock the read path uses
         (plan_airtable_cache_scaling_2026-08-08.md §4.4). The original
@@ -1879,14 +1974,25 @@ class AirtableService:
         if not cache.enabled:
             return "disabled"
 
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": list(selected_columns or []),
-            "filters": filters or [],
-            "personalizeEnabled": bool(personalize_enabled),
-            "personalizeColumn": personalize_column or None,
-        }
+        # Normalize BEFORE building the fingerprint, so the same (now
+        # possibly-overridden) values flow into the walk below via
+        # `_build_widget_cache_envelope` — one normalization, not two, so
+        # the key and the walked bytes can never disagree (see this
+        # method's own docstring, and `_widget_cache_fingerprint`'s).
+        if widget_type in (AIRTABLE_METRIC_WIDGET_TYPE, AIRTABLE_CHART_WIDGET_TYPE):
+            selected_columns = None
+            personalize_enabled = False
+            personalize_column = None
+
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=widget_type,
+            link=link,
+            url=url,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         # Checked before both the freshness lookup and lock acquisition, so

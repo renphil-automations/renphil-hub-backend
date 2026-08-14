@@ -351,6 +351,7 @@ async def _warm_after_config_save(link: str) -> None:
             return  # nothing to fetch yet — same guard `_refresh_one` uses
         stored = bundle.data or {}
         outcome = await get_airtable_service().warm_widget_cache(
+            widget_type=bundle.widget_type,
             link=link,
             url=source_url,
             api_key=bundle.pat,
@@ -924,6 +925,7 @@ async def _refresh_one(
 
         stored = bundle.data or {}
         outcome = await airtable_service.warm_widget_cache(
+            widget_type=bundle.widget_type,
             link=link,
             url=source_url,
             api_key=pat,
