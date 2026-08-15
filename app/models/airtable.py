@@ -57,8 +57,10 @@ class AirtableWidgetRowsResponse(BaseModel):
         default=None,
         description=(
             "Opaque cursor for the next page, or null on the last page. Pass "
-            "it back as `cursor`. Airtable expires these after a while — on "
-            "an error, restart from the first page."
+            "it back as `cursor`. Treat it as strictly opaque: it may be a "
+            "synthetic cache-relative cursor or a real Airtable offset "
+            "depending on whether this widget's rows are cached, either of "
+            "which can go stale — on an error, restart from the first page."
         ),
     )
     personalize_blocked: bool = Field(
@@ -69,6 +71,90 @@ class AirtableWidgetRowsResponse(BaseModel):
             "no rows' from 'the filter could not run' — the response is empty "
             "either way, because falling back to unfiltered rows would defeat "
             "the point."
+        ),
+    )
+    field_types: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Best-effort Airtable field-type hint per column ('url' or "
+            "'select'), for typed cell rendering. A column absent here "
+            "renders as plain text — either its type has no special "
+            "rendering, or the widget's token lacks the schema.bases:read "
+            "scope needed to discover it."
+        ),
+    )
+
+
+class AirtableWidgetFullRowsResponse(BaseModel):
+    """Whole-table view backing the viewer Filter/Sort/Group/Search toolbar
+    (plan_airtable_widget_viewer_controls_2026-08-12.md §2.4, §3.1). Reads
+    the SAME cached entry `AirtableWidgetRowsResponse`'s `/rows` endpoint
+    warms — no second walk, no new caching mechanism.
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    fields: list[str] = Field(
+        default_factory=list,
+        description="Column names, same ordering rule as the paginated /rows endpoint.",
+    )
+    field_types: dict[str, str] = Field(default_factory=dict)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    personalize_blocked: bool = Field(
+        default=False,
+        description="Same fail-closed meaning as the paginated /rows endpoint.",
+    )
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the table was not cacheable at all, the cache is "
+            "disabled, the viewer-controls toggle is off, or the "
+            "personalize-filtered result exceeds "
+            "AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS. The caller falls back to "
+            "the paginated /rows view rather than erroring."
+        ),
+    )
+    page_size: int = Field(
+        description=(
+            "Client-side page size for the toolbar's own pager "
+            "(AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE) — the single authority "
+            "for this number lives on the server, same as the paginated "
+            "widget's own page size."
+        ),
+    )
+
+
+class AirtableWidgetMetricResponse(BaseModel):
+    """Single-number Count/Sum aggregation for a dashboard Airtable Metric
+    widget, computed server-side over the SAME cached row set the Table
+    widget's `/rows` endpoint uses (see `AirtableService.fetch_widget_metric_cached`).
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    aggregation: str = Field(description="'count' or 'sum', echoed back for the caller's own bookkeeping.")
+    value: float | int | None = Field(
+        default=None,
+        description="The computed count/sum, or null when unavailable/blocked.",
+    )
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the underlying table is too large to cache (or the "
+            "cache walk itself failed) — deliberately never falls back to a "
+            "live partial fetch for an aggregate, since a count/sum over "
+            "only some rows would be silently wrong, not just incomplete."
+        ),
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description=(
+            "True when personalization is enabled but could not be applied, "
+            "so no value was computed. Distinguishes 'the filter could not "
+            "run' from 'the table is too large to cache' — both leave "
+            "`value` null, for different reasons."
         ),
     )
 
@@ -127,6 +213,16 @@ class AirtableEditorPreviewResponse(BaseModel):
             "distinguish 'personalize works, you have no rows' from 'the "
             "personalize column matches nothing' — both look identical "
             "otherwise."
+        ),
+    )
+    field_types: dict[str, str] = Field(default_factory=dict)
+    field_types_available: bool = Field(
+        default=True,
+        description=(
+            "False when the schema fetch itself failed (e.g. the widget's "
+            "token lacks the schema.bases:read scope) — distinct from a "
+            "table that legitimately has no URL/select columns, which "
+            "returns field_types={} with this still True."
         ),
     )
 
@@ -1953,7 +2049,7 @@ class EmailTicketWebhookPayload(BaseModel):
 
 # ── Users ─────────────────────────────────────────────────────────────
 class UserRecord(_TypedAirtableRecord):
-    """A user record from the Users table (RenPhil Hub base)."""
+    """A user record from the Postgres ``users`` table."""
 
     name: str | None = Field(default=None, alias="Name")
     first_name: str | None = Field(default=None, alias="First Name")
@@ -1961,7 +2057,9 @@ class UserRecord(_TypedAirtableRecord):
     employment_type: list[str] | None = Field(
         default=None, alias="Employment Type"
     )
+    for_website: str | None = Field(default=None, alias="for_website")
     status: str | None = Field(default=None, alias="Status")
+    is_fellow: bool | None = Field(default=None, alias="is_fellow")
     department: str | None = Field(default=None, alias="Department")
     program: Any = Field(default=None, alias="Program")
     start_date: str | None = Field(default=None, alias="Start Date")
@@ -1969,19 +2067,30 @@ class UserRecord(_TypedAirtableRecord):
     personal_email: str | None = Field(default=None, alias="Personal Email")
     position: str | None = Field(default=None, alias="Position")
     dob: str | None = Field(default=None, alias="DOB")
-    headshot: Any = Field(
+    birthday_shoutout_opt_out: bool | None = Field(
+        default=None, alias="birthday_shoutout_opt_out"
+    )
+    post_on_website: bool | None = Field(
+        default=None, alias="post_on_website"
+    )
+    headshot: str | None = Field(
         default=None,
         alias="Headshot",
-        description="Airtable attachment array for the user's headshot image.",
+        description="URL of the user's headshot image.",
     )
     office_location: str | None = Field(default=None, alias="Office location")
     home_address: str | None = Field(default=None, alias="Home Address")
     bio: str | None = Field(default=None, alias="Bio")
     scope_of_work: str | None = Field(default=None, alias="ScopeofWork")
+    new_headshot_bio_to_website: str | None = Field(
+        default=None, alias="New Headshot/Bio to Website"
+    )
     end_date: str | None = Field(default=None, alias="End Date")
-    manager: Any = Field(default=None, alias="Manager")
     tech_stack_selections: list[str] | None = Field(
         default=None, alias="Tech Stack Selections"
+    )
+    add_to_website_date: datetime | None = Field(
+        default=None, alias="add_to_website_date"
     )
 
     @field_validator("employment_type", "tech_stack_selections", mode="before")
@@ -2009,7 +2118,9 @@ class UserUpdate(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     employment_type: list[str] | None = None
+    for_website: str | None = None
     status: str | None = None
+    is_fellow: bool | None = None
     department: str | None = None
     program: Any | None = None
     start_date: str | None = Field(
@@ -2021,18 +2132,21 @@ class UserUpdate(BaseModel):
     dob: str | None = Field(
         default=None, description="ISO date of birth (YYYY-MM-DD)."
     )
-    headshot: list[str] | None = Field(
+    birthday_shoutout_opt_out: bool | None = None
+    post_on_website: bool | None = None
+    headshot: str | None = Field(
         default=None,
-        description="List of attachment URLs for the headshot.",
+        description="URL of the headshot image.",
     )
     office_location: str | None = None
     home_address: str | None = None
     bio: str | None = None
     scope_of_work: str | None = None
+    new_headshot_bio_to_website: str | None = None
     end_date: str | None = Field(
         default=None, description="ISO date (YYYY-MM-DD)."
     )
-    manager: Any | None = None
     tech_stack_selections: list[str] | None = None
+    add_to_website_date: datetime | None = None
 
 
