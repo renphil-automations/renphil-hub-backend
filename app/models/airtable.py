@@ -2049,7 +2049,7 @@ class EmailTicketWebhookPayload(BaseModel):
 
 # ── Users ─────────────────────────────────────────────────────────────
 class UserRecord(_TypedAirtableRecord):
-    """A user record from the Users table (RenPhil Hub base)."""
+    """A user record from the Postgres ``users`` table."""
 
     name: str | None = Field(default=None, alias="Name")
     first_name: str | None = Field(default=None, alias="First Name")
@@ -2057,7 +2057,9 @@ class UserRecord(_TypedAirtableRecord):
     employment_type: list[str] | None = Field(
         default=None, alias="Employment Type"
     )
+    for_website: str | None = Field(default=None, alias="for_website")
     status: str | None = Field(default=None, alias="Status")
+    is_fellow: bool | None = Field(default=None, alias="is_fellow")
     department: str | None = Field(default=None, alias="Department")
     program: Any = Field(default=None, alias="Program")
     start_date: str | None = Field(default=None, alias="Start Date")
@@ -2065,19 +2067,30 @@ class UserRecord(_TypedAirtableRecord):
     personal_email: str | None = Field(default=None, alias="Personal Email")
     position: str | None = Field(default=None, alias="Position")
     dob: str | None = Field(default=None, alias="DOB")
-    headshot: Any = Field(
+    birthday_shoutout_opt_out: bool | None = Field(
+        default=None, alias="birthday_shoutout_opt_out"
+    )
+    post_on_website: bool | None = Field(
+        default=None, alias="post_on_website"
+    )
+    headshot: str | None = Field(
         default=None,
         alias="Headshot",
-        description="Airtable attachment array for the user's headshot image.",
+        description="URL of the user's headshot image.",
     )
     office_location: str | None = Field(default=None, alias="Office location")
     home_address: str | None = Field(default=None, alias="Home Address")
     bio: str | None = Field(default=None, alias="Bio")
     scope_of_work: str | None = Field(default=None, alias="ScopeofWork")
+    new_headshot_bio_to_website: str | None = Field(
+        default=None, alias="New Headshot/Bio to Website"
+    )
     end_date: str | None = Field(default=None, alias="End Date")
-    manager: Any = Field(default=None, alias="Manager")
     tech_stack_selections: list[str] | None = Field(
         default=None, alias="Tech Stack Selections"
+    )
+    add_to_website_date: datetime | None = Field(
+        default=None, alias="add_to_website_date"
     )
 
     @field_validator("employment_type", "tech_stack_selections", mode="before")
@@ -2105,7 +2118,9 @@ class UserUpdate(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     employment_type: list[str] | None = None
+    for_website: str | None = None
     status: str | None = None
+    is_fellow: bool | None = None
     department: str | None = None
     program: Any | None = None
     start_date: str | None = Field(
@@ -2117,18 +2132,21 @@ class UserUpdate(BaseModel):
     dob: str | None = Field(
         default=None, description="ISO date of birth (YYYY-MM-DD)."
     )
-    headshot: list[str] | None = Field(
+    birthday_shoutout_opt_out: bool | None = None
+    post_on_website: bool | None = None
+    headshot: str | None = Field(
         default=None,
-        description="List of attachment URLs for the headshot.",
+        description="URL of the headshot image.",
     )
     office_location: str | None = None
     home_address: str | None = None
     bio: str | None = None
     scope_of_work: str | None = None
+    new_headshot_bio_to_website: str | None = None
     end_date: str | None = Field(
         default=None, description="ISO date (YYYY-MM-DD)."
     )
-    manager: Any | None = None
     tech_stack_selections: list[str] | None = None
+    add_to_website_date: datetime | None = None
 
 
