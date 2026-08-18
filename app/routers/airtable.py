@@ -162,6 +162,7 @@ from app.services.gridstack_service import (
     update_airtable_component_config,
 )
 from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
+from app.services import user_db_service
 
 logger = logging.getLogger(__name__)
 
@@ -4244,9 +4245,11 @@ _USER_SELF_EDITABLE_FIELDS = {"dob", "home_address", "personal_email"}
 async def get_user_by_email(
     work_email: str = Path(..., description="Work Email of the user to fetch."),
     _user: UserInfo = Depends(get_current_user),
-    airtable_service: AirtableService = Depends(get_airtable_service),
+    db: Session = Depends(get_db_v2),
 ):
-    return await airtable_service.get_user_by_work_email(work_email)
+    return await asyncio.to_thread(
+        user_db_service.get_user_by_work_email, db, work_email
+    )
 
 
 @router.patch(
@@ -4270,6 +4273,7 @@ async def update_user_by_email(
     work_email: str = Path(..., description="Work Email of the user to update."),
     payload: UserUpdate = Body(...),
     user: UserInfo = Depends(get_current_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     is_admin = await airtable_service.is_hub_admin(user.email)
@@ -4300,6 +4304,8 @@ async def update_user_by_email(
                 ),
             )
 
-    return await airtable_service.update_user_by_work_email(work_email, payload)
+    return await asyncio.to_thread(
+        user_db_service.update_user_by_work_email, db, work_email, payload
+    )
 
 
