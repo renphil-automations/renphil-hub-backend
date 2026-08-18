@@ -22,7 +22,7 @@ from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 
 from app.config import Settings
-from app.helpers.exceptions import DomainNotAllowedError, GoogleOAuthError
+from app.helpers.exceptions import GoogleOAuthError, UserNotAuthorizedError
 from app.helpers.google_client import build_oauth_flow
 from app.models.auth import TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
@@ -63,7 +63,6 @@ class AuthService:
         auth_url, state = flow.authorization_url(
             access_type="offline",
             prompt="consent",
-            hd=self._settings.ALLOWED_EMAIL_DOMAIN,  # hint — enforced server-side too
             code_challenge=code_challenge,
             code_challenge_method="S256",
         )
@@ -121,8 +120,8 @@ class AuthService:
         name: str = id_info.get("name", "")
         picture: str | None = id_info.get("picture")
 
-        # Enforce domain
-        self._enforce_domain(email)
+        # Gate login: org domain, or a pre-registered external email
+        await self._enforce_login_allowed(email, airtable_service)
 
         # Auto-provision a Hub Member Access Control record for first-time users
         await airtable_service.ensure_access_control_member(email)
@@ -181,8 +180,19 @@ class AuthService:
             roles=payload.get("roles") or [],
         )
 
-    # ── Domain restriction ─────────────────────────────────────────────
-    def _enforce_domain(self, email: str) -> None:
+    # ── Login allow-list ────────────────────────────────────────────────
+    async def _enforce_login_allowed(
+        self, email: str, airtable_service: AirtableService
+    ) -> None:
+        """Gate login by email.
+
+        Org-domain emails are always allowed. A non-org email is allowed only
+        when it is already present in the Access Control table (pre-registered
+        by an admin); otherwise login is refused. Runs BEFORE auto-provisioning
+        so an unknown external email is never provisioned into existence.
+        """
         domain = email.rsplit("@", 1)[-1].lower()
-        if domain != self._settings.ALLOWED_EMAIL_DOMAIN.lower():
-            raise DomainNotAllowedError(email, self._settings.ALLOWED_EMAIL_DOMAIN)
+        if domain == self._settings.ALLOWED_EMAIL_DOMAIN.lower():
+            return
+        if not await airtable_service.access_control_email_exists(email):
+            raise UserNotAuthorizedError(email)

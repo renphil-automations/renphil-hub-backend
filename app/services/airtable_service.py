@@ -3991,6 +3991,10 @@ class AirtableService:
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
+    async def access_control_email_exists(self, email: str) -> bool:
+        """Return True when ``email`` already has an Access Control record."""
+        return await self._find_access_control_by_email(email) is not None
+
     async def _find_role_id_by_name(self, role_name: str) -> str | None:
         """Return the Airtable record id of the Role matching ``role_name``."""
         name_field = self._settings.ROLES_NAME_FIELD
