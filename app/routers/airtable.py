@@ -2949,10 +2949,13 @@ async def create_announcement(
 )
 async def create_feedback(
     payload: FeedbackCreate = Body(...),
-    _user: UserInfo = Depends(get_current_user),
+    user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.create_feedback(payload)
+    return await airtable_service.create_feedback(
+        payload,
+        from_email=str(user.email),
+    )
 
 
 @router.patch(
