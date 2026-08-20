@@ -196,6 +196,32 @@ def _as_number(value: Any) -> float:
         ) from None
 
 
+def _filter_values(value: Any) -> list[str]:
+    """Normalize a widget filter condition's `value` to a list of non-blank
+    strings.
+
+    `eq`/`neq` conditions may now carry MULTIPLE values — the Property
+    Panel's tag input, e.g. Status is Active OR Pending — as a list; every
+    other operator still sends a bare scalar, which becomes a one-item
+    list here. Blank entries are dropped in BOTH shapes, so "no value
+    chosen yet" (a freshly added filter row, or every tag removed) is
+    treated the same whether it arrives as `''` (the pre-multi-value shape)
+    or `[]`: no clause, rather than an accidental blank-cell match. That is
+    a deliberate (small) behaviour change from the single-value past, where
+    `eq` + an empty value produced `{Field} = ''` — but it's the same
+    fail-open direction this module already commits to elsewhere (see this
+    function's caller's own docstring: "a dropped clause makes the result
+    set WIDER"), and it means an unfinished filter row never silently hides
+    every non-blank row while an admin is still typing.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v is not None and str(v) != ""]
+    text = str(value)
+    return [text] if text != "" else []
+
+
 def widget_filter_clause(field: str, operator: str, value: Any = "") -> str | None:
     """One clause of the widget's Filters section.
 
@@ -204,14 +230,21 @@ def widget_filter_clause(field: str, operator: str, value: Any = "") -> str | No
     take down the whole widget — but note that a dropped clause makes the
     result set WIDER, so callers that treat filters as a security boundary
     must not use this (personalize is applied separately and never dropped).
+
+    `eq`/`neq` accept either a single value or a list of values via
+    `_filter_values`, OR-combined for `eq` / AND-excluded for `neq` through
+    the existing `in_str`/`not_in_str` helpers — both already collapse a
+    one-item list to a plain equality clause, so a single legacy string
+    value formats identically to before.
     """
     name = validate_field_name(field)
-    text = "" if value is None else str(value)
+    values = _filter_values(value)
+    text = values[0] if values else ""
 
     if operator == "eq":
-        return eq_str(name, text)
+        return in_str(name, values)
     if operator == "neq":
-        return neq_str(name, text)
+        return not_in_str(name, values)
     if operator == "contains":
         return contains_str(name, text)
     if operator == "not_contains":

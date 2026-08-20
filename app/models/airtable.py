@@ -159,6 +159,92 @@ class AirtableWidgetMetricResponse(BaseModel):
     )
 
 
+class AirtableChartGroup(BaseModel):
+    """One group/slice/bar of a Chart widget's aggregation."""
+
+    label: str
+    value: float | int
+    is_other: bool = Field(
+        default=False,
+        description="True only for the single folded 'Other' remainder bucket, never a real group.",
+    )
+
+
+class AirtableWidgetChartResponse(BaseModel):
+    """Grouped Count/Sum aggregation for a dashboard Airtable Chart widget,
+    computed server-side over the SAME cached row set the Metric widget's
+    `fetch_widget_metric_cached` uses (see
+    `AirtableService.fetch_widget_chart_cached`) — one aggregate PER GROUP
+    instead of one aggregate overall.
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    aggregation: str = Field(description="'count' or 'sum', echoed back for the caller's own bookkeeping.")
+    group_field: str = Field(default="", description="The field grouped by, echoed back.")
+    groups: list[AirtableChartGroup] = Field(default_factory=list)
+    total: float | int = Field(
+        default=0,
+        description=(
+            "Sum of every returned group's value, INCLUDING 'Other' — the "
+            "percentage denominator, so displayed labels sum to 100%."
+        ),
+    )
+    other_group_count: int = Field(
+        default=0,
+        description="How many real groups were folded into the 'Other' bucket, if any.",
+    )
+    row_count: int = Field(default=0, description="Rows that fed the aggregation (post-personalize-filter).")
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the underlying table is too large to cache (or the "
+            "cache walk itself failed), or the widget is not yet configured "
+            "(no groupField, or no sumField while aggregation is 'sum'). "
+            "Deliberately never falls back to a live partial fetch for an "
+            "aggregate — same stance as AirtableWidgetMetricResponse."
+        ),
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description="Same fail-closed meaning as AirtableWidgetMetricResponse.",
+    )
+    partial: bool = Field(
+        default=False,
+        description=(
+            "True only on the editor preview path, when no warmed cache "
+            "entry could answer the request and a live, 100-record-capped "
+            "read was used instead. The saved-viewer endpoint never sets "
+            "this."
+        ),
+    )
+
+
+class AirtableChartPreviewRequest(BaseModel):
+    """Property Panel preview of an in-progress Chart widget's settings.
+
+    A separate model rather than extending `AirtableEditorPreviewRequest`
+    (which is `extra="forbid"` and shared with the column-discovery
+    preview) — same two-shape resolution (own token, or `link` + stored
+    token), plus the chart-specific aggregation fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    link: str | None = None
+    sourceUrl: str | None = None
+    pat: str | None = None
+    filters: list[dict[str, Any]] | None = None
+    personalizeEnabled: bool = False
+    personalizeColumn: str | None = None
+    groupField: str | None = None
+    aggregation: str = "count"
+    sumField: str | None = None
+    maxGroups: int | None = None
+    groupSort: str = "value_desc"
+
+
 class AirtableEditorPreviewRequest(BaseModel):
     """Property Panel preview of an Airtable widget's in-progress settings.
 

@@ -51,11 +51,13 @@ from app.helpers.slack import (
     verify_slack_signature,
 )
 from app.models.airtable import (
+    AirtableChartPreviewRequest,
     AirtableComponentConfigResponse,
     AirtableComponentConfigUpdate,
     AirtableEditorPreviewRequest,
     AirtableEditorPreviewResponse,
     AirtablePreviewResponse,
+    AirtableWidgetChartResponse,
     AirtableWidgetFullRowsResponse,
     AirtableWidgetMetricResponse,
     AirtableWidgetRowsResponse,
@@ -293,7 +295,17 @@ def update_airtable_component_config_endpoint(
     if "access_control" in provided:
         updates["access_control"] = body.access_control
 
-    config = update_airtable_component_config(db, link, **updates)
+    try:
+        config = update_airtable_component_config(db, link, **updates)
+    except ValueError as exc:
+        # §4.2 (plan_airtable_chart_widget_2026-08-13.md) — an access_control
+        # that widens past the widget's gridstack ceiling. Every other
+        # validation failure in this module surfaces the same way (see the
+        # canvas-save path's own ValueError -> 400 handling).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     if config is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -340,6 +352,7 @@ async def _warm_after_config_save(link: str) -> None:
             return  # nothing to fetch yet — same guard `_refresh_one` uses
         stored = bundle.data or {}
         outcome = await get_airtable_service().warm_widget_cache(
+            widget_type=bundle.widget_type,
             link=link,
             url=source_url,
             api_key=bundle.pat,
@@ -526,6 +539,198 @@ async def get_airtable_component_metric(
         filters=stored.get("filters") or None,
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
+    )
+
+
+# Registered BEFORE its /{link}-shaped GET sibling below, so a request here
+# is never captured as a link lookup — same precedent as
+# /airtable/component/preview vs. the /{link}/... GET routes (decision 3,
+# plan §3.6/L1). Methods differ (POST vs GET) so the two can never actually
+# collide, but the ordering is kept as the deliberate, defensive convention.
+@router.post(
+    "/airtable/component/chart/preview",
+    response_model=AirtableWidgetChartResponse,
+    summary="Preview a Chart widget's in-progress settings (Property Panel)",
+    description="""
+Preview settings that have not been saved yet — used by the Property Panel's
+Chart configuration fields and the in-canvas edit preview.
+
+Same two-shape resolution as `/airtable/component/preview`: send **either**
+your own `pat` + `sourceUrl`, **or** a `link` alone (token and source URL
+come from storage, and the widget's access control applies). A `sourceUrl`
+that differs from the stored one while relying on the stored token is
+rejected.
+
+Answered from the widget's already-warmed cache entry when one exists and
+matches the requested filters (`partial: false`); otherwise from one
+Airtable read capped at 100 records (`partial: true`). Never warms the
+cache itself — see `AirtableService.preview_widget_chart`'s docstring.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def preview_airtable_component_chart(
+    body: AirtableChartPreviewRequest = Body(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    # Same two-shape resolution as preview_airtable_component — see the
+    # comments there. Deliberately not extracted into a shared helper for
+    # this first duplication (two call sites); a third would earn one.
+    body_pat = (body.pat or "").strip()
+    body_url = (body.sourceUrl or "").strip()
+    link = (body.link or "").strip() or None
+
+    if body_pat:
+        if not body_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="sourceUrl is required when supplying a pat",
+            )
+        url, api_key = body_url, body_pat
+        link = None
+
+    elif link:
+        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+        if bundle is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Airtable component not found",
+            )
+        config = bundle.config
+
+        roles = list(user.roles)
+        widget_ac = config.get("access_control")
+        if widget_ac and HUB_ADMIN_ROLE not in roles:
+            if not _user_can_view_widget(widget_ac, user.email, roles):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have access to this widget",
+                )
+
+        stored_url = (config.get("sourceUrl") or "").strip()
+
+        if body_url and body_url != stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Enter the access token for the new source URL — the "
+                    "stored token is only valid for the stored URL."
+                ),
+            )
+
+        if not stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Airtable widget has no source URL configured",
+            )
+
+        stored_pat = bundle.pat
+        if not stored_pat:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Airtable widget has no access token configured",
+            )
+
+        url, api_key = stored_url, stored_pat
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either a link, or a pat with a sourceUrl",
+        )
+
+    return await airtable_service.preview_widget_chart(
+        link=link,
+        url=url,
+        api_key=api_key,
+        caller_email=user.email,
+        group_field=body.groupField,
+        aggregation=body.aggregation,
+        sum_field=body.sumField,
+        filters=body.filters or None,
+        personalize_enabled=bool(body.personalizeEnabled),
+        personalize_column=body.personalizeColumn,
+        max_groups=body.maxGroups,
+        group_sort=body.groupSort,
+    )
+
+
+@router.get(
+    "/airtable/component/{link}/chart",
+    response_model=AirtableWidgetChartResponse,
+    summary="Grouped Count/Sum aggregation for a dashboard Airtable Chart widget",
+    description="""
+Returns one computed value PER GROUP (Count of matching records, or Sum of
+one field) for a Chart widget, fetched server-side under the widget's stored
+token — the group-by field, aggregation, and (for Sum) the summed field are
+all read from the widget's OWN stored configuration, never from the request,
+same "caller cannot widen what they're shown" contract as
+`/airtable/component/{link}/rows`. When personalization is enabled, the
+groups are computed over just the caller's own matching rows.
+
+Computed over the SAME cached full row set the Table and Metric widgets'
+endpoints use. A table too large to cache reports `available: false` rather
+than an approximate value — there is no partial-fetch equivalent for an
+aggregate. High-cardinality group-by fields are folded into a single
+'Other' bucket past the widget's configured (or default) group limit.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_chart(
+    link: str = Path(..., description="The component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    # Same bundle/AC/source-url/pat shape as get_airtable_component_metric —
+    # see the comments there.
+    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+    config = bundle.config
+
+    roles = list(user.roles)
+    widget_ac = config.get("access_control")
+    if widget_ac and HUB_ADMIN_ROLE not in roles:
+        if not _user_can_view_widget(widget_ac, user.email, roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this widget",
+            )
+
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = bundle.pat
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    stored = bundle.data or {}
+
+    return await airtable_service.fetch_widget_chart_cached(
+        link=link,
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        group_field=stored.get("groupField") or None,
+        aggregation=stored.get("aggregation") or "count",
+        sum_field=stored.get("sumField") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
+        max_groups=stored.get("maxGroups"),
+        group_sort=stored.get("groupSort") or "value_desc",
     )
 
 
@@ -721,6 +926,7 @@ async def _refresh_one(
 
         stored = bundle.data or {}
         outcome = await airtable_service.warm_widget_cache(
+            widget_type=bundle.widget_type,
             link=link,
             url=source_url,
             api_key=pat,
