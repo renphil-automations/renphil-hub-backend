@@ -1,10 +1,13 @@
-"""Thread widget service layer (plan_thread_widget_2026-08-17.md) — Phase 1.
+"""Thread widget service layer (plan_thread_widget_2026-08-17.md) — Phase 1
+(threads/comments/votes) + Phase 3 (mentions).
 
 Threads + comments + votes: access-checked, `link`-addressed reads/writes,
 keyset pagination, and recompute-from-source counters. Mentions (plan §5)
-and notifications (plan §3.4, §4.5, §7) are Phase 3/4 — nothing here writes
-a `mentions` array or a `notifications` row (see app/schemas/thread.py's
-module docstring for why the request models don't even accept one yet).
+are now validated and stored — see `derive_mention_token`,
+`list_mentionable_users` and `_validate_and_resolve_mentions` below.
+Notifications (plan §3.4, §4.5, §7 — the *fan-out*, i.e. writing rows to
+`notifications`) are still Phase 4 and are NOT built here; nothing in this
+module writes a `notifications` row.
 
 Every public function here is a thin, synchronous, DB-session-bound unit —
 each is called from the router via a single `asyncio.to_thread(...)` per
@@ -24,11 +27,13 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, tuple_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
@@ -39,10 +44,14 @@ from app.db_v2.models.thread import (
     ThreadV2,
     ThreadVoteV2,
 )
+from app.db_v2.models.user import UserV2
 from app.models.auth import UserInfo
 from app.schemas.thread import (
+    MAX_MENTIONS_PER_POST,
     CommentListResponse,
     CommentSummary,
+    MentionableUser,
+    MentionInput,
     ThreadDetail,
     ThreadListResponse,
     ThreadSummary,
@@ -189,6 +198,165 @@ def _require_author(item_author_email: str, user: UserInfo) -> None:
 
 
 # ---------------------------------------------------------
+# Mentions (plan §5, D13) — directory + server-side validation. The token
+# derivation (§5.5) is the ONE function both this module's validation and
+# the directory endpoint call — a second, independent implementation
+# (e.g. in TypeScript) is exactly the bug §5.5 exists to prevent, which is
+# also why the frontend never derives one itself (plan §8 item 16).
+# ---------------------------------------------------------
+
+
+def derive_mention_token(name: str) -> str:
+    """plan §5.5: the person's name with everything that isn't a Unicode
+    letter or digit removed — `Roy Abdelnour` -> `RoyAbdelnour`. Keeps
+    accented letters as-is (no transliteration); drops apostrophes, hyphens,
+    periods and spaces, which is what makes the result a single "word" the
+    caret regex (frontend) and the word-boundary check (`_token_occurs_in_content`
+    below) can both bound. A name that strips to '' derives to '' — callers
+    treat that as "not mentionable" (plan §5.5's own note), never as an
+    error."""
+    return "".join(ch for ch in (name or "") if ch.isalnum())
+
+
+def _token_occurs_in_content(content: str, token: str) -> bool:
+    """plan §5.3 check 2 — "the token ... occurs in content, as `@<token>`
+    at a word boundary." The trailing negative lookahead is the boundary:
+    without it, a token that is a PREFIX of a longer run of letters/digits
+    (`@RoyAbdelnour` inside `@RoyAbdelnourite`) would count as a match.
+    `\\w` under Python's default Unicode `re` matches non-ASCII letters
+    too, so this holds for the 3 of 148 eligible names with accented
+    characters (plan D13's own note) without any extra handling."""
+    if not token:
+        return False
+    return re.search(rf"@{re.escape(token)}(?!\w)", content) is not None
+
+
+def _fold_for_search(value: str) -> str:
+    """Accent-insensitive fold (plan §5.1): NFKD-normalize, drop combining
+    marks, casefold. Deliberately Python-side rather than the Postgres
+    `unaccent` extension — avoids depending on that extension being
+    installed on Neon (plan §5.1's own reasoning)."""
+    normalized = unicodedata.normalize("NFKD", value or "")
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return stripped.casefold()
+
+
+MENTIONABLE_USERS_LIMIT = 8
+
+
+def _eligible_mentionable_users_query(db: Session):
+    """The one eligibility rule (plan D7 as amended by D13, §5.1):
+    `EndDate IS NULL OR EndDate > current_date`, `status` deliberately
+    ignored, plus the structural exclusion of rows with no `work_email`
+    (mentions are email-keyed). Shared by the directory endpoint AND
+    mention validation below so the two definitions can never drift apart —
+    the plan's own test list (§10) explicitly checks the directory and
+    validation agree on who's eligible."""
+    today = func.current_date()
+    return db.query(UserV2).filter(
+        or_(UserV2.end_date.is_(None), UserV2.end_date > today),
+        UserV2.work_email.isnot(None),
+        UserV2.work_email != "",
+    )
+
+
+def list_mentionable_users(db: Session, q: str | None) -> list[MentionableUser]:
+    """`GET /threads/mentionable-users` (plan §5.1). Eligibility filter runs
+    in SQL; the accent-insensitive substring/prefix match runs in Python
+    over that (small, ≤175-row) result set, per §5.1's own reasoning for why
+    that split is the simplest correct thing at this table size."""
+    rows = _eligible_mentionable_users_query(db).all()
+    q_folded = _fold_for_search(q) if q else ""
+
+    results: list[MentionableUser] = []
+    for row in rows:
+        token = derive_mention_token(row.name)
+        if not token:
+            # A name that strips to '' isn't mentionable (plan §5.5) —
+            # excluded from the directory rather than shown with a token
+            # that could never actually be typed or matched.
+            continue
+        if q_folded:
+            name_hit = q_folded in _fold_for_search(row.name or "")
+            token_hit = _fold_for_search(token).startswith(q_folded)
+            if not (name_hit or token_hit):
+                continue
+        results.append(
+            MentionableUser(
+                token=token,
+                name=row.name,
+                email=_norm_email(row.work_email),
+                headshot_url=row.headshot or None,
+            )
+        )
+
+    results.sort(key=lambda r: r.name.lower())
+    return results[:MENTIONABLE_USERS_LIMIT]
+
+
+def _validate_and_resolve_mentions(
+    db: Session, claimed: list[MentionInput], content: str
+) -> list[dict[str, str]]:
+    """plan §5.3 — the server does not trust the client's `mentions` array.
+    For each claimed email: (1) it must belong to an eligible `users` row
+    (the SAME eligibility rule the directory applies — `_eligible_
+    mentionable_users_query`), and (2) the token the SERVER derives from
+    that row's name must actually occur in `content` as `@<token>` at a
+    word boundary. Anything failing either check is silently dropped
+    (never a 4xx for the whole request — plan §5.3: "this closes the
+    obvious hole"). `name`/`token` on the returned entries always come from
+    the matched `users` row, never from `claimed` — a client cannot make a
+    chip render someone else's name.
+
+    De-duplicates by normalized email, preserving first-occurrence order
+    (plan §5.2: rendering resolves a token collision by "array order,
+    first wins", which only means something if this array's order is the
+    order the client actually claimed them in, not an arbitrary one a
+    `set()` would produce).
+
+    Raises 400 if more than `MAX_MENTIONS_PER_POST` mentions SURVIVE both
+    checks (plan §4.7 control 1 / §5.3 item 3) — deliberately counts
+    survivors, not the raw claimed count, so a client can't be blocked by
+    padding a request with mentions that would be dropped anyway."""
+    if not claimed:
+        return []
+
+    ordered_emails: list[str] = []
+    seen: set[str] = set()
+    for entry in claimed:
+        email = _norm_email(entry.email)
+        if email and email not in seen:
+            seen.add(email)
+            ordered_emails.append(email)
+    if not ordered_emails:
+        return []
+
+    eligible_rows = (
+        _eligible_mentionable_users_query(db)
+        .filter(func.lower(UserV2.work_email).in_(ordered_emails))
+        .all()
+    )
+    eligible_by_email = {_norm_email(row.work_email): row for row in eligible_rows}
+
+    resolved: list[dict[str, str]] = []
+    for email in ordered_emails:
+        row = eligible_by_email.get(email)
+        if row is None:
+            continue  # check 1 failed — not an eligible users row
+        token = derive_mention_token(row.name)
+        if not _token_occurs_in_content(content, token):
+            continue  # check 2 failed — token isn't actually in the text
+        resolved.append({"email": email, "name": row.name, "token": token})
+
+    if len(resolved) > MAX_MENTIONS_PER_POST:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"A post may mention at most {MAX_MENTIONS_PER_POST} people",
+        )
+    return resolved
+
+
+# ---------------------------------------------------------
 # Vote lookups — batched for list endpoints, single for detail responses.
 # ---------------------------------------------------------
 
@@ -250,6 +418,7 @@ def _to_thread_summary(thread: ThreadV2, my_vote: int) -> ThreadSummary:
         created_at=thread.created_at,
         edited_at=thread.edited_at,
         my_vote=my_vote,
+        mentions=thread.mentions or [],
     )
 
 
@@ -272,6 +441,7 @@ def _to_comment_summary(comment: ThreadCommentV2, my_vote: int) -> CommentSummar
         created_at=comment.created_at,
         edited_at=comment.edited_at,
         my_vote=my_vote,
+        mentions=comment.mentions or [],
     )
 
 
@@ -319,12 +489,22 @@ def list_threads_for_link(
 
 
 def create_thread_for_link(
-    db: Session, link: str, user: UserInfo, title: str, content: str
+    db: Session,
+    link: str,
+    user: UserInfo,
+    title: str,
+    content: str,
+    mentions: list[MentionInput] | None = None,
 ) -> ThreadDetail:
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
     _check_view_access(component, user)
+
+    # Resolve mentions BEFORE constructing the row — a 400 from the cap
+    # (plan §4.7) must not leave a half-built thread behind (nothing is
+    # `db.add`ed yet at this point).
+    resolved = _validate_and_resolve_mentions(db, mentions or [], content)
 
     now = _utc_now()
     thread = ThreadV2(
@@ -333,7 +513,7 @@ def create_thread_for_link(
         content=content,
         author_email=_norm_email(user.email),
         author_name=user.name,
-        mentions=[],
+        mentions=resolved,
         status=THREAD_STATUS_APPROVED,
         up_count=0,
         down_count=0,
@@ -346,8 +526,31 @@ def create_thread_for_link(
     return _to_thread_detail(thread, my_vote=0)
 
 
+def get_thread_by_id(db: Session, thread_id: int, user: UserInfo) -> ThreadDetail:
+    """Fetch one thread's full content — any viewer with the widget's own
+    view access, NOT author-only (session handoff 2026-08-20 §0/addendum:
+    the Phase 2 frontend worked around this endpoint not existing by
+    empty-PATCH'ing as the author, which only ever closed the gap for a
+    thread's own author). Gated the same way `list_threads_for_link` gates
+    the list — including the same `status == approved` filter, so a future
+    moderation queue (D5) can't be read around by id once it exists; today
+    every thread is 'approved' by construction, so this is a no-op filter,
+    not a behavior change."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, user)
+    if thread.status != THREAD_STATUS_APPROVED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+    my_vote = _my_vote_for_thread(db, thread.id, user.email)
+    return _to_thread_detail(thread, my_vote)
+
+
 def update_thread_by_id(
-    db: Session, thread_id: int, user: UserInfo, title: str | None, content: str | None
+    db: Session,
+    thread_id: int,
+    user: UserInfo,
+    title: str | None,
+    content: str | None,
+    mentions: list[MentionInput] | None = None,
 ) -> ThreadDetail:
     thread, component = _require_thread_and_component(db, thread_id)
     # A caller who has lost view access to the widget since posting must
@@ -356,9 +559,20 @@ def update_thread_by_id(
     _check_view_access(component, user)
     _require_author(thread.author_email, user)
 
-    # Only stamp "edited" when something was actually supplied to change —
-    # an empty PATCH ({} — both fields omitted) must not show an "edited"
-    # marker for an edit that never happened.
+    # Validate against the EFFECTIVE content — the new content if this PATCH
+    # touches it, otherwise the thread's current content — since a mention's
+    # token must occur in whatever the stored body ends up being, not
+    # necessarily what this specific request's `content` field carried
+    # (e.g. a title-only edit that also resends the same mentions).
+    if mentions is not None:
+        effective_content = content if content is not None else thread.content
+        thread.mentions = _validate_and_resolve_mentions(db, mentions, effective_content)
+
+    # Only stamp "edited" when title/content were actually supplied to
+    # change — an empty PATCH ({} — both omitted) must not show an "edited"
+    # marker for an edit that never happened. A mentions-only resend (no
+    # title/content change) is deliberately NOT treated as an edit either,
+    # for the same reason.
     changed = False
     if title is not None:
         thread.title = title
@@ -433,10 +647,18 @@ def _recompute_comment_count(db: Session, thread_id: int) -> int:
 
 
 def create_comment_for_thread(
-    db: Session, thread_id: int, user: UserInfo, content: str
+    db: Session,
+    thread_id: int,
+    user: UserInfo,
+    content: str,
+    mentions: list[MentionInput] | None = None,
 ) -> CommentSummary:
     thread, component = _require_thread_and_component(db, thread_id)
     _check_view_access(component, user)
+
+    # Resolve BEFORE the lock/recompute below — a 400 from the cap must not
+    # leave a half-built comment or a bumped comment_count behind.
+    resolved = _validate_and_resolve_mentions(db, mentions or [], content)
 
     # Lock the parent thread before the recompute below, same reasoning as
     # the vote recipe (plan §4.4): the recompute's snapshot must be taken
@@ -450,7 +672,7 @@ def create_comment_for_thread(
         content=content,
         author_email=_norm_email(user.email),
         author_name=user.name,
-        mentions=[],
+        mentions=resolved,
         up_count=0,
         down_count=0,
         created_at=now,
@@ -466,11 +688,20 @@ def create_comment_for_thread(
 
 
 def update_comment_by_id(
-    db: Session, comment_id: int, user: UserInfo, content: str | None
+    db: Session,
+    comment_id: int,
+    user: UserInfo,
+    content: str | None,
+    mentions: list[MentionInput] | None = None,
 ) -> CommentSummary:
     comment, _thread, component = _require_comment_thread_and_component(db, comment_id)
     _check_view_access(component, user)
     _require_author(comment.author_email, user)
+
+    # Same effective-content reasoning as update_thread_by_id.
+    if mentions is not None:
+        effective_content = content if content is not None else comment.content
+        comment.mentions = _validate_and_resolve_mentions(db, mentions, effective_content)
 
     # Same "only stamp edited when something changed" rule as
     # update_thread_by_id.

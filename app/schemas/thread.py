@@ -1,14 +1,16 @@
 """Pydantic request/response models for the Thread widget
-(plan_thread_widget_2026-08-17.md) — Phase 1 (threads/comments/votes).
+(plan_thread_widget_2026-08-17.md) — Phase 1 (threads/comments/votes) +
+Phase 3 (mentions).
 
-No `mentions` field on any request model yet. The plan's own wire shape
-(§4.1) is `{title, content, mentions[]}`, but trusting a client-supplied
-`mentions` array requires the validation pass in plan §5.3 (roster lookup +
-literal-token check), which doesn't exist until Phase 3. Accepting the field
-now and silently discarding it would look like a real API contract that
-isn't; accepting it and trusting it would violate §5.3's explicit "the
-server does not trust that array". Phase 3 adds the field to both request
-models alongside the validation that makes it safe to store.
+`mentions` now appears on the create/update request models (a
+`list[MentionInput]`) and on `ThreadSummary`/`CommentSummary` (a
+`list[MentionEntry]`, inherited by `ThreadDetail`). The request shape mirrors
+the stored/response shape (`{email, name, token}`, plan D13) rather than a
+bare email list, because the composer's own mention-tracking state is
+already `{token -> email, name}` (plan §5.4) and serializes directly into
+this array — but `name`/`token` on the way IN are never trusted (plan §5.3):
+`thread_service._validate_and_resolve_mentions` re-derives both from the
+`users` row it matches on `email` and discards whatever the client sent.
 """
 
 from __future__ import annotations
@@ -25,6 +27,46 @@ from pydantic import BaseModel, Field, field_validator
 # no extra machinery, and they agree.
 MAX_TITLE_LENGTH = 200
 MAX_CONTENT_LENGTH = 5000
+
+# plan §4.7 control (1) / §5.3 item 3 — counts SURVIVING (validated)
+# mentions, not the raw claimed count. Over the cap is a 400 naming the
+# limit, never a silent truncation.
+MAX_MENTIONS_PER_POST = 25
+
+
+class MentionInput(BaseModel):
+    """One entry of a client-submitted `mentions` array (plan §5.3/§5.4).
+    Only `email` is ever trusted — it's the key the server looks up in
+    `users` — `name`/`token` are accepted so the wire shape matches what the
+    composer already tracks, but the server overwrites both from the matched
+    row before anything is stored (plan §5.3: "the server overwrites both
+    from the users row it just matched, so a client cannot make a chip
+    render someone else's name")."""
+
+    email: str
+    name: str | None = None
+    token: str | None = None
+
+
+class MentionEntry(BaseModel):
+    """A validated, resolved mention (plan D13) — `email` is the only
+    identity; `name` and `token` are display snapshots of how the mention
+    read when it was posted (plan §3.6's "display snapshot is not an
+    anchor"). Mirrors the JSONB shape stored in `threads.mentions` /
+    `thread_comments.mentions`."""
+
+    email: str
+    name: str
+    token: str
+
+
+class MentionableUser(BaseModel):
+    """One row of `GET /threads/mentionable-users` (plan §5.1)."""
+
+    token: str
+    name: str
+    email: str
+    headshot_url: str | None = None
 
 
 def _validate_title(value: str) -> str:
@@ -50,6 +92,7 @@ def _validate_content(value: str) -> str:
 class ThreadCreateRequest(BaseModel):
     title: str
     content: str
+    mentions: list[MentionInput] = Field(default_factory=list)
 
     @field_validator("title")
     @classmethod
@@ -63,10 +106,17 @@ class ThreadCreateRequest(BaseModel):
 
 
 class ThreadUpdateRequest(BaseModel):
-    """Both fields optional — a PATCH may touch either independently."""
+    """Fields optional — a PATCH may touch any subset independently.
+    `mentions: None` (the default — omitted from the JSON body) means
+    "leave the stored mentions alone"; an explicit array, even `[]`,
+    means "replace them with this validated set" — the same tri-state
+    convention `title`/`content` already use, extended to `mentions` so a
+    PATCH that only touches the title can't silently wipe existing
+    mentions by omission."""
 
     title: str | None = None
     content: str | None = None
+    mentions: list[MentionInput] | None = None
 
     @field_validator("title")
     @classmethod
@@ -81,6 +131,7 @@ class ThreadUpdateRequest(BaseModel):
 
 class CommentCreateRequest(BaseModel):
     content: str
+    mentions: list[MentionInput] = Field(default_factory=list)
 
     @field_validator("content")
     @classmethod
@@ -89,7 +140,16 @@ class CommentCreateRequest(BaseModel):
 
 
 class CommentUpdateRequest(BaseModel):
+    """`mentions` follows the same None-means-don't-touch convention as
+    `ThreadUpdateRequest` (see there). Plan §4.1's endpoint table doesn't
+    list `mentions[]` in this one request's notes column, unlike every
+    other create/update endpoint — treated as an incomplete table entry
+    rather than a deliberate asymmetry (plan §12 item 2: "comments support
+    markdown and mentions, same rules ... as threads"), flagged in the
+    session handoff rather than silently resolved either way."""
+
     content: str | None = None
+    mentions: list[MentionInput] | None = None
 
     @field_validator("content")
     @classmethod
@@ -123,6 +183,12 @@ class ThreadSummary(BaseModel):
     created_at: datetime
     edited_at: datetime | None
     my_vote: Literal[1, -1, 0]
+    # Resolved, validated entries (plan D13/§5.3) — the list view doesn't
+    # render markdown bodies so it never needs these for the chip plugin,
+    # but they ride along here (rather than only on ThreadDetail) so every
+    # response shape that DOES render markdown (ThreadDetail, via
+    # inheritance) gets them without a second field declaration.
+    mentions: list[MentionEntry] = Field(default_factory=list)
 
 
 class ThreadDetail(ThreadSummary):
@@ -151,6 +217,7 @@ class CommentSummary(BaseModel):
     created_at: datetime
     edited_at: datetime | None
     my_vote: Literal[1, -1, 0]
+    mentions: list[MentionEntry] = Field(default_factory=list)
 
 
 class CommentListResponse(BaseModel):

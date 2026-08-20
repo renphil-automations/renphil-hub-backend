@@ -1,7 +1,8 @@
-"""Thread widget router (plan_thread_widget_2026-08-17.md) — Phase 1.
+"""Thread widget router (plan_thread_widget_2026-08-17.md) — Phase 1
+(threads/comments/votes) + Phase 3 (mentions).
 
-Threads + comments + votes only. Mentions (`/threads/mentionable-users`) and
-notifications (`/notifications*`) are Phase 3/4 and are not defined here —
+`/threads/mentionable-users` (the directory endpoint) now lives here.
+Notifications (`/notifications*`) are still Phase 4 and are not defined —
 see app/services/thread_service.py's module docstring.
 
 Every handler is a thin async wrapper: resolve + access-check + the actual
@@ -26,6 +27,7 @@ from app.schemas.thread import (
     CommentListResponse,
     CommentSummary,
     CommentUpdateRequest,
+    MentionableUser,
     ThreadCreateRequest,
     ThreadDetail,
     ThreadListResponse,
@@ -38,6 +40,28 @@ from app.services import thread_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["Threads"])
+
+
+# ---------------------------------------------------------
+# Mentions (plan §5.1) — a static path segment ("mentionable-users"),
+# declared ahead of the dynamic `/threads/{thread_id}` GET below. FastAPI/
+# Starlette would still fall through to this route even if it came second
+# (an `int` path-converter failure on "mentionable-users" just skips that
+# route rather than erroring), but ordering it first avoids relying on that.
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/threads/mentionable-users",
+    response_model=list[MentionableUser],
+    summary="Search the mention directory (plan §5.1) — any authenticated caller",
+)
+async def list_mentionable_users(
+    q: str | None = Query(default=None, description="Search prefix/substring, matched accent-insensitively."),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    return await asyncio.to_thread(thread_service.list_mentionable_users, db, q)
 
 
 # ---------------------------------------------------------
@@ -74,8 +98,28 @@ async def create_thread(
     user: UserInfo = Depends(get_current_user),
 ):
     return await asyncio.to_thread(
-        thread_service.create_thread_for_link, db, link, user, payload.title, payload.content
+        thread_service.create_thread_for_link,
+        db,
+        link,
+        user,
+        payload.title,
+        payload.content,
+        payload.mentions,
     )
+
+
+@router.get(
+    "/threads/{thread_id}",
+    response_model=ThreadDetail,
+    summary="Fetch one thread's full content — any viewer with widget access",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    return await asyncio.to_thread(thread_service.get_thread_by_id, db, thread_id, user)
 
 
 @router.patch(
@@ -91,7 +135,13 @@ async def update_thread(
     user: UserInfo = Depends(get_current_user),
 ):
     return await asyncio.to_thread(
-        thread_service.update_thread_by_id, db, thread_id, user, payload.title, payload.content
+        thread_service.update_thread_by_id,
+        db,
+        thread_id,
+        user,
+        payload.title,
+        payload.content,
+        payload.mentions,
     )
 
 
@@ -162,7 +212,12 @@ async def create_comment(
     user: UserInfo = Depends(get_current_user),
 ):
     return await asyncio.to_thread(
-        thread_service.create_comment_for_thread, db, thread_id, user, payload.content
+        thread_service.create_comment_for_thread,
+        db,
+        thread_id,
+        user,
+        payload.content,
+        payload.mentions,
     )
 
 
@@ -179,7 +234,12 @@ async def update_comment(
     user: UserInfo = Depends(get_current_user),
 ):
     return await asyncio.to_thread(
-        thread_service.update_comment_by_id, db, comment_id, user, payload.content
+        thread_service.update_comment_by_id,
+        db,
+        comment_id,
+        user,
+        payload.content,
+        payload.mentions,
     )
 
 
