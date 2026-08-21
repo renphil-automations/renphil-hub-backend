@@ -221,6 +221,11 @@ class Settings(BaseSettings):
     # ── Feedbacks fields ───────────────────────────────────────────────
     AT_F_FEEDBACK_FROM: str
     AT_F_FEEDBACK_MESSAGE: str
+    AT_F_FEEDBACK_SOURCE: str = "Source"
+    AT_F_FEEDBACK_IMPRESSION: str = "Impression"
+    AT_F_FEEDBACK_MESSAGE_ID: str = "Message ID"
+    AT_F_FEEDBACK_QUERY: str = "Query"
+    AT_F_FEEDBACK_RESPONSE: str = "Response"
 
     # ── Tickets fields ────────────────────────────────────────────────
     AT_F_TICKET_ID: str

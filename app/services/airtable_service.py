@@ -4593,6 +4593,10 @@ class AirtableService:
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
+    async def access_control_email_exists(self, email: str) -> bool:
+        """Return True when ``email`` already has an Access Control record."""
+        return await self._find_access_control_by_email(email) is not None
+
     async def _find_role_id_by_name(self, role_name: str) -> str | None:
         """Return the Airtable record id of the Role matching ``role_name``."""
         name_field = self._settings.ROLES_NAME_FIELD
@@ -7459,16 +7463,38 @@ class AirtableService:
     # Feedback field name constants (loaded from settings/.env)
     _F_FEEDBACK_FROM = _S.AT_F_FEEDBACK_FROM
     _F_FEEDBACK_MESSAGE = _S.AT_F_FEEDBACK_MESSAGE
+    _F_FEEDBACK_SOURCE = _S.AT_F_FEEDBACK_SOURCE
+    _F_FEEDBACK_IMPRESSION = _S.AT_F_FEEDBACK_IMPRESSION
+    _F_FEEDBACK_MESSAGE_ID = _S.AT_F_FEEDBACK_MESSAGE_ID
+    _F_FEEDBACK_QUERY = _S.AT_F_FEEDBACK_QUERY
+    _F_FEEDBACK_RESPONSE = _S.AT_F_FEEDBACK_RESPONSE
 
-    async def create_feedback(self, payload: FeedbackCreate) -> FeedbackRecord:
-        """Create a new feedback record.
+    async def create_feedback(
+        self,
+        payload: FeedbackCreate,
+        *,
+        from_email: str,
+    ) -> FeedbackRecord:
+        """Create a feedback record with authenticated identity.
 
-        'Date & Time' is a computed Airtable field, so it is not written here.
+        ``Date & Time`` is a computed Airtable field and is not written here.
+        V1 message-level fields are optional so the existing global feedback
+        widget remains backward-compatible.
         """
         fields: dict[str, Any] = {
-            self._F_FEEDBACK_FROM: str(payload.from_email),
+            self._F_FEEDBACK_FROM: from_email,
             self._F_FEEDBACK_MESSAGE: payload.message,
         }
+        optional_fields = (
+            (self._F_FEEDBACK_SOURCE, payload.source),
+            (self._F_FEEDBACK_IMPRESSION, payload.impression),
+            (self._F_FEEDBACK_MESSAGE_ID, payload.message_id),
+            (self._F_FEEDBACK_QUERY, payload.query),
+            (self._F_FEEDBACK_RESPONSE, payload.response),
+        )
+        for field_name, value in optional_fields:
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                fields[field_name] = value
 
         table = self._feedbacks_table()
         try:

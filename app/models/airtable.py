@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -1806,12 +1806,25 @@ class AnnouncementRecord(_TypedAirtableRecord):
 class FeedbackCreate(BaseModel):
     """Payload to submit a new piece of user feedback.
 
-    Stored in the Feedbacks table. ``Date & Time`` is a computed Airtable
-    field and is populated automatically on create.
+    ``from_email`` is accepted only for backward compatibility with the
+    existing floating feedback widget. The authenticated backend user is the
+    authority for the Airtable ``From`` field.
     """
 
-    from_email: EmailStr = Field(description="Email of the person giving feedback.")
-    message: str = Field(min_length=1, description="The feedback message body.")
+    from_email: EmailStr | None = Field(
+        default=None,
+        description="Deprecated client hint; the server derives From from authentication.",
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="Feedback shortcut plus optional custom comment.",
+    )
+    source: str | None = Field(default=None, max_length=100)
+    impression: Literal["Like", "Dislike"] | None = None
+    message_id: str | None = Field(default=None, max_length=128)
+    query: str | None = Field(default=None, max_length=12000)
+    response: str | None = Field(default=None, max_length=50000)
 
 
 class FeedbackRecord(_TypedAirtableRecord):
@@ -1821,6 +1834,11 @@ class FeedbackRecord(_TypedAirtableRecord):
     from_email: str | None = Field(default=None, alias="From")
     message: str | None = Field(default=None, alias="Message")
     date_time: str | None = Field(default=None, alias="Date & Time")
+    source: str | None = Field(default=None, alias="Source")
+    impression: str | None = Field(default=None, alias="Impression")
+    message_id: str | None = Field(default=None, alias="Message ID")
+    query: str | None = Field(default=None, alias="Query")
+    response: str | None = Field(default=None, alias="Response")
 
 
 # ── Access Control ────────────────────────────────────────────────────
