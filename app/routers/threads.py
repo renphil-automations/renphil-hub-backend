@@ -1,14 +1,20 @@
 """Thread widget router (plan_thread_widget_2026-08-17.md) — Phase 1
-(threads/comments/votes) + Phase 3 (mentions).
+(threads/comments/votes) + Phase 3 (mentions) + Phase 4 (notifications).
 
-`/threads/mentionable-users` (the directory endpoint) now lives here.
-Notifications (`/notifications*`) are still Phase 4 and are not defined —
-see app/services/thread_service.py's module docstring.
+`/threads/mentionable-users` (the directory endpoint) lives here, and so
+now does `/notifications*` (list, unread-count, mark-read, read-all — plan
+§4.1). Thread/comment create and every vote endpoint carry a
+`@rate_limited(...)` decorator (`helpers/rate_limit.py`, plan §4.7 control
+2) — it runs BEFORE the handler body, so a rate-limited caller never
+reaches the DB at all.
 
 Every handler is a thin async wrapper: resolve + access-check + the actual
 DB work all happen inside ONE `asyncio.to_thread(...)` call in
 thread_service, so a single request costs one hop off the event loop, not
-one per internal query (plan §4.6).
+one per internal query (plan §4.6). `/notifications/unread-count` is the
+one exception — it also needs the raw `Request`/`Response` for the
+`If-None-Match` / `ETag` pair (plan §4.5), which have no place in
+thread_service's plain-value return.
 """
 
 from __future__ import annotations
@@ -16,11 +22,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
 from app.dependencies import get_current_user
+from app.helpers.rate_limit import rate_limited
 from app.models.auth import UserInfo
 from app.schemas.thread import (
     CommentCreateRequest,
@@ -28,10 +35,12 @@ from app.schemas.thread import (
     CommentSummary,
     CommentUpdateRequest,
     MentionableUser,
+    NotificationListResponse,
     ThreadCreateRequest,
     ThreadDetail,
     ThreadListResponse,
     ThreadUpdateRequest,
+    UnreadCountResponse,
     VoteRequest,
     VoteResponse,
 )
@@ -91,6 +100,7 @@ async def list_threads(
     summary="Create a thread on a thread widget",
     responses={403: {"description": "Caller does not satisfy the widget's access control"}},
 )
+@rate_limited("thread")
 async def create_thread(
     payload: ThreadCreateRequest,
     link: str = Path(..., description="The thread widget component's stable `link`."),
@@ -165,6 +175,7 @@ async def delete_thread(
     summary="Cast, switch, or clear a vote on a thread",
     responses={403: {"description": "Caller is the thread's author, or lacks widget access"}},
 )
+@rate_limited("vote")
 async def vote_on_thread(
     payload: VoteRequest,
     thread_id: int = Path(...),
@@ -205,6 +216,7 @@ async def list_comments(
     summary="Add a comment to a thread",
     responses={403: {"description": "Caller does not satisfy the widget's access control"}},
 )
+@rate_limited("comment")
 async def create_comment(
     payload: CommentCreateRequest,
     thread_id: int = Path(...),
@@ -263,6 +275,7 @@ async def delete_comment(
     summary="Cast, switch, or clear a vote on a comment",
     responses={403: {"description": "Caller is the comment's author, or lacks widget access"}},
 )
+@rate_limited("vote")
 async def vote_on_comment(
     payload: VoteRequest,
     comment_id: int = Path(...),
@@ -272,3 +285,76 @@ async def vote_on_comment(
     return await asyncio.to_thread(
         thread_service.vote_on_comment, db, comment_id, user, payload.value
     )
+
+
+# ---------------------------------------------------------
+# Notifications (plan §3.4, §4.5, §7 — Phase 4). Self only throughout — none
+# of these take an `{id}`-addressed OTHER user, by design.
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/notifications",
+    response_model=NotificationListResponse,
+    summary="One page of the caller's own notifications, newest first",
+)
+async def list_notifications(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    unread_only: bool = Query(default=False),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    return await asyncio.to_thread(
+        thread_service.list_notifications_for_user, db, user, cursor, unread_only
+    )
+
+
+@router.get(
+    "/notifications/unread-count",
+    response_model=UnreadCountResponse,
+    summary="The caller's unread notification count — derived every time, never cached (plan §4.5)",
+)
+async def get_unread_notification_count(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    count, etag = await asyncio.to_thread(
+        thread_service.get_unread_notification_count, db, user
+    )
+    # plan §4.5 — "does not save a request, but it drops the body in the
+    # overwhelmingly common unchanged case." A 304 carries no body by HTTP
+    # definition, so the bell's poll saves the transfer even though it
+    # still costs the same DB round trip.
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    return UnreadCountResponse(count=count)
+
+
+@router.post(
+    "/notifications/{notification_id}/read",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Mark one of the caller's own notifications read — idempotent",
+)
+async def mark_notification_read(
+    notification_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    await asyncio.to_thread(
+        thread_service.mark_notification_read, db, notification_id, user
+    )
+
+
+@router.post(
+    "/notifications/read-all",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Mark all of the caller's own notifications read",
+)
+async def mark_all_notifications_read(
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    await asyncio.to_thread(thread_service.mark_all_notifications_read, db, user)

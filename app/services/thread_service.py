@@ -1,13 +1,21 @@
 """Thread widget service layer (plan_thread_widget_2026-08-17.md) — Phase 1
-(threads/comments/votes) + Phase 3 (mentions).
+(threads/comments/votes) + Phase 3 (mentions) + Phase 4 (notifications).
 
 Threads + comments + votes: access-checked, `link`-addressed reads/writes,
 keyset pagination, and recompute-from-source counters. Mentions (plan §5)
-are now validated and stored — see `derive_mention_token`,
+are validated and stored — see `derive_mention_token`,
 `list_mentionable_users` and `_validate_and_resolve_mentions` below.
-Notifications (plan §3.4, §4.5, §7 — the *fan-out*, i.e. writing rows to
-`notifications`) are still Phase 4 and are NOT built here; nothing in this
-module writes a `notifications` row.
+Notifications (plan §3.4, §4.5, §5.7, §7) are now live end to end: the
+"Notifications" section below fans rows out on thread/comment create and
+edit (`_notify_mentions`, plan §5.7's exact trigger rules), generates the
+panel excerpt via a bounded, non-backtracking stripper (`
+generate_notification_excerpt`, plan §4.8), and serves the read side
+(`list_notifications_for_user`, `get_unread_notification_count` — derived
+every time, never cached, plan §4.5 — `mark_notification_read`,
+`mark_all_notifications_read`). Per-user write rate limiting (plan §4.7
+control 2) lives one layer up, in `helpers/rate_limit.py`'s
+`@rate_limited(...)` decorator on the router handlers — it gates a request
+before it ever reaches this module, so there is nothing to enforce here.
 
 Every public function here is a thin, synchronous, DB-session-bound unit —
 each is called from the router via a single `asyncio.to_thread(...)` per
@@ -52,6 +60,8 @@ from app.schemas.thread import (
     CommentSummary,
     MentionableUser,
     MentionInput,
+    NotificationEntry,
+    NotificationListResponse,
     ThreadDetail,
     ThreadListResponse,
     ThreadSummary,
@@ -63,6 +73,11 @@ logger = logging.getLogger(__name__)
 
 THREADS_PAGE_SIZE = 20
 COMMENTS_PAGE_SIZE = 50
+NOTIFICATIONS_PAGE_SIZE = 20
+
+# D6 — the only two notification triggers.
+NOTIFICATION_TYPE_MENTION = "mention"
+NOTIFICATION_TYPE_THREAD_COMMENT = "thread_comment"
 
 # Thread status values (D5). Only 'approved' is ever written in Phase 1 —
 # the moderation workflow that would write anything else is deferred,
@@ -357,6 +372,299 @@ def _validate_and_resolve_mentions(
 
 
 # ---------------------------------------------------------
+# Notifications (plan §3.4, §4.5, §4.8, §5.7, §7 — Phase 4). Fan-out on
+# write (`_notify_mentions`, called from thread/comment create and edit
+# below), the bounded excerpt stripper, and the read side (list, derived
+# unread count, mark-read).
+# ---------------------------------------------------------
+
+# plan §4.8 rule 1 — bound the input BEFORE any pattern runs. This is the
+# step that actually makes the rest safe: every regex below only ever sees
+# up to this many code points, regardless of the post's real length (up to
+# MAX_CONTENT_LENGTH = 5000), so none of them can be driven quadratic by
+# input size even if a pattern were badly chosen.
+_EXCERPT_INPUT_BOUND = 400
+_EXCERPT_OUTPUT_LENGTH = 200
+
+# plan §4.8 rule 2 — linear, non-backtracking patterns only: character-class
+# deletion and anchored line-leading forms. No nested quantifiers, no
+# backreferences, no alternation over `.*`. This deliberately does NOT parse
+# markdown — a `[text](url)` link strips to `texturl`, and that is accepted
+# cosmetic loss ("losing the nuance of link-title syntax costs nothing" —
+# plan §4.8), not a bug to fix here.
+_EXCERPT_LINE_LEADING_RE = re.compile(r"^[ \t]*(?:[-+*]|\d+\.)[ \t]+", re.MULTILINE)
+_EXCERPT_MARKDOWN_CHARS_RE = re.compile(r"[*_`~#>\[\]()]+")
+_EXCERPT_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def generate_notification_excerpt(content: str) -> str:
+    """plan §4.8 — bound first, then strip, for a plain-text panel preview
+    (never rendered as markdown — the risk this guards against is
+    catastrophic backtracking on the write path, not XSS). Python string
+    slicing already operates on code points, not bytes or UTF-16 units
+    (same unit as §4.2 throughout), so bounding and the final trim are both
+    "on a code-point boundary" for free — no separate handling needed to
+    avoid corrupting a multi-code-point sequence."""
+    bounded = (content or "")[:_EXCERPT_INPUT_BOUND]
+    stripped = _EXCERPT_LINE_LEADING_RE.sub("", bounded)
+    stripped = _EXCERPT_MARKDOWN_CHARS_RE.sub("", stripped)
+    collapsed = _EXCERPT_WHITESPACE_RE.sub(" ", stripped).strip()
+    if len(collapsed) <= _EXCERPT_OUTPUT_LENGTH:
+        return collapsed
+    return collapsed[:_EXCERPT_OUTPUT_LENGTH].rstrip() + "…"
+
+
+def _notify_mentions(
+    db: Session,
+    resolved_mentions: list[dict[str, str]],
+    *,
+    actor: UserInfo,
+    component_id: int,
+    thread_id: int,
+    comment_id: int | None,
+    content: str,
+) -> set[str]:
+    """plan §5.7 — "notify every validated mention except the author (no
+    self-pings)". Returns the set of emails actually notified (excluding
+    the actor), so a caller creating a comment can tell whether the
+    thread's author already received a 'mention' notification on this same
+    comment before deciding whether to also send a 'thread_comment' one —
+    "one notification per person per event, mention wins" (plan §5.7).
+
+    Does not commit — caller controls the transaction, same convention as
+    every other write function in this module."""
+    actor_email = _norm_email(actor.email)
+    excerpt = generate_notification_excerpt(content)
+    notified: set[str] = set()
+    for entry in resolved_mentions:
+        recipient = _norm_email(entry["email"])
+        if recipient == actor_email or recipient in notified:
+            # No self-pings; `resolved_mentions` is already de-duped by
+            # email (plan §5.3), but a second guard here costs nothing and
+            # protects a future caller that passes an un-de-duped list.
+            continue
+        db.add(
+            NotificationV2(
+                recipient_email=recipient,
+                type=NOTIFICATION_TYPE_MENTION,
+                actor_email=actor_email,
+                actor_name=actor.name,
+                component_id=component_id,
+                thread_id=thread_id,
+                comment_id=comment_id,
+                excerpt=excerpt,
+                read_at=None,
+                created_at=_utc_now(),
+            )
+        )
+        notified.add(recipient)
+    return notified
+
+
+def _notify_new_thread_comment(
+    db: Session,
+    *,
+    thread_author_email: str,
+    actor: UserInfo,
+    component_id: int,
+    thread_id: int,
+    comment_id: int,
+    content: str,
+    already_notified: set[str],
+) -> None:
+    """plan §5.7 — "on comment create, additionally notify the thread's
+    author — unless they are the commenter, or they were already notified
+    by a mention on the same comment". `already_notified` is the return
+    value of `_notify_mentions` for this same comment; self-exclusion
+    covers the commenter-is-the-author case the same way `_notify_mentions`
+    covers self-mentions."""
+    thread_author = _norm_email(thread_author_email)
+    actor_email = _norm_email(actor.email)
+    if thread_author == actor_email or thread_author in already_notified:
+        return
+    db.add(
+        NotificationV2(
+            recipient_email=thread_author,
+            type=NOTIFICATION_TYPE_THREAD_COMMENT,
+            actor_email=actor_email,
+            actor_name=actor.name,
+            component_id=component_id,
+            thread_id=thread_id,
+            comment_id=comment_id,
+            excerpt=generate_notification_excerpt(content),
+            read_at=None,
+            created_at=_utc_now(),
+        )
+    )
+
+
+def _mention_emails(mentions: list[dict[str, Any]] | None) -> set[str]:
+    """Normalized email set of a stored `mentions` JSONB array, tolerant of
+    malformed entries (same defensive posture as `rekey_email`'s own scan
+    below) — used to diff an edit's mentions against what was already
+    there (plan §5.7's "on edit: notify only NEWLY added mentions")."""
+    result: set[str] = set()
+    for entry in mentions or []:
+        if isinstance(entry, dict):
+            email = _norm_email(entry.get("email", ""))
+            if email:
+                result.add(email)
+    return result
+
+
+def _notify_newly_added_mentions(
+    db: Session,
+    *,
+    previous_mentions: list[dict[str, Any]] | None,
+    resolved_mentions: list[dict[str, str]],
+    actor: UserInfo,
+    component_id: int,
+    thread_id: int,
+    comment_id: int | None,
+    content: str,
+) -> None:
+    """plan §5.7 — "on edit: notify only newly added mentions — diff the
+    stored mentions against the incoming set. Editing a post must not
+    re-ping everyone already in it." `resolved_mentions` is already the
+    validated set for the post's CURRENT (effective) content; this only
+    changes which subset of it gets a notification row."""
+    previously_notified = _mention_emails(previous_mentions)
+    newly_added = [
+        entry
+        for entry in resolved_mentions
+        if _norm_email(entry["email"]) not in previously_notified
+    ]
+    if newly_added:
+        _notify_mentions(
+            db,
+            newly_added,
+            actor=actor,
+            component_id=component_id,
+            thread_id=thread_id,
+            comment_id=comment_id,
+            content=content,
+        )
+
+
+def _to_notification_entry(
+    notification: NotificationV2, thread_title: str, component_link: str
+) -> NotificationEntry:
+    return NotificationEntry(
+        id=notification.id,
+        type=notification.type,
+        actor_email=notification.actor_email,
+        actor_name=notification.actor_name,
+        thread_id=notification.thread_id,
+        thread_title=thread_title,
+        component_link=component_link,
+        excerpt=notification.excerpt,
+        read_at=notification.read_at,
+        created_at=notification.created_at,
+    )
+
+
+def list_notifications_for_user(
+    db: Session, user: UserInfo, cursor: str | None, unread_only: bool
+) -> NotificationListResponse:
+    """`GET /notifications` (plan §4.1) — self only, newest first, pages of
+    `NOTIFICATIONS_PAGE_SIZE`. `thread_title` / `component_link` are joined
+    live rather than stored (see `NotificationEntry`'s own docstring for
+    why) — safe unconditionally because a notification cannot outlive its
+    thread or component (`ON DELETE CASCADE`, plan §3.4)."""
+    email = _norm_email(user.email)
+    query = (
+        db.query(NotificationV2, ThreadV2.title, ComponentV2.link)
+        .join(ThreadV2, ThreadV2.id == NotificationV2.thread_id)
+        .join(ComponentV2, ComponentV2.id == NotificationV2.component_id)
+        .filter(NotificationV2.recipient_email == email)
+    )
+    if unread_only:
+        query = query.filter(NotificationV2.read_at.is_(None))
+    if cursor:
+        after_created_at, after_id = _decode_cursor(cursor)
+        # Same row-comparison rule as threads/comments pagination (plan
+        # §4.3, finding E10) — not two ANDed predicates.
+        query = query.filter(
+            tuple_(NotificationV2.created_at, NotificationV2.id)
+            < (after_created_at, after_id)
+        )
+
+    rows = (
+        query.order_by(NotificationV2.created_at.desc(), NotificationV2.id.desc())
+        .limit(NOTIFICATIONS_PAGE_SIZE + 1)
+        .all()
+    )
+    has_more = len(rows) > NOTIFICATIONS_PAGE_SIZE
+    page = rows[:NOTIFICATIONS_PAGE_SIZE]
+
+    items = [
+        _to_notification_entry(notification, title, link)
+        for notification, title, link in page
+    ]
+    next_cursor = (
+        _encode_cursor(page[-1][0].created_at, page[-1][0].id)
+        if has_more and page
+        else None
+    )
+    return NotificationListResponse(items=items, next_cursor=next_cursor)
+
+
+def get_unread_notification_count(db: Session, user: UserInfo) -> tuple[int, str]:
+    """`GET /notifications/unread-count` (plan §4.5) — "one query, both
+    values", derived every time, never cached. Returns `(count, etag)`; the
+    router honours `If-None-Match` against the etag and 304s on a hit. The
+    partial index on `(recipient_email) WHERE read_at IS NULL` (plan §3.4)
+    is what keeps this an index-only scan over a handful of rows regardless
+    of table growth."""
+    email = _norm_email(user.email)
+    count, max_id = (
+        db.query(func.count(NotificationV2.id), func.max(NotificationV2.id))
+        .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
+        .one()
+    )
+    count = int(count or 0)
+    etag = f'"{count}-{int(max_id) if max_id is not None else 0}"'
+    return count, etag
+
+
+def mark_notification_read(db: Session, notification_id: int, user: UserInfo) -> None:
+    """`POST /notifications/{id}/read` (plan §4.5) — idempotent (the
+    `read_at IS NULL` predicate makes a repeat call a no-op: 0 rows match,
+    nothing changes) and scoped to the recipient (the IDOR guard plan §4.5
+    calls out explicitly — without the `recipient_email` predicate, any
+    authenticated caller could mark another user's notification read by
+    id). Deliberately does not distinguish "already read", "not yours" and
+    "does not exist" in its response — all three look identical from the
+    caller's side, which is the point of the IDOR guard, not an
+    oversight."""
+    email = _norm_email(user.email)
+    (
+        db.query(NotificationV2)
+        .filter(
+            NotificationV2.id == notification_id,
+            NotificationV2.recipient_email == email,
+            NotificationV2.read_at.is_(None),
+        )
+        .update({NotificationV2.read_at: _utc_now()}, synchronize_session=False)
+    )
+    db.commit()
+
+
+def mark_all_notifications_read(db: Session, user: UserInfo) -> int:
+    """`POST /notifications/read-all` (plan §4.1). Returns the number of
+    rows actually flipped, for callers that want it; the endpoint itself
+    doesn't need to expose it."""
+    email = _norm_email(user.email)
+    updated = (
+        db.query(NotificationV2)
+        .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
+        .update({NotificationV2.read_at: _utc_now()}, synchronize_session=False)
+    )
+    db.commit()
+    return int(updated or 0)
+
+
+# ---------------------------------------------------------
 # Vote lookups — batched for list endpoints, single for detail responses.
 # ---------------------------------------------------------
 
@@ -419,6 +727,10 @@ def _to_thread_summary(thread: ThreadV2, my_vote: int) -> ThreadSummary:
         edited_at=thread.edited_at,
         my_vote=my_vote,
         mentions=thread.mentions or [],
+        # Same generator notifications already use (plan §4.8) — `thread.content`
+        # is already loaded on this row regardless (ThreadV2 has no deferred
+        # columns), so this costs no extra query, only a few CPU cycles.
+        content_excerpt=generate_notification_excerpt(thread.content),
     )
 
 
@@ -521,6 +833,21 @@ def create_thread_for_link(
         created_at=now,
     )
     db.add(thread)
+    db.flush()  # assigns thread.id — the notifications below FK to it
+
+    # plan §5.7 — "on create: notify every validated mention except the
+    # author". Same transaction as the thread insert: a notification must
+    # never survive a thread that doesn't (and vice versa).
+    _notify_mentions(
+        db,
+        resolved,
+        actor=user,
+        component_id=component.id,
+        thread_id=thread.id,
+        comment_id=None,
+        content=content,
+    )
+
     db.commit()
     db.refresh(thread)
     return _to_thread_detail(thread, my_vote=0)
@@ -566,7 +893,21 @@ def update_thread_by_id(
     # (e.g. a title-only edit that also resends the same mentions).
     if mentions is not None:
         effective_content = content if content is not None else thread.content
-        thread.mentions = _validate_and_resolve_mentions(db, mentions, effective_content)
+        previous_mentions = thread.mentions
+        resolved = _validate_and_resolve_mentions(db, mentions, effective_content)
+        thread.mentions = resolved
+        # plan §5.7 — "on edit: notify only newly added mentions". Read
+        # BEFORE the reassignment above overwrites it.
+        _notify_newly_added_mentions(
+            db,
+            previous_mentions=previous_mentions,
+            resolved_mentions=resolved,
+            actor=user,
+            component_id=component.id,
+            thread_id=thread.id,
+            comment_id=None,
+            content=effective_content,
+        )
 
     # Only stamp "edited" when title/content were actually supplied to
     # change — an empty PATCH ({} — both omitted) must not show an "edited"
@@ -678,9 +1019,34 @@ def create_comment_for_thread(
         created_at=now,
     )
     db.add(comment)
-    db.flush()
+    db.flush()  # assigns comment.id — both the notifications below and
+    # the comment_count recompute need it to already exist.
 
     thread.comment_count = _recompute_comment_count(db, thread_id)
+
+    # plan §5.7 — mentions in the comment notify first ("mention wins"),
+    # then the thread's author is notified for the comment itself unless
+    # already covered by a mention on this same comment, or unless they are
+    # the commenter.
+    mention_notified = _notify_mentions(
+        db,
+        resolved,
+        actor=user,
+        component_id=component.id,
+        thread_id=thread_id,
+        comment_id=comment.id,
+        content=content,
+    )
+    _notify_new_thread_comment(
+        db,
+        thread_author_email=thread.author_email,
+        actor=user,
+        component_id=component.id,
+        thread_id=thread_id,
+        comment_id=comment.id,
+        content=content,
+        already_notified=mention_notified,
+    )
 
     db.commit()
     db.refresh(comment)
@@ -701,7 +1067,20 @@ def update_comment_by_id(
     # Same effective-content reasoning as update_thread_by_id.
     if mentions is not None:
         effective_content = content if content is not None else comment.content
-        comment.mentions = _validate_and_resolve_mentions(db, mentions, effective_content)
+        previous_mentions = comment.mentions
+        resolved = _validate_and_resolve_mentions(db, mentions, effective_content)
+        comment.mentions = resolved
+        # plan §5.7 — same "only newly added mentions" rule as thread edits.
+        _notify_newly_added_mentions(
+            db,
+            previous_mentions=previous_mentions,
+            resolved_mentions=resolved,
+            actor=user,
+            component_id=component.id,
+            thread_id=comment.thread_id,
+            comment_id=comment.id,
+            content=effective_content,
+        )
 
     # Same "only stamp edited when something changed" rule as
     # update_thread_by_id.

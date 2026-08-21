@@ -1,6 +1,6 @@
 """Pydantic request/response models for the Thread widget
 (plan_thread_widget_2026-08-17.md) — Phase 1 (threads/comments/votes) +
-Phase 3 (mentions).
+Phase 3 (mentions) + Phase 4 (notifications).
 
 `mentions` now appears on the create/update request models (a
 `list[MentionInput]`) and on `ThreadSummary`/`CommentSummary` (a
@@ -11,6 +11,11 @@ already `{token -> email, name}` (plan §5.4) and serializes directly into
 this array — but `name`/`token` on the way IN are never trusted (plan §5.3):
 `thread_service._validate_and_resolve_mentions` re-derives both from the
 `users` row it matches on `email` and discards whatever the client sent.
+
+`NotificationEntry` / `NotificationListResponse` / `UnreadCountResponse`
+(bottom of this file) back `GET /notifications`, `GET
+/notifications/unread-count`, `POST /notifications/{id}/read` and `POST
+/notifications/read-all` (plan §4.1, §4.5, §7).
 """
 
 from __future__ import annotations
@@ -189,6 +194,14 @@ class ThreadSummary(BaseModel):
     # response shape that DOES render markdown (ThreadDetail, via
     # inheritance) gets them without a second field declaration.
     mentions: list[MentionEntry] = Field(default_factory=list)
+    # Bounded, markdown-stripped preview for the list row's "read without
+    # opening the thread" card (2026-08-20 UI pass). Built the SAME way as a
+    # notification's own `excerpt` — `thread_service.generate_notification_excerpt`,
+    # reused rather than duplicated — deliberately NOT the full `content`
+    # ThreadDetail carries: the list endpoint still never sends a page of
+    # full markdown bodies (plan §4.1), it just now also sends a short,
+    # already-plain-text snippet of each one.
+    content_excerpt: str = ""
 
 
 class ThreadDetail(ThreadSummary):
@@ -232,3 +245,51 @@ class VoteResponse(BaseModel):
     up_count: int
     down_count: int
     my_vote: Literal[1, -1, 0]
+
+
+# ---------------------------------------------------------
+# Notifications (plan §3.4, §4.5, §7 — Phase 4)
+# ---------------------------------------------------------
+
+
+class NotificationEntry(BaseModel):
+    """One row of `GET /notifications` (plan §7.2's panel row content:
+    actor name, a type-keyed phrase the frontend derives from `type`, the
+    thread title, the excerpt, and a relative timestamp computed
+    client-side from `created_at`).
+
+    `thread_title` and `component_link` are NOT stored on the
+    `notifications` row itself (plan §3.4 lists no such columns) — they are
+    joined live from the thread/component at read time. This is
+    deliberately unlike `mentions`' `name`/`token` snapshots (plan §3.6's
+    "display snapshot is not an anchor"): a snapshot exists to survive an
+    identity change (an email, a name); a thread's title has no such
+    problem; a live join is simply the current, correct title, and it
+    costs nothing extra since the notification can only exist while its
+    thread does (`ON DELETE CASCADE`, plan §3.4 — "no orphan state and no
+    tombstone")."""
+
+    id: int
+    type: str
+    actor_email: str | None
+    actor_name: str | None
+    thread_id: int
+    thread_title: str
+    component_link: str
+    excerpt: str | None
+    read_at: datetime | None
+    created_at: datetime
+
+
+class NotificationListResponse(BaseModel):
+    items: list[NotificationEntry] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class UnreadCountResponse(BaseModel):
+    """plan §4.5 — derived every time via `COUNT(*)`, never cached. The
+    router also returns this value baked into an `ETag`
+    (`"{count}-{max_id}"`) so an unchanged poll can 304 — see
+    `thread_service.get_unread_notification_count`."""
+
+    count: int
