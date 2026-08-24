@@ -24,6 +24,7 @@ from app.routers import (
     hub,
     knowledge,
     nav_tabs,
+    rbac,
     super_blocknote_v2,
     tabs_v2,
     threads,
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(hub.router, prefix=api_prefix)
     app.include_router(super_blocknote_v2.router, prefix=api_prefix)
     app.include_router(threads.router, prefix=api_prefix)
+    app.include_router(rbac.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────
     @app.get("/health", tags=["Health"])

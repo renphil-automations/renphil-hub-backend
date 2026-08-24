@@ -23,6 +23,7 @@ from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
 from app.services.nav_tab_service import get_nav_tab_by_document_id
+from app.services.tab_service import HUB_ADMIN_ROLE
 
 _bearer_scheme = HTTPBearer()
 
@@ -130,4 +131,39 @@ async def require_nav_tab_editor(
         raise HTTPException(status_code=404, detail="Nav tab not found")
     if not access_control_service.can_edit(nav_tab.access_control, user.email, list(user.roles)):
         raise HTTPException(status_code=403, detail="Nav tab editor access required")
+    return user
+
+
+# ── Access Management gate (plan_access_control_schema_2026-08-22.md §6) ─
+#
+# Yes, this is the name phase 2 removed above — reintroduced deliberately,
+# not by accident. The reason it was wrong there does not apply here.
+#
+# Phase 2's objection was that a hub-wide gate let someone who fails
+# can_edit on a SPECIFIC nav tab mutate it anyway, because the check never
+# consulted the node being mutated. That argument is about per-node
+# resources: every nav tab and tab carries its own access_control.
+#
+# Roles and scopes have no per-node access_control and never will. They are
+# global org structure, so a global gate is the correct shape rather than a
+# shortcut — there is no node to consult. Assignments, which DO vary by the
+# caller's own (role, scope) envelope, get the §6 delegation check instead
+# when that surface lands; they must not reuse this dependency.
+
+
+async def require_hub_admin(user: UserInfo = Depends(get_current_user)) -> UserInfo:
+    """Gate for writing role/scope definitions and hierarchy edges.
+
+    Reads the JWT's role NAMES, which are sourced from Airtable at login —
+    the same signal the frontend's `isAdmin` uses.
+
+    TRANSITION HAZARD: this deliberately does not consult the new
+    `role_assignments` table, because during the parallel-running period
+    that table is empty and gating on it would lock every admin out of the
+    tool meant to populate it. Re-point this at the new tables as part of
+    the Airtable cutover, and do it BEFORE the Airtable roles stop being
+    issued into the JWT, never after.
+    """
+    if HUB_ADMIN_ROLE not in (user.roles or []):
+        raise HTTPException(status_code=403, detail="Hub Admin access required")
     return user
