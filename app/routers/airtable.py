@@ -59,6 +59,7 @@ from app.models.airtable import (
     AirtablePreviewResponse,
     AirtableWidgetChartResponse,
     AirtableWidgetFullRowsResponse,
+    AirtableWidgetIndexSnapshotResponse,
     AirtableWidgetMetricResponse,
     AirtableWidgetRowsResponse,
     AirtableRecord,
@@ -731,6 +732,262 @@ async def get_airtable_component_chart(
         personalize_column=config.get("personalizeColumn"),
         max_groups=stored.get("maxGroups"),
         group_sort=stored.get("groupSort") or "value_desc",
+    )
+
+
+
+def _require_airtable_index_sync_token(
+    x_sync_token: str | None = Header(
+        default=None,
+        alias="X-Sync-Token",
+    ),
+) -> None:
+    """Authenticate the Agent's server-to-server Airtable ingestion read."""
+
+    expected = (get_settings().AGENT_SYNC_TOKEN or "").strip()
+
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Airtable ingestion service authentication "
+                "is not configured."
+            ),
+        )
+
+    provided = (x_sync_token or "").strip()
+
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid sync token.",
+        )
+
+
+@router.get(
+    "/airtable/component/{link}/index-snapshot",
+    response_model=AirtableWidgetIndexSnapshotResponse,
+    include_in_schema=False,
+)
+async def get_airtable_component_index_snapshot(
+    link: str = Path(
+        ...,
+        description="The component's stable link.",
+    ),
+    _service_auth: None = Depends(
+        _require_airtable_index_sync_token
+    ),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(
+        get_airtable_service
+    ),
+):
+    """Return only viewer-independent Airtable data safe for shared indexing."""
+
+    bundle = await asyncio.to_thread(
+        get_airtable_component_bundle,
+        db,
+        link,
+    )
+
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    config = bundle.config or {}
+    stored = bundle.data or {}
+
+    widget_type = str(
+        bundle.widget_type or ""
+    ).strip().lower()
+
+    if widget_type not in {
+        "airtable",
+        "airtable_metric",
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget type is not supported "
+                "by component ingestion."
+            ),
+        )
+
+    source_url = str(
+        config.get("sourceUrl") or ""
+    ).strip()
+
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget has no source URL "
+                "configured"
+            ),
+        )
+
+    try:
+        base_id, table_id, view_id = (
+            AirtableService._parse_airtable_share_url(
+                source_url
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget has an invalid "
+                "source URL configured"
+            ),
+        ) from exc
+
+    selected_columns: list[str] = []
+
+    raw_selected = stored.get("selectedColumns")
+
+    if isinstance(raw_selected, list):
+        for value in raw_selected:
+            name = str(value or "").strip()
+            if name and name not in selected_columns:
+                selected_columns.append(name)
+
+    raw_filters = stored.get("filters")
+
+    filters = (
+        [
+            dict(item)
+            for item in raw_filters
+            if isinstance(item, dict)
+        ]
+        if isinstance(raw_filters, list)
+        else []
+    )
+
+    personalize_enabled = bool(
+        config.get("personalizeEnabled")
+    )
+
+    personalize_column = (
+        str(config.get("personalizeColumn") or "").strip()
+        or None
+    )
+
+    pat_available = bool(
+        str(bundle.pat or "").strip()
+    )
+
+    common = {
+        "widget_type": widget_type,
+        "base_id": base_id,
+        "table_id": table_id,
+        "view_id": view_id,
+        "selected_columns": selected_columns,
+        "filters": filters,
+        "personalize_enabled": personalize_enabled,
+        "personalize_column": personalize_column,
+    }
+
+    # Metric values are mutable structured facts. They remain a live-query
+    # concern and are never copied into the shared semantic index.
+    if widget_type == "airtable_metric":
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=[],
+            rows=[],
+            row_data_included=False,
+            available=pat_available,
+            reason="metric_live_only",
+            aggregation=(
+                str(
+                    stored.get("aggregation")
+                    or "count"
+                ).strip()
+                or "count"
+            ),
+            sum_field=(
+                str(
+                    stored.get("sumField")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_description=(
+                str(
+                    stored.get("description")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_note=(
+                str(
+                    stored.get("note")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_url=(
+                str(
+                    stored.get("url")
+                    or ""
+                ).strip()
+                or None
+            ),
+        )
+
+    # Personalized row data is viewer-specific. The index gets only the
+    # component's shared configuration/schema context; no caller identity
+    # is supplied and no row fetch is performed.
+    if personalize_enabled:
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=selected_columns,
+            rows=[],
+            row_data_included=False,
+            available=pat_available,
+            reason="personalized_live_only",
+        )
+
+    # A missing PAT means row material cannot be refreshed. Report that
+    # explicitly; the Agent will treat it as unavailable rather than
+    # replacing previously-good indexed rows with an empty snapshot.
+    if not pat_available:
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=selected_columns,
+            rows=[],
+            row_data_included=False,
+            available=False,
+            reason="source_credentials_unavailable",
+        )
+
+    # Reuse the existing filters-only shared cache. Personalization is
+    # deliberately forced OFF: this endpoint has no viewer identity.
+    full = await airtable_service.fetch_widget_full_rows_cached(
+        link=link,
+        url=source_url,
+        api_key=bundle.pat,
+        caller_email="",
+        selected_columns=selected_columns or None,
+        filters=filters or None,
+        personalize_enabled=False,
+        personalize_column=None,
+    )
+
+    available = bool(full.available)
+
+    return AirtableWidgetIndexSnapshotResponse(
+        **common,
+        fields=list(full.fields or []),
+        rows=list(full.rows or []) if available else [],
+        row_data_included=available,
+        available=available,
+        reason=(
+            "shared_rows"
+            if available
+            else "shared_rows_unavailable"
+        ),
     )
 
 

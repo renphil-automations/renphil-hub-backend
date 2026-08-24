@@ -125,6 +125,39 @@ class AirtableWidgetFullRowsResponse(BaseModel):
     )
 
 
+class AirtableWidgetIndexSnapshotResponse(BaseModel):
+    """PAT-free, viewer-independent snapshot used by Agent ingestion.
+
+    Shared Airtable Table widgets may include their shared filtered rows.
+    Personalized Tables and all Metric widgets intentionally return config
+    only so viewer-specific values never enter a shared semantic index.
+    """
+
+    widget_type: str
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+
+    selected_columns: list[str] = Field(default_factory=list)
+    filters: list[dict[str, Any]] = Field(default_factory=list)
+
+    personalize_enabled: bool = False
+    personalize_column: str | None = None
+
+    fields: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+
+    row_data_included: bool = False
+    available: bool = True
+    reason: str
+
+    aggregation: str | None = None
+    sum_field: str | None = None
+    metric_description: str | None = None
+    metric_note: str | None = None
+    metric_url: str | None = None
+
+
 class AirtableWidgetMetricResponse(BaseModel):
     """Single-number Count/Sum aggregation for a dashboard Airtable Metric
     widget, computed server-side over the SAME cached row set the Table
