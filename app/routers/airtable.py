@@ -16,6 +16,9 @@ When ``opportunity_rec_type`` is a list, an ``OR`` (IN) match is used.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import hmac
 import logging
 import time
@@ -59,6 +62,7 @@ from app.models.airtable import (
     AirtablePreviewResponse,
     AirtableWidgetChartResponse,
     AirtableWidgetFullRowsResponse,
+    AirtableWidgetIndexSnapshotResponse,
     AirtableWidgetMetricResponse,
     AirtableWidgetRowsResponse,
     AirtableRecord,
@@ -156,13 +160,15 @@ from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.gemini_service import GeminiService
 from app.services.gridstack_service import (
+    AIRTABLE_LIKE_WIDGET_TYPES,
+    get_component_by_link_for_access_check_v2,
     get_airtable_component_bundle,
     get_airtable_component_config,
     list_airtable_component_links,
     update_airtable_component_config,
 )
 from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
-from app.services import user_db_service
+from app.services import access_control_service, user_db_service
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +248,94 @@ async def get_airtable_preview(
 #   (PUT /v2/tabs/{id}/content) deliberately ignores those fields — see
 #   AIRTABLE_PROTECTED_DATA_FIELDS in gridstack_service.py.
 # ══════════════════════════════════════════════════════════════════════
+
+def _airtable_component_with_effective_ac(
+    db: Session,
+    link: str,
+):
+    """Resolve one Airtable-like component and its effective inherited ACL."""
+
+    component = get_component_by_link_for_access_check_v2(db, link)
+    if component is None or component.type not in AIRTABLE_LIKE_WIDGET_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    effective_ac = component.access_control or access_control_service.resolved_parent_ac(
+        db,
+        component,
+    )
+    return component, effective_ac
+
+
+def _require_airtable_component_view(
+    db: Session,
+    link: str,
+    email: str,
+    roles: list[str],
+):
+    """Require the same effective component visibility rule used by Hub V2."""
+
+    component, effective_ac = _airtable_component_with_effective_ac(db, link)
+    if not access_control_service.can_view(
+        effective_ac,
+        email,
+        list(roles or []),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this widget",
+        )
+    return component
+
+
+def _require_airtable_component_edit(
+    db: Session,
+    link: str,
+    email: str,
+    roles: list[str],
+):
+    """Require effective edit access before exposing or mutating protected config."""
+
+    component, effective_ac = _airtable_component_with_effective_ac(db, link)
+    if not access_control_service.can_edit(
+        effective_ac,
+        email,
+        list(roles or []),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to edit this widget",
+        )
+    return component
+
+
+def _airtable_component_visible_to(
+    db: Session,
+    link: str,
+    email: str,
+    roles: list[str],
+):
+    """Return an Airtable-like component only when its effective ACL is visible."""
+
+    try:
+        component, effective_ac = _airtable_component_with_effective_ac(db, link)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return None
+        raise
+
+    if not access_control_service.can_view(
+        effective_ac,
+        email,
+        list(roles or []),
+    ):
+        return None
+
+    return component
+
+
 @router.get(
     "/airtable/component/{link}/config",
     response_model=AirtableComponentConfigResponse,
@@ -252,6 +346,9 @@ def get_airtable_component_config_endpoint(
     db: Session = Depends(get_db_v2),
     _user: UserInfo = Depends(get_current_user),
 ):
+    _require_airtable_component_edit(
+        db, link, _user.email, list(_user.roles)
+    )
     config = get_airtable_component_config(db, link)
     if config is None:
         raise HTTPException(
@@ -282,6 +379,9 @@ def update_airtable_component_config_endpoint(
 ):
     # `model_fields_set` distinguishes "absent" from "explicitly null" —
     # which is the difference between preserving and clearing the PAT.
+    _require_airtable_component_edit(
+        db, link, _user.email, list(_user.roles)
+    )
     provided = body.model_fields_set
     updates: dict[str, Any] = {}
     if "sourceUrl" in provided:
@@ -405,6 +505,13 @@ async def get_airtable_component_rows(
     # Plain sync SQLAlchemy (finding #8) — off the event loop via to_thread
     # so this ~165ms Neon round trip doesn't stall every other in-flight
     # request on the shared asyncio loop.
+    await asyncio.to_thread(
+        _require_airtable_component_view,
+        db,
+        link,
+        user.email,
+        list(user.roles),
+    )
     bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
     if bundle is None:
         raise HTTPException(
@@ -495,6 +602,13 @@ async def get_airtable_component_metric(
     # Same bundle/AC/source-url/pat shape as get_airtable_component_rows —
     # see the comments there. Plain sync SQLAlchemy off the event loop
     # (finding #8), same reasoning.
+    await asyncio.to_thread(
+        _require_airtable_component_view,
+        db,
+        link,
+        user.email,
+        list(user.roles),
+    )
     bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
     if bundle is None:
         raise HTTPException(
@@ -577,6 +691,14 @@ async def preview_airtable_component_chart(
     # Same two-shape resolution as preview_airtable_component — see the
     # comments there. Deliberately not extracted into a shared helper for
     # this first duplication (two call sites); a third would earn one.
+    if not (body.pat or "").strip() and (body.link or "").strip():
+        await asyncio.to_thread(
+            _require_airtable_component_edit,
+            db,
+            (body.link or "").strip(),
+            user.email,
+            list(user.roles),
+        )
     body_pat = (body.pat or "").strip()
     body_url = (body.sourceUrl or "").strip()
     link = (body.link or "").strip() or None
@@ -685,6 +807,13 @@ async def get_airtable_component_chart(
 ):
     # Same bundle/AC/source-url/pat shape as get_airtable_component_metric —
     # see the comments there.
+    await asyncio.to_thread(
+        _require_airtable_component_view,
+        db,
+        link,
+        user.email,
+        list(user.roles),
+    )
     bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
     if bundle is None:
         raise HTTPException(
@@ -734,6 +863,654 @@ async def get_airtable_component_chart(
     )
 
 
+
+def _require_airtable_index_sync_token(
+    x_sync_token: str | None = Header(
+        default=None,
+        alias="X-Sync-Token",
+    ),
+) -> None:
+    """Authenticate the Agent's server-to-server Airtable ingestion read."""
+
+    expected = (get_settings().AGENT_SYNC_TOKEN or "").strip()
+
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Airtable ingestion service authentication "
+                "is not configured."
+            ),
+        )
+
+    provided = (x_sync_token or "").strip()
+
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid sync token.",
+        )
+
+
+_AIRTABLE_PERSONAL_CONTEXT_DOMAIN = b"renphil-airtable-personal-v1:"
+_AIRTABLE_PERSONAL_IDENTITY_TTL_SECONDS = 60
+_AIRTABLE_PERSONAL_IDENTITY_FUTURE_SKEW_SECONDS = 30
+_AIRTABLE_PERSONAL_CONTEXT_MAX_BYTES = 4096
+
+
+def _invalid_airtable_personal_identity() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid Agent identity context",
+    )
+
+
+def _verify_airtable_personal_identity(
+    encoded_context: str | None,
+    signature: str | None,
+) -> dict[str, Any]:
+    """Verify a short-lived HMAC-bound identity produced by the trusted Agent."""
+
+    secret = (get_settings().AGENT_SYNC_TOKEN or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent sync authentication is not configured",
+        )
+
+    encoded = (encoded_context or "").strip()
+    supplied_signature = (signature or "").strip()
+    if (
+        not encoded
+        or not supplied_signature
+        or len(encoded.encode("utf-8")) > _AIRTABLE_PERSONAL_CONTEXT_MAX_BYTES
+    ):
+        raise _invalid_airtable_personal_identity()
+
+    try:
+        encoded_bytes = encoded.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise _invalid_airtable_personal_identity() from exc
+
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        _AIRTABLE_PERSONAL_CONTEXT_DOMAIN + encoded_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(supplied_signature, expected):
+        raise _invalid_airtable_personal_identity()
+
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(
+            (encoded + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _invalid_airtable_personal_identity() from exc
+
+    if not isinstance(payload, dict):
+        raise _invalid_airtable_personal_identity()
+
+    version = payload.get("v")
+    issued_at = payload.get("iat")
+    email = payload.get("email")
+    raw_roles = payload.get("roles")
+
+    if type(version) is not int or version != 1:
+        raise _invalid_airtable_personal_identity()
+    if type(issued_at) is not int:
+        raise _invalid_airtable_personal_identity()
+    if not isinstance(email, str) or not email.strip():
+        raise _invalid_airtable_personal_identity()
+    if not isinstance(raw_roles, list) or any(
+        not isinstance(role, str) for role in raw_roles
+    ):
+        raise _invalid_airtable_personal_identity()
+
+    now = int(time.time())
+    if issued_at > now + _AIRTABLE_PERSONAL_IDENTITY_FUTURE_SKEW_SECONDS:
+        raise _invalid_airtable_personal_identity()
+    if now - issued_at > _AIRTABLE_PERSONAL_IDENTITY_TTL_SECONDS:
+        raise _invalid_airtable_personal_identity()
+
+    normalized_roles: list[str] = []
+    seen_roles: set[str] = set()
+    for role in raw_roles:
+        cleaned = role.strip()
+        if not cleaned or cleaned in seen_roles:
+            continue
+        seen_roles.add(cleaned)
+        normalized_roles.append(cleaned)
+
+    return {
+        "email": email.strip().lower(),
+        "roles": normalized_roles,
+    }
+
+
+def _require_airtable_personal_identity(
+    x_sync_token: str | None = Header(
+        default=None,
+        alias="X-Sync-Token",
+    ),
+    x_agent_context: str | None = Header(
+        default=None,
+        alias="X-RenPhil-Agent-Context",
+    ),
+    x_agent_signature: str | None = Header(
+        default=None,
+        alias="X-RenPhil-Agent-Signature",
+    ),
+) -> dict[str, Any]:
+    """Authenticate the Agent service and bind the authenticated end-user identity."""
+
+    _require_airtable_index_sync_token(x_sync_token)
+    return _verify_airtable_personal_identity(
+        x_agent_context,
+        x_agent_signature,
+    )
+
+
+
+
+@router.get(
+    "/airtable/component/{link}/index-snapshot",
+    response_model=AirtableWidgetIndexSnapshotResponse,
+    include_in_schema=False,
+)
+async def get_airtable_component_index_snapshot(
+    link: str = Path(
+        ...,
+        description="The component's stable link.",
+    ),
+    _service_auth: None = Depends(
+        _require_airtable_index_sync_token
+    ),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(
+        get_airtable_service
+    ),
+):
+    """Return only viewer-independent Airtable data safe for shared indexing."""
+
+    bundle = await asyncio.to_thread(
+        get_airtable_component_bundle,
+        db,
+        link,
+    )
+
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    config = bundle.config or {}
+    stored = bundle.data or {}
+
+    widget_type = str(
+        bundle.widget_type or ""
+    ).strip().lower()
+
+    if widget_type not in {
+        "airtable",
+        "airtable_metric",
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget type is not supported "
+                "by component ingestion."
+            ),
+        )
+
+    source_url = str(
+        config.get("sourceUrl") or ""
+    ).strip()
+
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget has no source URL "
+                "configured"
+            ),
+        )
+
+    try:
+        base_id, table_id, view_id = (
+            AirtableService._parse_airtable_share_url(
+                source_url
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget has an invalid "
+                "source URL configured"
+            ),
+        ) from exc
+
+    selected_columns: list[str] = []
+
+    raw_selected = stored.get("selectedColumns")
+
+    if isinstance(raw_selected, list):
+        for value in raw_selected:
+            name = str(value or "").strip()
+            if name and name not in selected_columns:
+                selected_columns.append(name)
+
+    raw_filters = stored.get("filters")
+
+    filters = (
+        [
+            dict(item)
+            for item in raw_filters
+            if isinstance(item, dict)
+        ]
+        if isinstance(raw_filters, list)
+        else []
+    )
+
+    personalize_enabled = bool(
+        config.get("personalizeEnabled")
+    )
+
+    personalize_column = (
+        str(config.get("personalizeColumn") or "").strip()
+        or None
+    )
+
+    pat_available = bool(
+        str(bundle.pat or "").strip()
+    )
+
+    common = {
+        "widget_type": widget_type,
+        "base_id": base_id,
+        "table_id": table_id,
+        "view_id": view_id,
+        "selected_columns": selected_columns,
+        "filters": filters,
+        "personalize_enabled": personalize_enabled,
+        "personalize_column": personalize_column,
+    }
+
+    # Metric values are mutable structured facts. They remain a live-query
+    # concern and are never copied into the shared semantic index.
+    if widget_type == "airtable_metric":
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=[],
+            rows=[],
+            row_data_included=False,
+            available=pat_available,
+            reason="metric_live_only",
+            aggregation=(
+                str(
+                    stored.get("aggregation")
+                    or "count"
+                ).strip()
+                or "count"
+            ),
+            sum_field=(
+                str(
+                    stored.get("sumField")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_description=(
+                str(
+                    stored.get("description")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_note=(
+                str(
+                    stored.get("note")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_url=(
+                str(
+                    stored.get("url")
+                    or ""
+                ).strip()
+                or None
+            ),
+        )
+
+    # Personalized row data is viewer-specific. The index gets only the
+    # component's shared configuration/schema context; no caller identity
+    # is supplied and no row fetch is performed.
+    if personalize_enabled:
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=selected_columns,
+            rows=[],
+            row_data_included=False,
+            available=pat_available,
+            reason="personalized_live_only",
+        )
+
+    # A missing PAT means row material cannot be refreshed. Report that
+    # explicitly; the Agent will treat it as unavailable rather than
+    # replacing previously-good indexed rows with an empty snapshot.
+    if not pat_available:
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=selected_columns,
+            rows=[],
+            row_data_included=False,
+            available=False,
+            reason="source_credentials_unavailable",
+        )
+
+    # Reuse the existing filters-only shared cache. Personalization is
+    # deliberately forced OFF: this endpoint has no viewer identity.
+    full = await airtable_service.fetch_widget_full_rows_cached(
+        link=link,
+        url=source_url,
+        api_key=bundle.pat,
+        caller_email="",
+        selected_columns=selected_columns or None,
+        filters=filters or None,
+        personalize_enabled=False,
+        personalize_column=None,
+    )
+
+    available = bool(full.available)
+
+    return AirtableWidgetIndexSnapshotResponse(
+        **common,
+        fields=list(full.fields or []),
+        rows=list(full.rows or []) if available else [],
+        row_data_included=available,
+        available=available,
+        reason=(
+            "shared_rows"
+            if available
+            else "shared_rows_unavailable"
+        ),
+    )
+
+
+_AIRTABLE_PERSONAL_MAX_COMPONENTS = 50
+_AIRTABLE_PERSONAL_MAX_PAGES = 4
+_AIRTABLE_PERSONAL_MAX_ROWS_PER_COMPONENT = 100
+
+
+def _airtable_personal_source_shell(
+    *,
+    component: Any,
+    link: str,
+    widget_type: str,
+) -> dict[str, Any]:
+    return {
+        "component_link": link,
+        "widget_type": widget_type,
+        "title": str(getattr(component, "title", "") or "").strip() or None,
+        "description": (
+            str(getattr(component, "description", "") or "").strip() or None
+        ),
+    }
+
+
+@router.get(
+    "/airtable/personal-context",
+    include_in_schema=False,
+)
+async def get_airtable_personal_context(
+    identity: dict[str, Any] = Depends(_require_airtable_personal_identity),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    """Return live, ACL-scoped personalized Airtable evidence for this caller.
+
+    Identity is infrastructure-controlled: there is no user email, role, formula,
+    base, table, or personalization column request argument. The endpoint only
+    discovers saved personalized widgets the caller can actually view, applies
+    each widget's saved filters and saved personalization column, and uses the
+    verified Agent identity as the row-level email.
+    """
+
+    email = str(identity.get("email") or "").strip().lower()
+    roles = [
+        str(role).strip()
+        for role in (identity.get("roles") or [])
+        if str(role).strip()
+    ]
+
+    links = await asyncio.to_thread(list_airtable_component_links, db)
+    total_links = len(links)
+    links = links[:_AIRTABLE_PERSONAL_MAX_COMPONENTS]
+
+    sources: list[dict[str, Any]] = []
+    overall_complete = total_links <= _AIRTABLE_PERSONAL_MAX_COMPONENTS
+
+    for link in links:
+        component = await asyncio.to_thread(
+            _airtable_component_visible_to,
+            db,
+            link,
+            email,
+            roles,
+        )
+        if component is None:
+            continue
+
+        widget_type = str(getattr(component, "type", "") or "").strip()
+        if widget_type not in {"airtable", "airtable_metric"}:
+            continue
+
+        bundle = await asyncio.to_thread(
+            get_airtable_component_bundle,
+            db,
+            link,
+        )
+        if bundle is None:
+            continue
+
+        config = bundle.config or {}
+        personalize_enabled = bool(config.get("personalizeEnabled"))
+        personalize_column = str(config.get("personalizeColumn") or "").strip()
+
+        if not personalize_enabled or not personalize_column:
+            continue
+
+        shell = _airtable_personal_source_shell(
+            component=component,
+            link=link,
+            widget_type=widget_type,
+        )
+
+        source_url = str(config.get("sourceUrl") or "").strip()
+        pat = bundle.pat
+        if not source_url or not pat:
+            sources.append(
+                {
+                    **shell,
+                    "available": False,
+                    "complete": False,
+                    "reason": "source_unavailable",
+                }
+            )
+            overall_complete = False
+            continue
+
+        stored = bundle.data or {}
+
+        try:
+            if widget_type == "airtable_metric":
+                metric = await airtable_service.fetch_widget_metric_cached(
+                    link=link,
+                    url=source_url,
+                    api_key=pat,
+                    caller_email=email,
+                    aggregation=stored.get("aggregation") or "count",
+                    sum_field=stored.get("sumField") or None,
+                    filters=stored.get("filters") or None,
+                    personalize_enabled=True,
+                    personalize_column=personalize_column,
+                )
+
+                blocked = bool(getattr(metric, "personalize_blocked", False))
+                available = bool(getattr(metric, "available", False)) and not blocked
+
+                source = {
+                    **shell,
+                    "aggregation": getattr(metric, "aggregation", None)
+                    or stored.get("aggregation")
+                    or "count",
+                    "available": available,
+                    "complete": available,
+                }
+
+                if available:
+                    source["value"] = getattr(metric, "value", None)
+                else:
+                    source["reason"] = (
+                        "personalization_blocked"
+                        if blocked
+                        else "metric_unavailable"
+                    )
+                    overall_complete = False
+
+                sources.append(source)
+                continue
+
+            rows: list[dict[str, Any]] = []
+            fields: list[str] = []
+            seen_fields: set[str] = set()
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            blocked = False
+            component_complete = True
+
+            for _ in range(_AIRTABLE_PERSONAL_MAX_PAGES):
+                page = await airtable_service.fetch_widget_rows_cached(
+                    link=link,
+                    url=source_url,
+                    api_key=pat,
+                    caller_email=email,
+                    selected_columns=stored.get("selectedColumns") or None,
+                    filters=stored.get("filters") or None,
+                    personalize_enabled=True,
+                    personalize_column=personalize_column,
+                    cursor=cursor,
+                )
+
+                if bool(getattr(page, "personalize_blocked", False)):
+                    blocked = True
+                    rows = []
+                    fields = []
+                    component_complete = False
+                    break
+
+                for field in list(getattr(page, "fields", None) or []):
+                    field_name = str(field)
+                    if field_name and field_name not in seen_fields:
+                        seen_fields.add(field_name)
+                        fields.append(field_name)
+
+                for row in list(getattr(page, "rows", None) or []):
+                    if not isinstance(row, dict):
+                        continue
+                    rows.append(
+                        {
+                            key: value
+                            for key, value in row.items()
+                            if key != "id"
+                        }
+                    )
+                    if len(rows) >= _AIRTABLE_PERSONAL_MAX_ROWS_PER_COMPONENT:
+                        component_complete = False
+                        break
+
+                if len(rows) >= _AIRTABLE_PERSONAL_MAX_ROWS_PER_COMPONENT:
+                    break
+
+                next_cursor_raw = getattr(page, "next_cursor", None)
+                next_cursor = str(next_cursor_raw or "").strip() or None
+                if next_cursor is None:
+                    cursor = None
+                    break
+                if next_cursor in seen_cursors:
+                    component_complete = False
+                    cursor = next_cursor
+                    break
+
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                if cursor is not None:
+                    component_complete = False
+
+            if blocked:
+                sources.append(
+                    {
+                        **shell,
+                        "fields": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "available": False,
+                        "complete": False,
+                        "reason": "personalization_blocked",
+                    }
+                )
+                overall_complete = False
+                continue
+
+            if cursor is not None:
+                component_complete = False
+
+            sources.append(
+                {
+                    **shell,
+                    "fields": fields,
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "available": True,
+                    "complete": component_complete,
+                }
+            )
+            if not component_complete:
+                overall_complete = False
+
+        except Exception as exc:
+            logger.warning(
+                "Airtable personal-context read failed link=%s error_type=%s",
+                link,
+                type(exc).__name__,
+            )
+            sources.append(
+                {
+                    **shell,
+                    "available": False,
+                    "complete": False,
+                    "reason": "source_error",
+                }
+            )
+            overall_complete = False
+
+    return {
+        "sources": sources,
+        "source_count": len(sources),
+        "complete": overall_complete,
+    }
+
+
+
+
 @router.get(
     "/airtable/component/{link}/rows/full",
     response_model=AirtableWidgetFullRowsResponse,
@@ -773,6 +1550,13 @@ async def get_airtable_component_rows_full(
 ):
     # Same bundle/AC/source-url/pat shape as get_airtable_component_rows and
     # get_airtable_component_metric — see the comments there.
+    await asyncio.to_thread(
+        _require_airtable_component_view,
+        db,
+        link,
+        user.email,
+        list(user.roles),
+    )
     bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
     if bundle is None:
         raise HTTPException(
@@ -1070,6 +1854,14 @@ async def preview_airtable_component(
     user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    if not (body.pat or "").strip() and (body.link or "").strip():
+        await asyncio.to_thread(
+            _require_airtable_component_edit,
+            db,
+            (body.link or "").strip(),
+            user.email,
+            list(user.roles),
+        )
     body_pat = (body.pat or "").strip()
     body_url = (body.sourceUrl or "").strip()
     link = (body.link or "").strip()
