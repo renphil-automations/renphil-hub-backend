@@ -537,6 +537,15 @@ class PersonContactItem(BaseModel):
     first_name: str | None = Field(default=None, alias="First Name")
     last_name: str | None = Field(default=None, alias="Last Name")
     work_email: str | None = Field(default=None, alias="Work Email")
+    office_location: str | None = Field(default=None, alias="Office location")
+    programs: list[str] = Field(
+        default_factory=list,
+        alias="Program Names",
+        description=(
+            "Program names resolved from the Users table's 'Program Names' "
+            "lookup field, split into individual values."
+        ),
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
