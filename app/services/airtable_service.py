@@ -4931,6 +4931,7 @@ class AirtableService:
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
                 s.USERS_EMPLOYMENT_TYPE_FIELD,
+                s.USERS_OFFICE_LOCATION_FIELD,
             ],
         )
         records = self._filter_by_employment_type(
@@ -4951,6 +4952,7 @@ class AirtableService:
                     first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
                     last_name=fields.get(s.USERS_LAST_NAME_FIELD),
                     work_email=fields.get(s.USERS_WORK_EMAIL_FIELD),
+                    office_location=fields.get(s.USERS_OFFICE_LOCATION_FIELD),
                 )
             )
         items.sort(
