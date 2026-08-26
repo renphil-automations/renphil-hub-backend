@@ -7,13 +7,20 @@ The graph is a DAG, not a tree: a role may have several parents (Hub Member
 sits under both Program Member and Function Member) and several children
 (Hub Admin sits above every Lead).
 
-Acyclicity is NOT enforced here by a cycle check. It falls out of ``rank``:
-every edge must satisfy ``parent.rank < child.rank``, so every path strictly
-increases rank and no path can return to its origin. That is why this graph
-needs no advisory lock on write, unlike ``parent_child_scopes`` (plan §5.2, §5.6).
-The rank rule itself spans three rows and cannot be a CHECK — it lives in
-the service layer, and the ONE thing that can break it after the fact is
-editing a role's rank once edges exist (plan §5.3).
+Acyclicity is enforced by a REAL CYCLE WALK plus a transaction-scoped
+advisory lock, exactly as ``parent_child_scopes`` does — the two graphs are
+now symmetric. See ``rbac_graph_service.validate_role_edge``.
+
+HISTORICAL NOTE — this was not always true. ``rank`` (renamed ``depth``
+below) used to carry acyclicity for free: every edge had to satisfy
+``parent.rank < child.rank``, so every path strictly increased rank and no
+path could return to its origin, which is why this graph needed neither a
+cycle check nor a lock. That rule was DISABLED by requirement, not deleted —
+the code is commented out in ``rbac_graph_service`` in case it is wanted
+back. With it off, nothing about ``depth`` constrains the graph, so the
+cycle walk is the only thing standing between the role DAG and a cycle.
+Two concurrent inserts CAN now each be individually acyclic yet jointly form
+a cycle, which is precisely why the advisory lock is no longer optional.
 
 No relationship() here, matching every other model in db_v2/.
 """
@@ -36,7 +43,8 @@ from app.db_v2.database import BaseV2
 
 
 class RoleV2(BaseV2):
-    """One role. Authority is carried by ``rank``, lineage by ``parent_child_roles``."""
+    """One role. Lineage is carried by ``parent_child_roles``; ``depth`` is
+    currently inert metadata (see below)."""
 
     __tablename__ = "roles"
 
@@ -51,25 +59,34 @@ class RoleV2(BaseV2):
 
     description = Column(Text, nullable=True)
 
-    # Lower = more senior. Hub Admin 100, the Leads 200, the Members 300,
-    # Hub Member 400.
+    # Renamed from `rank`, and NULLABLE, because it no longer constrains
+    # anything. Nothing in the application reads it: the rank ordering rule it
+    # existed to serve is commented out in rbac_graph_service, and the UI does
+    # not surface it. It is kept in the schema and on the wire so the rule can
+    # be switched back on without another migration.
     #
-    # NOT unique — peers share a rank on purpose. Program Lead, Function Lead
-    # and Studio Lead all sit at 200, which is exactly what makes them
-    # incomparable: neither `200 < 200` direction holds, so no edge between
-    # them is ever legal in either direction, and nothing has to know they
-    # belong to different trees for that to be true.
+    # Nullable is the honest shape for that: a role created today has no
+    # meaningful value to put here, and NOT NULL would force every caller to
+    # invent one. If the rank rule ever comes back, backfilling a value per
+    # role is the migration — re-adding the column would not be.
     #
-    # Leave GAPS when assigning values (100/200/300/400, never 0/1/2/3).
-    # Inserting a role between two existing levels later is then one INSERT
-    # instead of renumbering every role below it and re-validating every edge
-    # that touches them.
+    # Deliberately NOT indexed: never used as a query predicate. An index on a
+    # table of this size would be paid for on every write and chosen by
+    # nothing. That was true when it was `rank` and is more true now.
     #
-    # Deliberately NOT indexed: rank is only ever read for a role already
-    # located by id (the edge check loads both endpoints), never used as a
-    # query predicate. An index on a table of this size would be paid for on
-    # every write and chosen by nothing.
-    rank = Column(Integer, nullable=False)
+    # WHAT IT MEANT WHILE IT WAS ENFORCED, kept because the commented-out
+    # validator in rbac_graph_service refers to it:
+    #   - Lower = more senior. Hub Admin 100, Leads 200, Members 300,
+    #     Hub Member 400.
+    #   - NOT unique — peers shared a rank on purpose. Program/Function/Studio
+    #     Lead all sat at 200, which is what made them incomparable: neither
+    #     `200 < 200` direction holds, so no edge between them was ever legal
+    #     in either direction, and nothing had to know they belonged to
+    #     different trees for that to be true.
+    #   - Values were spaced in hundreds (100/200/300/400, never 0/1/2/3) so a
+    #     role could be inserted between two levels with one INSERT instead of
+    #     renumbering every role below it and re-validating every incident edge.
+    depth = Column(Integer, nullable=True)
 
     # Delete-guard for rows the application references by `key` — in practice
     # just `hub_admin`. Enforces nothing at the database level; the delete
@@ -77,6 +94,11 @@ class RoleV2(BaseV2):
     # both the role the admin gate depends on and the root every delegated
     # grant descends from (plan §6), so deleting it is unrecoverable through
     # the UI.
+    #
+    # KNOWN GAP: no code path sets this to True — rbac_service.create_role
+    # hardcodes False and it is absent from every request schema, so the guard
+    # is presently inert and hub_admin is deletable. Fixing it is a one-line
+    # UPDATE plus a decision about who may set the flag; out of scope here.
     is_system = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False)
@@ -116,8 +138,11 @@ class RoleEdgeV2(BaseV2):
         # the closure (which is a set) but it makes "delete this edge"
         # ambiguous. Also the index that serves every descendant walk.
         UniqueConstraint("parent_role_id", "child_role_id", name="uq_parent_child_roles_pair"),
-        # The only part of acyclicity a per-row CHECK can express. Strictly
-        # redundant given the rank rule (no role has rank < its own rank),
-        # but free, and it still holds if a rank is mid-edit.
+        # Catches a self-loop, and is now the ONLY cycle protection living in
+        # the database at all — exactly the note parent_child_scopes carries,
+        # for exactly the same reason. It used to be redundant against the
+        # rank rule (no role has rank < its own rank); with that rule disabled
+        # it is load-bearing, and every longer cycle is the service layer's
+        # job (rbac_graph_service.validate_role_edge).
         CheckConstraint("parent_role_id <> child_role_id", name="ck_parent_child_roles_no_self"),
     )

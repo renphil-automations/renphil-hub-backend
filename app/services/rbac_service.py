@@ -19,7 +19,10 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
-from app.services.rbac_graph_service import RbacGraphError, set_role_rank
+# `set_role_rank` was imported here to route rank edits through the validator.
+# That rule is disabled (see rbac_graph_service's "DISABLED: rank changes"
+# block); `depth` is now assigned directly in `update_role`.
+from app.services.rbac_graph_service import RbacGraphError
 
 
 def _utc_now() -> datetime:
@@ -67,7 +70,9 @@ def serialize_role(
         "key": role.key,
         "name": role.name,
         "description": role.description,
-        "rank": role.rank,
+        # Nullable and inert — kept on the wire so the rank rule can be
+        # switched back on without a migration. The UI does not render it.
+        "depth": role.depth,
         "is_system": bool(role.is_system),
         "parent_ids": sorted(parents.get(role.id, [])),
         "child_ids": sorted(children.get(role.id, [])),
@@ -95,11 +100,17 @@ def serialize_scope(
 
 
 def list_roles(db: Session) -> list[dict]:
-    """Ordered by rank so the response reads top-of-org first, then by name
-    so equal-rank peers (which is every Lead, by design) have a stable
-    order rather than whatever the heap returns."""
+    """Ordered by name.
+
+    This used to lead with `rank` so the response read top-of-org first. That
+    ordering is gone with the rule: `depth` is nullable now and usually NULL,
+    and the two dialects disagree about where NULLs sort (Postgres puts them
+    last on ASC, SQLite first), so leading with it would make list order
+    differ between production and the test suite for no benefit — nothing
+    renders it. Name alone is stable everywhere.
+    """
     parents, children = _role_edge_map(db)
-    rows = db.query(RoleV2).order_by(RoleV2.rank, RoleV2.name).all()
+    rows = db.query(RoleV2).order_by(RoleV2.name).all()
     return [serialize_role(r, parents, children) for r in rows]
 
 
@@ -121,14 +132,17 @@ def _assert_role_key_free(db: Session, key: str, name: str) -> None:
 
 
 def create_role(
-    db: Session, *, key: str, name: str, description: str | None, rank: int
+    db: Session, *, key: str, name: str, description: str | None, depth: int | None = None
 ) -> dict:
+    """`depth` is optional and constrains nothing (see RoleV2.depth). The UI
+    does not send it; the parameter stays so the rank rule can be restored
+    without changing this signature."""
     _assert_role_key_free(db, key, name)
     role = RoleV2(
         key=key,
         name=name,
         description=description,
-        rank=rank,
+        depth=depth,
         is_system=False,
         created_at=_utc_now(),
     )
@@ -143,15 +157,17 @@ def update_role(
     *,
     name: str | None,
     description: str | None,
-    rank: int | None,
+    depth: int | None,
     description_provided: bool,
+    depth_provided: bool = False,
 ) -> dict | None:
     """`key` is not updatable — see UpdateRoleRequest's docstring.
 
-    `description_provided` distinguishes "omitted, leave alone" from
-    "explicitly sent as null, clear it", the same three-way the nav-tab
-    `icon` field uses (schemas/tab.py). Without it there is no way to clear
-    a description once set.
+    `description_provided` / `depth_provided` distinguish "omitted, leave
+    alone" from "explicitly sent as null, clear it", the same three-way the
+    nav-tab `icon` field uses (schemas/tab.py). Without it there is no way to
+    clear either field once set — and `depth` is nullable precisely so it can
+    be cleared.
     """
     role = db.query(RoleV2).filter(RoleV2.id == role_id).first()
     if role is None:
@@ -167,10 +183,13 @@ def update_role(
     if description_provided:
         role.description = description
 
-    # Routed through the validator, never assigned directly: a rank change is
-    # the one edit that can invalidate existing edges (§5.3).
-    if rank is not None:
-        set_role_rank(db, role_id, rank)
+    # Assigned directly. This used to route through
+    # rbac_graph_service.set_role_rank, because a rank change was the one edit
+    # that could invalidate existing edges (§5.3) — with the rank rule
+    # disabled there is no invariant left to re-validate, and `depth` is inert
+    # metadata. Restoring the rule means restoring that call here.
+    if depth_provided:
+        role.depth = depth
 
     role.updated_at = _utc_now()
     db.flush()

@@ -13,8 +13,8 @@ router does not yet expose.
 
 Every rule violation returns 409 with a machine-readable `code`. That is the
 main product of this API: building a role graph by hand is mostly a
-conversation with the validator, so the errors name both endpoints and both
-ranks rather than just refusing.
+conversation with the validator, so the errors name both endpoints rather
+than just refusing.
 """
 
 from __future__ import annotations
@@ -59,8 +59,8 @@ def _conflict(error: RbacGraphError) -> HTTPException:
     """Map a validator failure onto 409 with its full payload.
 
     409 rather than 400 throughout: every one of these is a collision with
-    the CURRENT STATE of the graph (a cycle, an inverted rank, a name
-    already taken), not a malformed request — a body that is rejected today
+    the CURRENT STATE of the graph (a cycle, a name already taken), not a
+    malformed request — a body that is rejected today
     may be accepted tomorrow once the conflicting edge is gone. Malformed
     bodies are still 422, handled by Pydantic before reaching here.
     """
@@ -110,7 +110,7 @@ def create_role(request: CreateRoleRequest, db: Session = Depends(get_db_v2)):
             key=request.key,
             name=request.name,
             description=request.description,
-            rank=request.rank,
+            depth=request.depth,
         )
     except RbacGraphError as e:
         raise _conflict(e)
@@ -121,7 +121,7 @@ def create_role(request: CreateRoleRequest, db: Session = Depends(get_db_v2)):
 @router.patch(
     "/roles/{role_id}",
     response_model=RoleAPIResponse,
-    summary="Rename a role, or change its description or rank",
+    summary="Rename a role, or change its description or depth",
     responses={
         404: {"description": "Role not found"},
         **FORBIDDEN_RESPONSE,
@@ -130,17 +130,22 @@ def create_role(request: CreateRoleRequest, db: Session = Depends(get_db_v2)):
     dependencies=ADMIN_ONLY,
 )
 def update_role(role_id: int, request: UpdateRoleRequest, db: Session = Depends(get_db_v2)):
-    """A rank change that would invert an existing edge returns 409
-    `rank_change_conflict` listing every offending edge — refusing without
-    naming them is useless to whoever has to fix it (§5.3)."""
+    """`depth` is inert metadata — editing it cannot conflict with anything.
+
+    This route used to be able to return 409 `rank_change_conflict` listing
+    every edge a rank change would invert (§5.3). That rule is disabled, so
+    the code is gone from the response set along with the frontend renderer
+    for its `conflicts[]` array.
+    """
     try:
         role = rbac_service.update_role(
             db,
             role_id,
             name=request.name,
             description=request.description,
-            rank=request.rank,
+            depth=request.depth,
             description_provided="description" in request.model_fields_set,
+            depth_provided="depth" in request.model_fields_set,
         )
     except RbacGraphError as e:
         raise _conflict(e)
@@ -179,9 +184,13 @@ def delete_role(role_id: int, db: Session = Depends(get_db_v2)):
     dependencies=ADMIN_ONLY,
 )
 def add_role_edge(parent_id: int, child_id: int, db: Session = Depends(get_db_v2)):
-    """`parent` inherits everything `child` has. Requires
-    `parent.rank < child.rank`, which is what blocks the inverted edge and
-    also makes cycles structurally impossible (§5.2)."""
+    """`parent` inherits everything `child` has. The call takes an advisory
+    lock and walks for cycles (§5.4, §5.6) — same as the scope graph.
+
+    It used to require `parent.rank < child.rank` instead, which blocked
+    inverted edges and made cycles structurally impossible (§5.2). That rule
+    is disabled, so the cycle walk is now the only thing keeping this graph
+    acyclic, and 409 `rank_violation` is replaced by 409 `cycle`."""
     try:
         create_role_edge(db, parent_id, child_id)
     except RbacGraphError as e:

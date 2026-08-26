@@ -4,7 +4,7 @@ session_handoff_2026-08-24-permission-management-plan.md §3.1, §4).
 
 Kept separate from ``rbac_graph_service`` for the same split reason that
 module documents for itself: that one owns the two DAGs' structural rules
-(rank ordering, acyclicity); this one owns the one RULE built on top of their
+(acyclicity); this one owns the one RULE built on top of their
 closures — who may create or revoke a `role_assignments` row. Neither module
 touches the other's tables.
 

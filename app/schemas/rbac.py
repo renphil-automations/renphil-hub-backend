@@ -20,11 +20,13 @@ from app.schemas.tab import CLEAN_TEXT_PATTERN, StrictRequestModel
 # schemas/tab.py (kebab there, snake here to match Python/SQL naming).
 KEY_PATTERN = r"^[a-z0-9]+(_[a-z0-9]+)*$"
 
-# Ranks are spaced in hundreds by convention (§3.2) but nothing enforces the
-# spacing — only that a rank is a plain non-negative int well clear of the
-# int32 ceiling, so there is always room to insert above or below.
-MIN_RANK = 0
-MAX_RANK = 1_000_000
+# `depth` (formerly `rank`) is nullable and constrains nothing — the rank
+# ordering rule it served is disabled (see rbac_graph_service). These bounds
+# are all that is left of its validation: a plain non-negative int well clear
+# of the int32 ceiling, so there is always room to insert above or below if
+# the rule is ever restored.
+MIN_DEPTH = 0
+MAX_DEPTH = 1_000_000
 
 
 # ---------------------------------------------------------
@@ -37,7 +39,11 @@ class RoleResponse(BaseModel):
     key: StrictStr
     name: StrictStr
     description: StrictStr | None = None
-    rank: int
+
+    # Nullable and inert. Kept on the wire so the rank rule can be switched
+    # back on without a schema migration; the UI does not render it.
+    depth: int | None = None
+
     is_system: StrictBool = False
 
     # The role's DIRECT parents and children — one hop, not the closure.
@@ -60,7 +66,10 @@ class CreateRoleRequest(StrictRequestModel):
     key: StrictStr = Field(min_length=1, max_length=64, pattern=KEY_PATTERN)
     name: StrictStr = Field(min_length=1, max_length=255, pattern=CLEAN_TEXT_PATTERN)
     description: StrictStr | None = Field(default=None, max_length=2000)
-    rank: int = Field(ge=MIN_RANK, le=MAX_RANK)
+
+    # Was `rank`, required. Now optional and inert — the create form does not
+    # send it, and a role created without one is the normal case.
+    depth: int | None = Field(default=None, ge=MIN_DEPTH, le=MAX_DEPTH)
 
 
 class UpdateRoleRequest(StrictRequestModel):
@@ -78,7 +87,11 @@ class UpdateRoleRequest(StrictRequestModel):
         default=None, min_length=1, max_length=255, pattern=CLEAN_TEXT_PATTERN
     )
     description: StrictStr | None = Field(default=None, max_length=2000)
-    rank: int | None = Field(default=None, ge=MIN_RANK, le=MAX_RANK)
+
+    # Sending it explicitly as null clears it; omitting it leaves it alone —
+    # the router distinguishes the two via `model_fields_set`, same as
+    # `description`. Unlike a rank edit, this can never invalidate an edge.
+    depth: int | None = Field(default=None, ge=MIN_DEPTH, le=MAX_DEPTH)
 
 
 # ---------------------------------------------------------

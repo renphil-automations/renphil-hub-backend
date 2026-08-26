@@ -4,22 +4,24 @@
 Owns every rule the two DAGs obey that a per-row CHECK constraint cannot
 express. The models carry the per-row half (no self-edge, no duplicate edge,
 at most one universal scope); everything spanning more than one row lives
-here, and nothing may write ``parent_child_roles`` / ``parent_child_scopes`` / ``roles.rank``
+here, and nothing may write ``parent_child_roles`` / ``parent_child_scopes``
 without going through this module.
 
-THE TWO GRAPHS ARE NOT SYMMETRIC, which is the thing most likely to trip up
-a reader:
+THE TWO GRAPHS ARE NOW SYMMETRIC. Both enforce acyclicity the same way: a
+real descendant walk (§5.4) under a transaction-scoped advisory lock (§5.6),
+because two concurrent inserts can each be individually acyclic yet jointly
+form a cycle.
 
-  roles   — acyclicity is FREE. Every edge must satisfy
-            ``parent.rank < child.rank`` (§5.2), so every path strictly
-            increases rank and none can return to its origin. No cycle walk,
-            no advisory lock. The cost is §5.3: editing a rank after edges
-            exist is the only way to break it, so ``set_role_rank`` has to
-            re-validate every incident edge.
-
-  scopes  — no rank, so acyclicity is a real descendant walk (§5.4) and every
-            write must hold an advisory lock (§5.6). Two concurrent inserts
-            can each be individually acyclic yet jointly form a cycle.
+THAT IS A CHANGE, and the reason the rank code below is commented out rather
+than deleted. The role graph used to get acyclicity for free from
+``parent.rank < child.rank`` (§5.2): every path strictly increased rank, so
+none could return to its origin, so the role graph needed neither a cycle
+walk nor a lock — §5.6 says so explicitly. The rank rule has been DISABLED by
+requirement (``rank`` is now ``depth``, nullable, and constrains nothing), so
+that immunity is gone and the role graph needs exactly what the scope graph
+always needed. Every commented-out block below is kept verbatim so the rule
+can be switched back on; if it is, the role-side cycle walk and lock become
+redundant again but stay correct, so they can be left in place.
 
 Delegation (§6) is deliberately absent: it governs ASSIGNMENTS, and the
 first cut of Access Management is role/scope definitions only, with every
@@ -39,8 +41,9 @@ from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
 
 # Distinct constants so the two graphs never serialize against each other.
 # Arbitrary, but must stay stable — the lock is only meaningful if every
-# writer picks the same number.
-ROLE_GRAPH_LOCK_KEY = 0x5242_4143_0001  # unused today; reserved, see below
+# writer picks the same number. No transaction ever takes both, so there is
+# no lock-ordering deadlock to reason about.
+ROLE_GRAPH_LOCK_KEY = 0x5242_4143_0001
 SCOPE_GRAPH_LOCK_KEY = 0x5242_4143_0002
 
 
@@ -66,19 +69,41 @@ def _utc_now() -> datetime:
 # ---------------------------------------------------------
 
 
-def lock_scope_graph(db: Session) -> None:
-    """Serialize scope-edge writers for the rest of the transaction (§5.6).
-
-    Must be called BEFORE ``validate_scope_edge``, in the same transaction as
-    the insert — validating without it is a time-of-check/time-of-use hole:
-    A->B and B->A can pass independently and commit a two-node cycle.
+def _lock_graph(db: Session, key: int) -> None:
+    """Take a transaction-scoped advisory lock (§5.6).
 
     No-op on any non-PostgreSQL dialect. ``pg_advisory_xact_lock`` does not
     exist on SQLite, which is what tests/ runs against; the tests are
     single-threaded so there is nothing to serialize there anyway.
     """
     if db.bind is not None and db.bind.dialect.name == "postgresql":
-        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": SCOPE_GRAPH_LOCK_KEY})
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
+
+def lock_role_graph(db: Session) -> None:
+    """Serialize role-edge writers for the rest of the transaction (§5.6).
+
+    Required now that the rank rule is disabled. §5.6 originally exempted
+    this graph on the grounds that rank ordering is a per-edge property, so
+    no combination of individually-valid inserts could produce a cycle — true
+    while ranks were enforced, and false the moment they stopped being. With
+    the rule off, A->B and B->A can pass validation independently and commit
+    a two-node cycle, exactly the scope-graph hazard.
+
+    Must be called BEFORE ``validate_role_edge``, in the same transaction as
+    the insert.
+    """
+    _lock_graph(db, ROLE_GRAPH_LOCK_KEY)
+
+
+def lock_scope_graph(db: Session) -> None:
+    """Serialize scope-edge writers for the rest of the transaction (§5.6).
+
+    Must be called BEFORE ``validate_scope_edge``, in the same transaction as
+    the insert — validating without it is a time-of-check/time-of-use hole:
+    A->B and B->A can pass independently and commit a two-node cycle.
+    """
+    _lock_graph(db, SCOPE_GRAPH_LOCK_KEY)
 
 
 # ---------------------------------------------------------
@@ -194,12 +219,12 @@ def _get_scope(db: Session, scope_id: int) -> ScopeV2:
 def validate_role_edge(db: Session, parent_role_id: int, child_role_id: int) -> None:
     """Rules for adding ``parent -> child`` to the role DAG.
 
-    There is deliberately NO cycle check here. Rank ordering makes one
-    unreachable: if every existing edge satisfies parent.rank < child.rank
-    and this one does too, every path strictly increases rank. That
-    invariant is only ever at risk from a rank EDIT, which is why
-    ``set_role_rank`` re-validates instead (§5.3), and from raw SQL, which
-    bypasses this module entirely.
+    Callers must hold ``lock_role_graph`` for the cycle check to mean
+    anything under concurrency (§5.6) — ``create_role_edge`` takes it.
+
+    The rank ordering rule that used to live here is disabled (see the module
+    docstring) and kept commented out below. With it off, the cycle walk is
+    the only thing keeping this graph acyclic.
     """
     if parent_role_id == child_role_id:
         raise RbacGraphError(
@@ -209,19 +234,41 @@ def validate_role_edge(db: Session, parent_role_id: int, child_role_id: int) -> 
     parent = _get_role(db, parent_role_id)
     child = _get_role(db, child_role_id)
 
-    if parent.rank >= child.rank:
+    # ── DISABLED: rank ordering (§5.2) ────────────────────────────────
+    # Kept, not deleted — the requirement was to switch the rule off, and it
+    # may be wanted back. Restoring it is uncommenting this block; the cycle
+    # check below then becomes redundant but stays correct, so it can stay.
+    # Note `rank` is now the nullable `depth` column, so a restored rule has
+    # to decide what a NULL means before this compares cleanly.
+    #
+    # if parent.rank >= child.rank:
+    #     raise RbacGraphError(
+    #         "rank_violation",
+    #         (
+    #             f"{parent.name!r} (rank {parent.rank}) cannot be a parent of "
+    #             f"{child.name!r} (rank {child.rank}): a parent must rank "
+    #             f"strictly above its child. Equal ranks are peers and can "
+    #             f"never be related in either direction."
+    #         ),
+    #         parent_role_id=parent_role_id,
+    #         child_role_id=child_role_id,
+    #         parent_rank=parent.rank,
+    #         child_rank=child.rank,
+    #     )
+
+    # Adding parent -> child closes a loop exactly when `child` can already
+    # reach `parent`. Same test, same direction, same error code as
+    # validate_scope_edge — the two graphs are symmetric now.
+    if parent_role_id in role_descendants(db, child_role_id):
         raise RbacGraphError(
-            "rank_violation",
+            "cycle",
             (
-                f"{parent.name!r} (rank {parent.rank}) cannot be a parent of "
-                f"{child.name!r} (rank {child.rank}): a parent must rank "
-                f"strictly above its child. Equal ranks are peers and can "
-                f"never be related in either direction."
+                f"{parent.name!r} cannot inherit from {child.name!r}: "
+                f"{child.name!r} already inherits from {parent.name!r}, "
+                f"directly or through another role."
             ),
             parent_role_id=parent_role_id,
             child_role_id=child_role_id,
-            parent_rank=parent.rank,
-            child_rank=child.rank,
         )
 
     exists = (
@@ -242,7 +289,11 @@ def validate_role_edge(db: Session, parent_role_id: int, child_role_id: int) -> 
 
 
 def create_role_edge(db: Session, parent_role_id: int, child_role_id: int) -> RoleEdgeV2:
-    """Validate and insert. Does not commit — the caller owns the transaction."""
+    """Lock, validate, insert. Does not commit — the caller owns the
+    transaction. The lock is taken here rather than left to the caller so
+    there is no way to reach ``validate_role_edge`` unprotected on the write
+    path — same shape as ``create_scope_edge``."""
+    lock_role_graph(db)
     validate_role_edge(db, parent_role_id, child_role_id)
     edge = RoleEdgeV2(
         parent_role_id=parent_role_id,
@@ -277,76 +328,92 @@ def delete_role_edge(db: Session, parent_role_id: int, child_role_id: int) -> No
 
 
 # ---------------------------------------------------------
-# Rank changes (§5.3)
+# DISABLED: rank changes (§5.3)
 # ---------------------------------------------------------
-
-
-def rank_change_conflicts(db: Session, role_id: int, new_rank: int) -> list[dict[str, object]]:
-    """Every existing edge that ``new_rank`` would put in violation.
-
-    This is the ONE thing that can break the role graph's free acyclicity,
-    so it is exposed separately from ``set_role_rank``: the admin API reports
-    the conflicts rather than just refusing, because "you cannot do that" is
-    useless without "these four edges are why".
-    """
-    conflicts: list[dict[str, object]] = []
-
-    as_parent = (
-        db.query(RoleEdgeV2.child_role_id).filter(RoleEdgeV2.parent_role_id == role_id).all()
-    )
-    for (child_id,) in as_parent:
-        child = _get_role(db, child_id)
-        if new_rank >= child.rank:
-            conflicts.append(
-                {
-                    "edge": "parent_of",
-                    "other_role_id": child.id,
-                    "other_role_name": child.name,
-                    "other_rank": child.rank,
-                }
-            )
-
-    as_child = (
-        db.query(RoleEdgeV2.parent_role_id).filter(RoleEdgeV2.child_role_id == role_id).all()
-    )
-    for (parent_id,) in as_child:
-        parent = _get_role(db, parent_id)
-        if parent.rank >= new_rank:
-            conflicts.append(
-                {
-                    "edge": "child_of",
-                    "other_role_id": parent.id,
-                    "other_role_name": parent.name,
-                    "other_rank": parent.rank,
-                }
-            )
-
-    return conflicts
-
-
-def set_role_rank(db: Session, role_id: int, new_rank: int) -> RoleV2:
-    """Change a role's rank, refusing if any incident edge would break."""
-    role = _get_role(db, role_id)
-    if role.rank == new_rank:
-        return role
-
-    conflicts = rank_change_conflicts(db, role_id, new_rank)
-    if conflicts:
-        raise RbacGraphError(
-            "rank_change_conflict",
-            (
-                f"Rank {new_rank} would invalidate {len(conflicts)} existing "
-                f"edge(s) on {role.name!r}. Remove or re-point them first."
-            ),
-            role_id=role_id,
-            new_rank=new_rank,
-            conflicts=conflicts,
-        )
-
-    role.rank = new_rank
-    role.updated_at = _utc_now()
-    db.flush()
-    return role
+#
+# Both functions below are switched off, not deleted, along with the rank
+# ordering rule in validate_role_edge. They existed only to protect that
+# rule's invariant: a rank edit was the one thing that could put an existing
+# edge in violation, so changing a rank had to re-validate every incident
+# edge. With the rule off there is no invariant to protect — `depth` is inert
+# metadata — so `update_role` now assigns it directly.
+#
+# The 409 `rank_change_conflict` error code disappears with them. The
+# frontend's dedicated renderer for its `conflicts[]` array was removed at
+# the same time; restoring these means restoring that too.
+#
+# If this comes back: `rank` is now the nullable `depth` column, so both
+# functions need a stated rule for NULL (is an unranked role above or below
+# everything, or simply un-edgeable?) before the `>=` comparisons are sound.
+# On NULL, `new_rank >= child.rank` raises TypeError rather than returning
+# False — it will not fail quietly.
+#
+# def rank_change_conflicts(db: Session, role_id: int, new_rank: int) -> list[dict[str, object]]:
+#     """Every existing edge that ``new_rank`` would put in violation.
+#
+#     This is the ONE thing that can break the role graph's free acyclicity,
+#     so it is exposed separately from ``set_role_rank``: the admin API reports
+#     the conflicts rather than just refusing, because "you cannot do that" is
+#     useless without "these four edges are why".
+#     """
+#     conflicts: list[dict[str, object]] = []
+#
+#     as_parent = (
+#         db.query(RoleEdgeV2.child_role_id).filter(RoleEdgeV2.parent_role_id == role_id).all()
+#     )
+#     for (child_id,) in as_parent:
+#         child = _get_role(db, child_id)
+#         if new_rank >= child.rank:
+#             conflicts.append(
+#                 {
+#                     "edge": "parent_of",
+#                     "other_role_id": child.id,
+#                     "other_role_name": child.name,
+#                     "other_rank": child.rank,
+#                 }
+#             )
+#
+#     as_child = (
+#         db.query(RoleEdgeV2.parent_role_id).filter(RoleEdgeV2.child_role_id == role_id).all()
+#     )
+#     for (parent_id,) in as_child:
+#         parent = _get_role(db, parent_id)
+#         if parent.rank >= new_rank:
+#             conflicts.append(
+#                 {
+#                     "edge": "child_of",
+#                     "other_role_id": parent.id,
+#                     "other_role_name": parent.name,
+#                     "other_rank": parent.rank,
+#                 }
+#             )
+#
+#     return conflicts
+#
+#
+# def set_role_rank(db: Session, role_id: int, new_rank: int) -> RoleV2:
+#     """Change a role's rank, refusing if any incident edge would break."""
+#     role = _get_role(db, role_id)
+#     if role.rank == new_rank:
+#         return role
+#
+#     conflicts = rank_change_conflicts(db, role_id, new_rank)
+#     if conflicts:
+#         raise RbacGraphError(
+#             "rank_change_conflict",
+#             (
+#                 f"Rank {new_rank} would invalidate {len(conflicts)} existing "
+#                 f"edge(s) on {role.name!r}. Remove or re-point them first."
+#             ),
+#             role_id=role_id,
+#             new_rank=new_rank,
+#             conflicts=conflicts,
+#         )
+#
+#     role.rank = new_rank
+#     role.updated_at = _utc_now()
+#     db.flush()
+#     return role
 
 
 # ---------------------------------------------------------

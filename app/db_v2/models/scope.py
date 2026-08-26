@@ -8,11 +8,14 @@ walk serve both graphs.
 Multi-parent is expected, not exceptional: Scope A can sit inside both
 "All Programs" and "Onboarding" at once.
 
-Unlike the role graph, this one has NO rank to exploit, so acyclicity is a
-real service-layer check and every edge write must take a transaction-scoped
-advisory lock first — two concurrent inserts can each be individually
-acyclic yet jointly form a cycle (plan §5.4, §5.6). That asymmetry between
-the two graphs is deliberate: scopes have no natural authority ordering.
+Acyclicity is a real service-layer check and every edge write must take a
+transaction-scoped advisory lock first — two concurrent inserts can each be
+individually acyclic yet jointly form a cycle (plan §5.4, §5.6).
+
+This used to be the asymmetric half: the role graph got acyclicity free from
+its rank ordering and needed neither check nor lock, while scopes, having no
+natural authority ordering, needed both. The rank rule is now disabled, so
+``role.py`` does exactly what this module does and the two are symmetric.
 
 No relationship() here, matching every other model in db_v2/.
 """
