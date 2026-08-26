@@ -4086,6 +4086,10 @@ class AirtableService:
                         first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
                         last_name=fields.get(s.USERS_LAST_NAME_FIELD),
                         work_email=email,
+                        office_location=fields.get(s.USERS_OFFICE_LOCATION_FIELD),
+                        programs=self._normalize_program_names(
+                            fields.get(s.USERS_PROGRAM_NAMES_FIELD)
+                        ),
                     )
                 )
                 continue
@@ -4166,6 +4170,43 @@ class AirtableService:
             names.append(name)
         return names
 
+    @staticmethod
+    def _normalize_program_names(value: Any) -> list[str]:
+        """Normalize a 'Program Names' lookup value into a list of names.
+
+        The lookup may return a list (one entry per linked record, each of
+        which may itself hold comma-separated values) or a single string.
+        Values are split on commas, trimmed and de-duplicated (first wins).
+        """
+        if not value:
+            return []
+
+        raw: list[str] = []
+        if isinstance(value, str):
+            raw = [value]
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    raw.append(item)
+                elif isinstance(item, dict):
+                    name = item.get("name")
+                    if isinstance(name, str):
+                        raw.append(name)
+
+        seen: set[str] = set()
+        names: list[str] = []
+        for chunk in raw:
+            for part in chunk.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                key = part.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(part)
+        return names
+
     async def _fetch_fellow_entries(
         self, *, include_names: bool = False
     ) -> list[tuple[str, dict[str, Any] | None]]:
@@ -4213,6 +4254,8 @@ class AirtableService:
                 s.USERS_FIRST_NAME_FIELD,
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
+                s.USERS_OFFICE_LOCATION_FIELD,
+                s.USERS_PROGRAM_NAMES_FIELD,
             ]
         user_records = await self._list_records(
             self._users_table(), formula=user_formula, fields=fields
