@@ -18,17 +18,23 @@ from sqlalchemy.orm import Session
 
 from app.services import access_control_service
 from app.services.access_control_service import NodeRef
+from app.services.gridstack_service import _refresh_index_for_touched
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _format_hub(hub: Any) -> dict[str, Any]:
+def _format_hub(
+    hub: Any,
+    *,
+    search_updates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "documentId": hub.document_id,
         "title": "Hub",
         "access_control": hub.access_control,
+        "search_updates": search_updates or [],
     }
 
 
@@ -42,11 +48,15 @@ def update_hub_v2(db: Session, access_control: dict[str, Any] | None) -> dict[st
         hub = access_control_service.get_hub(db)
         if hub is None:
             return None
+        touched: list[NodeRef] = []
         if access_control is not None:
-            access_control_service.apply_write(db, NodeRef("hub", hub.id), access_control)
+            touched = access_control_service.apply_write(
+                db, NodeRef("hub", hub.id), access_control
+            )
+        search_updates = _refresh_index_for_touched(db, touched)
         hub.updated_at = _utc_now()
         db.commit()
-        return _format_hub(hub)
+        return _format_hub(hub, search_updates=search_updates)
     except Exception:
         db.rollback()
         raise
@@ -76,9 +86,15 @@ def purge_hub_principal_v2(
         if hub is None:
             return None
         principal = access_control_service.principal_from_payload(principal_payload)
-        touched = access_control_service.purge_principal(db, NodeRef("hub", hub.id), principal)
+        touched = access_control_service.purge_principal(
+            db, NodeRef("hub", hub.id), principal
+        )
+        search_updates = _refresh_index_for_touched(db, touched)
         db.commit()
-        return {"touched": [access_control_service.node_summary(db, r) for r in touched]}
+        return {
+            "touched": [access_control_service.node_summary(db, r) for r in touched],
+            "search_updates": search_updates,
+        }
     except Exception:
         db.rollback()
         raise

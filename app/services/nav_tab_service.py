@@ -36,6 +36,7 @@ from app.services.gridstack_service import (
     _UNSET,
     _access_control_or_default,
     _component_ids_for_gridstack_tree,
+    _refresh_index_for_touched,
     _generate_id,
     _get_root_tab,
     _is_root,
@@ -120,6 +121,52 @@ def _format_nav_tab(nav_tab: NavTabV2) -> dict[str, Any]:
         "protected": bool(nav_tab.protected),
         "icon": nav_tab.icon,
     }
+
+
+def _dedupe_search_updates(
+    updates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    final: dict[int, str] = {}
+    order: list[int] = []
+    for item in updates:
+        component_id = int(item["component_id"])
+        action = str(item["action"])
+        if component_id not in final:
+            order.append(component_id)
+        final[component_id] = action
+    return [
+        {"component_id": component_id, "action": final[component_id]}
+        for component_id in order
+    ]
+
+
+def _nav_tab_component_search_updates(
+    db: Session,
+    nav_tab_id: int,
+) -> list[dict[str, Any]]:
+    """Reindex every semantic component whose nav metadata belongs to this nav tab."""
+    updates: list[dict[str, Any]] = []
+    roots = (
+        db.query(TabV2)
+        .filter(
+            TabV2.nav_tab_id == nav_tab_id,
+            TabV2.parent_tab_id.is_(None),
+        )
+        .all()
+    )
+    for root in roots:
+        if not root.document_id:
+            continue
+        gridstack = get_gridstack_by_document_id(db, root.document_id)
+        if gridstack is None:
+            continue
+        updates.extend(
+            {"component_id": component_id, "action": "upsert"}
+            for component_id in _component_ids_for_gridstack_tree(
+                db, gridstack, include_variants=True
+            )
+        )
+    return _dedupe_search_updates(updates)
 
 
 # ---------------------------------------------------------
@@ -237,19 +284,25 @@ def update_nav_tab_v2(
         title = _validate_title(title)
         order = _validate_order(order)
 
+        semantic_nav_changed = False
+        search_updates: list[dict[str, Any]] = []
+
         if title is not None:
             if nav_tab.protected:
                 raise ValueError("The Dashboard nav tab cannot be renamed")
-            # Renaming a nav tab to its own current title is not a
-            # self-collision — exclude_id skips the row being renamed.
+            # Renaming changes nav title/slug metadata embedded in every
+            # descendant component's Hybrid V2 payload, so it is a semantic
+            # index mutation even though no component body changed.
             nav_tab.slug = _resolve_nav_slug(db, title, exclude_id=nav_tab.id)
             nav_tab.title = title
+            semantic_nav_changed = True
 
         if order is not None:
             nav_tab.order = order
 
         if access_control is not None:
-            apply_write(db, NodeRef("nav_tab", nav_tab.id), access_control)
+            touched = apply_write(db, NodeRef("nav_tab", nav_tab.id), access_control)
+            search_updates.extend(_refresh_index_for_touched(db, touched))
 
         # `_UNSET` (not `None`) is the "leave alone" sentinel here, unlike
         # title/order/access_control above — icon needs a real three-way:
@@ -265,8 +318,15 @@ def update_nav_tab_v2(
 
         nav_tab.updated_at = _utc_now()
 
+        if semantic_nav_changed:
+            search_updates.extend(
+                _nav_tab_component_search_updates(db, nav_tab.id)
+            )
+
         db.commit()
-        return _format_nav_tab(nav_tab)
+        response = _format_nav_tab(nav_tab)
+        response["search_updates"] = _dedupe_search_updates(search_updates)
+        return response
 
     except Exception:
         db.rollback()
@@ -464,8 +524,12 @@ def purge_nav_tab_principal_v2(
             return None
         principal = principal_from_payload(principal_payload)
         touched = purge_principal(db, NodeRef("nav_tab", nav_tab.id), principal)
+        search_updates = _refresh_index_for_touched(db, touched)
         db.commit()
-        return {"touched": [node_summary(db, r) for r in touched]}
+        return {
+            "touched": [node_summary(db, r) for r in touched],
+            "search_updates": _dedupe_search_updates(search_updates),
+        }
     except Exception:
         db.rollback()
         raise
@@ -481,8 +545,12 @@ def reset_nav_tab_access_v2(db: Session, document_id: str) -> dict[str, Any] | N
         if nav_tab is None:
             return None
         touched = reset_to_inherited(db, NodeRef("nav_tab", nav_tab.id))
+        search_updates = _refresh_index_for_touched(db, touched)
         db.commit()
-        return {"touched": [node_summary(db, r) for r in touched]}
+        return {
+            "touched": [node_summary(db, r) for r in touched],
+            "search_updates": _dedupe_search_updates(search_updates),
+        }
     except Exception:
         db.rollback()
         raise
