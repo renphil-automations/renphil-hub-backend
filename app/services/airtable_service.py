@@ -1225,6 +1225,98 @@ class AirtableService:
             field_types=field_types,
         )
 
+    async def fetch_widget_index_rows(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        selected_columns: list[str] | None = None,
+        filters: list[dict[str, Any]] | None = None,
+    ):
+        """Return one complete viewer-independent row set for shared indexing.
+
+        Unlike ``fetch_widget_full_rows_cached`` this path is intentionally
+        independent of the optional viewer cache.  It performs the same
+        filters-only Airtable walk used to warm that cache, honors the existing
+        hard row/byte caps, and never returns a partial result as complete.
+        """
+        from app.models.airtable import AirtableWidgetFullRowsResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+        formula, allowed = af.widget_formula(
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+            email="",
+        )
+        if not allowed:
+            # This should be unreachable because personalization is forced off,
+            # but fail closed if formula semantics ever change.
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=list(selected_columns or []),
+                field_types={},
+                rows=[],
+                personalize_blocked=True,
+                available=False,
+                page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+            )
+
+        fetch_fields = list(selected_columns) if selected_columns else None
+        api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
+        table = api.table(base_id, table_id)
+        rows, seen_fields, oversized = await self._walk_full_table(
+            api=api,
+            table=table,
+            view_id=view_id,
+            fetch_fields=fetch_fields,
+            formula=formula,
+        )
+
+        response_fields = (
+            list(selected_columns)
+            if selected_columns
+            else list(seen_fields)
+        )
+
+        if oversized:
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=response_fields,
+                field_types={},
+                rows=[],
+                personalize_blocked=False,
+                available=False,
+                page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+            )
+
+        field_set = set(response_fields)
+        projected_rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key == "id" or key in field_set
+            }
+            for row in rows
+        ]
+
+        return AirtableWidgetFullRowsResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=response_fields,
+            field_types={},
+            rows=projected_rows,
+            personalize_blocked=False,
+            available=True,
+            page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+        )
+
+
     async def fetch_widget_full_rows_cached(
         self,
         *,

@@ -100,7 +100,7 @@ def test_unpersonalized_table_returns_only_shared_filtered_rows():
     ]
 
     service = SimpleNamespace(
-        fetch_widget_full_rows_cached=AsyncMock(
+        fetch_widget_index_rows=AsyncMock(
             return_value=SimpleNamespace(
                 fields=["Name", "Status"],
                 rows=[
@@ -137,7 +137,7 @@ def test_unpersonalized_table_returns_only_shared_filtered_rows():
 
     kwargs = (
         service
-        .fetch_widget_full_rows_cached
+        .fetch_widget_index_rows
         .await_args
         .kwargs
     )
@@ -147,9 +147,6 @@ def test_unpersonalized_table_returns_only_shared_filtered_rows():
         "Status",
     ]
     assert kwargs["filters"] == filters
-    assert kwargs["personalize_enabled"] is False
-    assert kwargs["personalize_column"] is None
-    assert kwargs["caller_email"] == ""
 
     dumped = result.model_dump()
 
@@ -160,7 +157,7 @@ def test_unpersonalized_table_returns_only_shared_filtered_rows():
 
 def test_personalized_table_never_fetches_or_returns_rows():
     service = SimpleNamespace(
-        fetch_widget_full_rows_cached=AsyncMock(
+        fetch_widget_index_rows=AsyncMock(
             side_effect=AssertionError(
                 "Personalized ingestion must not fetch rows"
             )
@@ -187,7 +184,7 @@ def test_personalized_table_never_fetches_or_returns_rows():
     assert result.row_data_included is False
     assert result.reason == "personalized_live_only"
 
-    service.fetch_widget_full_rows_cached.assert_not_awaited()
+    service.fetch_widget_index_rows.assert_not_awaited()
 
     assert "SAFE_TEST_PAT" not in repr(
         result.model_dump()
@@ -196,7 +193,7 @@ def test_personalized_table_never_fetches_or_returns_rows():
 
 def test_metric_is_config_only_and_never_returns_live_value():
     service = SimpleNamespace(
-        fetch_widget_full_rows_cached=AsyncMock(
+        fetch_widget_index_rows=AsyncMock(
             side_effect=AssertionError(
                 "Metric ingestion must not fetch rows"
             )
@@ -233,12 +230,12 @@ def test_metric_is_config_only_and_never_returns_live_value():
     assert "value" not in dumped
     assert "SAFE_TEST_PAT" not in repr(dumped)
 
-    service.fetch_widget_full_rows_cached.assert_not_awaited()
+    service.fetch_widget_index_rows.assert_not_awaited()
 
 
 def test_unpersonalized_missing_pat_is_unavailable_not_empty_authority():
     service = SimpleNamespace(
-        fetch_widget_full_rows_cached=AsyncMock(
+        fetch_widget_index_rows=AsyncMock(
             side_effect=AssertionError(
                 "Missing PAT must not fetch rows"
             )
@@ -261,4 +258,47 @@ def test_unpersonalized_missing_pat_is_unavailable_not_empty_authority():
     assert result.rows == []
     assert result.reason == "source_credentials_unavailable"
 
-    service.fetch_widget_full_rows_cached.assert_not_awaited()
+    service.fetch_widget_index_rows.assert_not_awaited()
+
+
+def test_chart_uses_complete_shared_index_rows_and_only_required_fields():
+    service = SimpleNamespace(
+        fetch_widget_index_rows=AsyncMock(
+            return_value=SimpleNamespace(
+                fields=["Location", "Earnings"],
+                rows=[
+                    {
+                        "id": "rec-safe",
+                        "Location": "Northeast",
+                        "Earnings": 12,
+                    }
+                ],
+                available=True,
+            )
+        )
+    )
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="chart",
+            data={
+                "title": "Earning per Region",
+                "groupField": "Location",
+                "aggregation": "sum",
+                "sumField": "Earnings",
+                "filters": [],
+            },
+        ),
+        service,
+    )
+
+    assert result.widget_type == "chart"
+    assert result.reason == "shared_rows"
+    assert result.row_data_included is True
+    assert result.available is True
+    assert result.fields == ["Location", "Earnings"]
+
+    kwargs = service.fetch_widget_index_rows.await_args.kwargs
+    assert kwargs["selected_columns"] == ["Location", "Earnings"]
+    assert kwargs["filters"] is None
+    assert "SAFE_TEST_PAT" not in repr(result.model_dump())
