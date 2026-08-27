@@ -192,7 +192,7 @@ class AuthService:
         so an unknown external email is never provisioned into existence.
         """
         domain = email.rsplit("@", 1)[-1].lower()
-        if domain == self._settings.ALLOWED_EMAIL_DOMAIN.lower():
+        if domain in self._settings.allowed_email_domains:
             return
         if not await airtable_service.access_control_email_exists(email):
             raise UserNotAuthorizedError(email)

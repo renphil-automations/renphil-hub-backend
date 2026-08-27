@@ -28,7 +28,17 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str
     GOOGLE_CLIENT_SECRET: str
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
+    # Comma-separated list of email domains allowed to log in.
     ALLOWED_EMAIL_DOMAIN: str = "renphil.org"
+
+    @property
+    def allowed_email_domains(self) -> list[str]:
+        """Parsed, lower-cased set of allowed login domains."""
+        return [
+            d.strip().lower()
+            for d in self.ALLOWED_EMAIL_DOMAIN.split(",")
+            if d.strip()
+        ]
 
     # ── JWT Tokens (issued after OAuth) ────────────────────────────────
     JWT_SECRET_KEY: str
