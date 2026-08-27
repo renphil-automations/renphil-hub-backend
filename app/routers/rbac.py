@@ -104,6 +104,12 @@ def get_role(role_id: int, db: Session = Depends(get_db_v2)):
     dependencies=ADMIN_ONLY,
 )
 def create_role(request: CreateRoleRequest, db: Session = Depends(get_db_v2)):
+    """Optional `parent_ids` attaches the new role beneath existing ones in
+    this same transaction, so the Access Management UI's per-leaf "Add role"
+    affordance is one call. Any parent that is missing or would make an
+    illegal edge fails the WHOLE request with the usual 409 — the single
+    `db.commit()` below is never reached, and closing the session unwinds the
+    role row along with it, so there is no half-created orphan to clean up."""
     try:
         role = rbac_service.create_role(
             db,
@@ -111,6 +117,7 @@ def create_role(request: CreateRoleRequest, db: Session = Depends(get_db_v2)):
             name=request.name,
             description=request.description,
             depth=request.depth,
+            parent_ids=request.parent_ids,
         )
     except RbacGraphError as e:
         raise _conflict(e)
@@ -246,7 +253,12 @@ def get_scope(scope_id: int, db: Session = Depends(get_db_v2)):
 )
 def create_scope(request: CreateScopeRequest, db: Session = Depends(get_db_v2)):
     """`is_universal` is set here or never — it cannot be changed later
-    (see UpdateScopeRequest for why neither direction has a migration)."""
+    (see UpdateScopeRequest for why neither direction has a migration).
+
+    Optional `parent_ids` behaves as it does on `POST /roles`: same
+    transaction, all-or-nothing. Sending it together with `is_universal` is a
+    409 `universal_scope_edge` — the universal scope takes no explicit edges
+    (§5.5), so that combination has no valid outcome to fall back to."""
     try:
         scope = rbac_service.create_scope(
             db,
@@ -254,6 +266,7 @@ def create_scope(request: CreateScopeRequest, db: Session = Depends(get_db_v2)):
             name=request.name,
             description=request.description,
             is_universal=request.is_universal,
+            parent_ids=request.parent_ids,
         )
     except RbacGraphError as e:
         raise _conflict(e)

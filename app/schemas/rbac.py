@@ -28,6 +28,11 @@ KEY_PATTERN = r"^[a-z0-9]+(_[a-z0-9]+)*$"
 MIN_DEPTH = 0
 MAX_DEPTH = 1_000_000
 
+# Ceiling on `parent_ids` at creation. The UI sends at most one (the leaf the
+# "Add" affordance hangs off), so this is only here to stop an unbounded list
+# from turning one request into an unbounded number of cycle walks.
+MAX_CREATE_PARENTS = 32
+
 
 # ---------------------------------------------------------
 # Roles
@@ -70,6 +75,17 @@ class CreateRoleRequest(StrictRequestModel):
     # Was `rank`, required. Now optional and inert — the create form does not
     # send it, and a role created without one is the normal case.
     depth: int | None = Field(default=None, ge=MIN_DEPTH, le=MAX_DEPTH)
+
+    # Optional: attach the new role beneath these existing roles in the same
+    # transaction as the insert. Exists so the "Add role" affordance on a leaf
+    # node is one atomic call rather than create-then-edge, which can strand
+    # an unattached role if the second call fails. Empty (the default) creates
+    # a free-standing role exactly as before.
+    #
+    # Only PARENTS, never children: the affordance creates leaves, and a role
+    # that does not exist yet cannot meaningfully be given descendants in the
+    # same breath. Edges in the other direction go through the edge endpoint.
+    parent_ids: list[int] = Field(default_factory=list, max_length=MAX_CREATE_PARENTS)
 
 
 class UpdateRoleRequest(StrictRequestModel):
@@ -129,6 +145,12 @@ class CreateScopeRequest(StrictRequestModel):
 
     # Set once, at creation. See UpdateScopeRequest for why it cannot change.
     is_universal: StrictBool = False
+
+    # Same contract as CreateRoleRequest.parent_ids. Combining it with
+    # `is_universal` is refused by validate_scope_edge (§5.5 — the universal
+    # scope takes no explicit edges in either direction), so the whole create
+    # is rejected rather than half-applied.
+    parent_ids: list[int] = Field(default_factory=list, max_length=MAX_CREATE_PARENTS)
 
 
 class UpdateScopeRequest(StrictRequestModel):

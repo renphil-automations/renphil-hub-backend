@@ -4,7 +4,10 @@
 Split from ``rbac_graph_service`` on purpose: that module owns the RULES the
 two DAGs obey, this one owns the rows' create/read/update/delete. Edge
 operations live there, not here — anything touching ``parent_child_roles`` or
-``parent_child_scopes`` has to go through the validator.
+``parent_child_scopes`` has to go through the validator. ``create_role`` and
+``create_scope`` do write edges, for their optional ``parent_ids``, but only
+by calling that module's ``create_*_edge``; the rule stays in one place and
+this one gains no second opinion about what a legal edge is.
 
 v1 covers definitions only. Assignments (and the §6 delegation rule that
 governs them) are a later phase.
@@ -12,6 +15,7 @@ governs them) are a later phase.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -22,7 +26,17 @@ from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
 # `set_role_rank` was imported here to route rank edits through the validator.
 # That rule is disabled (see rbac_graph_service's "DISABLED: rank changes"
 # block); `depth` is now assigned directly in `update_role`.
-from app.services.rbac_graph_service import RbacGraphError
+#
+# The two edge creators are imported for `create_role`/`create_scope`'s
+# optional `parent_ids` only. That does not move edge OWNERSHIP into this
+# module — the lock, the validation and the insert all still happen in
+# rbac_graph_service; this module just calls the same front door the edge
+# endpoints call, inside the create transaction.
+from app.services.rbac_graph_service import (
+    RbacGraphError,
+    create_role_edge,
+    create_scope_edge,
+)
 
 
 def _utc_now() -> datetime:
@@ -132,11 +146,31 @@ def _assert_role_key_free(db: Session, key: str, name: str) -> None:
 
 
 def create_role(
-    db: Session, *, key: str, name: str, description: str | None, depth: int | None = None
+    db: Session,
+    *,
+    key: str,
+    name: str,
+    description: str | None,
+    depth: int | None = None,
+    parent_ids: Sequence[int] = (),
 ) -> dict:
     """`depth` is optional and constrains nothing (see RoleV2.depth). The UI
     does not send it; the parameter stays so the rank rule can be restored
-    without changing this signature."""
+    without changing this signature.
+
+    `parent_ids` attaches the new role beneath existing ones. This is the one
+    place in this module that writes edges, and it still does not own the
+    rules: it delegates to ``create_role_edge``, which locks and validates
+    exactly as the edge endpoint does. The point is the TRANSACTION — the row
+    and its edges land together or not at all, because the caller commits once
+    at the end. Doing it as create-then-edge from the client can strand an
+    unattached role when the second call fails, which is precisely the mess
+    the "Add role" affordance exists to avoid.
+
+    A brand-new role has no descendants, so no parent edge here can close a
+    cycle. The walk still runs — this is the shared write path, and a rule
+    that only holds because of who is calling is not a rule.
+    """
     _assert_role_key_free(db, key, name)
     role = RoleV2(
         key=key,
@@ -148,7 +182,18 @@ def create_role(
     )
     db.add(role)
     db.flush()
-    return serialize_role(role, {}, {})
+
+    # dict.fromkeys, not set(): a repeated id would otherwise hit the edge's
+    # primary key on flush, and order stays deterministic for the error
+    # message if one of them is invalid.
+    for parent_id in dict.fromkeys(parent_ids):
+        create_role_edge(db, parent_id, role.id)
+
+    # Re-read rather than echo `parent_ids` back: what the caller gets is then
+    # what the table holds, deduped and sorted by the same path a list request
+    # takes. Skipped entirely in the common no-parent case.
+    parents, children = _role_edge_map(db) if parent_ids else ({}, {})
+    return serialize_role(role, parents, children)
 
 
 def update_role(
@@ -258,8 +303,19 @@ def get_scope(db: Session, scope_id: int) -> dict | None:
 
 
 def create_scope(
-    db: Session, *, key: str, name: str, description: str | None, is_universal: bool
+    db: Session,
+    *,
+    key: str,
+    name: str,
+    description: str | None,
+    is_universal: bool,
+    parent_ids: Sequence[int] = (),
 ) -> dict:
+    """`parent_ids` behaves exactly as it does in ``create_role`` — see there
+    for why the edges are written in this transaction rather than by a second
+    request. Passing both `is_universal` and a parent is refused by
+    ``validate_scope_edge`` (§5.5), and refused whole: the caller has not
+    committed yet, so the scope row goes back with the edge."""
     if db.query(ScopeV2.id).filter(ScopeV2.key == key).first():
         raise RbacGraphError("duplicate_key", f"A scope with key {key!r} already exists", key=key)
     if db.query(ScopeV2.id).filter(ScopeV2.name == name).first():
@@ -292,7 +348,12 @@ def create_scope(
     )
     db.add(scope)
     db.flush()
-    return serialize_scope(scope, {}, {})
+
+    for parent_id in dict.fromkeys(parent_ids):
+        create_scope_edge(db, parent_id, scope.id)
+
+    parents, children = _scope_edge_map(db) if parent_ids else ({}, {})
+    return serialize_scope(scope, parents, children)
 
 
 def update_scope(
