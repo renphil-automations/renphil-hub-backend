@@ -85,9 +85,8 @@ class ScopeV2(BaseV2):
         # emits a PLAIN unique index on is_universal — which permits exactly
         # one true row AND exactly one false row, i.e. the second ordinary
         # scope anyone creates fails with "UNIQUE constraint failed".
-        # Postgres is production; SQLite is what tests/ runs against
-        # (see test_access_propagation.py), and it has supported partial
-        # indexes since 3.8.0, so both are spelled out.
+        # Postgres is production; SQLite is what tests/ runs against, and it
+        # has supported partial indexes since 3.8.0, so both are spelled out.
         Index(
             "uq_scopes_single_universal",
             "is_universal",

@@ -34,7 +34,7 @@ class HubUserV2(BaseV2):
     # The join key from an authenticated request: the JWT's `sub` is an
     # email, so this is the only thing that connects a request to a row.
     # Lowercased and stripped on write by the service layer — the same
-    # normalization access_control_service._user_principal already applies.
+    # normalization every other email comparison in this codebase applies.
     # Not citext: this codebase does not use the extension anywhere, so
     # normalization is an application invariant, not a database one.
     email = Column(String(320), nullable=False, unique=True, index=True)

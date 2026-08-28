@@ -25,7 +25,6 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
-from app.services.access_control_service import resolved_parent_ac
 from app.services.gridstack_service import (
     _generate_id,
     _resolve_component_data,
@@ -35,7 +34,6 @@ from app.services.gridstack_service import (
     _validate_title,
     _write_component_data,
 )
-from app.services.tab_service import access_control_subset_violation
 
 SBN_ROOT_TYPE = "super_block_note"
 SBN_LEAF_TYPE = "block_note"
@@ -132,20 +130,11 @@ def get_sbn_workspace(db: Session, link: str) -> dict[str, Any] | None:
         "order": props.get("order", 0),
         "parent": parent,
         "page_content": {"documentId": component.link, "content": data.get("content")},
-        # NULL means "inherit" (§3.4/§5.2) -- pass it through as NULL rather
-        # than manufacturing DEFAULT_ACCESS_CONTROL. Load-bearing: the SBN
-        # child filter's only consumer is canViewTab (frontend, landmine 12),
-        # which must treat an absent access_control as viewable -- ships in
-        # the same deploy as this change (plan §10 commit 6's ordering
-        # constraint).
+        # NULL means "no access_control set" -- pass it through as NULL
+        # rather than manufacturing DEFAULT_ACCESS_CONTROL. Load-bearing:
+        # the SBN child filter's only consumer is canViewTab (frontend),
+        # which must treat an absent access_control as viewable.
         "access_control": component.access_control,
-        # The ceiling THIS node's own access_control is checked against on
-        # write (§3.4, access_control_subset_violation's caller in
-        # update_sbn_node) -- exposed on read too so the frontend's
-        # parent-scoped component picker (plan §6.1's last bullet, commit 8)
-        # has one source for it instead of re-implementing landmine 14's
-        # NULL-skipping walk-up in TypeScript.
-        "resolved_parent_access_control": resolved_parent_ac(db, component),
         "locked": bool(props.get("locked", False)),
         "locked_by": props.get("locked_by", "") or "",
         "children": child_summaries,
@@ -368,17 +357,6 @@ def update_sbn_node(
         if title is not None:
             component.title = title
         if access_control is not None:
-            # Component subset rule (§3.4) — an SBN node's access_control may
-            # only narrow its resolved parent's, never widen it. Resolves
-            # past a NULL parent chain up to the nearest explicit ancestor
-            # (landmine 14) rather than comparing against the immediate
-            # parent, which would pass vacuously whenever that parent is
-            # itself NULL.
-            violation = access_control_subset_violation(
-                access_control, resolved_parent_ac(db, component)
-            )
-            if violation is not None:
-                raise ValueError(f"SBN node '{link}': {violation}")
             component.access_control = access_control
         if order is not None:
             component.props = {**_sbn_props(component), "order": order}

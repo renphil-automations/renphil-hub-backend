@@ -23,9 +23,12 @@ class NavTabV2(BaseV2):
     Phase 2 flips this to False with a one-row UPDATE and needs no routing
     change at all.
 
-    `access_control` is stored and editable in phase 1 but read by nothing —
-    present now so phase 2 (access-control propagation, the `hub` object)
-    needs no second migration.
+    `access_control` is stored and editable, but read by nothing server-side
+    — only the frontend consults it, to decide what to show. Phase 2's
+    propagation engine used to cascade this value through the whole tab
+    family; that engine has been removed ahead of a new access control
+    algorithm, so the column is now a plain per-node value with no
+    relationship to any other node's.
 
     `icon` is a lucide-react icon name (kebab-case, e.g. "layout-grid"),
     looked up client-side via `lucide-react/dynamic`'s `DynamicIcon` — never

@@ -1,26 +1,23 @@
 """
-Nav tabs router (phase 1 — see AI Docs/plan_nav_tabs_2026-07-28.md; gate
-split in phase 2, see AI Docs/plan_nav_tabs_phase2_2026-07-30.md §5.3).
+Nav tabs router (phase 1 — see AI Docs/plan_nav_tabs_2026-07-28.md).
 
-Router-level authentication, plus a per-endpoint access-control gate on
-every mutating route: require_hub_editor for collection-level operations
-(create, reorder — there's no single node to ask about yet), and
-require_nav_tab_editor for per-node operations (rename / AC / delete on
-one specific nav tab — a hub-wide gate would let a principal blocked from
-that node act on it anyway, since it never consulted the node itself).
+Router-level authentication, plus `require_hub_admin` on every mutating
+route. That gate replaced the propagation engine's per-node
+`require_hub_editor` / `require_nav_tab_editor` when the engine was
+removed; since every nav tab's stored `admins` was already narrowed to
+{Hub Admin}, it is the same outcome without the coupling. It is a
+placeholder pending the new access control algorithm.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, require_hub_editor, require_nav_tab_editor
+from app.dependencies import get_current_user, require_hub_admin
 from app.schemas.tab import (
     CreateNavTabRequest,
     NavTabListAPIResponse,
     NavTabResponse,
-    PreviewAccessWriteRequest,
-    PurgePrincipalRequest,
     ReorderNavTabsRequest,
     TabSummaryListAPIResponse,
     UpdateNavTabRequest,
@@ -31,10 +28,7 @@ from app.services.nav_tab_service import (
     delete_nav_tab_v2,
     get_nav_tab_by_document_id,
     get_nav_tabs_v2,
-    preview_nav_tab_access_v2,
-    purge_nav_tab_principal_v2,
     reorder_nav_tabs_v2,
-    reset_nav_tab_access_v2,
     update_nav_tab_v2,
 )
 from app.routers.tabs import value_error_to_http_exception
@@ -89,7 +83,7 @@ def get_nav_tab_tabs(document_id: str, db: Session = Depends(get_db_v2)):
     response_model=NavTabResponse,
     summary="Create a nav tab",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_CONFLICT_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
-    dependencies=[Depends(require_hub_editor)],
+    dependencies=[Depends(require_hub_admin)],
 )
 def create_nav_tab(request: CreateNavTabRequest, db: Session = Depends(get_db_v2)):
     try:
@@ -114,7 +108,7 @@ def create_nav_tab(request: CreateNavTabRequest, db: Session = Depends(get_db_v2
     response_model=NavTabListAPIResponse,
     summary="Reorder nav tabs",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
-    dependencies=[Depends(require_hub_editor)],
+    dependencies=[Depends(require_hub_admin)],
 )
 def reorder_nav_tabs(request: ReorderNavTabsRequest, db: Session = Depends(get_db_v2)):
     try:
@@ -133,7 +127,7 @@ def reorder_nav_tabs(request: ReorderNavTabsRequest, db: Session = Depends(get_d
         **COMMON_CONFLICT_RESPONSE,
         **COMMON_FORBIDDEN_RESPONSE,
     },
-    dependencies=[Depends(require_nav_tab_editor)],
+    dependencies=[Depends(require_hub_admin)],
 )
 def update_nav_tab(document_id: str, request: UpdateNavTabRequest, db: Session = Depends(get_db_v2)):
     validate_document_id(document_id)
@@ -173,7 +167,7 @@ def update_nav_tab(document_id: str, request: UpdateNavTabRequest, db: Session =
         **COMMON_CONFLICT_RESPONSE,
         **COMMON_FORBIDDEN_RESPONSE,
     },
-    dependencies=[Depends(require_nav_tab_editor)],
+    dependencies=[Depends(require_hub_admin)],
 )
 def delete_nav_tab(document_id: str, db: Session = Depends(get_db_v2)):
     validate_document_id(document_id)
@@ -183,62 +177,5 @@ def delete_nav_tab(document_id: str, db: Session = Depends(get_db_v2)):
         if delete_result is None:
             raise HTTPException(status_code=404, detail="Nav tab not found")
         return {"data": delete_result}
-    except ValueError as e:
-        raise value_error_to_http_exception(e)
-
-
-@router.post(
-    "/{document_id}/access/preview",
-    summary="Preview the blast radius of a nav-tab access-control write",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
-    dependencies=[Depends(require_nav_tab_editor)],
-)
-def preview_nav_tab_access(
-    document_id: str, request: PreviewAccessWriteRequest, db: Session = Depends(get_db_v2)
-):
-    validate_document_id(document_id)
-    access_control = (
-        request.access_control.model_dump()
-        if hasattr(request.access_control, "model_dump")
-        else request.access_control
-    )
-    preview = preview_nav_tab_access_v2(db, document_id, access_control)
-    if preview is None:
-        raise HTTPException(status_code=404, detail="Nav tab not found")
-    return preview
-
-
-@router.post(
-    "/{document_id}/access/purge",
-    summary="Purge a principal from a nav tab and its entire subtree",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
-    dependencies=[Depends(require_nav_tab_editor)],
-)
-def purge_nav_tab_principal(
-    document_id: str, request: PurgePrincipalRequest, db: Session = Depends(get_db_v2)
-):
-    validate_document_id(document_id)
-    try:
-        result = purge_nav_tab_principal_v2(db, document_id, request.principal.model_dump())
-        if result is None:
-            raise HTTPException(status_code=404, detail="Nav tab not found")
-        return result
-    except ValueError as e:
-        raise value_error_to_http_exception(e)
-
-
-@router.post(
-    "/{document_id}/access/reset",
-    summary="Reset a nav tab's access control to inherit from the hub",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
-    dependencies=[Depends(require_nav_tab_editor)],
-)
-def reset_nav_tab_access(document_id: str, db: Session = Depends(get_db_v2)):
-    validate_document_id(document_id)
-    try:
-        result = reset_nav_tab_access_v2(db, document_id)
-        if result is None:
-            raise HTTPException(status_code=404, detail="Nav tab not found")
-        return result
     except ValueError as e:
         raise value_error_to_http_exception(e)

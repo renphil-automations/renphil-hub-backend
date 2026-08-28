@@ -1185,7 +1185,7 @@ def _cast_vote(
     )
     # Mutate the already-loaded ORM object directly rather than a bulk
     # `Query.update()` — matches this codebase's convention elsewhere
-    # (access_control_service.write_ac, gridstack_service) and sidesteps
+    # (gridstack_service) and sidesteps
     # `synchronize_session` entirely: the row `target` refers to is the
     # SAME identity-mapped object the FOR UPDATE query above resolved to,
     # so this write is guaranteed visible to anything reading `target`

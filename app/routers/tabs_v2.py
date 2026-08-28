@@ -10,9 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_hub_admin
 from app.models.auth import UserInfo
-from app.services import access_control_service
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
@@ -21,8 +20,6 @@ from app.schemas.tab import (
     LockTabRequest,
     MoveTabRequest,
     MoveTabToNavTabRequest,
-    PreviewAccessWriteRequest,
-    PurgePrincipalRequest,
     ReorderTabsRequest,
     ReorderTabVariantsRequest,
     TabSummaryListAPIResponse,
@@ -45,11 +42,8 @@ from app.services.gridstack_service import (
     get_tab_workspace_v2,
     lock_tab_by_document_id_v2,
     move_tab_by_document_id_v2,
-    preview_tab_access_v2,
-    purge_tab_principal_v2,
     reorder_tab_variants_v2,
     reorder_tabs_by_document_id_v2,
-    reset_tab_access_v2,
     resolve_component_location_v2,
     unlock_tab_by_document_id_v2,
     update_tab_by_document_id_v2,
@@ -59,9 +53,12 @@ from app.services.nav_tab_service import (
     get_dashboard_nav_tab,
     get_nav_tab_by_document_id,
     move_tab_to_nav_tab_v2,
-    resolve_move_authorization_targets,
 )
-from app.services.tab_service import filter_widget_content_for_user
+from app.services.tab_service import (
+    HUB_ADMIN_ROLE,
+    _user_can_view_widget,
+    filter_widget_content_for_user,
+)
 
 router = APIRouter(prefix="/v2/tabs", tags=["Tabs V2"], dependencies=[Depends(get_current_user)])
 
@@ -140,18 +137,21 @@ def get_component_location(
     component = get_component_by_link_for_access_check_v2(db, link)
     if component is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
-    # The nearest ancestor with a non-NULL access_control (§3.4) — a
-    # component with no explicit AC inherits it, and an explicit AC is
-    # always subset-constrained against it, so this one check covers both
-    # widget-level and tab-level restriction. Same primitive
-    # `filter_widget_content_for_user` uses server-side to redact a
-    # restricted widget from a workspace response; this is that same rule
-    # applied to the one endpoint that hands out a component's location
-    # instead of its content.
-    effective_ac = component.access_control or access_control_service.resolved_parent_ac(
-        db, component
-    )
-    if not access_control_service.can_view(effective_ac, user.email, list(user.roles)):
+    # The component's OWN access_control — exactly the rule
+    # `filter_widget_content_for_user` applies server-side to redact a
+    # restricted widget from a workspace response, applied here to the one
+    # endpoint that hands out a component's location instead of its
+    # content. It used to fall back to the nearest ancestor's resolved AC;
+    # there is no inheritance any more, so a component with no explicit AC
+    # is locatable, matching how such a widget is already served in full by
+    # every other read path.
+    roles = list(user.roles)
+    widget_ac = component.access_control
+    if (
+        widget_ac
+        and HUB_ADMIN_ROLE not in roles
+        and not _user_can_view_widget(widget_ac, user.email, roles)
+    ):
         raise HTTPException(status_code=403, detail="You don't have access to this component")
     result = resolve_component_location_v2(db, link)
     if result is None:
@@ -470,30 +470,21 @@ def move_tab(document_id: str, request: MoveTabRequest, db: Session = Depends(ge
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
         **COMMON_CONFLICT_RESPONSE,
-        403: {"description": "Editor access required on the tab and the destination nav tab"},
+        403: {"description": "Hub Admin role required"},
     },
-    # No blanket `Depends` here (plan §5.3, §9.9c) — this writes to BOTH the
-    # root tab and the destination nav tab, and the destination is only
-    # known from the request body, which a per-node path-param dependency
-    # can't see. Checked inline below instead.
+    # Moving a root tab between nav tabs is a nav-tab-level operation, so
+    # it carries the same gate every other /v2/nav-tabs mutation does. It
+    # used to run a per-node `can_edit` on both the tab and the destination
+    # nav tab; that engine is gone, and both checks only ever admitted Hub
+    # Admins in practice.
+    dependencies=[Depends(require_hub_admin)],
 )
 def move_tab_to_nav_tab(
     document_id: str,
     request: MoveTabToNavTabRequest,
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
 ):
     validate_document_id(document_id)
-
-    tab, dest_nav_tab = resolve_move_authorization_targets(db, document_id, request.navTabDocumentId)
-    if tab is None:
-        raise HTTPException(status_code=404, detail="Tab not found")
-    if not access_control_service.can_edit(tab.access_control, user.email, list(user.roles)):
-        raise HTTPException(status_code=403, detail="Cannot edit this tab")
-    if dest_nav_tab is None:
-        raise HTTPException(status_code=404, detail="Destination nav tab does not exist")
-    if not access_control_service.can_edit(dest_nav_tab.access_control, user.email, list(user.roles)):
-        raise HTTPException(status_code=403, detail="Cannot edit the destination nav tab")
 
     try:
         moved_workspace = move_tab_to_nav_tab_v2(
@@ -521,64 +512,5 @@ def delete_tab(document_id: str, db: Session = Depends(get_db_v2)):
         if delete_result is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": delete_result}
-    except ValueError as e:
-        raise value_error_to_http_exception(e)
-
-
-# No additional gate on the three endpoints below, matching every other
-# mutating endpoint on this router (update/move/delete) — landmine 6,
-# explicitly out of phase-2 scope: "any authenticated user can do anything
-# to a tab" is a pre-existing gap this phase never closes, not one these
-# introduce.
-@router.post(
-    "/{document_id}/access/preview",
-    summary="Preview the blast radius of a tab access-control write (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
-)
-def preview_tab_access(
-    document_id: str, request: PreviewAccessWriteRequest, db: Session = Depends(get_db_v2)
-):
-    validate_document_id(document_id)
-    access_control = (
-        request.access_control.model_dump()
-        if hasattr(request.access_control, "model_dump")
-        else request.access_control
-    )
-    preview = preview_tab_access_v2(db, document_id, access_control)
-    if preview is None:
-        raise HTTPException(status_code=404, detail="Tab not found")
-    return preview
-
-
-@router.post(
-    "/{document_id}/access/purge",
-    summary="Purge a principal from a tab and its entire subtree (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
-)
-def purge_tab_principal(
-    document_id: str, request: PurgePrincipalRequest, db: Session = Depends(get_db_v2)
-):
-    validate_document_id(document_id)
-    try:
-        result = purge_tab_principal_v2(db, document_id, request.principal.model_dump())
-        if result is None:
-            raise HTTPException(status_code=404, detail="Tab not found")
-        return result
-    except ValueError as e:
-        raise value_error_to_http_exception(e)
-
-
-@router.post(
-    "/{document_id}/access/reset",
-    summary="Reset a tab's access control to inherit from its resolved parent (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
-)
-def reset_tab_access(document_id: str, db: Session = Depends(get_db_v2)):
-    validate_document_id(document_id)
-    try:
-        result = reset_tab_access_v2(db, document_id)
-        if result is None:
-            raise HTTPException(status_code=404, detail="Tab not found")
-        return result
     except ValueError as e:
         raise value_error_to_http_exception(e)

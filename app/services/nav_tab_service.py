@@ -20,18 +20,6 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.tab import TabV2
 
-from app.services.access_control_service import (
-    NodeRef,
-    apply_reparent_repair,
-    apply_write,
-    describe_write_plan,
-    get_hub,
-    node_summary,
-    plan_write,
-    principal_from_payload,
-    purge_principal,
-    reset_to_inherited,
-)
 from app.services.gridstack_service import (
     _UNSET,
     _access_control_or_default,
@@ -143,22 +131,6 @@ def get_dashboard_nav_tab(db: Session) -> NavTabV2 | None:
     return db.query(NavTabV2).filter(NavTabV2.protected.is_(True)).first()
 
 
-def resolve_move_authorization_targets(
-    db: Session, tab_document_id: str, nav_tab_document_id: str
-) -> tuple[TabV2 | None, NavTabV2 | None]:
-    """Looks up the root tab and destination nav tab for
-    `PUT /v2/tabs/{id}/nav-tab`'s dual authorization check (plan §5.3,
-    §9.9c) — it writes to both, so both must independently satisfy
-    `can_edit` before `move_tab_to_nav_tab_v2` is even attempted. A plain
-    per-node `Depends` can't express this: it needs both the path's tab AND
-    the request body's destination nav tab, so the router checks inline
-    using this lookup rather than a FastAPI dependency."""
-    gridstack = get_gridstack_by_document_id(db, tab_document_id)
-    tab = _get_root_tab(db, gridstack) if gridstack is not None and _is_root(gridstack) else None
-    nav_tab = get_nav_tab_by_document_id(db, nav_tab_document_id)
-    return tab, nav_tab
-
-
 # ---------------------------------------------------------
 # Create / update / reorder / delete
 # ---------------------------------------------------------
@@ -182,22 +154,17 @@ def create_nav_tab_v2(
             max_order = db.query(func.max(NavTabV2.order)).scalar()
             order = (max_order + 1) if max_order is not None else 0
 
-        hub = get_hub(db)
-        if hub is None:
-            raise ValueError(
-                "The hub row does not exist — run scripts/migrate_hub_ac_propagation.py"
-            )
-
         now = _utc_now()
         nav_tab = NavTabV2(
             document_id=_generate_id(),
             slug=slug,
             title=title,
             order=order,
-            # Materialized below via apply_write — starts empty, like any
-            # brand new node, so the diff against the effective AC below
-            # propagates correctly (harmless no-op for the common case).
-            access_control=None,
+            # Whatever the caller asked for, or nothing. A new nav tab used
+            # to inherit the hub's access_control; there is no inheritance
+            # any more, so NULL means "no access_control set" rather than
+            # standing in for an ancestor's value.
+            access_control=access_control,
             protected=False,
             icon=icon,
             created_at=now,
@@ -205,13 +172,6 @@ def create_nav_tab_v2(
         )
         db.add(nav_tab)
         db.flush()
-
-        # A new nav tab inherits the hub's AC (§5.2) — invariant A would be
-        # violated the instant it existed otherwise. apply_write also
-        # correctly propagates any extra principals the caller passed
-        # beyond that baseline (rules 1/2), same as an ordinary edit.
-        effective_ac = access_control if access_control is not None else hub.access_control
-        apply_write(db, NodeRef("nav_tab", nav_tab.id), effective_ac)
 
         db.commit()
         return _format_nav_tab(nav_tab)
@@ -249,7 +209,7 @@ def update_nav_tab_v2(
             nav_tab.order = order
 
         if access_control is not None:
-            apply_write(db, NodeRef("nav_tab", nav_tab.id), access_control)
+            nav_tab.access_control = access_control
 
         # `_UNSET` (not `None`) is the "leave alone" sentinel here, unlike
         # title/order/access_control above — icon needs a real three-way:
@@ -409,13 +369,7 @@ def move_tab_to_nav_tab_v2(
             variant.nav_tab_id = destination.id
             variant.updated_at = _utc_now()
 
-        # §5.2 / landmine 3: the only operation that changes a node's
-        # position in the tree, so the only one where both invariants can
-        # break in one write. Additive only — see apply_reparent_repair's
-        # docstring; NT_A's stale grants are cleaned up via
-        # reset_to_inherited, never automatically here.
         db.flush()
-        apply_reparent_repair(db, NodeRef("tab", tab.id))
 
         affected_component_ids = _component_ids_for_gridstack_tree(
             db, gridstack, include_variants=True
@@ -430,59 +384,6 @@ def move_tab_to_nav_tab_v2(
             ]
         return response
 
-    except Exception:
-        db.rollback()
-        raise
-
-
-# ---------------------------------------------------------
-# Preview / purge / reset (§5.4, §6.3, §6.4) — read-only preview plus the
-# two reset affordances, for a nav tab addressed by document_id. Mirrors the
-# hub's own trio in hub_service.py and the tab-level trio in
-# gridstack_service.py; kept here rather than centralized since each needs
-# its own document_id -> NodeRef lookup.
-# ---------------------------------------------------------
-
-
-def preview_nav_tab_access_v2(
-    db: Session, document_id: str, access_control: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """Read-only — backs the preview modal. Never writes."""
-    nav_tab = get_nav_tab_by_document_id(db, document_id)
-    if nav_tab is None:
-        return None
-    plan = plan_write(db, NodeRef("nav_tab", nav_tab.id), access_control)
-    return describe_write_plan(db, plan)
-
-
-def purge_nav_tab_principal_v2(
-    db: Session, document_id: str, principal_payload: dict[str, Any]
-) -> dict[str, Any] | None:
-    try:
-        nav_tab = get_nav_tab_by_document_id(db, document_id)
-        if nav_tab is None:
-            return None
-        principal = principal_from_payload(principal_payload)
-        touched = purge_principal(db, NodeRef("nav_tab", nav_tab.id), principal)
-        db.commit()
-        return {"touched": [node_summary(db, r) for r in touched]}
-    except Exception:
-        db.rollback()
-        raise
-
-
-def reset_nav_tab_access_v2(db: Session, document_id: str) -> dict[str, Any] | None:
-    """Discards this nav tab's own access_control and re-derives it from the
-    hub's effective AC (§6.4's "match the parent again"). The hub is never
-    NULL post-migration, so there is no landmine-14-style walk here — but
-    reset_to_inherited itself is generic and handles it either way."""
-    try:
-        nav_tab = get_nav_tab_by_document_id(db, document_id)
-        if nav_tab is None:
-            return None
-        touched = reset_to_inherited(db, NodeRef("nav_tab", nav_tab.id))
-        db.commit()
-        return {"touched": [node_summary(db, r) for r in touched]}
     except Exception:
         db.rollback()
         raise

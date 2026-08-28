@@ -20,14 +20,12 @@ from app.config import get_settings
 from app.db_v2.database import get_db_v2
 from app.db_v2.models.hub_user import HubUserV2
 from app.models.auth import UserInfo
-from app.services import access_control_service
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
 from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
-from app.services.nav_tab_service import get_nav_tab_by_document_id
 from app.services.tab_service import HUB_ADMIN_ROLE
 
 _bearer_scheme = HTTPBearer()
@@ -92,72 +90,30 @@ async def get_current_user(
     return auth_service.decode_access_token(credentials.credentials)
 
 
-# ── Hub / nav-tab authorization dependencies (phase 2, §5.3) ───────────
+# ── Hub Admin gate ─────────────────────────────────────────────────────
 #
-# Replaces the phase-1 `require_hub_admin` JWT-role gate. Phase 1's own
-# comment predicted "a one-line dependency swap, every call site
-# unchanged" — that turned out to be wrong (plan §5.3): a single hub-wide
-# gate would let a principal who fails `can_edit` on a specific nav tab
-# delete or rename it anyway, since the check never consulted the node
-# being mutated. So this is two dependencies, not one:
-#   - require_hub_editor: collection-level (create a nav tab, reorder them)
-#   - require_nav_tab_editor: per-node (rename / AC / delete on THAT tab)
-# Both evaluate access_control_service.can_edit, which already implements
-# rule C (admins AND viewers), the empty-group rules (§3.3), the
-# Hub-Admin-role bypass, and the scoped-role skip — no new logic here,
-# just the lookup + the two shapes of "which node to check."
-
-
-async def require_hub_editor(
-    user: UserInfo = Depends(get_current_user),
-    db: Session = Depends(get_db_v2),
-) -> UserInfo:
-    """The collection-level gate: creating a nav tab, or reordering them —
-    there is no single node to check yet (or the check is a property of
-    the whole collection), so this asks the hub."""
-    hub = access_control_service.get_hub(db)
-    hub_ac = hub.access_control if hub is not None else None
-    if not access_control_service.can_edit(hub_ac, user.email, list(user.roles)):
-        raise HTTPException(status_code=403, detail="Hub editor access required")
-    return user
-
-
-async def require_nav_tab_editor(
-    document_id: str,
-    user: UserInfo = Depends(get_current_user),
-    db: Session = Depends(get_db_v2),
-) -> UserInfo:
-    """Per-node: can_edit on THAT nav tab. FastAPI injects `document_id`
-    from the route's own path parameter of the same name — used for
-    rename / access-control edits / delete, all of which mutate (or
-    cascade-delete from) one specific nav tab, not the collection."""
-    nav_tab = get_nav_tab_by_document_id(db, document_id)
-    if nav_tab is None:
-        raise HTTPException(status_code=404, detail="Nav tab not found")
-    if not access_control_service.can_edit(nav_tab.access_control, user.email, list(user.roles)):
-        raise HTTPException(status_code=403, detail="Nav tab editor access required")
-    return user
-
-
-# ── Access Management gate (plan_access_control_schema_2026-08-22.md §6) ─
+# The single write gate in the product, used by two unrelated surfaces:
 #
-# Yes, this is the name phase 2 removed above — reintroduced deliberately,
-# not by accident. The reason it was wrong there does not apply here.
+#   - Role/scope definitions and hierarchy edges
+#     (plan_access_control_schema_2026-08-22.md §6). Roles and scopes have
+#     no per-node access_control and never will — they are global org
+#     structure, so a global gate is the correct shape rather than a
+#     shortcut. Assignments, which DO vary by the caller's own (role,
+#     scope) envelope, get the §6 delegation check instead; they must not
+#     reuse this dependency.
 #
-# Phase 2's objection was that a hub-wide gate let someone who fails
-# can_edit on a SPECIFIC nav tab mutate it anyway, because the check never
-# consulted the node being mutated. That argument is about per-node
-# resources: every nav tab and tab carries its own access_control.
-#
-# Roles and scopes have no per-node access_control and never will. They are
-# global org structure, so a global gate is the correct shape rather than a
-# shortcut — there is no node to consult. Assignments, which DO vary by the
-# caller's own (role, scope) envelope, get the §6 delegation check instead
-# when that surface lands; they must not reuse this dependency.
+#   - Nav-tab and hub-level mutations. These used to be gated by
+#     `require_hub_editor` / `require_nav_tab_editor`, which evaluated the
+#     propagation engine's `can_edit` against the node being written. That
+#     engine is gone, and with every nav tab's stored `admins` narrowed to
+#     {Hub Admin} by migrate_hub_ac_propagation.py, those gates only ever
+#     admitted Hub Admins in practice — so this is the same outcome with
+#     none of the coupling. It is a placeholder for whatever the new access
+#     control algorithm decides, not a designed end state.
 
 
 async def require_hub_admin(user: UserInfo = Depends(get_current_user)) -> UserInfo:
-    """Gate for writing role/scope definitions and hierarchy edges.
+    """Gate for role/scope definition writes and nav-tab mutations.
 
     Reads the JWT's role NAMES, which are sourced from Airtable at login —
     the same signal the frontend's `isAdmin` uses.
@@ -208,10 +164,8 @@ async def get_current_hub_user(
 ) -> CurrentHubUser:
     """Resolve (and provision if needed) the caller's `hub_users` row.
 
-    Normalizes with the identical `.strip().lower()` rule
-    `access_control_service._user_principal` already applies — matching the
-    RULE, not calling that function itself, since it returns a `Principal`
-    tuple built for a different purpose.
+    Normalizes emails with `.strip().lower()`, the same rule every other
+    email comparison in this codebase applies.
 
     UNLIKE every other dependency in this module, this one commits. A GET
     endpoint (e.g. "my assignments") never calls `db.commit()` itself, but
