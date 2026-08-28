@@ -1094,7 +1094,12 @@ def update_airtable_component_config(
         _write_component_data(db, component, data)
         db.commit()
 
-        return get_airtable_component_config(db, link)
+        config = get_airtable_component_config(db, link)
+        if config is not None:
+            config["search_updates"] = [
+                {"component_id": component.id, "action": "upsert"}
+            ]
+        return config
 
     except Exception:
         db.rollback()

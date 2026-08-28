@@ -473,6 +473,7 @@ class HubResponse(BaseModel):
     documentId: StrictStr | None = None
     title: StrictStr = "Hub"
     access_control: AccessControlResponse | dict[str, Any] | None = None
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
 
 class HubAPIResponse(BaseModel):

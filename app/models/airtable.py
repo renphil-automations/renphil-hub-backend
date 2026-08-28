@@ -373,6 +373,7 @@ class AirtableComponentConfigResponse(BaseModel):
         description="ISO-8601 timestamp of the last PAT change, if any.",
     )
     access_control: dict[str, Any] | None = None
+    search_updates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AirtableComponentConfigUpdate(BaseModel):

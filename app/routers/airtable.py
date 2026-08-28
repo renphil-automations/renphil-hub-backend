@@ -1059,6 +1059,7 @@ async def get_airtable_component_index_snapshot(
     if widget_type not in {
         "airtable",
         "airtable_metric",
+        "chart",
     }:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1102,7 +1103,19 @@ async def get_airtable_component_index_snapshot(
 
     if isinstance(raw_selected, list):
         for value in raw_selected:
-            name = str(value or "").strip()
+            name = str(value or "")
+            if name.strip() and name not in selected_columns:
+                selected_columns.append(name)
+
+    if widget_type == "chart":
+        chart_fields = [
+            str(stored.get("groupField") or "").strip(),
+        ]
+        if str(stored.get("aggregation") or "").strip().lower() == "sum":
+            chart_fields.append(
+                str(stored.get("sumField") or "").strip()
+            )
+        for name in chart_fields:
             if name and name not in selected_columns:
                 selected_columns.append(name)
 
@@ -1215,17 +1228,14 @@ async def get_airtable_component_index_snapshot(
             reason="source_credentials_unavailable",
         )
 
-    # Reuse the existing filters-only shared cache. Personalization is
-    # deliberately forced OFF: this endpoint has no viewer identity.
-    full = await airtable_service.fetch_widget_full_rows_cached(
-        link=link,
+    # Shared indexing must not depend on the optional viewer cache.
+    # Perform a bounded filters-only full walk; partial/oversized results are
+    # reported unavailable so the Agent preserves the previous valid vectors.
+    full = await airtable_service.fetch_widget_index_rows(
         url=source_url,
         api_key=bundle.pat,
-        caller_email="",
         selected_columns=selected_columns or None,
         filters=filters or None,
-        personalize_enabled=False,
-        personalize_column=None,
     )
 
     available = bool(full.available)
