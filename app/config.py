@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
     # Comma-separated list of email domains allowed to log in.
-    ALLOWED_EMAIL_DOMAIN: str = "renphil.org"
+    ALLOWED_EMAIL_DOMAIN: str = "renphil.org,centerforcivicfutures.org"
 
     @property
     def allowed_email_domains(self) -> list[str]:
