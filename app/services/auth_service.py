@@ -184,5 +184,5 @@ class AuthService:
     # ── Domain restriction ─────────────────────────────────────────────
     def _enforce_domain(self, email: str) -> None:
         domain = email.rsplit("@", 1)[-1].lower()
-        if domain != self._settings.ALLOWED_EMAIL_DOMAIN.lower():
+        if domain not in self._settings.allowed_email_domains:
             raise DomainNotAllowedError(email, self._settings.ALLOWED_EMAIL_DOMAIN)
