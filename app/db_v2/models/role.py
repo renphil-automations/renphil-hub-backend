@@ -33,10 +33,12 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 
 from app.db_v2.database import BaseV2
@@ -101,8 +103,50 @@ class RoleV2(BaseV2):
     # UPDATE plus a decision about who may set the flag; out of scope here.
     is_system = Column(Boolean, nullable=False, default=False)
 
+    # "Any Role" — the BOTTOM of the role lattice
+    # (plan_access_control_algorithm_2026-08-27.md §4.4). Every role
+    # implicitly inherits it, so it is unioned into every descendant set
+    # unconditionally. See ScopeV2.is_public for the full argument on why
+    # this is a flag rather than an edge from every role; it applies here
+    # verbatim, minus the CHECK — this table has no is_universal, because
+    # the role lattice's top is an ordinary row (Hub Admin) and not a flag.
+    #
+    # WHY BOTH AXES AND NOT JUST SCOPES, which is the obvious economy:
+    # `(Hub Member, any-scope)` reaches everyone at Hub Member OR ABOVE, and
+    # roles BELOW Hub Member are anticipated. The day one is added, every
+    # grant written as `(Hub Member, any-scope)` and meaning "everyone"
+    # SILENTLY NARROWS — holders of the new junior role stop matching, and
+    # nothing errors. Recovering means auditing every such grant with no way
+    # left to tell which ones meant "everyone" from the ones that genuinely
+    # meant "Hub Member and up". `(any-role, any-scope)` never narrows. One
+    # extra boolean now against an audit-and-rewrite later, on a trigger that
+    # is already expected.
+    #
+    # Same three service-layer corollaries as the scope flag: never an edge
+    # endpoint (and that guard must precede the cycle check — see
+    # rbac_graph_service.validate_role_edge), never valid as an assignment,
+    # immutable after creation.
+    is_public = Column(Boolean, nullable=False, default=False)
+
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # At most one public role. Mirrors uq_scopes_single_public exactly,
+        # including the requirement that BOTH dialect predicates be spelled
+        # out: a dialect with no matching kwarg silently drops the WHERE and
+        # emits a plain unique index on is_public, which permits one true row
+        # AND one false row — so the second ordinary role anyone creates
+        # fails with "UNIQUE constraint failed". Postgres is production,
+        # SQLite is what tests/ runs against.
+        Index(
+            "uq_roles_single_public",
+            "is_public",
+            unique=True,
+            postgresql_where=text("is_public"),
+            sqlite_where=text("is_public"),
+        ),
+    )
 
 
 class RoleEdgeV2(BaseV2):

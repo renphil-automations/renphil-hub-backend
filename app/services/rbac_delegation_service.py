@@ -4,9 +4,22 @@ session_handoff_2026-08-24-permission-management-plan.md §3.1, §4).
 
 Kept separate from ``rbac_graph_service`` for the same split reason that
 module documents for itself: that one owns the two DAGs' structural rules
-(acyclicity); this one owns the one RULE built on top of their
-closures — who may create or revoke a `role_assignments` row. Neither module
-touches the other's tables.
+(acyclicity) and their closures; this one owns the one RULE built on top of
+those closures — who may create or revoke a `role_assignments` row. This
+module writes nothing at all, and reads `role_assignments` only through
+``held_closures``.
+
+THE ⊥ CAVEAT, and it is a real one (algorithm plan §4.4's "one power to
+watch"). "Any Scope" sits in `scope_descendants(anything)` by construction,
+so the SCOPE HALF of the check below now passes for every user against a ⊥
+target, and "Any Role" does the same to the role half for anyone holding a
+role other than ⊥ itself. What stops that from being a hole is that ⊥ is
+refused as an assignment outright, at the router
+(`routers/rbac_assignments.py`), before this check is ever reached. That
+refusal is not a nicety layered on afterwards — it is the other half of the
+flag, and the two must never be separated. If grant-writing on NODES is
+later gated by this same rule, ⊥ needs deciding on again there, from
+scratch.
 
 THE TRAP THIS MODULE EXISTS TO AVOID (design doc §6.2, restated a third
 time because it is the single most likely bug in this phase): the check
@@ -30,11 +43,17 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.role_assignment import RoleAssignmentV2
-from app.services.rbac_graph_service import RbacGraphError, role_descendants, scope_descendants
+from app.services.rbac_graph_service import RbacClosures, RbacGraphError, held_closures
 
 
-def can_delegate(db: Session, granter_hub_user_id: int, role_id: int, scope_id: int) -> bool:
+def can_delegate(
+    db: Session,
+    granter_hub_user_id: int,
+    role_id: int,
+    scope_id: int,
+    *,
+    closures: RbacClosures | None = None,
+) -> bool:
     """§6.1: may the holder of ``granter_hub_user_id``'s assignments create
     or revoke ``(_, role_id, scope_id)``?
 
@@ -46,18 +65,29 @@ def can_delegate(db: Session, granter_hub_user_id: int, role_id: int, scope_id: 
     granting or revoking your own role, or anything at/above it, is refused.
     Scope: inclusive of the held scope itself — granting on your own scope
     is the primary use case (plan §6.1's asymmetry, deliberate).
+
+    WHY THIS DOES NOT CALL ``effective_pairs``, which is the obvious
+    consolidation and is wrong. That helper answers §4.2's match direction —
+    "does the user hold a pair at or above this one" — over a FLAT set of
+    pairs, and flattening has already thrown away which role came from which
+    row. §6.1 needs the target role to be a PROPER descendant of a
+    SPECIFIC held role, so a granter holding exactly (Program Lead, A) has
+    (Program Lead, A) in their effective pairs and still may not grant it.
+    Testing membership in the flat set would silently let everyone delegate
+    their own role. Both functions are instead built on ``held_closures``,
+    one level down, where the rows are still rows.
+
+    ``closures`` shares one snapshot with a caller making several checks; it
+    is otherwise built once per call, which is already the point — this used
+    to call ``role_descendants``/``scope_descendants`` inside the loop, and
+    each of those rescanned an entire edge table (algorithm plan §8.2).
     """
-    assignments = (
-        db.query(RoleAssignmentV2.role_id, RoleAssignmentV2.scope_id)
-        .filter(RoleAssignmentV2.user_id == granter_hub_user_id)
-        .all()
-    )
-    for held_role_id, held_scope_id in assignments:
-        if role_id == held_role_id:
+    for held in held_closures(db, granter_hub_user_id, closures=closures):
+        if role_id == held.role_id:
             continue  # not a PROPER descendant of itself
-        if role_id not in role_descendants(db, held_role_id):
+        if role_id not in held.role_ids:
             continue
-        if scope_id not in scope_descendants(db, held_scope_id):
+        if scope_id not in held.scope_ids:
             continue
         return True
     return False

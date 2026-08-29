@@ -117,6 +117,7 @@ def create_role(request: CreateRoleRequest, db: Session = Depends(get_db_v2)):
             name=request.name,
             description=request.description,
             depth=request.depth,
+            is_public=request.is_public,
             parent_ids=request.parent_ids,
         )
     except RbacGraphError as e:
@@ -252,13 +253,17 @@ def get_scope(scope_id: int, db: Session = Depends(get_db_v2)):
     dependencies=ADMIN_ONLY,
 )
 def create_scope(request: CreateScopeRequest, db: Session = Depends(get_db_v2)):
-    """`is_universal` is set here or never — it cannot be changed later
-    (see UpdateScopeRequest for why neither direction has a migration).
+    """`is_universal` and `is_public` are both set here or never — neither
+    can be changed later (see UpdateScopeRequest for why no direction has a
+    migration). They are the two ends of one lattice, so sending both on one
+    row is a 409 `universal_and_public`.
 
     Optional `parent_ids` behaves as it does on `POST /roles`: same
     transaction, all-or-nothing. Sending it together with `is_universal` is a
     409 `universal_scope_edge` — the universal scope takes no explicit edges
-    (§5.5), so that combination has no valid outcome to fall back to."""
+    (§5.5), so that combination has no valid outcome to fall back to. With
+    `is_public` it is a 409 `public_scope_edge`, barred at the other end for
+    the mirror reason."""
     try:
         scope = rbac_service.create_scope(
             db,
@@ -266,6 +271,7 @@ def create_scope(request: CreateScopeRequest, db: Session = Depends(get_db_v2)):
             name=request.name,
             description=request.description,
             is_universal=request.is_universal,
+            is_public=request.is_public,
             parent_ids=request.parent_ids,
         )
     except RbacGraphError as e:

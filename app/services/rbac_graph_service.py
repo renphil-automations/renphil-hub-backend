@@ -27,16 +27,29 @@ Delegation (§6) is deliberately absent: it governs ASSIGNMENTS, and the
 first cut of Access Management is role/scope definitions only, with every
 write gated to Hub Admin. The closure helpers below are what it will be
 built from when the assignments surface lands.
+
+WHY ``effective_pairs`` LIVES HERE, given the paragraph above says this
+module does not own assignments. It reads ``role_assignments``, but it is
+not a rule ABOUT assignments — it is the closures' own expansion, and the
+per-row pairing it protects is a property of how the two closures compose,
+not of who may write a row. Putting it here is what lets the delegation
+rule, and the read-time visibility fold that comes next
+(plan_access_control_algorithm_2026-08-27.md §8.1), share one
+``RbacClosures`` snapshot instead of each rebuilding the adjacency. The
+module still writes nothing outside ``parent_child_roles`` /
+``parent_child_scopes``; the assignments table is read-only from here.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
+from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
 
 # Distinct constants so the two graphs never serialize against each other.
@@ -111,11 +124,15 @@ def lock_scope_graph(db: Session) -> None:
 # ---------------------------------------------------------
 
 
-def _walk(db: Session, start_id: int, edges: list[tuple[int, int]]) -> set[int]:
-    """Breadth-first reachability over ``(from, to)`` pairs. Loads the whole
-    edge table once rather than querying per level: both graphs are tens of
-    rows, so one round trip beats N, and the walk is also what runs inside
-    the advisory lock where round trips are most expensive."""
+def _walk_edges(start_id: int, edges: list[tuple[int, int]]) -> set[int]:
+    """Breadth-first reachability over ``(from, to)`` pairs. The caller has
+    already loaded the whole edge table: both graphs are tens of rows, so one
+    round trip beats N, and the walk is also what runs inside the advisory
+    lock where round trips are most expensive.
+
+    Takes no Session — it never had a use for one, and dropping it is what
+    lets ``RbacClosures`` walk the same edge list repeatedly without touching
+    the database again."""
     adjacency: dict[int, list[int]] = {}
     for src, dst in edges:
         adjacency.setdefault(src, []).append(dst)
@@ -145,6 +162,100 @@ def _scope_edge_pairs(db: Session) -> list[tuple[int, int]]:
     ]
 
 
+class RbacClosures:
+    """Both DAGs and both ⊥ rows, loaded ONCE, with memoized walks
+    (algorithm plan §8.2).
+
+    Every closure helper below is a one-shot wrapper around an instance of
+    this, so the ordinary call shape is unchanged. The class exists for the
+    callers that need MANY closures from one consistent snapshot —
+    ``held_closures`` / ``effective_pairs`` expand one closure per assignment
+    row, and ``can_delegate`` walks the granter's rows the same way.
+
+    THE COST THIS EXISTS TO AVOID, quoted because it is the thing that makes
+    the read-time visibility path unusable if it is copied: the free
+    functions rescan the WHOLE of ``parent_child_roles`` (and
+    ``parent_child_scopes``) on every single call. ``can_delegate`` used to
+    call both inside a loop over the granter's assignments, and
+    ``list_revocable`` calls ``can_delegate`` once per assignment row in the
+    org — O(rows × assignments) full table scans. Harmless at today's volumes
+    (both graphs are tens of rows), lethal the moment the per-request
+    visibility fold starts asking the same questions per node.
+
+    A snapshot is exactly as stale as the transaction that built it. Build
+    one per request, never cache one across requests: an edge added in
+    between would not be seen, and this is an authorization input.
+    """
+
+    def __init__(self, db: Session) -> None:
+        self._role_edges = _role_edge_pairs(db)
+        self._scope_edges = _scope_edge_pairs(db)
+        self._role_edges_up = [(c, p) for p, c in self._role_edges]
+        self._scope_edges_up = [(c, p) for p, c in self._scope_edges]
+
+        # Both ⊥ ids are held as SETS rather than as a single id or None.
+        # What keeps them to one row each is the partial unique index, and
+        # this code should not independently assume what the index already
+        # guarantees — unioning a set of any size is the same operation, so
+        # the defensive shape costs nothing and cannot go wrong if a second
+        # row ever appears through some path nobody anticipated.
+        self._public_role_ids: set[int] = {
+            row[0] for row in db.query(RoleV2.id).filter(RoleV2.is_public.is_(True)).all()
+        }
+
+        # One pass over `scopes` for all three sets rather than three
+        # queries: the universal short-circuit needs every id, the ordinary
+        # branch needs the ⊥ ids, and both branches need to know whether the
+        # starting id exists at all.
+        self._all_scope_ids: set[int] = set()
+        self._universal_scope_ids: set[int] = set()
+        self._public_scope_ids: set[int] = set()
+        for scope_id, is_universal, is_public in db.query(
+            ScopeV2.id, ScopeV2.is_universal, ScopeV2.is_public
+        ).all():
+            self._all_scope_ids.add(scope_id)
+            if is_universal:
+                self._universal_scope_ids.add(scope_id)
+            if is_public:
+                self._public_scope_ids.add(scope_id)
+
+        self._role_descendant_cache: dict[int, set[int]] = {}
+        self._scope_descendant_cache: dict[int, set[int]] = {}
+
+    # -- descendants ----------------------------------------------
+
+    def role_descendants(self, role_id: int) -> set[int]:
+        """See the module-level ``role_descendants``."""
+        cached = self._role_descendant_cache.get(role_id)
+        if cached is None:
+            cached = _walk_edges(role_id, self._role_edges) | self._public_role_ids
+            self._role_descendant_cache[role_id] = cached
+        # A copy, so a caller mutating the result cannot corrupt the cache
+        # for the next one. These sets are tens of ids.
+        return set(cached)
+
+    def scope_descendants(self, scope_id: int) -> set[int]:
+        """See the module-level ``scope_descendants``."""
+        cached = self._scope_descendant_cache.get(scope_id)
+        if cached is None:
+            if scope_id not in self._all_scope_ids:
+                cached = set()
+            elif scope_id in self._universal_scope_ids:
+                cached = set(self._all_scope_ids)
+            else:
+                cached = _walk_edges(scope_id, self._scope_edges) | self._public_scope_ids
+            self._scope_descendant_cache[scope_id] = cached
+        return set(cached)
+
+    # -- ancestors: no cache, no ⊥ (see the free functions) --------
+
+    def role_ancestors(self, role_id: int) -> set[int]:
+        return _walk_edges(role_id, self._role_edges_up)
+
+    def scope_ancestors(self, scope_id: int) -> set[int]:
+        return _walk_edges(scope_id, self._scope_edges_up)
+
+
 def role_descendants(db: Session, role_id: int) -> set[int]:
     """Every role whose access ``role_id`` inherits, INCLUDING itself.
 
@@ -152,13 +263,34 @@ def role_descendants(db: Session, role_id: int) -> set[int]:
     (Program Lead, A) is satisfied by holding exactly that. Callers wanting
     "strictly beneath me" — the delegation rule (§6.1) is the one that does —
     must subtract the starting id themselves.
+
+    The PUBLIC role — "Any Role", the lattice's bottom — is unioned in
+    unconditionally (algorithm plan §4.4), because every role implicitly
+    inherits it. Unlike the universal scope's short-circuit this is an
+    addition, not a replacement: the walk still runs and its result still
+    matters.
+
+    Deliberately does NOT validate that ``role_id`` exists, which is the
+    behaviour it has always had — ``validate_role_edge`` looks roles up
+    separately via ``_get_role`` and wants its own error message. An unknown
+    id therefore returns ``{that id} | {public}`` rather than empty. The
+    scope side does validate, because it has to read ``is_universal``
+    anyway; the asymmetry predates this change.
     """
-    return _walk(db, role_id, _role_edge_pairs(db))
+    return RbacClosures(db).role_descendants(role_id)
 
 
 def role_ancestors(db: Session, role_id: int) -> set[int]:
-    """Every role that inherits ``role_id``'s access, including itself."""
-    return _walk(db, role_id, [(c, p) for p, c in _role_edge_pairs(db)])
+    """Every role that inherits ``role_id``'s access, including itself.
+
+    No ⊥ here, and the asymmetry is the same one ``scope_ancestors``
+    documents: everything inherits the public role, so nothing meaningful is
+    gained by walking UP from an arbitrary role into it, and this direction
+    must never be used to answer "is X covered by Y" — that is a descendants
+    question. ``role_ancestors(public_role)`` would be every role, but the
+    public role is barred from the edge table, so the walk cannot reach it.
+    """
+    return RbacClosures(db).role_ancestors(role_id)
 
 
 def scope_descendants(db: Session, scope_id: int) -> set[int]:
@@ -169,13 +301,13 @@ def scope_descendants(db: Session, scope_id: int) -> set[int]:
     created tomorrow is inside "All Scopes" without anyone remembering to
     add an edge. §5.5 keeps a universal scope out of ``parent_child_scopes``
     entirely, so there is no path where both branches could disagree.
+
+    The PUBLIC scope — "Any Scope", the bottom — is unioned into the
+    ordinary branch unconditionally (algorithm plan §4.4). The universal
+    branch needs no special case: "every scope row" already contains it, and
+    the CHECK on ``scopes`` makes sure no single row is both ends at once.
     """
-    scope = db.query(ScopeV2).filter(ScopeV2.id == scope_id).first()
-    if scope is None:
-        return set()
-    if scope.is_universal:
-        return {row[0] for row in db.query(ScopeV2.id).all()}
-    return _walk(db, scope_id, _scope_edge_pairs(db))
+    return RbacClosures(db).scope_descendants(scope_id)
 
 
 def scope_ancestors(db: Session, scope_id: int) -> set[int]:
@@ -186,8 +318,110 @@ def scope_ancestors(db: Session, scope_id: int) -> set[int]:
     from an ordinary scope will never reach it — it holds no edges — which is
     exactly right. It also means this must never be used to answer "is X
     covered by Y"; that is a descendants question.
+
+    The public scope gets the mirror treatment for the mirror reason: every
+    scope contains it, so it is not an ANCESTOR of anything and is not
+    unioned in here. It holds no edges either, so the walk cannot wander
+    into it.
     """
-    return _walk(db, scope_id, [(c, p) for p, c in _scope_edge_pairs(db)])
+    return RbacClosures(db).scope_ancestors(scope_id)
+
+
+# ---------------------------------------------------------
+# Effective access — §4.1, expanded PER ASSIGNMENT ROW
+# ---------------------------------------------------------
+
+
+class HeldClosure(NamedTuple):
+    """One ``role_assignments`` row with both of its closures expanded.
+
+    ``role_id`` / ``scope_id`` are the row's own ids, kept alongside the
+    expansions because the delegation rule needs them: "strictly beneath the
+    role I hold" cannot be answered once the held role has been absorbed
+    into a set with everything below it.
+    """
+
+    role_id: int
+    scope_id: int
+    role_ids: set[int]
+    scope_ids: set[int]
+
+
+def held_assignments(db: Session, hub_user_id: int) -> list[tuple[int, int]]:
+    """The user's raw ``(role_id, scope_id)`` assignment ROWS.
+
+    One query, one place, so every consumer of "what does this user hold"
+    starts from the same rows.
+    """
+    return [
+        (row[0], row[1])
+        for row in db.query(RoleAssignmentV2.role_id, RoleAssignmentV2.scope_id)
+        .filter(RoleAssignmentV2.user_id == hub_user_id)
+        .all()
+    ]
+
+
+def held_closures(
+    db: Session, hub_user_id: int, *, closures: RbacClosures | None = None
+) -> list[HeldClosure]:
+    """Every assignment row the user holds, each with its two closures.
+
+    THIS IS THE PRIMITIVE, and everything about effective access is built on
+    it precisely so the pairing stays intact one level down. Returning a
+    LIST OF ROWS rather than a flat set is the whole point: the moment the
+    rows are merged, which role went with which scope is gone, and no
+    consumer can recover it.
+
+    Pass ``closures`` to share one snapshot across several calls; omitted, a
+    fresh one is built (one load of each edge table, not one per row).
+    """
+    graph = closures if closures is not None else RbacClosures(db)
+    return [
+        HeldClosure(
+            role_id=role_id,
+            scope_id=scope_id,
+            role_ids=graph.role_descendants(role_id),
+            scope_ids=graph.scope_descendants(scope_id),
+        )
+        for role_id, scope_id in held_assignments(db, hub_user_id)
+    ]
+
+
+def effective_pairs(
+    db: Session, hub_user_id: int, *, closures: RbacClosures | None = None
+) -> set[tuple[int, int]]:
+    """§4.1's ``effective(U)`` — every ``(role, scope)`` pair the user's
+    assignments reach::
+
+        effective(U) = ⋃ over each of U's assignment ROWS (R, S):
+                           role_descendants*(R) × scope_descendants*(S)
+
+    PER ROW, NEVER THE UNION OF ROLES CROSSED WITH THE UNION OF SCOPES. This
+    is the pairing bug ``role_assignments`` exists to prevent, and it is the
+    easier version to write, which is why it is now restated in five places:
+    ``role_assignment.py``'s module docstring, schema plan §6.2,
+    ``rbac_delegation_service``'s module docstring, algorithm plan §4.1, and
+    here. The cross-product is taken INSIDE the loop, over one row's two
+    closures; the union across rows happens after. Alice holding
+    (Program Lead, A) and (Program Member, B) must never yield
+    (Program Lead, B).
+
+    WHAT THIS IS AND IS NOT USABLE FOR. It answers "does the user hold a
+    pair at or above this stored grant?" — §4.2's match direction, and the
+    read path in §8.1. It CANNOT answer the delegation question, and
+    ``can_delegate`` deliberately does not call it: §6.1 needs the target
+    role to be a PROPER descendant of a held role, and properness is a
+    per-row fact that flattening has already destroyed. A user holding
+    exactly (Program Lead, A) has (Program Lead, A) in this set, yet may not
+    grant it. ``can_delegate`` uses ``held_closures`` instead, one level
+    down, sharing this function's snapshot and its walks.
+    """
+    pairs: set[tuple[int, int]] = set()
+    for held in held_closures(db, hub_user_id, closures=closures):
+        for role_id in held.role_ids:
+            for scope_id in held.scope_ids:
+                pairs.add((role_id, scope_id))
+    return pairs
 
 
 # ---------------------------------------------------------
@@ -255,6 +489,30 @@ def validate_role_edge(db: Session, parent_role_id: int, child_role_id: int) -> 
     #         parent_rank=parent.rank,
     #         child_rank=child.rank,
     #     )
+
+    # §4.4 — the public role is implicitly beneath every role. An edge INTO
+    # it is redundant with the union in `role_descendants`, and an edge OUT
+    # of it says some role is beneath the bottom, which is a contradiction.
+    #
+    # THIS MUST PRECEDE THE CYCLE WALK, exactly as the scope graph's
+    # equivalent does (see validate_scope_edge, where the reasoning is
+    # spelled out in full). The public role is in every descendant set, so
+    # `parent_role_id in role_descendants(child_role_id)` is trivially true
+    # whenever the parent IS the public role — the cycle check would get
+    # there first and blame a cycle that does not exist. Unlike the scope
+    # side there was no existing guard here to extend: roles have no
+    # is_universal, so this loop is new, and its POSITION is the part that
+    # matters.
+    for role in (parent, child):
+        if role.is_public:
+            raise RbacGraphError(
+                "public_role_edge",
+                (
+                    f"{role.name!r} is the public role: every role already "
+                    f"inherits it implicitly and it cannot take explicit edges."
+                ),
+                role_id=role.id,
+            )
 
     # Adding parent -> child closes a loop exactly when `child` can already
     # reach `parent`. Same test, same direction, same error code as
@@ -439,6 +697,16 @@ def validate_scope_edge(db: Session, parent_scope_id: int, child_scope_id: int) 
     # a contradiction (nothing contains everything), and an edge OUT of it is
     # redundant with the is_universal short-circuit in scope_descendants,
     # which would then be the only one of the two that anybody reads.
+    #
+    # BOTH checks must stay AHEAD OF THE CYCLE WALK below, and for the
+    # public scope that ordering is load-bearing rather than tidy: it sits
+    # in EVERY descendant set by construction, so
+    # `parent_scope_id in scope_descendants(child_scope_id)` is trivially
+    # true for any edge whose parent is the public scope. Reached in the
+    # other order, a perfectly ordinary mistake would come back as "Any
+    # Scope already contains X" — a cycle error naming a cycle that does not
+    # exist. The is_universal guard already occupied this position, which is
+    # why adding to the same loop inherits the right answer for free.
     for scope in (parent, child):
         if scope.is_universal:
             raise RbacGraphError(
@@ -446,6 +714,15 @@ def validate_scope_edge(db: Session, parent_scope_id: int, child_scope_id: int) 
                 (
                     f"{scope.name!r} is the universal scope: it already contains "
                     f"every scope implicitly and cannot take explicit edges."
+                ),
+                scope_id=scope.id,
+            )
+        if scope.is_public:
+            raise RbacGraphError(
+                "public_scope_edge",
+                (
+                    f"{scope.name!r} is the public scope: every scope already "
+                    f"contains it implicitly and it cannot take explicit edges."
                 ),
                 scope_id=scope.id,
             )

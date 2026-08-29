@@ -88,6 +88,7 @@ def serialize_role(
         # switched back on without a migration. The UI does not render it.
         "depth": role.depth,
         "is_system": bool(role.is_system),
+        "is_public": bool(role.is_public),
         "parent_ids": sorted(parents.get(role.id, [])),
         "child_ids": sorted(children.get(role.id, [])),
     }
@@ -103,6 +104,7 @@ def serialize_scope(
         "description": scope.description,
         "is_universal": bool(scope.is_universal),
         "is_system": bool(scope.is_system),
+        "is_public": bool(scope.is_public),
         "parent_ids": sorted(parents.get(scope.id, [])),
         "child_ids": sorted(children.get(scope.id, [])),
     }
@@ -152,11 +154,15 @@ def create_role(
     name: str,
     description: str | None,
     depth: int | None = None,
+    is_public: bool = False,
     parent_ids: Sequence[int] = (),
 ) -> dict:
     """`depth` is optional and constrains nothing (see RoleV2.depth). The UI
     does not send it; the parameter stays so the rank rule can be restored
     without changing this signature.
+
+    `is_public` marks this row as "Any Role", the lattice's bottom (algorithm
+    plan §4.4). Set here or never — it is absent from UpdateRoleRequest.
 
     `parent_ids` attaches the new role beneath existing ones. This is the one
     place in this module that writes edges, and it still does not own the
@@ -172,12 +178,31 @@ def create_role(
     that only holds because of who is calling is not a rule.
     """
     _assert_role_key_free(db, key, name)
+
+    # Checked here as well as by the partial unique index, purely so the
+    # caller gets a named error instead of an IntegrityError — same split as
+    # the universal-scope check in `create_scope`. The index is still the
+    # thing that makes it true under concurrency.
+    if is_public:
+        existing_public = db.query(RoleV2).filter(RoleV2.is_public.is_(True)).first()
+        if existing_public is not None:
+            raise RbacGraphError(
+                "public_role_exists",
+                (
+                    f"{existing_public.name!r} is already the public role. There "
+                    f"can only be one, or \"the bottom of the lattice\" becomes "
+                    f"ambiguous and every closure gains two of them."
+                ),
+                role_id=existing_public.id,
+            )
+
     role = RoleV2(
         key=key,
         name=name,
         description=description,
         depth=depth,
         is_system=False,
+        is_public=is_public,
         created_at=_utc_now(),
     )
     db.add(role)
@@ -288,9 +313,27 @@ def delete_role(db: Session, role_id: int) -> bool:
 
 
 def list_scopes(db: Session) -> list[dict]:
-    """Universal scope first (it is conceptually the root), then by name."""
+    """Universal scope first (it is conceptually the root), then the ordinary
+    scopes by name, then the public scope last.
+
+    The two ends bracket the list because that is what they are — the top and
+    the bottom of one lattice — and sorting "Any Scope" into the A's would
+    put it directly above "All Scopes" in the picker, which is the single
+    worst place for it: the two names are one word apart and mean close to
+    opposite things on an object grant (algorithm plan §9). Both flags are
+    NOT NULL, so unlike `depth` there is no NULL-ordering divergence between
+    Postgres and SQLite to worry about here.
+
+    Roles are deliberately NOT reordered to match. `list_roles` has no
+    flag-based ordering to extend, and inventing one is a UI decision the
+    plan does not make.
+    """
     parents, children = _scope_edge_map(db)
-    rows = db.query(ScopeV2).order_by(ScopeV2.is_universal.desc(), ScopeV2.name).all()
+    rows = (
+        db.query(ScopeV2)
+        .order_by(ScopeV2.is_universal.desc(), ScopeV2.is_public.asc(), ScopeV2.name)
+        .all()
+    )
     return [serialize_scope(s, parents, children) for s in rows]
 
 
@@ -309,18 +352,41 @@ def create_scope(
     name: str,
     description: str | None,
     is_universal: bool,
+    is_public: bool = False,
     parent_ids: Sequence[int] = (),
 ) -> dict:
     """`parent_ids` behaves exactly as it does in ``create_role`` — see there
     for why the edges are written in this transaction rather than by a second
     request. Passing both `is_universal` and a parent is refused by
     ``validate_scope_edge`` (§5.5), and refused whole: the caller has not
-    committed yet, so the scope row goes back with the edge."""
+    committed yet, so the scope row goes back with the edge. `is_public` is
+    barred from the edge table on the same terms, so it behaves identically.
+
+    `is_public` marks this row as "Any Scope", the lattice's BOTTOM
+    (algorithm plan §4.4) — the mirror of `is_universal`'s top, and never the
+    same row as it."""
     if db.query(ScopeV2.id).filter(ScopeV2.key == key).first():
         raise RbacGraphError("duplicate_key", f"A scope with key {key!r} already exists", key=key)
     if db.query(ScopeV2.id).filter(ScopeV2.name == name).first():
         raise RbacGraphError(
             "duplicate_name", f"A scope named {name!r} already exists", name=name
+        )
+
+    # A row cannot be both ends of the lattice: the descendant walk would
+    # short-circuit to every scope AND append this row to every other walk.
+    # The DB carries this as a CHECK; this is here so the caller gets a
+    # named error rather than an IntegrityError, same as the two below.
+    if is_universal and is_public:
+        raise RbacGraphError(
+            "universal_and_public",
+            (
+                "A scope cannot be both the universal scope and the public "
+                "scope. \"All Scopes\" is the top of the lattice — held in an "
+                "ASSIGNMENT it covers every scope. \"Any Scope\" is the "
+                "bottom — written on an OBJECT it is reachable from every "
+                "scope. One row cannot be both."
+            ),
+            key=key,
         )
 
     # Checked here as well as by the partial unique index, purely so the
@@ -338,12 +404,25 @@ def create_scope(
                 scope_id=existing.id,
             )
 
+    if is_public:
+        existing_public = db.query(ScopeV2).filter(ScopeV2.is_public.is_(True)).first()
+        if existing_public is not None:
+            raise RbacGraphError(
+                "public_scope_exists",
+                (
+                    f"{existing_public.name!r} is already the public scope. There "
+                    f"can only be one, or every closure picks up two bottoms."
+                ),
+                scope_id=existing_public.id,
+            )
+
     scope = ScopeV2(
         key=key,
         name=name,
         description=description,
         is_universal=is_universal,
         is_system=False,
+        is_public=is_public,
         created_at=_utc_now(),
     )
     db.add(scope)

@@ -14,6 +14,12 @@ Every route depends on `get_current_hub_user`, not `get_current_user`: this
 is the surface that made hub_users auto-provisioning a hard prerequisite
 (handoff §3.2) rather than a nice-to-have, since nobody — including the
 granter — can be resolved to a row without it.
+
+This router also owns the one rule that keeps the ⊥ flags
+("Any Role" / "Any Scope", plan_access_control_algorithm_2026-08-27.md §4.4)
+from being a delegation hole: they may never be assigned. See
+`_assert_not_public`, which explains why it lives here and why it runs where
+it runs.
 """
 
 from __future__ import annotations
@@ -36,7 +42,14 @@ from app.services.tab_service import HUB_ADMIN_ROLE
 
 router = APIRouter(prefix="/v2/rbac", tags=["Permission Management"])
 
-CONFLICT_RESPONSE = {409: {"description": "The delegation rule, or a uniqueness rule, was violated"}}
+CONFLICT_RESPONSE = {
+    409: {
+        "description": (
+            "The delegation rule, a uniqueness rule, or the ⊥-not-assignable "
+            "rule was violated"
+        )
+    }
+}
 
 
 def _conflict(error: RbacGraphError) -> HTTPException:
@@ -54,6 +67,53 @@ def _conflict(error: RbacGraphError) -> HTTPException:
 
 def _is_hub_admin(current: CurrentHubUser) -> bool:
     return HUB_ADMIN_ROLE in (current.info.roles or [])
+
+
+def _assert_not_public(role: dict, scope: dict) -> None:
+    """⊥ IS NEVER VALID AS AN ASSIGNMENT
+    (plan_access_control_algorithm_2026-08-27.md §4.4).
+
+    "Any Role" and "Any Scope" are the two lattice bottoms. They exist so
+    that a grant written on an OBJECT can be reached from whatever anyone
+    holds — which is exactly why holding one yourself is meaningless: it
+    confers only what every single person already reaches. Each flag stays
+    in its lane. `is_universal` is the one that belongs in an assignment
+    ("every scope"); `is_public` is the one that belongs on an object grant.
+
+    THIS IS A SECURITY CHECK, not a tidiness rule, and it is the other half
+    of the flag rather than a follow-up to it. ⊥ sits in EVERY descendant
+    set by construction, so `scope_id in scope_descendants(held)` is true
+    for every user alive — the scope half of §6.1's delegation rule passes
+    unconditionally against a ⊥ target, and the role half does the same for
+    anyone holding any role but ⊥ itself. Without this refusal, adding the
+    flags would hand every user in the hub the ability to grant
+    `(anyone, Any Role, Any Scope)` — universal access, delegable by
+    everybody, in a feature nobody is using yet. Ship the two together or
+    ship neither.
+
+    Hence the ORDER in `create_assignment`: this runs BEFORE
+    `assert_can_delegate`, because the delegation gate is precisely what ⊥
+    walks through. Running it after would be running it never.
+
+    Deliberately NOT applied on the revoke path. A ⊥ row should not exist,
+    but if one ever does — written before these flags landed, or straight
+    into the database — refusing to revoke it would strand it permanently,
+    with the widest reach in the system and no way to remove it through the
+    UI. Refuse the way in, never the way out.
+    """
+    for kind, row, key in (("role", role, "role_id"), ("scope", scope, "scope_id")):
+        if row.get("is_public"):
+            raise RbacGraphError(
+                "public_not_assignable",
+                (
+                    f"{row['name']!r} is the public {kind} — the bottom of the "
+                    f"{kind} lattice. It cannot be assigned to anyone: holding "
+                    f"it grants only what everybody already reaches. It is "
+                    f"meant for grants written ON CONTENT, to publish "
+                    f"something to the whole hub."
+                ),
+                **{key: row["id"]},
+            )
 
 
 # ---------------------------------------------------------
@@ -139,13 +199,19 @@ def create_assignment(
 ):
     """`role_id`/`scope_id` not found stays a plain 404, matching every
     other `/v2/rbac` endpoint — checked BEFORE the delegation gate so a bad
-    id never leaks whether it would otherwise have been delegable."""
-    if rbac_service.get_role(db, request.role_id) is None:
+    id never leaks whether it would otherwise have been delegable.
+
+    The ⊥ refusal below sits between the two, and its position is not
+    cosmetic — see `_assert_not_public`."""
+    role = rbac_service.get_role(db, request.role_id)
+    if role is None:
         raise HTTPException(status_code=404, detail="Role not found")
-    if rbac_service.get_scope(db, request.scope_id) is None:
+    scope = rbac_service.get_scope(db, request.scope_id)
+    if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
 
     try:
+        _assert_not_public(role, scope)
         assert_can_delegate(
             db,
             granter_hub_user_id=current.hub_user_id,

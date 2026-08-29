@@ -67,6 +67,43 @@ class ScopeV2(BaseV2):
     # explicit edge is redundant at best and contradictory at worst.
     is_universal = Column(Boolean, nullable=False, default=False)
 
+    # "Any Scope" — the BOTTOM of the lattice, mirroring is_universal's top
+    # (plan_access_control_algorithm_2026-08-27.md §4.4). Every scope
+    # implicitly CONTAINS it, so it is unioned into every descendant set
+    # unconditionally: a grant written on it is reachable from whatever
+    # scope anyone holds, which is what makes "open to everyone" one row.
+    #
+    # WHY A FLAG AND NOT N EDGES. The mirror argument to is_universal's,
+    # and it is worth spelling out because "just add S -> bottom for every
+    # scope" is the obvious first idea. Modelling the bottom with explicit
+    # edges means every newly created scope has to be remembered and given
+    # an edge DOWN to it, and forgetting one is silent: nodes published to
+    # "everyone" quietly stop reaching that scope's users, with no error and
+    # nothing to notice. That is the same failure is_universal avoids, just
+    # pointing the other way — there it is a silent access HOLE, here a
+    # silent access GAP. There is nothing to forget with a flag.
+    #
+    # The edge encoding is also barred by construction: §5.5 keeps the
+    # universal scope out of parent_child_scopes entirely, so even the one
+    # edge that would matter most (top -> bottom) has no legal home.
+    #
+    # Corollaries enforced in the service layer, not here:
+    #   - never an endpoint in parent_child_scopes, same as is_universal
+    #     (rbac_graph_service.validate_scope_edge). That guard must sit
+    #     BEFORE the cycle check: with the bottom in every descendant set,
+    #     `parent in scope_descendants(child)` is trivially true for any
+    #     edge pointing at it, so the cycle check would reject it first with
+    #     a thoroughly misleading message.
+    #   - never valid as an ASSIGNMENT (routers/rbac_assignments.py).
+    #     Holding it grants only what everyone already reaches, and it would
+    #     blow the scope half of the delegation rule wide open, since
+    #     `scope_descendants(anything)` contains it for every user alive.
+    #     Each flag stays in its lane: is_universal for assignments,
+    #     is_public for object grants.
+    #   - immutable after creation, same as is_universal — flipping it
+    #     silently rewrites what every existing grant reaches.
+    is_public = Column(Boolean, nullable=False, default=False)
+
     # Delete-guard, same terms as RoleV2.is_system — in practice the
     # universal scope.
     is_system = Column(Boolean, nullable=False, default=False)
@@ -93,6 +130,38 @@ class ScopeV2(BaseV2):
             unique=True,
             postgresql_where=text("is_universal"),
             sqlite_where=text("is_universal"),
+        ),
+        # At most one public scope, for the mirror reason: a second one would
+        # make "the bottom" ambiguous, and since both get unioned into every
+        # descendant set, two of them silently double the reach of every
+        # grant written on either.
+        #
+        # BOTH dialect predicates are required here for exactly the reason
+        # spelled out above uq_scopes_single_universal — a dialect with no
+        # matching kwarg loses the WHERE and emits a PLAIN unique index,
+        # which permits one true row AND one false row, i.e. the second
+        # ordinary scope anyone creates fails with "UNIQUE constraint
+        # failed". Dropping either line is a live bug, not a tidy-up.
+        Index(
+            "uq_scopes_single_public",
+            "is_public",
+            unique=True,
+            postgresql_where=text("is_public"),
+            sqlite_where=text("is_public"),
+        ),
+        # The two flags are the opposite ends of one lattice, so no row may
+        # be both. A row that was would return every scope (the is_universal
+        # short-circuit) AND be appended to every walk (the is_public
+        # union) — the top and the bottom at once, which is not a coherent
+        # thing for a closure to mean.
+        #
+        # This CHECK has no role-table counterpart: RoleV2 has no
+        # is_universal. The role lattice's top is an ordinary row (Hub
+        # Admin) rather than a flag, so there is no second flag there to
+        # contradict, and roles carry only the partial unique index.
+        CheckConstraint(
+            "NOT (is_universal AND is_public)",
+            name="ck_scopes_not_universal_and_public",
         ),
     )
 
