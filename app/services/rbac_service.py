@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.db_v2.models.resource_grant import ResourceGrantV2
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
@@ -269,13 +270,18 @@ def update_role(
 
 
 def delete_role(db: Session, role_id: int) -> bool:
-    """Refuses on a system role or one that still has assignments.
+    """Refuses on a system role, one that still has assignments, or one still
+    granted on a node.
 
-    The assignment check is done here rather than left to the FK's RESTRICT
-    so the caller gets a count and a reason instead of an opaque
-    IntegrityError. Incident EDGES are not checked — they CASCADE, which is
-    correct: an edge describing a role that no longer exists is meaningless,
-    and keeping it would block the delete for no benefit.
+    Both counts are done here rather than left to the FK's RESTRICT so the
+    caller gets a count and a reason instead of an opaque IntegrityError.
+    Incident EDGES are not checked — they CASCADE, which is correct: an edge
+    describing a role that no longer exists is meaningless, and keeping it
+    would block the delete for no benefit.
+
+    THE TWO COUNTS ARE INDEPENDENT and a role can be blocked by either;
+    clearing one does not clear the other. Assignments are checked first only
+    because that check predates ``resource_grants``.
     """
     role = db.query(RoleV2).filter(RoleV2.id == role_id).first()
     if role is None:
@@ -300,6 +306,31 @@ def delete_role(db: Session, role_id: int) -> bool:
             ),
             role_id=role_id,
             assignment_count=assignment_count,
+        )
+
+    # The second pre-count, and it is not optional: algorithm plan §7 gives
+    # `resource_grants` the same RESTRICT discipline on `role_id` that
+    # `role_assignments` has, for the same reason — deleting a role must not
+    # silently revoke access. Without this, a role that is granted on a node
+    # but assigned to nobody sails past the check above and is refused by the
+    # FK instead, as an IntegrityError the router has no branch for: a 500,
+    # from a code path that already knows exactly how to say why.
+    #
+    # A DISTINCT CODE from `role_in_use`, deliberately. The two failures have
+    # different remedies — remove assignments from people, versus remove
+    # grants from nodes — and an admin who clears every assignment and gets
+    # `role_in_use` a second time with a different count has been told
+    # nothing useful.
+    grant_count = db.query(ResourceGrantV2).filter(ResourceGrantV2.role_id == role_id).count()
+    if grant_count:
+        raise RbacGraphError(
+            "role_granted_on_nodes",
+            (
+                f"{role.name!r} is still granted on {grant_count} node(s). "
+                f"Remove those grants first."
+            ),
+            role_id=role_id,
+            grant_count=grant_count,
         )
 
     db.delete(role)
@@ -468,7 +499,8 @@ def update_scope(
 
 
 def delete_scope(db: Session, scope_id: int) -> bool:
-    """Same terms as delete_role. Edges cascade; assignments block."""
+    """Same terms as delete_role. Edges cascade; assignments and grants both
+    block, independently."""
     scope = db.query(ScopeV2).filter(ScopeV2.id == scope_id).first()
     if scope is None:
         return False
@@ -492,6 +524,21 @@ def delete_scope(db: Session, scope_id: int) -> bool:
             ),
             scope_id=scope_id,
             assignment_count=assignment_count,
+        )
+
+    # The grants pre-count, mirroring delete_role's — see the long note there
+    # for why the FK's RESTRICT is not left to speak for itself, and why this
+    # gets its own code rather than reusing `scope_in_use`.
+    grant_count = db.query(ResourceGrantV2).filter(ResourceGrantV2.scope_id == scope_id).count()
+    if grant_count:
+        raise RbacGraphError(
+            "scope_granted_on_nodes",
+            (
+                f"{scope.name!r} is still granted on {grant_count} node(s). "
+                f"Remove those grants first."
+            ),
+            scope_id=scope_id,
+            grant_count=grant_count,
         )
 
     db.delete(scope)
