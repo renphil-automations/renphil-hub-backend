@@ -1748,6 +1748,53 @@ def update_tab_content_v2(
             widget_type = widget_entry.get("type")
             widget_data = widget_entry.get("data")
 
+            # THE REDACTION SENTINEL IS NEVER PERSISTED — leave the stored
+            # component exactly as it is (algorithm plan §6.7, §10 item 7).
+            #
+            # `filter_widget_content_for_user` replaces a widget the caller
+            # may not see with `{type: 'restricted', data: null}` and KEEPS
+            # ITS KEY (tab_service.py:100), so the sentinel travels out in
+            # `GridCanvasContent.widgets` and comes straight back on the next
+            # save. Without this guard the loop below would treat it as an
+            # ordinary edit and write it through: `existing.type` becomes
+            # 'restricted', `title` and `description` become None, and
+            # `_write_component_data` overwrites the real content with `{}`.
+            # The widget the caller was not allowed to SEE is destroyed by the
+            # act of saving the canvas around it.
+            #
+            # `continue` is the whole fix, and the two things it does NOT do
+            # matter as much as the one it does:
+            #
+            #  - It does not remove `widget_id` from `incoming_ids`, which was
+            #    computed from the raw payload above. That is load-bearing:
+            #    the delete pass removes every existing component whose key is
+            #    ABSENT, so filtering these entries out of the payload — the
+            #    obvious client-side "fix" — would not preserve the widget, it
+            #    would DELETE it. The key must survive even though the entry
+            #    is ignored.
+            #  - It does not create a row when no component matches, so a
+            #    sentinel for an unknown key cannot insert a junk
+            #    'restricted' component either.
+            #
+            # PRESERVE-AND-CONTINUE RATHER THAN REFUSING THE REQUEST, which
+            # was the other reading of "reject `restricted` server-side". A
+            # hard failure would make the canvas unsaveable for anyone who
+            # holds edit on it and cannot see one widget on it — the very
+            # combination §6.7 says fine-grained grants make ORDINARY — and a
+            # merely stale client would trip it too. Ignoring one entry
+            # degrades gracefully and matches how this function already
+            # handles fields it must not clobber: an absent `access_control`
+            # means "preserve", not "overwrite with null", and Airtable's
+            # protected fields are carried over rather than rejected.
+            #
+            # This guard stands on its own and does not depend on any client
+            # stripping sentinels first (§6.7: "the canvas save must hold on
+            # its own"). Rare today only because redaction and edit rights
+            # almost never coincide; fine-grained edit grants remove that
+            # accident, which is why §10 orders this BEFORE they exist.
+            if widget_type == RESTRICTED_WIDGET_TYPE:
+                continue
+
             # Structural-metadata-only now — a widget's actual `data` never
             # lives in `props` (see ComponentV2's docstring); it's persisted
             # via `_write_component_data` below instead.
