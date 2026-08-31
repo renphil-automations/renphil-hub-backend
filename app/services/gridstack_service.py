@@ -1074,6 +1074,195 @@ def update_airtable_component_config(
         raise
 
 
+def update_component_content(
+    db: Session,
+    link: str,
+    *,
+    title: Any = _UNSET,
+    description: Any = _UNSET,
+    data: Any = _UNSET,
+) -> dict[str, Any] | None:
+    """Write one component's own content fields, addressed by its stable
+    `link`. Arguments left at `_UNSET` are untouched, so a caller can change
+    a title without resending the widget's whole data blob.
+
+    §6.7 of plan_access_control_algorithm_2026-08-27.md — THE RULE THIS
+    EXISTS FOR: *a caller whose edit region begins at a component writes
+    through a per-component endpoint, never through `PUT /{id}/content`.*
+
+    WHY THE CANVAS SAVE CANNOT BE USED FOR THIS. `update_tab_content_v2` is a
+    whole-gridstack diff: it compares EVERY component on the canvas against
+    the payload, and **components absent from the payload are deleted**.
+    Routing a component-scoped editor through it therefore puts every sibling
+    in the request body, which is wrong twice over — they can rewrite widgets
+    they hold no grant on, and they can delete those widgets by simply
+    omitting them. This function reads and writes exactly one row (plus that
+    row's own `page_content`), so a sibling cannot be touched by a request
+    that never mentions it, and nothing is ever deleted.
+
+    Same shape as `update_airtable_component_config` above, which §6.7 names
+    as the sanctioned precedent: named fields, one component, addressed by
+    `link`, `_UNSET` to keep "not sent" and "set to null" distinguishable.
+
+    ── WHAT IS DELIBERATELY NOT WRITABLE HERE ───────────────────────────────
+
+    `x` / `y` / `width` / `height` — **repositioning is NOT implemented, on
+    purpose.** §11.3 defers it pending team discussion and §6.7 says so
+    twice: position is a property of the canvas, and the canvas belongs to
+    the tab, so whether a one-widget editor may relocate their widget inside
+    someone else's arrangement is a product question that is not settled. It
+    is additive once this endpoint exists (a four-column write plus a
+    box-intersection check against siblings), so nothing is lost by leaving
+    it out. **Do not add it because a caller asks; it needs the decision
+    first.**
+
+    `access_control` — authorization, not content. §6.3 routes "edit `n`'s
+    grants" through the grants surface with its own delegation gate, not
+    through a content write. Adding it here would give a component-scoped
+    editor a second door to the very ACL that gates their own widget.
+    (Airtable-like widgets already have a single sanctioned door for theirs:
+    `update_airtable_component_config`.)
+
+    `type` — a type change re-interprets the stored blob, and it is the only
+    route by which the `restricted` redaction sentinel could reach
+    `components.type`. The request schema is `extra="forbid"`, so a client
+    that naively posts a whole serialized widget entry (which carries
+    `type`, `link` and the layout keys) gets a 422 rather than a partial
+    write. See the sentinel guard below, which is the second half of that.
+
+    ── AUTHORIZATION: LOGIN ONLY, MATCHING THE CANVAS SAVE EXACTLY ──────────
+
+    This is deliberate, not an omission, and it is the reason this docstring
+    says so rather than staying silent:
+
+      * **No grant check.** `granted` / `visible` are not consulted here, by
+        any endpoint. §10's cutover order is not negotiable — populate
+        `role_assignments`, author `resource_grants`, verify, and only then
+        flip enforcement. Both tables are empty today, so a grant check here
+        would refuse every real user while `update_tab_content_v2` kept
+        letting them write the same component through the canvas. That is
+        strictly worse than no check: it moves the hole rather than closing
+        it.
+      * **No lock check.** `update_tab_content_v2` never reads `tab.locked`
+        either (§6.6 — locking is advisory today, unenforced on writes, and
+        its authorization is a separate piece of work). Adding enforcement on
+        this path alone would make the NEW endpoint stricter than the old one
+        for the same edit, which is not a security improvement, just an
+        inconsistency.
+
+    So the gate is `Depends(get_current_user)` at the router, and nothing
+    else — identical to the canvas save. When §10 flips enforcement, this
+    function and `update_tab_content_v2` must gain it together.
+
+    Returns the updated component view, or None for an unknown `link` (404 at
+    the router). Raises ValueError — 400 — for a link that resolves to
+    something with no content of its own to write.
+    """
+    link = (link or "").strip()
+    if not link:
+        return None
+
+    component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
+    if component is None:
+        return None
+
+    # THE REDACTION SENTINEL, GUARDED ON ITS OWN RATHER THAN INHERITED.
+    # `update_tab_content_v2` got its own guard on 2026-08-30, and §6.7 is
+    # explicit that each write path must hold independently ("the canvas save
+    # must hold on its own"), so this one does not lean on that one.
+    #
+    # Two halves, because the sentinel can arrive two ways:
+    #  - INBOUND, as `type: 'restricted'` in the body. Closed structurally:
+    #    `type` is not a field on the request schema and the schema forbids
+    #    extras, so such a body is a 422 before reaching here.
+    #  - STORED, as a row whose own type is already the sentinel. That row
+    #    should not exist — nothing persists it — but if one ever did,
+    #    writing content into it would be operating on a redaction artifact
+    #    and would make a real widget's replacement permanent. Refused.
+    #
+    # Note the trap this deliberately does NOT repeat: stripping sentinels
+    # client-side does not preserve a widget on the CANVAS path, it DELETES
+    # it, because the delete pass keys on a missing key. That trap is
+    # specific to the whole-canvas diff and cannot arise here — this function
+    # has no delete pass at all.
+    if component.type == RESTRICTED_WIDGET_TYPE:
+        raise ValueError(
+            "This component is a redaction sentinel and cannot be written to"
+        )
+
+    # A mirror holds no content of its own — its only persisted state is
+    # `target_link` in `props`, and everything it renders is resolved from
+    # its target at read time (`_serialize_component`). `_write_component_data`
+    # documents that it is never called for a mirror. Editing "a mirror's
+    # content" means editing the target, which the caller addresses by the
+    # TARGET's link.
+    if component.type == MIRROR_WIDGET_TYPE:
+        raise ValueError(
+            "This link points at a mirror, which has no content of its own — "
+            "write to the target component instead"
+        )
+
+    # A gridstack's self-representation row (`current_grid_id`) stands in for
+    # a sub-tab, not a widget. It is excluded from every canvas query and has
+    # no page_content; writing a data blob into it would invent content for
+    # something that never renders one.
+    if component.type in GRIDSTACK_REPRESENTATION_TYPES:
+        raise ValueError(
+            "This link points at a sub-tab representation, not a widget"
+        )
+
+    try:
+        before_signature = _component_persistence_signature(db, component)
+
+        if title is not _UNSET:
+            component.title = title
+
+        if description is not _UNSET:
+            component.description = description
+
+        if data is not _UNSET:
+            incoming = data if isinstance(data, dict) else {}
+            if component.type in AIRTABLE_LIKE_WIDGET_TYPES:
+                # NOT OPTIONAL, and the reason is the same one
+                # AIRTABLE_PROTECTED_DATA_FIELDS spells out at its
+                # definition: this path checks login only, exactly like the
+                # canvas save. Without this, a plain content write would
+                # clobber the stored PAT with whatever the client sent (or
+                # with nothing), and would let a caller flip
+                # `personalizeEnabled` / `sourceUrl` — the fields that decide
+                # what rows the Airtable endpoints will serve. RAW, not the
+                # sanitised view: the sanitised one has `pat` stripped, so
+                # preserving from it would delete the token on every save.
+                incoming = _apply_airtable_protection(
+                    _raw_component_data(db, component), incoming
+                )
+            _write_component_data(db, component, incoming)
+
+        db.flush()
+        changed = before_signature != _component_persistence_signature(db, component)
+        db.commit()
+
+        response: dict[str, Any] = {
+            "link": component.link,
+            "type": component.type,
+            "title": component.title,
+            "description": component.description,
+            "data": _resolve_component_data(db, component),
+            "sbn": _sbn_node_info(db, component),
+        }
+        # Same convention as `update_sbn_content`, the other single-component
+        # content write: emit a receipt only when persisted state actually
+        # changed, so a no-op save does not churn the search index.
+        response["search_updates"] = (
+            _search_update_receipts({component.id: "upsert"}) if changed else []
+        )
+        return response
+
+    except Exception:
+        db.rollback()
+        raise
+
+
 def _get_gridstack_ancestor_chain(db: Session, gridstack: GridstackV2) -> list[str]:
     """Root-first ordered `document_id`s from the root's immediate child
     down to (and including) `gridstack` itself — i.e. the sequence of SGS/

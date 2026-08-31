@@ -363,6 +363,69 @@ class UpdateTabContentRequest(StrictRequestModel):
     content: dict[str, Any] | list[Any] | None = None
 
 
+class UpdateComponentContentRequest(StrictRequestModel):
+    """Body of the per-component content write (§6.7 of
+    plan_access_control_algorithm_2026-08-27.md).
+
+    Partial: only the fields actually present are applied — the router reads
+    `model_fields_set` — so a caller can rename a widget without resending
+    its whole data blob.
+
+    WHAT IS ABSENT IS THE INTERESTING PART, and `extra="forbid"` (inherited
+    from StrictRequestModel) is what makes the absences enforceable rather
+    than merely conventional:
+
+      * `x`/`y`/`w`/`h` — repositioning is DELIBERATELY not implemented;
+        §11.3 defers it pending team discussion.
+      * `access_control` — authorization, not content. Grants are edited
+        through the grants surface, which has its own gate (§6.3).
+      * `type`, `link` — a type change re-interprets the stored blob, and
+        `type` is the only route by which the `restricted` redaction
+        sentinel could reach `components.type`. A client that posts a whole
+        serialized widget entry therefore gets a 422 instead of a partial
+        write, which is the intended outcome: that body was built for the
+        canvas save, and the canvas save is exactly what §6.7 says a
+        component-scoped editor must not use.
+
+    See `gridstack_service.update_component_content` for the full rationale.
+    """
+
+    title: StrictStr | None = Field(default=None, max_length=255)
+    description: StrictStr | None = None
+
+    # Nullable in the ANNOTATION so an absent key is representable, but an
+    # EXPLICIT null is refused below. See `_reject_explicit_null_data`.
+    data: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _reject_explicit_null_data(self) -> "UpdateComponentContentRequest":
+        """`data: null` is a 422, while an omitted `data` means "leave it
+        alone" and `data: {}` means "empty this widget".
+
+        THIS IS THE SECOND HALF OF THE SENTINEL GUARD. A widget the caller
+        may not see is served as `{"type": "restricted", "data": null}`
+        (tab_service.py:100), and that entry KEEPS ITS KEY, so it round-trips
+        through a stale client and comes back on the next save. `type` is
+        already refused by `extra="forbid"`; `data: null` is the other half
+        of that same body. Accepting it would overwrite a real widget's
+        stored content with `{}` — the precise data-loss path the canvas save
+        was fixed for on 2026-08-30, rebuilt on a new door.
+
+        Refusing rather than ignoring, because unlike the canvas save there
+        is nothing to degrade gracefully FOR here: this endpoint edits one
+        component the caller named explicitly, so a null blob is a
+        malformed request about that component, not an incidental sibling
+        entry that can be skipped. "Clear this widget" stays expressible as
+        `data: {}`.
+        """
+        if "data" in self.model_fields_set and self.data is None:
+            raise ValueError(
+                "data must be an object; send {} to empty the widget, or omit "
+                "the field to leave it unchanged"
+            )
+        return self
+
+
 class LockTabRequest(StrictRequestModel):
     locked_by: StrictStr = Field(
         min_length=1,

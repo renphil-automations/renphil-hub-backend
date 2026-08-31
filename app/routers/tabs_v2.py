@@ -26,6 +26,7 @@ from app.schemas.tab import (
     TabSummaryResponse,
     TabWorkspaceAPIResponse,
     UnlockTabRequest,
+    UpdateComponentContentRequest,
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
@@ -46,6 +47,7 @@ from app.services.gridstack_service import (
     reorder_tabs_by_document_id_v2,
     resolve_component_location_v2,
     unlock_tab_by_document_id_v2,
+    update_component_content,
     update_tab_by_document_id_v2,
     update_tab_content_v2,
 )
@@ -157,6 +159,61 @@ def get_component_location(
     if result is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
     return {"data": result}
+
+
+@router.put(
+    "/components/by-link/{link}/content",
+    summary="Update one component's content (v2)",
+    description="""
+Writes ONE component's own content, addressed by its stable `link`. Partial —
+only the fields present in the request body are applied.
+
+**This is the write path for an editor whose region begins at a component**
+(plan_access_control_algorithm_2026-08-27.md §6.7). `PUT /{document_id}/content`
+is a whole-gridstack diff that DELETES any component absent from the payload,
+so using it for a single-widget edit requires sending every sibling — which
+both rewrites widgets the caller may hold no grant on and deletes them by
+omission. This endpoint touches one row and never deletes anything.
+
+`data: null` is rejected (422); send `{}` to empty a widget, or omit the field
+to leave it unchanged. `type`, `access_control` and the layout fields are not
+accepted — see the request schema for why each one is absent.
+
+Authorization is login-only, **identical to the canvas save** — no grant check
+and no lock check. Both omissions are deliberate; see the service function's
+docstring.
+""",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+    },
+)
+def update_component_content_endpoint(
+    link: str,
+    request: UpdateComponentContentRequest,
+    db: Session = Depends(get_db_v2),
+):
+    # `model_fields_set` distinguishes "absent" from "explicitly null" — the
+    # difference between preserving a title and clearing it. Same mechanism
+    # the Airtable config endpoint uses for its own partial update.
+    provided = request.model_fields_set
+    updates: dict[str, object] = {}
+    if "title" in provided:
+        updates["title"] = request.title
+    if "description" in provided:
+        updates["description"] = request.description
+    if "data" in provided:
+        updates["data"] = request.data
+
+    try:
+        updated = update_component_content(db, link, **updates)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Component not found")
+
+    return {"data": updated}
 
 
 @router.get(
