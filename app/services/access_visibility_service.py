@@ -53,7 +53,12 @@ from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.resource_grant import LEVEL_EDIT
 from app.db_v2.models.tab import TabV2
 from app.services.rbac_graph_service import RbacClosures
-from app.services.resource_grant_service import GrantMatch, matching_grants
+from app.services.resource_grant_service import (
+    GrantMatch,
+    get_grant,
+    matching_grants,
+    seeds_for_principal,
+)
 
 # A node's address: the same ``(kind, id)`` pair ``resource_grant_service``
 # already speaks in, so a ``GrantMatch`` drops straight into this tree with no
@@ -190,6 +195,42 @@ class NodeTree:
             chain.append(current)
             current = self.parents.get(current)
         return chain
+
+    def descendants(self, ref: NodeRef) -> set[NodeRef]:
+        """``ref``'s STRICT descendants. Empty for a leaf, for an unknown
+        node, and for an orphan.
+
+        Added for §6.2's revoke-time confirmation, which asks *"which of the
+        revoked node's descendants would this principal still reach?"* — the
+        one question in this design that is scoped to a subtree rather than
+        to a root path. Nothing in the two folds needs it: ``_fold_down``
+        descends the whole tree at once and ``_reveal_ancestors`` walks
+        upward, which is exactly why the subtree walk did not exist until
+        something outside the folds wanted it.
+
+        Orphans return empty rather than their real subtree, matching
+        ``ancestors``. A node that fails closed has no reachable descendants
+        to report, and reporting them would let the confirmation modal name
+        nodes that are invisible to everyone (§3.3).
+
+        Iterative with a visited set, never recursive (§3.3), and the visited
+        set is load-bearing here in a way it is not in ``ancestors``: this
+        walk fans out, so a cycle among ``children`` would revisit nodes
+        combinatorially rather than merely looping. ``rooted`` already
+        excludes cycle members, so this is the second lock on that door —
+        see ``_walk_from_root`` for the first.
+        """
+        if self.is_orphan(ref):
+            return set()
+        found: set[NodeRef] = set()
+        frontier = [ref]
+        while frontier:
+            current = frontier.pop()
+            for child in self.children.get(current, ()):
+                if child not in found and child != ref:
+                    found.add(child)
+                    frontier.append(child)
+        return found
 
 
 def _walk_from_root(
@@ -781,3 +822,114 @@ def _apply_mirror_substitution(
             # A dangling target (None) never satisfies the second half.
             if target_ref is None or target_ref not in before:
                 granted.discard(mirror_ref)
+
+
+# ---------------------------------------------------------
+# §6.2 — the revoke-time confirmation: "what would they still retain?"
+# ---------------------------------------------------------
+
+
+class RetainedAccess(NamedTuple):
+    """The answer to §6.2's question, for one grant about to be revoked.
+
+    ``node``               the grant's own node.
+    ``retained_view``      nodes in ``{node} ∪ descendants(node)`` this
+                           principal would STILL reach after the revoke.
+    ``retained_edit``      the subset of those they would still EDIT.
+    ``responsible_grants`` surviving seeds sitting AT OR BELOW ``node``.
+                           These are the rows §6.2's `[ Remove that too ]`
+                           would delete — the narrow grants some other admin
+                           made deliberately.
+    ``covering_grants``    surviving seeds sitting STRICTLY ABOVE ``node``.
+                           Different case, different sentence in the modal:
+                           the principal keeps everything regardless, because
+                           an ancestor grant covers it, so revoking this row
+                           changes nothing for them. This is §6.2's
+                           "already granted by Nav 1" redundancy, and the one
+                           it says to DISPLAY rather than delete.
+
+    Empty ``retained_*`` with empty ``covering_grants`` is the plain case:
+    the revoke does what the admin expects and no confirmation is needed.
+    """
+
+    node: NodeRef
+    retained_view: list[NodeRef]
+    retained_edit: list[NodeRef]
+    responsible_grants: list[GrantMatch]
+    covering_grants: list[GrantMatch]
+
+
+def what_would_they_retain(
+    db: Session,
+    grant_id: int,
+    *,
+    closures: RbacClosures | None = None,
+    tree: NodeTree | None = None,
+) -> RetainedAccess | None:
+    """§6.2's revoke-time confirmation. ``None`` if the grant does not exist.
+
+    THIS IS WHAT MAKES D4 SAFE, and that is why §9 calls it required rather
+    than optional and why it ships WITH the write path rather than after it.
+    D4 chose to DERIVE edit grants at read time instead of collapsing them
+    into storage, and the one thing the collapse rule was actually good at
+    was making revocation feel complete: delete the high grant and the low
+    ones went with it. Derivation leaves them, so the admin's mental model
+    ("Alice has nothing now") diverges from the truth unless something says
+    so out loud. This function is that something.
+
+    IT COMPUTES, IT DOES NOT ENFORCE, AND IT DELETES NOTHING. §6.2 is
+    explicit that the confirmation is ADVISORY and that `[ Leave it ]` is a
+    legitimate answer — narrow grants made by other admins are usually
+    deliberate. Nothing here writes; the caller shows the answer and the
+    admin decides. ``resource_grant_service.delete_grant`` stays the plain
+    single-row revoke that an approved multi-row removal calls once per
+    named row.
+
+    ONE FOLD, NOT A SECOND TRAVERSAL. ``fold`` takes a seed set directly and
+    touches no Session, which is exactly so this can be the same function
+    called with one seed removed. If a future change makes ``fold`` need a
+    ``db``, this is the caller that breaks and it should be fixed by keeping
+    ``fold`` pure, not by writing a subtree walk here.
+
+    THE DROP HAPPENS ON THE SEED SET, NOT IN THE DATABASE. No transaction is
+    opened, nothing is deleted-then-rolled-back, and the answer is a genuine
+    hypothetical about a row that still exists. That matters for a GET.
+
+    Pass ``closures`` / ``tree`` to share one snapshot per request (§8.2,
+    §8.4). Never cache either across requests — both are authorization
+    inputs.
+    """
+    grant = get_grant(db, grant_id)
+    if grant is None:
+        return None
+
+    graph = closures if closures is not None else RbacClosures(db)
+    node_tree = tree if tree is not None else build_node_tree(db)
+
+    seeds = seeds_for_principal(
+        db,
+        role_id=grant["role_id"],
+        scope_id=grant["scope_id"],
+        user_id=grant["user_id"],
+        closures=graph,
+    )
+    # The whole hypothetical, on one line: the same seeds this principal has
+    # today, minus the one row being revoked. Compared by grant_id rather
+    # than by node, because several DIFFERENT grants can sit on one node —
+    # §7's "a node carries a bag of grants, not an ACL" — and dropping the
+    # node would silently revoke the principal's other rows on it too.
+    surviving = [seed for seed in seeds if seed.grant_id != grant_id]
+
+    result = fold(node_tree, surviving)
+
+    node: NodeRef = (grant["node_kind"], grant["node_id"])
+    region = {node} | node_tree.descendants(node)
+    ancestors = set(node_tree.ancestors(node))
+
+    return RetainedAccess(
+        node=node,
+        retained_view=sorted(ref for ref in region if ref in result.granted_view),
+        retained_edit=sorted(ref for ref in region if ref in result.granted_edit),
+        responsible_grants=[s for s in surviving if (s.node_kind, s.node_id) in region],
+        covering_grants=[s for s in surviving if (s.node_kind, s.node_id) in ancestors],
+    )

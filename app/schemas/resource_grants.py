@@ -8,12 +8,15 @@ role/scope DEFINITIONS only and references neither `hub_users` nor
 stale. Grants are a third surface again — they reference nodes, which neither
 of the others does.
 
-NOTHING SERVES THESE YET. There is no grants router: this step builds the
-table and the matching primitive, and stops before any enforcement. These
-shapes exist because `resource_grant_service.serialize_grant` produces them
-and something has to pin that contract — `test_resource_grants.py` validates
-the service's output against `ResourceGrantResponse`, so the two cannot drift
-before the router lands.
+`app/routers/resource_grants.py` serves these. It is a NEW surface, added
+2026-08-31, and it enforces nothing about CONTENT: no existing endpoint reads
+`granted` or `visible`, and no response shape a client reads today changed
+when it landed. The only thing gated here is the grants surface itself.
+
+`test_resource_grants.py` additionally validates
+`resource_grant_service.serialize_grant`'s output against
+`ResourceGrantResponse`, so the service and the wire shape cannot drift even
+where the router is not involved.
 
 Same conventions as `rbac.py`: `StrictRequestModel` (extra="forbid") for
 request bodies, `StrictStr` everywhere.
@@ -88,11 +91,21 @@ class CreateGrantRequest(StrictRequestModel):
     No update counterpart, deliberately: a grant is three immutable facts, and
     "changing" one is a revoke plus a write. See the service module docstring.
 
-    `user_id` is an id here where `CreateAssignmentRequest` takes an email,
-    and that difference is not yet a decision — it is the router's to make
-    when the grants surface lands, along with whether the §6 delegation rule
-    gates writing a grant at all (the algorithm plan assumes it at §6.3 and
-    explicitly leaves it undesigned at §12).
+    `user_id` IS AN ID, where `CreateAssignmentRequest` takes an email. Both
+    of the questions this docstring used to leave open were decided by the
+    owner on 2026-08-31, when the router landed:
+
+      - **Addressed by id.** The `/v2/rbac/hub-users` picker already returns
+        ids, so the client has one in hand at the moment it builds this
+        request, and a grant — unlike an assignment — is written about
+        somebody who is already on screen rather than typed in from memory.
+        The assignments path keeps its email for its own stated reason (the
+        granter has no reason to know an internal id when inviting someone),
+        and the two surfaces differ deliberately rather than by accident.
+      - **The write gate is NOT the §6 delegation rule.** It is
+        `edit(node)` plus "the pair must be one you match yourself". See
+        `app/services/resource_grant_authz_service.py`, which records why
+        `can_delegate` is the wrong rule here and what was measured.
     """
 
     node_kind: NodeKind
@@ -102,3 +115,51 @@ class CreateGrantRequest(StrictRequestModel):
     role_id: int | None = None
     scope_id: int | None = None
     user_id: int | None = None
+
+
+class NodeRefResponse(BaseModel):
+    """One node's address. The tree is not returned with it — the caller
+    already has the node titles it is rendering, and shipping a second
+    representation of the hierarchy from an authorization endpoint is how
+    the two drift apart."""
+
+    node_kind: NodeKind
+    node_id: int
+
+
+class RetainedAccessResponse(BaseModel):
+    """§6.2's revoke-time confirmation: *"what would this principal still
+    retain?"*, answered for one grant that has NOT been deleted.
+
+    ADVISORY, NOT A GATE. §6.2 is explicit that `[ Leave it ]` is a
+    legitimate answer — narrow grants made by other admins are usually
+    deliberate — so nothing here is a precondition of the DELETE, and the
+    DELETE does not check that it was called. It exists so D4's "derive,
+    never collapse" decision is safe: derivation leaves lower grants in
+    place, and an admin who is not shown them will believe they removed
+    more than they did.
+
+    `retained_view` / `retained_edit` cover the revoked node AND everything
+    beneath it, because that is the span the revoke was meant to affect.
+    """
+
+    node_kind: NodeKind
+    node_id: int
+
+    retained_view: list[NodeRefResponse] = Field(default_factory=list)
+    retained_edit: list[NodeRefResponse] = Field(default_factory=list)
+
+    # The rows `[ Remove that too ]` would delete — surviving grants sitting
+    # at or below the revoked node.
+    responsible_grants: list[ResourceGrantResponse] = Field(default_factory=list)
+
+    # A different sentence in the modal, not a longer list: surviving grants
+    # sitting ABOVE the node. These cover it from an ancestor, so revoking
+    # this row changes nothing for this principal at all. §6.2 says to
+    # DISPLAY that ("already granted by Nav 1") and offer a tidy-up, never
+    # to delete it for them.
+    covering_grants: list[ResourceGrantResponse] = Field(default_factory=list)
+
+
+class RetainedAccessAPIResponse(BaseModel):
+    data: RetainedAccessResponse

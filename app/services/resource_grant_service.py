@@ -6,9 +6,15 @@ this module owns ``resource_grants`` rows' create/read/delete plus the one
 read-time question built directly on them — *which stored grants does this
 user reach?* It computes no visibility. The two folds of §5.1
 (``granted`` descending the root path, ``visible`` ascending the subtree) are
-deliberately NOT here, and neither is any enforcement: nothing in this module
-is wired into an endpoint, and no response shape any client reads today is
-affected by it.
+deliberately NOT here.
+
+Neither is the write GATE. ``app/routers/resource_grants.py`` now serves this
+module, and who may call it is decided by
+``app/services/resource_grant_authz_service.py`` — read that one before
+changing anything here, because it is where the ⊥ decision lives. Nothing in
+this module authorizes anybody, and it still enforces nothing about CONTENT:
+no existing endpoint reads ``granted`` or ``visible``, and no response shape
+any client reads today is affected by it.
 
 There is no update path. A grant is three immutable facts — a node, a
 principal, a level — and "changing" one is revoking it and writing another,
@@ -141,6 +147,19 @@ def serialize_grant(grant: ResourceGrantV2) -> dict:
 # ---------------------------------------------------------
 
 
+def node_exists(db: Session, node_kind: str, node_id: int) -> bool:
+    """Does this node exist? Public because the router needs the question
+    without the exception — a GET wants a 404, not a 409.
+
+    Deliberately answers only after the caller has been authorized for the
+    node: on its own it is an existence oracle for the whole node tree, and
+    §9 wants a hidden node to 404 rather than confirm itself.
+    """
+    _assert_known_kind(node_kind)
+    model = NODE_MODELS[node_kind]
+    return db.query(model.id).filter(model.id == node_id).first() is not None
+
+
 def _assert_node_exists(db: Session, node_kind: str, node_id: int) -> None:
     """Named 409 instead of the FK's IntegrityError, same trade the rest of
     this codebase makes — see ``rbac_service.delete_role``'s pre-count."""
@@ -246,6 +265,34 @@ def list_grants_for_node(db: Session, node_kind: str, node_id: int) -> list[dict
 def get_grant(db: Session, grant_id: int) -> dict | None:
     grant = db.query(ResourceGrantV2).filter(ResourceGrantV2.id == grant_id).first()
     return None if grant is None else serialize_grant(grant)
+
+
+def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
+    """Full rows for a set of ids the caller already holds, in the order it
+    gave them.
+
+    Exists for §6.2's confirmation, which arrives holding ``GrantMatch``
+    seeds — ``(grant_id, node, level)`` and nothing else — and has to render
+    *"granted directly by Sam, 3 Feb"*. The provenance columns are the point:
+    ``granted_by_email`` is the immutable snapshot that survives the granter
+    leaving, which is exactly the case that sentence has to keep working in.
+
+    One query, not one per id. The lists are small today, but this is called
+    with every surviving seed inside a subtree and §5.5's no-break-glass rule
+    makes per-child grants the normal way to author, so "small" is a property
+    of current data rather than of the design.
+
+    Order is preserved from ``grant_ids`` rather than re-sorted: the caller
+    built that order from the fold, and a silent re-sort here would make the
+    modal's list disagree with the traversal that produced it. Ids with no
+    row are dropped rather than raising — a concurrently deleted grant is a
+    shorter list, not a failed confirmation.
+    """
+    if not grant_ids:
+        return []
+    rows = db.query(ResourceGrantV2).filter(ResourceGrantV2.id.in_(set(grant_ids))).all()
+    by_id = {row.id: row for row in rows}
+    return [serialize_grant(by_id[gid]) for gid in grant_ids if gid in by_id]
 
 
 def create_grant(
@@ -364,6 +411,46 @@ def matching_grants(
     """Every grant reached by ``hub_user_id``'s effective pairs, plus every
     grant naming them directly (§8.1 step 2, §4.2, D5).
 
+    §8.1's step 1 and step 2 in that order: ``effective_pairs`` computes E
+    per assignment ROW, and ``grants_matching_pairs`` does the lookup. The
+    mechanics — and the pairing trap they exist to survive — live there;
+    this is the entry point every read path should call.
+
+    THIS IS THE ONLY CORRECT WAY TO ASK "which grants does this user reach".
+    Do not write the question again anywhere else.
+
+    Pass ``closures`` to share one snapshot with the rest of a request — the
+    adjacency is loaded once per snapshot, never rebuilt per node (§8.2).
+    """
+    pairs = effective_pairs(db, hub_user_id, closures=closures)
+    return grants_matching_pairs(db, pairs=pairs, user_id=hub_user_id)
+
+
+def grants_matching_pairs(
+    db: Session, *, pairs: set[tuple[int, int]], user_id: int | None
+) -> list[GrantMatch]:
+    """The lookup itself: every grant whose principal is one of ``pairs``,
+    plus every grant naming ``user_id`` directly.
+
+    SPLIT OUT OF ``matching_grants`` SO THE PAIRING GUARD HAS EXACTLY ONE
+    HOME. Two callers need this question asked about two different pair
+    sets — the read path asks it about a USER's ``effective_pairs``, and
+    §6.2's revoke-time confirmation asks it about ONE PRINCIPAL's two
+    closures (``seeds_for_principal``). Giving the second caller its own
+    query is how the trap below gets reintroduced in a sixth place, so it
+    does not get one.
+
+    ``pairs`` must already have been built PER ASSIGNMENT ROW — one row's
+    role closure crossed with that same row's scope closure, unioned
+    afterwards. This function cannot check that for you, and it is the one
+    precondition that matters. ``effective_pairs`` is the only thing that
+    should ever construct it from a user; ``seeds_for_principal`` constructs
+    it from a single pair, where there is only one row and so nothing to
+    cross wrongly.
+
+    Pass ``user_id=None`` for a principal that is not a person — a pair
+    principal reaches no user-form grants, and must not.
+
     TWO STAGES, AND THE SPLIT IS THE WHOLE DESIGN. The SQL below is a
     deliberately WIDE filter — ``role_id IN roles(E) AND scope_id IN
     scopes(E)`` — and **on its own it is wrong**. It crosses the union of the
@@ -390,34 +477,38 @@ def matching_grants(
     (Hub Member, All Scopes) is NOT matched by holding (Hub Member, Scope X),
     because nothing walks up into the universal scope.
 
-    Pass ``closures`` to share one snapshot with the rest of a request — the
-    adjacency is loaded once per snapshot, never rebuilt per node (§8.2).
-
     Returns the seed set only. It does not fold, and it says nothing about
     what is visible: a node is granted if a seed lies anywhere on its root
-    path, and visible if one lies anywhere in its subtree (§5.1). Both are
-    the next step.
+    path, and visible if one lies anywhere in its subtree (§5.1). That is
+    ``access_visibility_service``'s job.
     """
-    pairs = effective_pairs(db, hub_user_id, closures=closures)
-
     reachable_role_ids = {role_id for role_id, _ in pairs}
     reachable_scope_ids = {scope_id for _, scope_id in pairs}
 
-    rows = (
-        db.query(ResourceGrantV2)
-        .filter(
-            or_(
-                # D5's direct grants. Unconditional — no closure is involved,
-                # the row names this person.
-                ResourceGrantV2.user_id == hub_user_id,
-                and_(
-                    ResourceGrantV2.role_id.in_(reachable_role_ids),
-                    ResourceGrantV2.scope_id.in_(reachable_scope_ids),
-                ),
-            )
-        )
-        .all()
+    pair_filter = and_(
+        ResourceGrantV2.role_id.in_(reachable_role_ids),
+        ResourceGrantV2.scope_id.in_(reachable_scope_ids),
     )
+    # A pair principal names no person, so there is no user arm at all.
+    #
+    # THIS BRANCH IS AN EFFICIENCY AND LEGIBILITY GUARD, NOT A CORRECTNESS
+    # ONE, and saying so is the honest version — it was mutation-tested on
+    # 2026-08-31 and the mutation SURVIVED, correctly. Written without it,
+    # `ResourceGrantV2.user_id == None` renders as `user_id IS NULL`, which
+    # matches every PAIR-form row in the table (they all have a null
+    # user_id) — so the query would drag the whole table into Python, where
+    # the pairing guard below would then narrow it back to the same answer.
+    # Same result, arbitrarily more rows. It is the shape that misleads:
+    # `== None` silently becoming `IS NULL` reads like a deliberate "match
+    # the rows with no user", which is not what a pair principal wants to
+    # say.
+    #
+    # The Python guard below remains the thing that makes the ANSWER right,
+    # here exactly as it does for the wide pair filter. Do not move either
+    # of them into SQL.
+    where = pair_filter if user_id is None else or_(ResourceGrantV2.user_id == user_id, pair_filter)
+
+    rows = db.query(ResourceGrantV2).filter(where).all()
 
     matched: list[GrantMatch] = []
     for grant in rows:
@@ -425,11 +516,11 @@ def matching_grants(
             # A user-form grant reached this far only by naming them, since
             # the pair half of the filter cannot match a row whose role_id
             # and scope_id are both NULL.
-            if grant.user_id != hub_user_id:
+            if grant.user_id != user_id:
                 continue
         elif (grant.role_id, grant.scope_id) not in pairs:
-            # The wide filter admitted a cross-product pair the user does not
-            # actually hold together. This branch IS the pairing guard.
+            # The wide filter admitted a cross-product pair the principal does
+            # not actually hold together. This branch IS the pairing guard.
             continue
 
         node_kind, node_id = node_of(grant)
@@ -446,3 +537,74 @@ def matching_grants(
     # the seed set itself is a set, and the folds are order-independent (§5.1).
     matched.sort(key=lambda m: m.grant_id)
     return matched
+
+
+def seeds_for_principal(
+    db: Session,
+    *,
+    role_id: int | None,
+    scope_id: int | None,
+    user_id: int | None,
+    closures: RbacClosures | None = None,
+) -> list[GrantMatch]:
+    """Every grant ONE PRINCIPAL reaches — §6.2's revoke-time confirmation,
+    step one.
+
+    §6.2 requires that revoking a grant first shows *"what would this
+    principal still retain?"*, and describes it as the §8.1 read algorithm
+    restricted to one principal. That restriction is exactly this function:
+    it produces a seed set the same shape ``matching_grants`` produces, so
+    ``access_visibility_service.fold`` consumes it unchanged and there is no
+    second traversal anywhere.
+
+    THE TWO PRINCIPAL FORMS ARE NOT THE SAME QUESTION, and conflating them
+    would make the confirmation lie in the dangerous direction:
+
+    - A **user** principal is a real person with real assignments, so the
+      honest answer is what that person reaches — ``matching_grants``
+      itself, unchanged. This is §6.2's Alice: removing her from Nav 1 must
+      surface the grant Sam wrote on Root Tab 2, and it does so whether Sam
+      wrote it to her directly or to a pair she happens to match.
+
+    - A **pair** principal is an AUDIENCE, not a person. The answer is what
+      a holder of exactly that pair would reach, which is that one pair's
+      two closures crossed. Note what this deliberately is NOT: the set of
+      OTHER grants written on the identical pair. That narrower reading is
+      the tempting one — it needs no closures at all — and it under-reports.
+      Revoke ``(Program Member, A)`` from Nav 1 while ``(Hub Member, A)``
+      sits on Root Tab 2 and the narrow reading says "they retain nothing",
+      which is a false reassurance handed to an admin at exactly the moment
+      they are deciding whether to remove more rows.
+
+    ONE PAIR IS ONE ROW, so the cross below cannot commit the pairing bug —
+    there is no union of roles and no union of scopes to cross, only one
+    closure against one closure, which is precisely what ``effective_pairs``
+    does inside its own loop for a single assignment. Building it here
+    rather than calling ``effective_pairs`` is not a duplicate of that rule:
+    a pair principal has no ``role_assignments`` row to read, and inventing
+    a fake user to get one would be worse in every way.
+
+    Reports what the principal reaches, INCLUDING the grant about to be
+    revoked. Dropping that row is the caller's job — see
+    ``access_visibility_service.what_would_they_retain``, which is the only
+    thing that should call this — because the drop is what makes the answer
+    a hypothetical rather than a description of today.
+    """
+    if user_id is not None:
+        return matching_grants(db, user_id, closures=closures)
+
+    if role_id is None or scope_id is None:
+        raise RbacGraphError(
+            "incomplete_pair",
+            "A principal pair needs both a role and a scope.",
+            role_id=role_id,
+            scope_id=scope_id,
+        )
+
+    graph = closures if closures is not None else RbacClosures(db)
+    pairs = {
+        (reached_role, reached_scope)
+        for reached_role in graph.role_descendants(role_id)
+        for reached_scope in graph.scope_descendants(scope_id)
+    }
+    return grants_matching_pairs(db, pairs=pairs, user_id=None)
