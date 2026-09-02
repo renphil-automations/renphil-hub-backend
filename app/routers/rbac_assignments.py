@@ -45,8 +45,8 @@ router = APIRouter(prefix="/v2/rbac", tags=["Permission Management"])
 CONFLICT_RESPONSE = {
     409: {
         "description": (
-            "The delegation rule, a uniqueness rule, or the ⊥-not-assignable "
-            "rule was violated"
+            "The delegation rule, a uniqueness rule, the ⊥-not-assignable "
+            "rule, or the admin floor was violated"
         )
     }
 }
@@ -250,7 +250,15 @@ def delete_assignment(
     """Symmetric with create, not ownership-based (design doc §6.3,
     restated as a landmine in handoff §7): the check re-runs §6.1 against
     the assignment's OWN role/scope, regardless of who originally granted
-    it. There is deliberately no `granted_by_user_id == me` shortcut here."""
+    it. There is deliberately no `granted_by_user_id == me` shortcut here.
+
+    A SECOND, DIFFERENT REFUSAL can also come back as a 409 here: the admin
+    floor, raised from inside `rbac_assignment_service.delete_assignment` as
+    `last_hub_admin`. It is NOT gated on `is_hub_admin` and must never be —
+    it is an integrity rule rather than an authorization one, and a Hub Admin
+    is precisely the person it exists to stop. See
+    `_assert_not_the_last_hub_admin`'s docstring, which explains at length
+    why the bypass every other gate applies first is inverted there."""
     assignment = rbac_assignment_service.get_assignment(db, assignment_id)
     if assignment is None:
         raise HTTPException(status_code=404, detail="Assignment not found")

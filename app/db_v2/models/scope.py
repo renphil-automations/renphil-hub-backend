@@ -104,8 +104,15 @@ class ScopeV2(BaseV2):
     #     silently rewrites what every existing grant reaches.
     is_public = Column(Boolean, nullable=False, default=False)
 
-    # Delete-guard, same terms as RoleV2.is_system — in practice the
-    # universal scope.
+    # Delete-guard, same terms as RoleV2.is_system — read that comment, it
+    # carries the whole argument. In practice the universal scope, which
+    # `scripts/set_rbac_system_flags.py` marks alongside the `hub_admin` role.
+    #
+    # It matters here for a reason specific to this table: §6.5 condition 1
+    # requires a Hub Admin to be assigned on the UNIVERSAL scope for a
+    # hub-node grant to match at all, so deleting this row would make the
+    # admin pair unwritable even with the `hub_admin` role intact. Same
+    # unclearability too — `update_scope` writes only name/description.
     is_system = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False)

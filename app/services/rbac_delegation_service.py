@@ -43,7 +43,12 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.services.rbac_graph_service import RbacClosures, RbacGraphError, held_closures
+from app.services.rbac_graph_service import (
+    HeldClosure,
+    RbacClosures,
+    RbacGraphError,
+    held_closures,
+)
 
 
 def can_delegate(
@@ -53,6 +58,7 @@ def can_delegate(
     scope_id: int,
     *,
     closures: RbacClosures | None = None,
+    held: list[HeldClosure] | None = None,
 ) -> bool:
     """§6.1: may the holder of ``granter_hub_user_id``'s assignments create
     or revoke ``(_, role_id, scope_id)``?
@@ -81,13 +87,38 @@ def can_delegate(
     is otherwise built once per call, which is already the point — this used
     to call ``role_descendants``/``scope_descendants`` inside the loop, and
     each of those rescanned an entire edge table (algorithm plan §8.2).
+
+    ``held`` GOES ONE STEP FURTHER, and exists for exactly one caller: audit
+    finding §2.3, ``list_revocable``, which asks this question once per
+    candidate row in the org. ``closures`` alone is not enough there —
+    ``held_closures`` still issues its own ``held_assignments`` query on
+    every call, so sharing the snapshot removes four of the five per-row
+    queries and leaves the fifth, improving the NUMBER without fixing the
+    SHAPE. Passing the expanded rows in removes the last one, and the loop
+    below becomes pure Python.
+
+    THE PRECONDITION, and it cannot be checked from here: ``held`` MUST be
+    ``held_closures(db, granter_hub_user_id)`` for the SAME granter. Passing
+    somebody else's rows answers a different question and this function has
+    no way to notice — verifying it would take the very query the parameter
+    exists to avoid. One caller passes it, immediately after computing it
+    from the same id, and that adjacency is the guarantee.
+
+    WHAT MUST NOT HAPPEN INSTEAD, since it is the obvious alternative and it
+    is what the 2026-08-25 audit proposed before this parameter existed: do
+    not lift the comparison below into the caller as a pre-computed
+    "envelope" test. §6.1's properness clause — strictly BELOW a role you
+    hold — is a per-row fact that is easy to get subtly wrong the second
+    time, which is why the rule lives in this function and only this
+    function. Hoisting the DATA is safe; hoisting the RULE is not.
     """
-    for held in held_closures(db, granter_hub_user_id, closures=closures):
-        if role_id == held.role_id:
+    rows = held if held is not None else held_closures(db, granter_hub_user_id, closures=closures)
+    for one in rows:
+        if role_id == one.role_id:
             continue  # not a PROPER descendant of itself
-        if role_id not in held.role_ids:
+        if role_id not in one.role_ids:
             continue
-        if scope_id not in held.scope_ids:
+        if scope_id not in one.scope_ids:
             continue
         return True
     return False

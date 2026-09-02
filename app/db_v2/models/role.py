@@ -97,10 +97,32 @@ class RoleV2(BaseV2):
     # grant descends from (plan §6), so deleting it is unrecoverable through
     # the UI.
     #
-    # KNOWN GAP: no code path sets this to True — rbac_service.create_role
-    # hardcodes False and it is absent from every request schema, so the guard
-    # is presently inert and hub_admin is deletable. Fixing it is a one-line
-    # UPDATE plus a decision about who may set the flag; out of scope here.
+    # SET BY SCRIPT ONLY, deliberately (owner decision, 2026-08-31; audit
+    # finding §2.1). `rbac_service.create_role` still hardcodes False and the
+    # flag is still absent from every request schema — those are
+    # `StrictRequestModel` (`extra="forbid"`), so a client sending it gets a
+    # 422 rather than a silent no-op. `scripts/set_rbac_system_flags.py` is
+    # the only thing that writes it.
+    #
+    # THE OMISSION IS THE PROTECTION, not an oversight to tidy up later.
+    # `update_role` writes only name/description/depth, so once this is True
+    # it CANNOT BE CLEARED through the API at all. That makes the guard
+    # durable — and it is also why the flag must not become settable on
+    # create: an admin who set it by accident would have produced a
+    # permanently undeletable role with no way back through the UI.
+    # `tests/test_admin_floor.TestIsSystemCannotBeCleared` pins the
+    # unclearability, which was previously an accident of which fields the
+    # updater happens to write rather than a stated rule.
+    #
+    # WHAT IT DOES NOT DO: it protects the role DEFINITION row, never the
+    # ASSIGNMENT rows. Post-cutover `is_hub_admin` resolves from
+    # `role_assignments` (plan §6.8), so an undeletable `hub_admin` role with
+    # no assignment naming it still leaves nobody able to administer the hub.
+    # That is the separate job of the last-admin guard in
+    # `rbac_assignment_service`, and NEITHER of them removes §6.5's
+    # requirement for a settings-level `BOOTSTRAP_ADMIN_EMAILS` backstop,
+    # which is specified as permanent precisely because it lives outside the
+    # database.
     is_system = Column(Boolean, nullable=False, default=False)
 
     # "Any Role" — the BOTTOM of the role lattice
