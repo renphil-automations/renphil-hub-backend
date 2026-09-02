@@ -126,7 +126,15 @@ def node_of(grant: ResourceGrantV2) -> tuple[str, int]:
     )
 
 
-def serialize_grant(grant: ResourceGrantV2) -> dict:
+def serialize_grant(grant: ResourceGrantV2, *, user_email: str | None = None) -> dict:
+    """`user_email` is resolved by the CALLER, never looked up in here — this
+    stays a one-row, no-query function so a caller serializing many grants
+    (``list_grants_for_node``, ``list_grants_by_ids``) can resolve every
+    email in one bulk query first (``_hub_user_email_map``) rather than
+    round-tripping per row. Pass ``None`` for a (role, scope)-form grant or
+    when the caller has not resolved it; the schema treats both the same
+    (handoff §4.1).
+    """
     node_kind, node_id = node_of(grant)
     return {
         "id": grant.id,
@@ -135,11 +143,36 @@ def serialize_grant(grant: ResourceGrantV2) -> dict:
         "role_id": grant.role_id,
         "scope_id": grant.scope_id,
         "user_id": grant.user_id,
+        "user_email": user_email,
         "level": grant.level,
         "granted_by_user_id": grant.granted_by_user_id,
         "granted_by_email": grant.granted_by_email,
         "created_at": grant.created_at,
     }
+
+
+def _hub_user_email_map(db: Session, user_ids: set[int]) -> dict[int, str]:
+    """One query for every user-form grant's grantee a page of grants needs,
+    rather than one per row — same shape as
+    ``rbac_assignment_service._hub_user_email_map``, and the same live-join
+    reasoning: ``user_id`` CASCADEs (§7), so a grant row can never outlive
+    the ``hub_users`` row it names, and there is no snapshot column to fall
+    back to the way ``granted_by_email`` is for the (SET NULL) granter side.
+    """
+    if not user_ids:
+        return {}
+    rows = db.query(HubUserV2.id, HubUserV2.email).filter(HubUserV2.id.in_(user_ids)).all()
+    return {row[0]: row[1] for row in rows}
+
+
+def _serialize_many(db: Session, rows: list[ResourceGrantV2]) -> list[dict]:
+    """``serialize_grant`` over a whole result set, resolving every
+    user-form grantee's email in ONE bulk query rather than N."""
+    emails = _hub_user_email_map(db, {g.user_id for g in rows if g.user_id is not None})
+    return [
+        serialize_grant(g, user_email=emails.get(g.user_id) if g.user_id is not None else None)
+        for g in rows
+    ]
 
 
 # ---------------------------------------------------------
@@ -259,12 +292,18 @@ def list_grants_for_node(db: Session, node_kind: str, node_id: int) -> list[dict
         .order_by(ResourceGrantV2.level, ResourceGrantV2.id)
         .all()
     )
-    return [serialize_grant(g) for g in rows]
+    return _serialize_many(db, rows)
 
 
 def get_grant(db: Session, grant_id: int) -> dict | None:
     grant = db.query(ResourceGrantV2).filter(ResourceGrantV2.id == grant_id).first()
-    return None if grant is None else serialize_grant(grant)
+    if grant is None:
+        return None
+    user_email = None
+    if grant.user_id is not None:
+        row = db.query(HubUserV2.email).filter(HubUserV2.id == grant.user_id).first()
+        user_email = row[0] if row is not None else None
+    return serialize_grant(grant, user_email=user_email)
 
 
 def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
@@ -292,7 +331,15 @@ def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
         return []
     rows = db.query(ResourceGrantV2).filter(ResourceGrantV2.id.in_(set(grant_ids))).all()
     by_id = {row.id: row for row in rows}
-    return [serialize_grant(by_id[gid]) for gid in grant_ids if gid in by_id]
+    emails = _hub_user_email_map(db, {row.user_id for row in rows if row.user_id is not None})
+    return [
+        serialize_grant(
+            by_id[gid],
+            user_email=emails.get(by_id[gid].user_id) if by_id[gid].user_id is not None else None,
+        )
+        for gid in grant_ids
+        if gid in by_id
+    ]
 
 
 def create_grant(
@@ -364,7 +411,11 @@ def create_grant(
     )
     db.add(grant)
     db.flush()
-    return serialize_grant(grant)
+    user_email = None
+    if grant.user_id is not None:
+        row = db.query(HubUserV2.email).filter(HubUserV2.id == grant.user_id).first()
+        user_email = row[0] if row is not None else None
+    return serialize_grant(grant, user_email=user_email)
 
 
 def delete_grant(db: Session, grant_id: int) -> bool:

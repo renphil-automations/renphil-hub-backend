@@ -804,6 +804,14 @@ def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
     if component is None or component.type == MIRROR_WIDGET_TYPE:
         return None
     return {
+        # Added for session_handoff_2026-09-02-grant-editor.md §4.2: this was
+        # the only client-facing way to resolve a `link` (a string) and it
+        # returned no `id` (the integer `components.id`), so nothing could
+        # turn a pasted link into the numeric id a component-kind resource
+        # grant addresses. Additive — every existing caller (the mirror
+        # target picker) reads `type`/`title`/`data`/`sbn` and ignores unknown
+        # keys, so this changes nothing for them.
+        "id": component.id,
         "type": component.type,
         "title": component.title,
         "data": _resolve_component_data(db, component),

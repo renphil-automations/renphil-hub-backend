@@ -1,9 +1,13 @@
 """Object grants router
-(plan_access_control_algorithm_2026-08-27.md §6.2, §6.3, §7, §9).
+(plan_access_control_algorithm_2026-08-27.md §6.2, §6.3, §7, §9;
+session_handoff_2026-09-02-grant-editor.md §0).
 
-The grants surface: list what is stored on a node, write a grant, revoke one,
-and — §6.2's requirement, which ships WITH the write path rather than after
-it — ask what a principal would still retain if a grant were revoked.
+The grants surface: list what is stored on a node (direct AND, since this
+session, inherited-from-ancestor), write a grant, revoke one, ask what a
+principal would still retain if a grant were revoked (§6.2 — ships WITH the
+write path, not after it), preview how many people a `(role, scope)` pair
+would reach before writing a grant on it, and list every node one person can
+currently reach.
 
 Its own module rather than more routes on `rbac.py`, following
 `rbac_assignments.py`'s precedent. The three surfaces are genuinely
@@ -11,7 +15,10 @@ different: `rbac.py` owns role/scope DEFINITIONS behind `require_hub_admin`,
 `rbac_assignments.py` owns WHO HOLDS WHAT behind the §6.1 delegation rule,
 and this owns WHAT CONTENT REACHES WHOM behind a third rule again — the
 first of the three that is evaluated against a NODE. They share a URL prefix
-because they are one product surface; they share no gate.
+because they are one product surface; they share no gate. Two of this
+session's additions — the audience preview and the per-person access list —
+have no node to evaluate at all and fall back to `require_hub_admin`
+instead; see `ADMIN_ONLY`'s own comment for why.
 
 ═══════════════════════════════════════════════════════════════════════════
 NOTHING HERE ENFORCES ANYTHING ABOUT CONTENT
@@ -56,21 +63,32 @@ tomorrow once an assignment exists.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import CurrentHubUser, get_current_hub_user
+from app.db_v2.models.hub_user import HubUserV2
+from app.dependencies import CurrentHubUser, get_current_hub_user, require_hub_admin
 from app.schemas.resource_grants import (
+    AudienceCountAPIResponse,
     CreateGrantRequest,
+    InheritedGrantsAPIResponse,
     NodeKind,
     ResourceGrantAPIResponse,
     ResourceGrantListAPIResponse,
     RetainedAccessAPIResponse,
+    UserAccessAPIResponse,
 )
+from app.services import rbac_service
 from app.services import resource_grant_service as grants
-from app.services.access_visibility_service import build_node_tree, what_would_they_retain
-from app.services.rbac_graph_service import RbacClosures, RbacGraphError
+from app.services.access_visibility_service import (
+    build_node_tree,
+    compute_visibility,
+    list_inherited_grants,
+    list_visible_nodes,
+    what_would_they_retain,
+)
+from app.services.rbac_graph_service import RbacClosures, RbacGraphError, audience_count
 from app.services.resource_grant_authz_service import (
     assert_can_administer_node,
     assert_can_grant,
@@ -82,6 +100,15 @@ router = APIRouter(prefix="/v2/rbac", tags=["Access Control — Grants"])
 CONFLICT_RESPONSE = {
     409: {"description": "The write gate, a uniqueness rule, or a node/principal rule was violated"}
 }
+
+# §0.2 / §0.3's gate (handoff 2026-09-02): both endpoints are org-wide admin
+# views with no NODE to hang `edit(n)` on — an audience count is asked about
+# a (role, scope) pair before any grant naming it exists, and a per-person
+# access list is about a PERSON, not a node. §12 leaves delegated
+# grant-administration undesigned, so both stay behind the same identity
+# gate role/scope DEFINITION writes already use (`rbac.py`'s `ADMIN_ONLY`),
+# rather than inventing a node-based rule for a question that has none.
+ADMIN_ONLY = [Depends(require_hub_admin)]
 
 
 def _conflict(error: RbacGraphError) -> HTTPException:
@@ -161,6 +188,105 @@ def list_node_grants(
         raise HTTPException(status_code=404, detail=f"No {node_kind} with id {node_id} exists")
 
     return {"data": grants.list_grants_for_node(db, node_kind, node_id)}
+
+
+@router.get(
+    "/nodes/{node_kind}/{node_id}/grants/inherited",
+    response_model=InheritedGrantsAPIResponse,
+    summary="Grants stored on this node's ancestors, grouped by ancestor",
+    responses={404: {"description": "Node not found"}, **CONFLICT_RESPONSE},
+)
+def list_node_inherited_grants(
+    node_kind: NodeKind,
+    node_id: int,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """The ancestor half of "who can access this node" (§9), which
+    `list_node_grants` above never served — see its own docstring: inherited
+    grants come from the descending fold, and that fold's read side is
+    `access_visibility_service.list_inherited_grants` (handoff §0.1).
+
+    SAME GATE, SAME ORDER, FOR THE SAME REASON as `list_node_grants`: an
+    administrative view of a node is gated on `edit(n)` even though it is a
+    read, and the gate runs BEFORE the existence check so a caller without
+    edit on the node gets the same answer whether it is absent, orphaned,
+    invisible, or uneditable (§9: a hidden node should not confirm itself
+    exists).
+    """
+    try:
+        assert_can_administer_node(
+            db,
+            hub_user_id=current.hub_user_id,
+            is_hub_admin=_is_hub_admin(current),
+            node_kind=node_kind,
+            node_id=node_id,
+        )
+    except RbacGraphError as e:
+        raise _conflict(e)
+
+    if not grants.node_exists(db, node_kind, node_id):
+        raise HTTPException(status_code=404, detail=f"No {node_kind} with id {node_id} exists")
+
+    return {"data": list_inherited_grants(db, node_kind, node_id)}
+
+
+@router.get(
+    "/audience",
+    response_model=AudienceCountAPIResponse,
+    dependencies=ADMIN_ONLY,
+    summary="How many people a (role, scope) pair currently reaches",
+    responses={404: {"description": "Role or scope not found"}},
+)
+def get_audience_count(
+    role_id: int = Query(...),
+    scope_id: int = Query(...),
+    db: Session = Depends(get_db_v2),
+):
+    """*"This grant currently reaches 34 people"* (§9) — a live preview for
+    the grant-creation picker, computed for a pair BEFORE any grant naming it
+    exists, not read back off a stored row. See `ADMIN_ONLY`'s comment above
+    for why this is Hub-Admin-gated rather than node-gated (handoff §0.2).
+
+    404 on an unknown role or scope, checked before anything closure-related
+    runs — same ordering `create_assignment` already uses.
+    """
+    if rbac_service.get_role(db, role_id) is None:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if rbac_service.get_scope(db, scope_id) is None:
+        raise HTTPException(status_code=404, detail="Scope not found")
+
+    count = audience_count(db, role_id, scope_id)
+    return {"data": {"role_id": role_id, "scope_id": scope_id, "count": count}}
+
+
+@router.get(
+    "/hub-users/{user_id}/access",
+    response_model=UserAccessAPIResponse,
+    dependencies=ADMIN_ONLY,
+    summary="Every node this person can currently reach",
+    responses={404: {"description": "Hub user not found"}},
+)
+def get_user_access(
+    user_id: int,
+    db: Session = Depends(get_db_v2),
+):
+    """§9's "what can this person access" panel (handoff §0.3) — the
+    per-user mirror of `list_node_grants` / `list_node_inherited_grants`'s
+    per-node view. See `ADMIN_ONLY`'s comment above for why this is
+    Hub-Admin-gated rather than node-gated: a person is not a node, so there
+    is nothing to run `edit()` against.
+
+    Runs the full §5.1 fold for this one user (`compute_visibility`) and
+    returns only their `visible` set with the §5.2 triple — see
+    `list_visible_nodes`'s docstring for why the invisible majority is
+    omitted rather than returned as `view: false` rows.
+    """
+    if db.query(HubUserV2.id).filter(HubUserV2.id == user_id).first() is None:
+        raise HTTPException(status_code=404, detail="Hub user not found")
+
+    visibility = compute_visibility(db, user_id)
+    return {"data": {"user_id": user_id, "nodes": list_visible_nodes(visibility)}}
 
 
 @router.get(

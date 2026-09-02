@@ -63,6 +63,23 @@ class ResourceGrantResponse(BaseModel):
     scope_id: int | None = None
     user_id: int | None = None
 
+    # A LIVE LOOKUP, not a snapshot — safe because `user_id` CASCADEs
+    # (§7's table: "user_id FK hub_users ON DELETE CASCADE"), so a grant row
+    # can never outlive the hub_users row it names. That is the opposite
+    # rule from `granted_by_email` two fields below, whose FK is SET NULL
+    # rather than CASCADE and therefore does need a stored snapshot. Same
+    # split `rbac_assignment_service._hub_user_email_map` already draws
+    # between `AssignmentResponse.user_email` (live) and
+    # `granted_by_email` (snapshot).
+    #
+    # Handoff §4.1: added because no endpoint could previously turn a bare
+    # `user_id` on a user-form grant back into a name — the only lookup on
+    # `hub_users` was a search-by-query, not a get-by-id. Always `None` for
+    # a (role, scope)-form grant, and — for a user-form grant — `None` only
+    # in the impossible case the CASCADE has not yet caught up within one
+    # transaction; a client should treat that identically to "unresolved".
+    user_email: str | None = None
+
     level: GrantLevel
 
     # Both nullable together only when the granter's hub_users row was later
@@ -163,3 +180,89 @@ class RetainedAccessResponse(BaseModel):
 
 class RetainedAccessAPIResponse(BaseModel):
     data: RetainedAccessResponse
+
+
+# ---------------------------------------------------------
+# §0.1 — inherited grants (handoff 2026-09-02, plan §9)
+# ---------------------------------------------------------
+
+
+class InheritedGrantsEntry(BaseModel):
+    """Every grant stored on ONE ancestor of the node the caller asked about
+    — the unit `list_node_grants` (direct-only) was always missing.
+
+    Grouped rather than flattened, per §9's own wording: "listing direct and
+    inherited grants SEPARATELY and naming the ancestor". A flat list with a
+    tag on each row says the same thing but makes an admin re-group it by
+    eye to answer "what does Nav 1 contribute here?" — the exact question
+    §6.2's Alice case turns on.
+    """
+
+    node_kind: NodeKind
+    node_id: int
+    grants: list[ResourceGrantResponse] = Field(default_factory=list)
+
+
+class InheritedGrantsAPIResponse(BaseModel):
+    # Nearest ancestor first, root-ward. Ancestors with no grants of their
+    # own are omitted — there is nothing to name them for, and an admin
+    # scanning the list for "why is this visible" gets only entries that
+    # answer the question.
+    data: list[InheritedGrantsEntry] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------
+# §0.2 — audience count (handoff 2026-09-02, plan §9)
+# ---------------------------------------------------------
+
+
+class AudienceCountResponse(BaseModel):
+    """*"This grant currently reaches 34 people"* (§9), computed for a
+    `(role, scope)` pair rather than for an existing grant row — the picker
+    needs this BEFORE the grant is written, while the admin is still
+    choosing.
+
+    A count, not a list: §9's own phrasing asks for a number, and naming
+    every individual who happens to hold a role/scope pair is a materially
+    bigger exposure than the pair itself (role and scope NAMES are open to
+    any authenticated user today; a roster of who holds one is not).
+    """
+
+    role_id: int
+    scope_id: int
+    count: int
+
+
+class AudienceCountAPIResponse(BaseModel):
+    data: AudienceCountResponse
+
+
+# ---------------------------------------------------------
+# §0.3 — what can this person access (handoff 2026-09-02, plan §9)
+# ---------------------------------------------------------
+
+
+class UserAccessNodeResponse(BaseModel):
+    """One node in the caller's `visible` set for the target person, with
+    §5.2's full triple — not just a bare node list, so the panel can show a
+    reveal (`revealed=True`) differently from a real grant."""
+
+    node_kind: NodeKind
+    node_id: int
+    view: bool
+    edit: bool
+    revealed: bool
+
+
+class UserAccessResponse(BaseModel):
+    user_id: int
+    # Only VISIBLE nodes — §5.1's `visible` set, not the whole node tree.
+    # An invisible node carries no information for this panel and, at
+    # today's ~240-node hub, omitting it is what keeps the response
+    # proportional to what the person can actually reach rather than to the
+    # size of the hub.
+    nodes: list[UserAccessNodeResponse] = Field(default_factory=list)
+
+
+class UserAccessAPIResponse(BaseModel):
+    data: UserAccessResponse

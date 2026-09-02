@@ -56,6 +56,7 @@ from app.services.rbac_graph_service import RbacClosures
 from app.services.resource_grant_service import (
     GrantMatch,
     get_grant,
+    list_grants_for_node,
     matching_grants,
     seeds_for_principal,
 )
@@ -933,3 +934,96 @@ def what_would_they_retain(
         responsible_grants=[s for s in surviving if (s.node_kind, s.node_id) in region],
         covering_grants=[s for s in surviving if (s.node_kind, s.node_id) in ancestors],
     )
+
+
+# ---------------------------------------------------------
+# §0.1 (session_handoff_2026-09-02-grant-editor.md) — inherited grants,
+# the ancestor half of §9's "who can access this node" panel
+# ---------------------------------------------------------
+
+
+def list_inherited_grants(
+    db: Session,
+    node_kind: str,
+    node_id: int,
+    *,
+    tree: NodeTree | None = None,
+) -> list[dict]:
+    """Every grant stored on an ANCESTOR of ``(node_kind, node_id)``, grouped
+    by which ancestor it came from.
+
+    THE GAP THIS FILLS. ``resource_grant_service.list_grants_for_node``'s own
+    docstring says so directly: *"Inherited grants come from the descending
+    fold, which is not built yet."* This is that read, finally built —
+    handoff §0.1 confirmed it was still the one thing blocking §9's "who can
+    access this node" panel from showing the whole picture, not just the
+    direct rows.
+
+    NOT A VISIBILITY COMPUTATION, AND DELIBERATELY SO. This does not
+    intersect anything with any user's ``effective_pairs`` — it lists what
+    is STORED, full stop. That is the right answer for this panel because of
+    §5.5's D3: a grant is unconditional for everything beneath it, with no
+    per-node "stop inheriting" flag, so EVERY ancestor's grants reach this
+    node regardless of who happens to be asking. An admin auditing "why can
+    people see this" needs the stored facts, not one user's filtered view of
+    them — ``compute_visibility`` is the function for that question, and it
+    answers a different one.
+
+    Nearest ancestor first, root-ward — the order ``NodeTree.ancestors``
+    already returns, and the one worth keeping: the closest thing controlling
+    this node is the first line of the answer, not the last.
+
+    ANCESTORS WITH NO GRANTS ARE OMITTED, not returned with an empty
+    ``grants`` list. There is nothing to name them for, and listing every
+    ancestor whether or not it has anything to report would make the
+    response's length track the node's DEPTH rather than the number of
+    grants actually reaching it from above — the thing an admin is scanning
+    for.
+
+    Returns ``[]`` for an unknown node, for the hub itself (no ancestors),
+    and for an orphan (§3.3) — ``NodeTree.ancestors`` already returns ``[]``
+    for all three, so none of them needs a separate check here.
+    """
+    node_tree = tree if tree is not None else build_node_tree(db)
+    entries: list[dict] = []
+    for ancestor_kind, ancestor_id in node_tree.ancestors((node_kind, node_id)):
+        rows = list_grants_for_node(db, ancestor_kind, ancestor_id)
+        if not rows:
+            continue
+        entries.append({"node_kind": ancestor_kind, "node_id": ancestor_id, "grants": rows})
+    return entries
+
+
+# ---------------------------------------------------------
+# §0.3 (session_handoff_2026-09-02-grant-editor.md) — what can this
+# person access
+# ---------------------------------------------------------
+
+
+def list_visible_nodes(visibility: VisibilityResult) -> list[dict]:
+    """Every node in ``visibility.visible``, each with its full §5.2 triple
+    — §9's "what can this person access" panel, the per-user mirror of
+    ``list_inherited_grants``'s per-node one (handoff §0.3).
+
+    PURE, matching every other pure/impure split in this module: it takes an
+    already-computed ``VisibilityResult`` — the same object
+    ``compute_visibility`` returns — rather than a ``db`` and a
+    ``hub_user_id``, so a caller that already holds one for another reason
+    in the same request never recomputes it.
+
+    ONLY VISIBLE NODES ARE RETURNED, not the whole tree. An invisible node
+    carries no information for this panel (§5.2: ``view`` gates the chrome,
+    and an invisible node fails that by definition), and at the hub's
+    ~240-node scale (§8.1's docstring) the omission is what keeps the
+    response proportional to what the PERSON can reach, not to the size of
+    the hub.
+
+    Sorted by ``(node_kind, node_id)`` — the tuple order this module already
+    uses everywhere else a node set is returned (``RetainedAccess.retained_view``
+    is the same shape) — so two calls a moment apart diff meaningfully
+    instead of differing only by dict/set iteration order.
+    """
+    return [
+        {"node_kind": kind, "node_id": node_id, **visibility.verdict(kind, node_id)._asdict()}
+        for kind, node_id in sorted(visibility.visible)
+    ]

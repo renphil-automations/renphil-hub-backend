@@ -424,6 +424,61 @@ def effective_pairs(
     return pairs
 
 
+def audience_count(
+    db: Session, role_id: int, scope_id: int, *, closures: RbacClosures | None = None
+) -> int:
+    """§0.2 / plan §9 — how many distinct people a grant stored on
+    ``(role_id, scope_id)`` would reach right now.
+
+    THE REVERSE OF ``effective_pairs``. That function starts from one user
+    and expands every assignment row into the pairs they reach; this starts
+    from one fixed OBJECT pair and asks which ``role_assignments`` ROWS
+    reach it — §4.2's match direction, run in the audience direction instead
+    of the seed direction:
+
+        a held row (R_h, S_h) reaches the object pair (role_id, scope_id)
+        iff role_id in role_descendants(R_h) and scope_id in scope_descendants(R_h)
+
+    which is exactly ``grants_matching_pairs``'s per-row membership test,
+    asked about a pair that may not be attached to any grant yet — this is
+    the picker's live preview (§9), computed BEFORE a grant is written, not
+    read back off one that already exists.
+
+    ⊥ NEEDS NO SPECIAL CASE HERE, and that is worth calling out because
+    every other place ⊥ appears in this codebase does. ``role_descendants`` /
+    ``scope_descendants`` already union the public id in unconditionally
+    (§4.4), so if ``role_id`` is the public role, `role_id in
+    role_descendants(R_h)` is true for every ``R_h`` — every row matches on
+    that axis, which is exactly "everyone" for a grant written on
+    ``(⊥role, scope)``. Same for the universal scope on the OTHER side:
+    `scope_descendants(R_h's scope)` is every scope only when that held
+    scope IS universal, so a grant on ``(role, All Scopes)`` correctly
+    counts only hub-wide assignees (§4.3) with no extra logic.
+
+    Counts DISTINCT users — someone with two assignment rows that both reach
+    the pair is one person, not two.
+
+    Does not validate that ``role_id`` / ``scope_id`` exist; the router does
+    that the same way ``create_assignment`` does (a plain 404 via
+    ``rbac_service.get_role`` / ``get_scope``), so a bad id never reaches
+    here at all.
+    """
+    graph = closures if closures is not None else RbacClosures(db)
+    rows = db.query(
+        RoleAssignmentV2.user_id, RoleAssignmentV2.role_id, RoleAssignmentV2.scope_id
+    ).all()
+
+    reached: set[int] = set()
+    for user_id, held_role_id, held_scope_id in rows:
+        if user_id in reached:
+            continue
+        if role_id in graph.role_descendants(held_role_id) and scope_id in graph.scope_descendants(
+            held_scope_id
+        ):
+            reached.add(user_id)
+    return len(reached)
+
+
 # ---------------------------------------------------------
 # Lookups
 # ---------------------------------------------------------
