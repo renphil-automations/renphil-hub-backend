@@ -19,6 +19,7 @@ as everything else in this schema.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -28,11 +29,13 @@ from app.db_v2.models.page_content import PageContentV2
 from app.services.gridstack_service import (
     _generate_id,
     _resolve_component_data,
+    _utc_now,
     _validate_document_id_value,
     _validate_locked_by,
     _validate_order,
     _validate_title,
     _write_component_data,
+    is_lock_stale,
 )
 
 SBN_ROOT_TYPE = "super_block_note"
@@ -60,6 +63,24 @@ def _sbn_props(component: ComponentV2) -> dict[str, Any]:
     return component.props or {}
 
 
+def _sbn_locked_at(props: dict[str, Any]) -> datetime | None:
+    """`props["locked_at"]` is an ISO-8601 string (JSONB has no native
+    datetime type), written by `_utc_now().isoformat()` in `lock_sbn_node`
+    below. Missing OR unparseable both return None — which `is_lock_stale`
+    (gridstack_service.py) already treats as stale, the same "no usable
+    timestamp ⇒ assume stale, never assume fresh" convention
+    `airtable_service._envelope_age_seconds` uses for cache envelopes. Every
+    node locked before plan §6.6 Fix 2 landed has no `locked_at` key at all
+    and lands here."""
+    stamp = props.get("locked_at")
+    if not isinstance(stamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+
+
 def _has_sbn_children(db: Session, component_id: int) -> bool:
     return (
         db.query(ComponentV2.id)
@@ -71,13 +92,17 @@ def _has_sbn_children(db: Session, component_id: int) -> bool:
 
 def _format_sbn_summary(db: Session, component: ComponentV2) -> dict[str, Any]:
     props = _sbn_props(component)
+    locked = bool(props.get("locked", False))
+    locked_at = _sbn_locked_at(props)
     return {
         "id": component.id,
         "documentId": component.link,
         "title": component.title,
         "order": props.get("order", 0),
-        "locked": bool(props.get("locked", False)),
+        "locked": locked,
         "locked_by": props.get("locked_by", "") or "",
+        "locked_at": locked_at,
+        "lock_is_stale": locked and is_lock_stale(locked_at),
         "has_children": _has_sbn_children(db, component.id),
         "has_content": component.page_content_id is not None,
         "apiVersion": "v2",
@@ -123,6 +148,9 @@ def get_sbn_workspace(db: Session, link: str) -> dict[str, Any] | None:
 
     data = _resolve_component_data(db, component)
 
+    locked = bool(props.get("locked", False))
+    locked_at = _sbn_locked_at(props)
+
     return {
         "id": component.id,
         "documentId": component.link,
@@ -135,8 +163,10 @@ def get_sbn_workspace(db: Session, link: str) -> dict[str, Any] | None:
         # the SBN child filter's only consumer is canViewTab (frontend),
         # which must treat an absent access_control as viewable.
         "access_control": component.access_control,
-        "locked": bool(props.get("locked", False)),
+        "locked": locked,
         "locked_by": props.get("locked_by", "") or "",
+        "locked_at": locked_at,
+        "lock_is_stale": locked and is_lock_stale(locked_at),
         "children": child_summaries,
         "apiVersion": "v2",
     }
@@ -380,7 +410,15 @@ def lock_sbn_node(db: Session, link: str, locked_by: str) -> dict[str, Any] | No
     independently lockable, matching v1 (where the host tab and every
     sub-tab could each be locked independently). Unlike
     `gridstack_service.py`'s tab-level lock (root-tab-only), there's no
-    "must be root" restriction here."""
+    "must be root" restriction here.
+
+    `locked_by` is the caller's OWN identity — the router derives it from
+    the authenticated JWT (plan §6.6 Fix 1), same as
+    `lock_tab_by_document_id_v2`. This function reuses that one's staleness
+    rule (`is_lock_stale`, owner decision 2026-09-03: Fix 2 extends to SBN
+    nodes too) with `locked_at` stored as an ISO-8601 string under
+    `props["locked_at"]` rather than a column — `component.props` is
+    already JSONB and this needed no migration."""
     try:
         locked_by = _validate_locked_by(locked_by)
         if not locked_by:
@@ -392,10 +430,16 @@ def lock_sbn_node(db: Session, link: str, locked_by: str) -> dict[str, Any] | No
 
         props = _sbn_props(component)
         current_locked_by = props.get("locked_by") or ""
-        if props.get("locked") and current_locked_by and current_locked_by != locked_by:
+        held_by_someone_else = bool(props.get("locked")) and current_locked_by and current_locked_by != locked_by
+        if held_by_someone_else and not is_lock_stale(_sbn_locked_at(props)):
             raise ValueError(f"Node is already locked by {current_locked_by}")
 
-        component.props = {**props, "locked": True, "locked_by": locked_by}
+        component.props = {
+            **props,
+            "locked": True,
+            "locked_by": locked_by,
+            "locked_at": _utc_now().isoformat(),
+        }
         db.commit()
         return get_sbn_workspace(db, link)
 
@@ -407,6 +451,9 @@ def lock_sbn_node(db: Session, link: str, locked_by: str) -> dict[str, Any] | No
 def unlock_sbn_node(
     db: Session, link: str, unlocked_by: str | None = None, force: bool = False
 ) -> dict[str, Any] | None:
+    """`unlocked_by` is identity-sourced and `force` is unchanged — see
+    `unlock_tab_by_document_id_v2`'s docstring in gridstack_service.py,
+    which this mirrors exactly including the omission-bypass note."""
     try:
         unlocked_by = _validate_locked_by(unlocked_by)
 
@@ -416,10 +463,15 @@ def unlock_sbn_node(
 
         props = _sbn_props(component)
         current_locked_by = props.get("locked_by") or ""
-        if not force and props.get("locked") and current_locked_by and unlocked_by and current_locked_by != unlocked_by:
+        # No `and unlocked_by` short-circuit — see
+        # unlock_tab_by_document_id_v2's docstring in gridstack_service.py
+        # for why: a falsy unlocked_by must read as "not proven to be the
+        # holder", never as "no identity ⇒ let it through".
+        held_by_someone_else = bool(props.get("locked")) and current_locked_by and current_locked_by != unlocked_by
+        if not force and held_by_someone_else and not is_lock_stale(_sbn_locked_at(props)):
             raise ValueError(f"Node is locked by {current_locked_by}")
 
-        component.props = {**props, "locked": False, "locked_by": ""}
+        component.props = {**props, "locked": False, "locked_by": "", "locked_at": None}
         db.commit()
         return get_sbn_workspace(db, link)
 

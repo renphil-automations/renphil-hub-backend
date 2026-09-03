@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import (
@@ -104,6 +105,14 @@ class TabSummaryResponse(BaseModel):
 
     locked: StrictBool = False
     locked_by: StrictStr = ""
+    # plan §6.6 Fix 2. `locked_at` is None for an unlocked tab AND for a
+    # locked one with no timestamp (every lock taken before this column
+    # existed — see TabV2.locked_at's own comment); `lock_is_stale` is
+    # server-computed (is_lock_stale in gridstack_service.py) rather than
+    # left for the client to re-derive from `locked_at` + a TTL it would
+    # have to know separately — always False when `locked` is False.
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
 
     has_children: StrictBool = False
     has_content: StrictBool = False
@@ -155,6 +164,8 @@ class TabWorkspaceResponse(BaseModel):
 
     locked: StrictBool = False
     locked_by: StrictStr = ""
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
 
     children: list[TabSummaryResponse] = Field(default_factory=list)
 
@@ -263,6 +274,28 @@ class CreateTabRequest(StrictRequestModel):
 
 
 class UpdateTabRequest(StrictRequestModel):
+    """NO `locked` / `locked_by` FIELDS — DELIBERATELY, NOT AN OVERSIGHT.
+
+    plan_access_control_algorithm_2026-08-27.md §6.6 Fix 1 calls this the
+    "third door": `update_tab_by_document_id_v2` used to accept these two
+    fields and write them straight onto the row with NO ownership check at
+    all — a client could set `{locked: true, locked_by: "anyone"}` on any
+    root tab, or silently clear someone else's lock, without going near
+    `PUT .../lock` or `PUT .../unlock`.
+
+    Removed outright rather than accepted-and-ignored: `StrictRequestModel`
+    is `extra="forbid"`, so a client that still sends either field now gets
+    a 422 — the loud failure this door needs, matching how `LockTabRequest`
+    / `UnlockTabRequest` below dropped their own client-supplied identity
+    fields for the same reason. Nothing in the frontend ever sent these
+    (verified against every `updateTab`/`updateTabV2` call site), so this
+    is uncoupled from the frontend change those two request classes require.
+
+    Locking stays reachable only through `PUT .../lock` and
+    `PUT .../unlock`, which derive the holder from the authenticated
+    identity — never from a request body — and which still refuse a nested
+    gridstack (hazard 4)."""
+
     title: StrictStr | None = Field(
         default=None,
         min_length=1,
@@ -277,14 +310,6 @@ class UpdateTabRequest(StrictRequestModel):
     )
 
     access_control: AccessControlResponse | dict[str, Any] | None = None
-
-    locked: StrictBool | None = None
-
-    locked_by: StrictStr | None = Field(
-        default=None,
-        max_length=255,
-        pattern=CLEAN_TEXT_PATTERN,
-    )
 
     @field_validator("order", mode="before")
     @classmethod
@@ -427,19 +452,42 @@ class UpdateComponentContentRequest(StrictRequestModel):
 
 
 class LockTabRequest(StrictRequestModel):
-    locked_by: StrictStr = Field(
-        min_length=1,
-        max_length=255,
-        pattern=CLEAN_TEXT_PATTERN,
-    )
+    """NO `locked_by` FIELD — DELIBERATELY, NOT AN OVERSIGHT.
+
+    plan_access_control_algorithm_2026-08-27.md §6.6 Fix 1: `locked_by` used
+    to be a required client-supplied string, compared verbatim against the
+    stored holder — so a lock could be taken over by sending the right name.
+    The router already authenticates every request (`get_current_user`); it
+    simply never used who the caller actually was. Removed rather than
+    accepted-and-ignored: `StrictRequestModel` is `extra="forbid"`, so a
+    client that still sends the field now gets a 422 — the loud failure
+    intended here, not a silent ignore. Body is `{}`.
+
+    Owner's decision, 2026-09-02 (carried into the 2026-09-03 locking
+    session): both `renphil-hub-backend` and `renphil-hub-frontend` change
+    in the same session and deploy together, so there is no transitional
+    accept-and-ignore period — the field is gone outright on both sides.
+    Shipping only one half is a 422 on every lock."""
 
 
 class UnlockTabRequest(StrictRequestModel):
-    unlocked_by: StrictStr | None = Field(
-        default=None,
-        max_length=255,
-        pattern=CLEAN_TEXT_PATTERN,
-    )
+    """NO `unlocked_by` FIELD — same reasoning as `LockTabRequest` above,
+    PLUS it closes a second, undocumented bypass by construction.
+
+    `unlocked_by` used to be OPTIONAL (`str | None = None`), and the
+    ownership check in `unlock_tab_by_document_id_v2` was
+    `... and unlocked_by and ...` — a caller that omitted the field (or sent
+    `null`) short-circuited that check to `False` and the unlock proceeded
+    with NO ownership check at all. `force: true` was never required to
+    steal a lock; simply not sending `unlocked_by` was an equally effective,
+    entirely undocumented way in. Removing the field closes this
+    structurally: an identity that cannot be supplied by the client cannot
+    be omitted by the client either — the server derives it from the JWT on
+    every call, with nothing left for an absent/null value to short-circuit.
+
+    `force` is UNCHANGED (owner decision, 2026-09-03): still present, still
+    unrestricted — see `unlock_tab_by_document_id_v2`'s docstring in
+    gridstack_service.py for why."""
 
     force: StrictBool = False
 

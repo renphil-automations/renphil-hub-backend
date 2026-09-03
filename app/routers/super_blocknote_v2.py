@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
 from app.dependencies import get_current_user
+from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
@@ -164,10 +165,21 @@ def reorder_nodes(request: ReorderTabsRequest, db: Session = Depends(get_db_v2))
     summary="Lock an SBN node (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
 )
-def lock_node(link: str, request: LockTabRequest, db: Session = Depends(get_db_v2)):
+def lock_node(
+    link: str,
+    request: LockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
     validate_document_id(link)
     try:
-        locked = lock_sbn_node(db=db, link=link, locked_by=request.locked_by)
+        # This router reuses tabs_v2.py's LockTabRequest verbatim, so
+        # plan §6.6 Fix 1 (identity-sourced holder, no client-supplied
+        # locked_by) applies here too automatically — see LockTabRequest's
+        # own docstring in schemas/tab.py. Not an optional extension: the
+        # field simply no longer exists on the shared schema.
+        locked_by = (user.email or "").strip().lower()
+        locked = lock_sbn_node(db=db, link=link, locked_by=locked_by)
         if locked is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": locked}
@@ -181,10 +193,19 @@ def lock_node(link: str, request: LockTabRequest, db: Session = Depends(get_db_v
     summary="Unlock an SBN node (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
 )
-def unlock_node(link: str, request: UnlockTabRequest, db: Session = Depends(get_db_v2)):
+def unlock_node(
+    link: str,
+    request: UnlockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
     validate_document_id(link)
     try:
-        unlocked = unlock_sbn_node(db=db, link=link, unlocked_by=request.unlocked_by, force=request.force)
+        # Same shared-schema consequence as lock_node above — this also
+        # closes the omission bypass for SBN nodes, for the same reason
+        # UnlockTabRequest's docstring gives.
+        unlocked_by = (user.email or "").strip().lower()
+        unlocked = unlock_sbn_node(db=db, link=link, unlocked_by=unlocked_by, force=request.force)
         if unlocked is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": unlocked}

@@ -725,11 +725,17 @@ def unlock_tab_by_document_id(
         if tab is None:
             return None
 
+        # No `and unlocked_by` short-circuit — see
+        # unlock_tab_by_document_id_v2's docstring in gridstack_service.py
+        # for the full story (found by mutation testing during the
+        # 2026-09-03 locking session, same defect, same fix, mirrored here
+        # since app/routers/tabs.py's lock_tab/unlock_tab now also derive
+        # the identity from the JWT rather than the request body — this
+        # guard would otherwise let a falsy unlocked_by match any lock).
         if (
             not force
             and tab.locked
             and tab.locked_by
-            and unlocked_by
             and tab.locked_by != unlocked_by
         ):
             raise ValueError(f"Tab is locked by {tab.locked_by}")

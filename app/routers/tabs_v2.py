@@ -429,11 +429,20 @@ def reorder_tabs(request: ReorderTabsRequest, db: Session = Depends(get_db_v2)):
     summary="Lock tab (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
 )
-def lock_tab(document_id: str, request: LockTabRequest, db: Session = Depends(get_db_v2)):
+def lock_tab(
+    document_id: str,
+    request: LockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
     validate_document_id(document_id)
 
     try:
-        locked_workspace = lock_tab_by_document_id_v2(db=db, document_id=document_id, locked_by=request.locked_by)
+        # plan §6.6 Fix 1: the holder is the AUTHENTICATED identity, never a
+        # request-body field — `LockTabRequest` no longer has one to read.
+        # Same normalization dependencies.get_current_hub_user applies.
+        locked_by = (user.email or "").strip().lower()
+        locked_workspace = lock_tab_by_document_id_v2(db=db, document_id=document_id, locked_by=locked_by)
         if locked_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": locked_workspace}
@@ -447,14 +456,24 @@ def lock_tab(document_id: str, request: LockTabRequest, db: Session = Depends(ge
     summary="Unlock tab (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
 )
-def unlock_tab(document_id: str, request: UnlockTabRequest, db: Session = Depends(get_db_v2)):
+def unlock_tab(
+    document_id: str,
+    request: UnlockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
     validate_document_id(document_id)
 
     try:
+        # plan §6.6 Fix 1: identity-sourced, same as lock_tab above. This
+        # also closes the omission bypass by construction — see
+        # UnlockTabRequest's docstring — there is no longer a body field an
+        # unlock could omit to skip the ownership check.
+        unlocked_by = (user.email or "").strip().lower()
         unlocked_workspace = unlock_tab_by_document_id_v2(
             db=db,
             document_id=document_id,
-            unlocked_by=request.unlocked_by,
+            unlocked_by=unlocked_by,
             force=request.force,
         )
         if unlocked_workspace is None:
@@ -480,14 +499,16 @@ def update_tab_metadata(document_id: str, request: UpdateTabRequest, db: Session
             else request.access_control
         )
 
+        # plan §6.6 Fix 1, the "third door": UpdateTabRequest no longer
+        # carries locked/locked_by at all (see its docstring) — nothing to
+        # pass through here, and update_tab_by_document_id_v2 no longer
+        # accepts those parameters either.
         updated_workspace = update_tab_by_document_id_v2(
             db=db,
             document_id=document_id,
             title=request.title,
             order=request.order,
             access_control=access_control,
-            locked=request.locked,
-            locked_by=request.locked_by,
         )
         if updated_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")

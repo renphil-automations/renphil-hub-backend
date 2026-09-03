@@ -485,14 +485,26 @@ def lock_tab(
     document_id: str,
     request: LockTabRequest,
     db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user),
 ):
     validate_document_id(document_id)
 
     try:
+        # plan_access_control_algorithm_2026-08-27.md §6.6 Fix 1. This
+        # router shares LockTabRequest/UnlockTabRequest with tabs_v2.py and
+        # super_blocknote_v2.py (schemas/tab.py) — removing `locked_by` /
+        # `unlocked_by` from those classes for the v2 fix applies here
+        # automatically too, mechanically, whether or not v1 was in the
+        # original brief's scope: `request.locked_by` below would otherwise
+        # be a hard AttributeError the moment this endpoint is called, since
+        # the field no longer exists on the model. Deriving from the
+        # authenticated identity instead is both the fix that keeps this
+        # endpoint working AND the same security improvement v2 got.
+        locked_by = (user.email or "").strip().lower()
         locked_workspace = lock_tab_by_document_id(
             db=db,
             document_id=document_id,
-            locked_by=request.locked_by,
+            locked_by=locked_by,
         )
 
         if locked_workspace is None:
@@ -527,14 +539,18 @@ def unlock_tab(
     document_id: str,
     request: UnlockTabRequest,
     db: Session = Depends(get_db),
+    user: UserInfo = Depends(get_current_user),
 ):
     validate_document_id(document_id)
 
     try:
+        # See lock_tab's comment above — same mechanical consequence of the
+        # shared schema, same Fix 1 identity-sourcing.
+        unlocked_by = (user.email or "").strip().lower()
         unlocked_workspace = unlock_tab_by_document_id(
             db=db,
             document_id=document_id,
-            unlocked_by=request.unlocked_by,
+            unlocked_by=unlocked_by,
             force=request.force,
         )
 
@@ -589,14 +605,22 @@ def update_tab_metadata(
             else request.access_control
         )
 
+        # plan §6.6 Fix 1's "third door", same as tabs_v2.py:
+        # UpdateTabRequest no longer carries locked/locked_by (it had no
+        # ownership check on this path either) — nothing to pass through.
+        # update_tab_by_document_id's own locked/locked_by parameters are
+        # left in place (unlike the v2 service function) rather than
+        # removed here: they feed `edited_by` on the version-history save
+        # a few lines into that function, a v1-only coupling out of scope
+        # for this session to touch. With no caller left that can supply
+        # them, they are simply always None now — the door is closed by
+        # having nothing that can open it, not by deleting the parameters.
         updated_workspace = update_tab_by_document_id(
             db=db,
             document_id=document_id,
             title=request.title,
             order=request.order,
             access_control=access_control,
-            locked=request.locked,
-            locked_by=request.locked_by,
         )
 
         if updated_workspace is None:

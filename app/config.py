@@ -512,8 +512,18 @@ class Settings(BaseSettings):
     AGENT_API_URL: str | None = None
     AGENT_SYNC_TOKEN: str | None = None
 
-
-@lru_cache
+    # ══════════════════════════════════════════════════════════════════
+    # Tab / SBN-node locking (plan_access_control_algorithm_2026-08-27.md §6.6)
+    # ══════════════════════════════════════════════════════════════════
+    # A lock past this age with no refresh is STALE and claimable by any
+    # authenticated user (§0 of the locking session: no edit(n) gate exists
+    # yet — resource_grants is empty in production, so gating locks on it
+    # today would mean only Hub Admins could lock anything). Re-entry by the
+    # same holder refreshes it. Owner-picked value, 2026-09-03: 4 hours.
+    # Shared by both lock systems — TabV2.locked_at (a real column) and an
+    # SBN node's component.props["locked_at"] (a JSONB key, no column) —
+    # so the two stay on one TTL rather than silently drifting apart.
+    TAB_LOCK_TTL_SECONDS: int = 14_400  # 4h
 def get_settings() -> Settings:
     """Return a cached singleton of the application settings."""
     return Settings()  # type: ignore[call-arg]

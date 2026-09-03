@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db_v2.models.tab import TabV2
 from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.component import ComponentV2
@@ -203,6 +204,40 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# plan_access_control_algorithm_2026-08-27.md §6.6 Fix 2 — shared by BOTH
+# lock systems: TabV2.locked_at (a real column, below) and an SBN node's
+# component.props["locked_at"] (a JSONB key, no column — see
+# super_blocknote_service.py). One helper, one TTL setting
+# (Settings.TAB_LOCK_TTL_SECONDS), so the two cannot drift onto different
+# staleness rules.
+def is_lock_stale(locked_at: datetime | None) -> bool:
+    """True if a lock taken at `locked_at` is old enough to be claimed by
+    anyone, without needing `force`.
+
+    `locked_at is None` returns True (STALE), not False. This covers every
+    lock taken before this column/key existed — including the live tab 42,
+    locked since 2026-08-07 with no `locked_at` at all — per the model
+    comment on TabV2.locked_at: a NULL lock predates the TTL concept
+    entirely, so there is no acquisition time to compare against, and
+    treating it as fresh would leave exactly the stranded locks this fix
+    exists to release. Same "missing timestamp ⇒ treat as stale, never as
+    fresh" convention `airtable_service._envelope_age_seconds` already uses
+    for cache envelopes.
+
+    Defends against a naive `locked_at` the same way
+    `airtable_service._envelope_age_seconds` does: SQLite (the test suite's
+    engine) does not round-trip tzinfo through a DateTime column, so a value
+    read back mid-test can be naive even though `_utc_now()` always writes
+    an aware one. Comparing a naive and an aware datetime raises at runtime
+    (hazard 7) — the exact place a TTL check would silently break."""
+    if locked_at is None:
+        return True
+    if locked_at.tzinfo is None:
+        locked_at = locked_at.replace(tzinfo=timezone.utc)
+    age_seconds = (_utc_now() - locked_at).total_seconds()
+    return age_seconds > get_settings().TAB_LOCK_TTL_SECONDS
+
+
 def _access_control_or_default(access_control: dict[str, Any] | None) -> dict[str, Any]:
     return access_control if access_control else DEFAULT_ACCESS_CONTROL
 
@@ -322,19 +357,22 @@ def _safe_access_control_for_gridstack(
     return _access_control_or_default(component.access_control if component else None)
 
 
-def _safe_locked_pair(
+def _safe_locked_triple(
     db: Session,
     gridstack: GridstackV2,
     root_tab: TabV2 | None = _ROOT_TAB_NOT_FETCHED,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, datetime | None]:
+    """(locked, locked_by, locked_at). Was `_safe_locked_pair` — widened for
+    plan §6.6 Fix 2 rather than adding a third parallel helper; both call
+    sites already destructure it right where they need `is_lock_stale`."""
     if _is_root(gridstack):
         tab = root_tab if root_tab is not _ROOT_TAB_NOT_FETCHED else _get_root_tab(db, gridstack)
         if tab is None:
-            return False, ""
-        return bool(tab.locked), (tab.locked_by or "")
+            return False, "", None
+        return bool(tab.locked), (tab.locked_by or ""), tab.locked_at
     # Nested gridstacks have no lock columns — lock granularity is
     # whole-tab-only in this schema (Phase 2 decision).
-    return False, ""
+    return False, "", None
 
 
 def _has_variants(db: Session, tab_id: int) -> bool:
@@ -348,7 +386,7 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
     # the identical TabV2 row — see `_ROOT_TAB_NOT_FETCHED`'s doc comment.
     root_tab = _get_root_tab(db, gridstack) if is_root else None
 
-    locked, locked_by = _safe_locked_pair(db, gridstack, root_tab)
+    locked, locked_by, locked_at = _safe_locked_triple(db, gridstack, root_tab)
     node_id = gridstack.parent_tab_id if is_root else gridstack.id
     title = None
     order = gridstack.position if gridstack.position is not None else 0
@@ -377,6 +415,8 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "order": order,
         "locked": locked,
         "locked_by": locked_by,
+        "locked_at": locked_at,
+        "lock_is_stale": locked and is_lock_stale(locked_at),
         "has_children": _has_children(db, gridstack.id),
         "has_content": _has_content(db, gridstack.id),
         "has_variants": has_variants,
@@ -1705,7 +1745,7 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
     child_summaries = [_format_tab_summary(db, c) for c in children]
     child_summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
 
-    locked, locked_by = _safe_locked_pair(db, gridstack, root_tab)
+    locked, locked_by, locked_at = _safe_locked_triple(db, gridstack, root_tab)
 
     return {
         "id": node_id,
@@ -1717,6 +1757,8 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
         "locked": locked,
         "locked_by": locked_by,
+        "locked_at": locked_at,
+        "lock_is_stale": locked and is_lock_stale(locked_at),
         "children": child_summaries,
         "has_variants": has_variants,
         "apiVersion": "v2",
@@ -2378,13 +2420,32 @@ def update_tab_by_document_id_v2(
     title: str | None = None,
     order: int | None = None,
     access_control: dict[str, Any] | None = None,
-    locked: bool | None = None,
-    locked_by: str | None = None,
 ) -> dict[str, Any] | None:
+    """NO `locked` / `locked_by` PARAMETERS — DELIBERATELY, NOT AN OVERSIGHT.
+
+    This is the generic tab-metadata PUT, and until
+    plan_access_control_algorithm_2026-08-27.md §6.6's locking session it
+    quietly accepted `locked`/`locked_by` here too, writing them onto `tab`
+    with NO ownership check at all — the "third door": anyone authenticated
+    could set `{locked: true, locked_by: "anyone"}` on any root tab, or
+    clear someone else's lock, without going near lock_tab_by_document_id_v2
+    / unlock_tab_by_document_id_v2 below.
+
+    Fixed by removing the fields from `UpdateTabRequest` (schemas/tab.py)
+    entirely rather than ignoring them here — StrictRequestModel's
+    `extra="forbid"` then 422s a client that still sends them, which is the
+    loud failure this door needs. Removing the PARAMETERS here too, not just
+    the call in tabs_v2.py that used to pass them, is the second half of
+    that: a future session cannot silently wire this door back open by
+    adding a keyword argument, the way the schema alone would still allow.
+
+    If you are re-adding lock/unlock here — DON'T, without first re-reading
+    this comment AND hazard 4's requirement that locking stay refused for a
+    nested gridstack (the `else` branch below has never accepted locked/
+    locked_by and must not start now)."""
     try:
         title = _validate_title(title)
         order = _validate_order(order)
-        locked_by = _validate_locked_by(locked_by)
 
         gridstack = get_gridstack_by_document_id(db, document_id)
         if gridstack is None:
@@ -2423,10 +2484,6 @@ def update_tab_by_document_id_v2(
                 gridstack.position = order
             if access_control is not None:
                 tab.access_control = access_control
-            if locked is not None:
-                tab.locked = locked
-            if locked_by is not None:
-                tab.locked_by = locked_by
             tab.updated_at = _utc_now()
         else:
             if title is not None:
@@ -2441,10 +2498,12 @@ def update_tab_by_document_id_v2(
                 if component is None:
                     component = _create_gridstack_component(db, gridstack)
                 component.access_control = access_control
-            if locked is not None or locked_by is not None:
-                raise ValueError(
-                    "Locking is only supported for top-level tabs in this schema version"
-                )
+            # Locking a nested gridstack through this path is refused by
+            # CONSTRUCTION now (see the module-level docstring above): there
+            # is no locked/locked_by parameter left to reach here at all.
+            # Hazard 4 stays satisfied by the function no longer having the
+            # capability, which is stronger than the runtime raise this
+            # branch used to do.
 
         # The indexed component payload reads the owning root/variant title
         # and access control, but never the visual order. A nested gridstack's
@@ -2476,6 +2535,21 @@ def update_tab_by_document_id_v2(
 
 
 def lock_tab_by_document_id_v2(db: Session, document_id: str, locked_by: str) -> dict[str, Any] | None:
+    """`locked_by` is the caller's OWN identity by the time this is called —
+    the router derives it from the authenticated JWT
+    (plan §6.6 Fix 1), never from a request body field. This function does
+    not care where the value came from; it only ever compares it, so the
+    behaviour below is unchanged by Fix 1 except for the one thing it fixes:
+    the value is no longer forgeable.
+
+    Fix 2: a lock past the TTL with no refresh is STALE
+    (`is_lock_stale`, keyed off `tab.locked_at`) and claimable by anyone,
+    exactly like the fresh-acquire case below — no separate "is it stale"
+    branch, because both cases reduce to "does the CURRENT holder, if any,
+    still have a live claim on this lock". Re-entry by the same holder and a
+    claim of a stale lock both refresh `locked_at`, which is what makes a
+    lock that is actively being used never go stale out from under its own
+    holder."""
     try:
         locked_by = _validate_locked_by(locked_by)
         if not locked_by:
@@ -2492,11 +2566,13 @@ def lock_tab_by_document_id_v2(db: Session, document_id: str, locked_by: str) ->
         if tab is None:
             return None
 
-        if tab.locked and tab.locked_by and tab.locked_by != locked_by:
+        held_by_someone_else = tab.locked and tab.locked_by and tab.locked_by != locked_by
+        if held_by_someone_else and not is_lock_stale(tab.locked_at):
             raise ValueError(f"Tab is already locked by {tab.locked_by}")
 
         tab.locked = True
         tab.locked_by = locked_by
+        tab.locked_at = _utc_now()
         tab.updated_at = _utc_now()
 
         db.commit()
@@ -2513,6 +2589,38 @@ def unlock_tab_by_document_id_v2(
     unlocked_by: str | None = None,
     force: bool = False,
 ) -> dict[str, Any] | None:
+    """`unlocked_by` is the caller's OWN identity, router-derived, same as
+    `lock_tab_by_document_id_v2` above — see its docstring. It is no longer
+    OPTIONAL in practice (the router's dependency always resolves one), but
+    the parameter stays `str | None` for a caller that genuinely has none
+    (see the ownership rule immediately below for what that means).
+
+    HISTORICAL NOTE, kept because a future session WILL be tempted to
+    reintroduce what this describes. Before Fix 1, `unlocked_by` was the
+    request body's own OPTIONAL field, and the ownership check used to read
+    `... and unlocked_by and ...` — a short-circuit ANY caller could trigger
+    by simply omitting the field, or passing `null`: with no identity to
+    compare, the check went `False` and the unlock proceeded as if
+    uncontested, regardless of who actually held the lock. That was the
+    "omission bypass" plan §6.6 Fix 1 names. Removing the field from
+    `UnlockTabRequest` closes it for every caller reachable through the
+    router, but this function is still called directly by e.g. a future
+    internal/scripted caller, so THE GUARD ITSELF had to change too, not
+    only the schema — an absent `unlocked_by` must be treated as "not
+    proven to be the holder" (blocked, unless `force`), never as "no
+    identity ⇒ let it through". Caught by mutation testing during the
+    2026-09-03 locking session: a service-level test calling this function
+    directly with `unlocked_by=None` against a real lock found the OLD
+    guard (kept unchanged from before Fix 1, on the mistaken assumption the
+    schema change alone was sufficient) still let it through silently.
+
+    `force` is UNCHANGED by this session (owner decision, 2026-09-03,
+    plan_access_control_algorithm_2026-08-27.md's §0 follow-up): still
+    unrestricted, still skips the ownership AND staleness checks below —
+    there is no `edit(n)` yet to gate it on (§0 Option A), and no frontend
+    path has ever set it, so this is a pure no-op for every existing client.
+    A stale lock does NOT need `force` — see `is_lock_stale` below — `force`
+    remains the one way to take a lock that is still fresh."""
     try:
         unlocked_by = _validate_locked_by(unlocked_by)
 
@@ -2527,11 +2635,16 @@ def unlock_tab_by_document_id_v2(
         if tab is None:
             return None
 
-        if not force and tab.locked and tab.locked_by and unlocked_by and tab.locked_by != unlocked_by:
+        # No `and unlocked_by` short-circuit — see the docstring above. A
+        # falsy `unlocked_by` must never read as "match", only ever as
+        # "not proven to be the holder".
+        held_by_someone_else = tab.locked and tab.locked_by and tab.locked_by != unlocked_by
+        if not force and held_by_someone_else and not is_lock_stale(tab.locked_at):
             raise ValueError(f"Tab is locked by {tab.locked_by}")
 
         tab.locked = False
         tab.locked_by = ""
+        tab.locked_at = None
         tab.updated_at = _utc_now()
 
         db.commit()
