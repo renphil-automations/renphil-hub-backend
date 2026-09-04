@@ -21,6 +21,14 @@ Admin bypass (``ViewerAccess.full_access``) remains load-bearing for exactly
 the reason §10 items 1-2 give: an ordinary user who has been granted nothing
 correctly sees, and can now change, nothing.
 
+§6.8's nav-tab/hub split (below, ``resolve_hub_node``) is also done as of
+this task: ``nav_tabs.py``'s four mutating routes and ``tabs_v2.py``'s
+``move_tab_to_nav_tab`` now gate on ``edit(hub)``/``edit(nav_tab)`` instead
+of the identity-only ``require_hub_admin``. That dependency survives only
+for role/scope DEFINITION writes (``rbac.py``), which have no resource node
+to hang a grant on — see ``dependencies.py``'s own docstring on why that half
+does not move.
+
 WHAT THIS MODULE OWES ITS READER, in the order the surprises arrive:
 
 1. **The parent chain is three different lookups, not one** (§3.1). See
@@ -1083,6 +1091,34 @@ def resolve_gridstack_parent_node(db: Session, gridstack: GridstackV2) -> NodeRe
     if parent_gridstack is None:
         return None
     return resolve_gridstack_node(db, parent_gridstack)
+
+
+def resolve_hub_node(db: Session) -> NodeRef | None:
+    """The hub's own node — plan §6.3's ``n`` for a caller whose parent IS
+    the hub (project_ac_enforcement_gap.md's §6.8 nav-tab/hub split: nav tab
+    create/reorder, and the ``order`` field of a nav tab update, all gate on
+    ``edit(hub)``).
+
+    There is no ``nav_tabs.hub_id`` column to join through —
+    ``build_node_tree``'s own comment says the link is implicit, every nav
+    tab hangs off the single hub row — so this re-derives the SAME "exactly
+    one row, or fail closed" rule that function applies for the tree root,
+    as a single query rather than the whole-tree build. Appropriate for the
+    same reason ``resolve_gridstack_node``/``resolve_gridstack_parent_node``
+    are single-lookup rather than tree-wide: a write route resolves ONE node
+    per request.
+
+    ``None`` when the row count is not exactly one — zero rows (a
+    fresh/misconfigured database) or two (a schema violation;
+    ``build_node_tree``'s own docstring explains why picking one arbitrarily
+    would be worse than failing closed). Callers must treat that as
+    INVISIBLE, never as open, matching every other ``None`` in this module
+    (§3.3) — though in practice a caller with ``full_access`` (the Hub Admin
+    bypass) never notices, since ``ViewerAccess.verdict`` short-circuits on
+    ``full_access`` before it ever looks at the node.
+    """
+    hub_ids = [row[0] for row in db.query(HubV2.id).all()]
+    return ("hub", hub_ids[0]) if len(hub_ids) == 1 else None
 
 
 class AccessDeniedError(Exception):

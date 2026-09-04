@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, get_viewer_access, require_hub_admin
+from app.dependencies import get_current_user, get_viewer_access
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
@@ -71,7 +71,7 @@ COMMON_CONFLICT_RESPONSE = {409: {"description": "Conflict"}}
 COMMON_FORBIDDEN_RESPONSE = {403: {"description": "You do not have edit access to this item"}}
 
 
-def _access_denied_to_http_exception(error: AccessDeniedError) -> HTTPException:
+def access_denied_to_http_exception(error: AccessDeniedError) -> HTTPException:
     """plan_access_control_algorithm_2026-08-27.md §6.3's write gate
     (project_ac_enforcement_gap.md item 2) maps to two different codes
     depending on which half of `access_visibility_service.require_edit`
@@ -235,7 +235,7 @@ def update_component_content_endpoint(
     try:
         updated = update_component_content(db, link, access=access, **updates)
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -348,7 +348,7 @@ def create_variant(
             access=access,
         )
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -378,7 +378,7 @@ def reorder_variants(
             raise HTTPException(status_code=404, detail="Parent tab not found")
         return {"data": reordered}
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -425,7 +425,7 @@ def update_content(
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": updated_content}
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -479,7 +479,7 @@ def create_new_tab(
             access=access,
         )
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -508,7 +508,7 @@ def reorder_tabs(
         )
         return {"data": reordered}
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -620,7 +620,7 @@ def update_tab_metadata(
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": updated_workspace}
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -656,7 +656,7 @@ def move_tab(
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": moved_workspace}
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -669,19 +669,21 @@ def move_tab(
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
         **COMMON_CONFLICT_RESPONSE,
-        403: {"description": "Hub Admin role required"},
+        **COMMON_FORBIDDEN_RESPONSE,
     },
-    # Moving a root tab between nav tabs is a nav-tab-level operation, so
-    # it carries the same gate every other /v2/nav-tabs mutation does. It
-    # used to run a per-node `can_edit` on both the tab and the destination
-    # nav tab; that engine is gone, and both checks only ever admitted Hub
-    # Admins in practice.
-    dependencies=[Depends(require_hub_admin)],
+    # Moving a root tab between nav tabs is a nav-tab-level operation
+    # (project_ac_enforcement_gap.md's §6.8 nav-tab/hub split, 2026-09-04):
+    # it used to carry the same `require_hub_admin` gate every other
+    # /v2/nav-tabs mutation did, replaced here with `nav_tab_service.
+    # move_tab_to_nav_tab_v2`'s own edit(OLD nav tab) AND edit(NEW nav tab)
+    # check — the same two-parent judgement call `move_tab` above makes at
+    # the gridstack level, one node kind up.
 )
 def move_tab_to_nav_tab(
     document_id: str,
     request: MoveTabToNavTabRequest,
     db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
@@ -690,10 +692,13 @@ def move_tab_to_nav_tab(
             db=db,
             tab_document_id=document_id,
             nav_tab_document_id=request.navTabDocumentId,
+            access=access,
         )
         if moved_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": moved_workspace}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -716,6 +721,6 @@ def delete_tab(
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": delete_result}
     except AccessDeniedError as e:
-        raise _access_denied_to_http_exception(e)
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)

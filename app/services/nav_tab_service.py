@@ -20,7 +20,11 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.tab import TabV2
 
-from app.services.access_visibility_service import ViewerAccess
+from app.services.access_visibility_service import (
+    ViewerAccess,
+    require_edit,
+    resolve_hub_node,
+)
 from app.services.gridstack_service import (
     _UNSET,
     _access_control_or_default,
@@ -154,12 +158,22 @@ def create_nav_tab_v2(
     access_control: dict[str, Any] | None = None,
     order: int | None = None,
     icon: str | None = None,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any]:
     try:
         title = _validate_title(title)
         if not title:
             raise ValueError("Title is required")
         order = _validate_order(order)
+
+        # plan §6.3 "create a child of n" → n, applied one level up from
+        # `create_tab_v2`'s root-tab branch (project_ac_enforcement_gap.md's
+        # §6.8 nav-tab/hub split): a new nav tab is a child of the SINGLE hub
+        # row, not of anything the caller names. Checked before the slug
+        # uniqueness/reserved-word query below, so a caller without edit
+        # never learns whether a title collides.
+        require_edit(access, resolve_hub_node(db))
 
         slug = _resolve_nav_slug(db, title)
 
@@ -201,7 +215,26 @@ def update_nav_tab_v2(
     order: int | None = None,
     access_control: dict[str, Any] | None = None,
     icon: Any = _UNSET,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
+    """THREE OPERATIONS, ONE GATE EACH, project_ac_enforcement_gap.md's §6.8
+    nav-tab/hub split — the same conflation
+    `gridstack_service.update_tab_by_document_id_v2` already has for root
+    tabs, one level up: this single PUT does rename + access_control-edit
+    (both §6.3 "edit n's grants"/"rename n" → `edit(n)`, n = this nav tab)
+    and reorder (`order` is how a nav tab's own sibling position is
+    persisted — see `reorder_nav_tabs_v2` below — squarely §6.3's "reorder n
+    → parent(n)", parent = the hub). Icon carries no AC weight of its own
+    (§3.4 of the icon feature) and rides along with whichever check the
+    OTHER fields present already require.
+
+    Gated ONCE, on the STRICTEST requirement any field present implies,
+    before touching anything — same reasoning as the root-tab function:
+    `edit(parent(n)) ⟹ edit(n)` by §6.1's fold construction, so checking the
+    stricter requirement when `order` is present also clears the looser one
+    a bundled rename would otherwise need separately.
+    """
     try:
         nav_tab = get_nav_tab_by_document_id(db, document_id)
         if nav_tab is None:
@@ -209,6 +242,9 @@ def update_nav_tab_v2(
 
         title = _validate_title(title)
         order = _validate_order(order)
+
+        gate_node = resolve_hub_node(db) if order is not None else ("nav_tab", nav_tab.id)
+        require_edit(access, gate_node)
 
         if title is not None:
             if nav_tab.protected:
@@ -246,10 +282,20 @@ def update_nav_tab_v2(
         raise
 
 
-def reorder_nav_tabs_v2(db: Session, ordered_document_ids: list[str]) -> list[dict[str, Any]]:
+def reorder_nav_tabs_v2(
+    db: Session, ordered_document_ids: list[str], *, access: ViewerAccess | None = None
+) -> list[dict[str, Any]]:
     try:
         if not ordered_document_ids:
             raise ValueError("Reorder list cannot be empty")
+
+        # plan §6.3 "reorder n → parent(n)" — unlike root-tab reordering
+        # (`reorder_tabs_by_document_id_v2`), every nav tab shares the SAME
+        # parent (the single hub row), so there is no per-item resolution
+        # needed: one gate, checked before the existence lookup below so a
+        # caller without edit never learns which of the named document_ids
+        # are real.
+        require_edit(access, resolve_hub_node(db))
 
         nav_tabs_by_document_id = {
             t.document_id: t
@@ -274,15 +320,33 @@ def reorder_nav_tabs_v2(db: Session, ordered_document_ids: list[str]) -> list[di
         raise
 
 
-def delete_nav_tab_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+def delete_nav_tab_v2(
+    db: Session, document_id: str, *, access: ViewerAccess | None = None
+) -> dict[str, Any] | None:
     """Cascades: every root TabV2 under this nav tab is deleted (subtree and
     all) via delete_tab_subtree_by_document_id_v2 — which already handles
     variants, gridstack descendants, and components — before the nav_tabs
-    row itself is deleted last, so tabs.nav_tab_id's FK never dangles."""
+    row itself is deleted last, so tabs.nav_tab_id's FK never dangles.
+
+    Gated on `edit(parent(n))` = `edit(hub)` — §6.3's delete row — checked
+    ONCE, at this boundary, not once per cascaded root tab: the same
+    reasoning `delete_tab_subtree_by_document_id_v2` already gives for its
+    own single check (being entrusted with the parent is being entrusted
+    with the whole subtree, cascade included). The cascade calls that
+    function WITHOUT `access` (see below), matching every other internal
+    caller in this design — `access=None` means "no check requested", not
+    "deny" (access_visibility_service.require_edit's own docstring).
+
+    Checked BEFORE the `protected` business rule, not instead of it: an
+    AC-gated caller who cannot edit the hub gets 404/403 without ever
+    learning whether the row is protected; a caller who CAN edit the hub
+    still hits the protected refusal below exactly as before this session.
+    """
     try:
         nav_tab = get_nav_tab_by_document_id(db, document_id)
         if nav_tab is None:
             return None
+        require_edit(access, resolve_hub_node(db))
         if nav_tab.protected:
             raise ValueError("The Dashboard nav tab cannot be deleted")
 
@@ -325,6 +389,8 @@ def move_tab_to_nav_tab_v2(
     db: Session,
     tab_document_id: str,
     nav_tab_document_id: str,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
     """Root tabs only — a sub-tab gridstack has no nav_tab_id of its own, and
     a variant follows its parent tab rather than moving independently."""
@@ -349,6 +415,31 @@ def move_tab_to_nav_tab_v2(
 
         if destination.id == tab.nav_tab_id:
             raise ValueError("This tab already belongs to that nav tab")
+
+        # plan §6.3 "move n → parent(n)" — the SAME two-parent judgement
+        # call `move_tab_by_document_id_v2` makes at the gridstack level
+        # (project_ac_enforcement_gap.md item 2 §3: a move has a source AND
+        # a destination, unlike delete/reorder's single parent), applied one
+        # level up. A root tab's true AC parent is its nav tab —
+        # `NodeTree`'s own branch, `("tab", id) -> ("nav_tab", nav_tab_id)`
+        # when there is no `parent_tab_id` — so moving it between nav tabs
+        # requires edit on BOTH: the OLD one (content is leaving it) and the
+        # NEW one (content is arriving in it), the same bar a file-system
+        # move sets for source and destination directories. Checked after
+        # the structural validations above (root/variant, destination
+        # exists, not a no-op) so a caller without edit never learns those
+        # passed, and before the slug-conflict query below for the same
+        # reason create_tab_v2 checks edit before its own conflict query.
+        #
+        # Variants need NO separate check here, unlike delete's cascade into
+        # them: a variant's true AC parent is the ROOT TAB it varies
+        # (`TabV2.parent_tab_id`, §3.1), not the nav tab it happens to share
+        # `nav_tab_id` with — moving the root changes the ROOT's AC parent,
+        # not the variant's, so `variant_tabs` below get their `nav_tab_id`
+        # column updated (placement metadata, matching `create_tab_variant_v2`)
+        # without crossing any AC boundary of their own.
+        require_edit(access, ("nav_tab", tab.nav_tab_id) if tab.nav_tab_id is not None else None)
+        require_edit(access, ("nav_tab", destination.id))
 
         # Slug-based, not exact title: "Home" and "home" address the same
         # URL in the destination, so moving one next to the other would make
