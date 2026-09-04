@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, require_hub_admin
+from app.dependencies import get_current_user, get_viewer_access, require_hub_admin
 from app.schemas.tab import (
     CreateNavTabRequest,
     NavTabListAPIResponse,
@@ -22,6 +22,7 @@ from app.schemas.tab import (
     TabSummaryListAPIResponse,
     UpdateNavTabRequest,
 )
+from app.services.access_visibility_service import ViewerAccess
 from app.services.gridstack_service import get_root_tabs_v2
 from app.services.nav_tab_service import (
     create_nav_tab_v2,
@@ -58,8 +59,8 @@ def reorder_method_not_allowed():
 
 
 @router.get("", response_model=NavTabListAPIResponse, summary="Get all nav tabs")
-def get_nav_tabs(db: Session = Depends(get_db_v2)):
-    return {"data": get_nav_tabs_v2(db)}
+def get_nav_tabs(db: Session = Depends(get_db_v2), access: ViewerAccess = Depends(get_viewer_access)):
+    return {"data": get_nav_tabs_v2(db, access=access)}
 
 
 @router.get(
@@ -68,14 +69,23 @@ def get_nav_tabs(db: Session = Depends(get_db_v2)):
     summary="Get root tabs scoped to one nav tab",
     responses={**COMMON_NOT_FOUND_RESPONSE},
 )
-def get_nav_tab_tabs(document_id: str, db: Session = Depends(get_db_v2)):
+def get_nav_tab_tabs(
+    document_id: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
     nav_tab = get_nav_tab_by_document_id(db, document_id)
     if nav_tab is None:
         raise HTTPException(status_code=404, detail="Nav tab not found")
+    # Same fail-closed convention as the tabs_v2.py list endpoints: listing
+    # what is under a nav tab the caller cannot even see would itself leak
+    # more than the accepted §5.2 reveal.
+    if not access.verdict(("nav_tab", nav_tab.id)).view:
+        raise HTTPException(status_code=404, detail="Nav tab not found")
 
-    return {"data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id)}
+    return {"data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id, access=access)}
 
 
 @router.post(

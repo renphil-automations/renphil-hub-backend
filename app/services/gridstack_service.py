@@ -32,6 +32,7 @@ from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.nav_tab import NavTabV2
 
+from app.services.access_visibility_service import ViewerAccess, resolve_gridstack_node
 from app.services.tab_service import DEFAULT_ACCESS_CONTROL
 
 
@@ -379,7 +380,9 @@ def _has_variants(db: Session, tab_id: int) -> bool:
     return db.query(TabV2.id).filter(TabV2.parent_tab_id == tab_id).first() is not None
 
 
-def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
+def _format_tab_summary(
+    db: Session, gridstack: GridstackV2, *, access: ViewerAccess | None = None
+) -> dict[str, Any]:
     is_root = _is_root(gridstack)
     # Fetched once here (only when root — non-root gridstacks never had this
     # query) and threaded into both helpers below instead of each re-fetching
@@ -408,7 +411,7 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
     else:
         title = gridstack.name
 
-    return {
+    summary = {
         "id": node_id,
         "documentId": gridstack.document_id,
         "title": title,
@@ -425,6 +428,17 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "navTabTitle": nav_tab_title,
         "apiVersion": "v2",
     }
+    # plan_access_control_algorithm_2026-08-27.md §5.2's triple. Only added
+    # when a caller passes `access` — every internal caller that doesn't
+    # (mutation-response echoes; see gridstack_service.py's own call sites)
+    # keeps returning exactly what it always has, `view`/`edit`/`revealed`
+    # simply absent (the schema defaults them to None on the wire).
+    if access is not None:
+        verdict = access.verdict(resolve_gridstack_node(db, gridstack))
+        summary["view"] = verdict.view
+        summary["edit"] = verdict.edit
+        summary["revealed"] = verdict.revealed
+    return summary
 
 
 # ---------------------------------------------------------
@@ -829,6 +843,60 @@ def _format_page_content(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "documentId": gridstack.document_id,
         "content": _serialize_gridstack_content(db, gridstack),
     }
+
+
+def _apply_visibility_to_content(
+    content: dict[str, Any] | list[Any] | None, *, access: ViewerAccess
+) -> dict[str, Any] | list[Any] | None:
+    """New-model replacement for
+    ``tab_service.filter_widget_content_for_user`` — same guard, same
+    sentinel shape, driven by the resource_grants fold instead of Airtable
+    role names, so the frontend's existing `isRestrictedWidgetType` handling
+    needs no change.
+
+    Only processes grid-canvas content (``schemaVersion == 2``), exactly
+    like the function it replaces — BlockNote content and ``None`` pass
+    through untouched, and so does anything already caught by
+    ``access.full_access`` (the Hub Admin bypass — mirrors that function's
+    own "Hub admins bypass per-widget filtering" short-circuit).
+
+    ``_serialize_gridstack_content`` keys ``widgets`` by
+    ``str(component.id)`` (confirmed by reading it — NOT by ``link``), so
+    the numeric id recovered from each key IS the component's AC node id
+    with no lookup needed. A mirror's own key already reflects §3.4's
+    conjunction (position AND target) because ``access.is_granted`` reads
+    the fold's ``granted_view``, which ``_apply_mirror_substitution``
+    already adjusted — no separate mirror handling belongs here.
+    """
+    if not isinstance(content, dict) or content.get("schemaVersion") != 2:
+        return content
+    if access.full_access:
+        return content
+
+    widgets = content.get("widgets")
+    if not isinstance(widgets, dict):
+        return content
+
+    filtered_widgets: dict[str, Any] = {}
+    changed = False
+    for widget_id, widget_entry in widgets.items():
+        try:
+            component_id = int(widget_id)
+        except (TypeError, ValueError):
+            # Not a shape _serialize_gridstack_content ever produces; pass
+            # through rather than guess, matching the old function's own
+            # "not a dict → leave it" defensiveness one line up.
+            filtered_widgets[widget_id] = widget_entry
+            continue
+        if access.is_granted(("component", component_id)):
+            filtered_widgets[widget_id] = widget_entry
+        else:
+            filtered_widgets[widget_id] = {"type": "restricted", "data": None}
+            changed = True
+
+    if not changed:
+        return content
+    return {**content, "widgets": filtered_widgets}
 
 
 def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
@@ -1442,7 +1510,9 @@ def resolve_component_location_v2(db: Session, link: str) -> dict[str, Any] | No
 # Read API
 # ---------------------------------------------------------
 
-def get_root_tabs_v2(db: Session, nav_tab_id: int | None = None) -> list[dict[str, Any]]:
+def get_root_tabs_v2(
+    db: Session, nav_tab_id: int | None = None, *, access: ViewerAccess | None = None
+) -> list[dict[str, Any]]:
     # A root gridstack whose owning TabV2 itself has parent_tab_id set is a
     # tab variant, not a top-level tab — it must only ever surface via
     # get_tab_variants_v2, never duplicated into the main tab bar.
@@ -1459,17 +1529,31 @@ def get_root_tabs_v2(db: Session, nav_tab_id: int | None = None) -> list[dict[st
     if nav_tab_id is not None:
         query = query.filter(TabV2.nav_tab_id == nav_tab_id)
     root_gridstacks = query.all()
-    summaries = [_format_tab_summary(db, g) for g in root_gridstacks]
+    summaries = [_format_tab_summary(db, g, access=access) for g in root_gridstacks]
+    # §5.2: `visible` gates the CHROME — an invisible root tab must not
+    # appear in the tab bar at all, not merely render disabled. `access is
+    # None` (an internal caller with no user context) skips this filter
+    # entirely, matching every other caller of this function unchanged.
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
 
 
-def get_tab_variants_v2(db: Session, parent_document_id: str) -> list[dict[str, Any]] | None:
+def get_tab_variants_v2(
+    db: Session, parent_document_id: str, *, access: ViewerAccess | None = None
+) -> list[dict[str, Any]] | None:
     parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
     if parent_gridstack is None or not _is_root(parent_gridstack):
         return None
     parent_tab = _get_root_tab(db, parent_gridstack)
     if parent_tab is None:
+        return None
+    # The parent itself must be visible, or listing its variants leaks more
+    # than the accepted §5.2 reveal does (it would expose "these variants
+    # exist" for a node the caller cannot even see the existence of). Same
+    # None-means-404 convention every other function below uses.
+    if access is not None and not access.verdict(("tab", parent_tab.id)).view:
         return None
 
     variant_tabs = db.query(TabV2).filter(TabV2.parent_tab_id == parent_tab.id).all()
@@ -1482,8 +1566,10 @@ def get_tab_variants_v2(db: Session, parent_document_id: str) -> list[dict[str, 
         )
         if variant_gridstack is None:
             continue
-        summaries.append(_format_tab_summary(db, variant_gridstack))
+        summaries.append(_format_tab_summary(db, variant_gridstack, access=access))
 
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
 
@@ -1681,9 +1767,15 @@ def reorder_tab_variants_v2(
         raise
 
 
-def get_tab_children_v2(db: Session, document_id: str) -> list[dict[str, Any]] | None:
+def get_tab_children_v2(
+    db: Session, document_id: str, *, access: ViewerAccess | None = None
+) -> list[dict[str, Any]] | None:
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
+        return None
+    # Same fail-closed convention as get_tab_variants_v2 above: a caller who
+    # cannot see `gridstack` itself does not get to learn what is under it.
+    if access is not None and not access.verdict(resolve_gridstack_node(db, gridstack)).view:
         return None
 
     children = (
@@ -1691,22 +1783,44 @@ def get_tab_children_v2(db: Session, document_id: str) -> list[dict[str, Any]] |
         .filter(GridstackV2.parent_id == gridstack.id)
         .all()
     )
-    summaries = [_format_tab_summary(db, c) for c in children]
+    summaries = [_format_tab_summary(db, c, access=access) for c in children]
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
 
 
-def get_tab_content_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+def get_tab_content_v2(
+    db: Session, document_id: str, *, access: ViewerAccess | None = None
+) -> dict[str, Any] | None:
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
-    return _format_page_content(db, gridstack)
+    if access is not None and not access.verdict(resolve_gridstack_node(db, gridstack)).view:
+        return None
+    content = _format_page_content(db, gridstack)
+    if access is not None:
+        content["content"] = _apply_visibility_to_content(content["content"], access=access)
+    return content
 
 
-def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+def get_tab_workspace_v2(
+    db: Session, document_id: str, *, access: ViewerAccess | None = None
+) -> dict[str, Any] | None:
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
+
+    # plan §9: a deep link to a HIDDEN node fails closed as 404, same as one
+    # that does not exist, so it does not confirm the node's existence — the
+    # router's existing `if workspace is None: raise 404` already produces
+    # that response; returning None here for "exists but invisible" is what
+    # makes the two indistinguishable from outside, as designed.
+    own_verdict = None
+    if access is not None:
+        own_verdict = access.verdict(resolve_gridstack_node(db, gridstack))
+        if not own_verdict.view:
+            return None
 
     is_root = _is_root(gridstack)
     # Fetched once here (only when root) and threaded into both
@@ -1742,18 +1856,24 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         .filter(GridstackV2.parent_id == gridstack.id)
         .all()
     )
-    child_summaries = [_format_tab_summary(db, c) for c in children]
+    child_summaries = [_format_tab_summary(db, c, access=access) for c in children]
+    if access is not None:
+        child_summaries = [s for s in child_summaries if s["view"]]
     child_summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
 
     locked, locked_by, locked_at = _safe_locked_triple(db, gridstack, root_tab)
 
-    return {
+    page_content = _format_page_content(db, gridstack)
+    if access is not None:
+        page_content["content"] = _apply_visibility_to_content(page_content["content"], access=access)
+
+    workspace = {
         "id": node_id,
         "documentId": gridstack.document_id,
         "title": title,
         "order": order,
         "parent": parent,
-        "page_content": _format_page_content(db, gridstack),
+        "page_content": page_content,
         "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
         "locked": locked,
         "locked_by": locked_by,
@@ -1763,6 +1883,11 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         "has_variants": has_variants,
         "apiVersion": "v2",
     }
+    if own_verdict is not None:
+        workspace["view"] = own_verdict.view
+        workspace["edit"] = own_verdict.edit
+        workspace["revealed"] = own_verdict.revealed
+    return workspace
 
 
 # ---------------------------------------------------------

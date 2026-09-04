@@ -103,6 +103,18 @@ class TabSummaryResponse(BaseModel):
     title: StrictStr | None = None
     order: int = 0
 
+    # plan_access_control_algorithm_2026-08-27.md §5.2's triple —
+    # server-computed, never re-derived on the client. `revealed = view and
+    # not granted`: the node appears and opens, but its own payload is
+    # filtered to (usually) nothing but the child that earned the reveal.
+    # All three are None when the caller (an internal mutation-response
+    # echo, not a read endpoint) built this summary without a ViewerAccess
+    # — see gridstack_service._format_tab_summary's own `access` parameter.
+    # A read endpoint always supplies one, so they are never None there.
+    view: bool | None = None
+    edit: bool | None = None
+    revealed: bool | None = None
+
     locked: StrictBool = False
     locked_by: StrictStr = ""
     # plan §6.6 Fix 2. `locked_at` is None for an unlocked tab AND for a
@@ -149,6 +161,13 @@ class TabWorkspaceResponse(BaseModel):
     title: StrictStr | None = None
     order: int = 0
 
+    # See TabSummaryResponse's identical fields for what these mean. Absence
+    # of `view=True` here for a real tab is impossible from a read endpoint
+    # — an invisible node's workspace 404s instead (plan §9).
+    view: bool | None = None
+    edit: bool | None = None
+    revealed: bool | None = None
+
     parent: TabParentResponse | None = None
     page_content: PageContentWorkspaceResponse | None = None
 
@@ -194,6 +213,11 @@ class NavTabResponse(BaseModel):
     slug: StrictStr | None = None
     title: StrictStr | None = None
     order: int = 0
+
+    # See TabSummaryResponse's identical fields for what these mean.
+    view: bool | None = None
+    edit: bool | None = None
+    revealed: bool | None = None
 
     access_control: AccessControlResponse | dict[str, Any] | None = None
 

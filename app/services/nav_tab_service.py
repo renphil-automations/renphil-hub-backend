@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.tab import TabV2
 
+from app.services.access_visibility_service import ViewerAccess
 from app.services.gridstack_service import (
     _UNSET,
     _access_control_or_default,
@@ -97,8 +98,8 @@ def _resolve_nav_slug(db: Session, title: str, exclude_id: int | None = None) ->
 # Formatting
 # ---------------------------------------------------------
 
-def _format_nav_tab(nav_tab: NavTabV2) -> dict[str, Any]:
-    return {
+def _format_nav_tab(nav_tab: NavTabV2, *, access: ViewerAccess | None = None) -> dict[str, Any]:
+    summary = {
         "id": nav_tab.id,
         "documentId": nav_tab.document_id,
         "slug": nav_tab.slug,
@@ -108,15 +109,27 @@ def _format_nav_tab(nav_tab: NavTabV2) -> dict[str, Any]:
         "protected": bool(nav_tab.protected),
         "icon": nav_tab.icon,
     }
+    if access is not None:
+        # A nav tab maps straight to its own node — no gridstack indirection
+        # to resolve, unlike a tab/sub-grid (see resolve_gridstack_node).
+        verdict = access.verdict(("nav_tab", nav_tab.id))
+        summary["view"] = verdict.view
+        summary["edit"] = verdict.edit
+        summary["revealed"] = verdict.revealed
+    return summary
 
 
 # ---------------------------------------------------------
 # Read API
 # ---------------------------------------------------------
 
-def get_nav_tabs_v2(db: Session) -> list[dict[str, Any]]:
+def get_nav_tabs_v2(db: Session, *, access: ViewerAccess | None = None) -> list[dict[str, Any]]:
     nav_tabs = db.query(NavTabV2).order_by(NavTabV2.order, NavTabV2.id).all()
-    return [_format_nav_tab(t) for t in nav_tabs]
+    summaries = [_format_nav_tab(t, access=access) for t in nav_tabs]
+    # §5.2: an invisible nav tab is chrome nobody should see a row for.
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
+    return summaries
 
 
 def get_nav_tab_by_document_id(db: Session, document_id: str) -> NavTabV2 | None:

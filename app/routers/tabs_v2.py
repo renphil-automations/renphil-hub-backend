@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, require_hub_admin
+from app.dependencies import get_current_user, get_viewer_access, require_hub_admin
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
@@ -30,6 +30,7 @@ from app.schemas.tab import (
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
+from app.services.access_visibility_service import ViewerAccess
 from app.services.gridstack_service import (
     create_tab_v2,
     create_tab_variant_v2,
@@ -55,11 +56,6 @@ from app.services.nav_tab_service import (
     get_dashboard_nav_tab,
     get_nav_tab_by_document_id,
     move_tab_to_nav_tab_v2,
-)
-from app.services.tab_service import (
-    HUB_ADMIN_ROLE,
-    _user_can_view_widget,
-    filter_widget_content_for_user,
 )
 
 router = APIRouter(prefix="/v2/tabs", tags=["Tabs V2"], dependencies=[Depends(get_current_user)])
@@ -95,8 +91,8 @@ def reorder_method_not_allowed():
 
 
 @router.get("/root", response_model=TabSummaryListAPIResponse, summary="Get root tabs (v2)")
-def get_roots(db: Session = Depends(get_db_v2)):
-    return {"data": get_root_tabs_v2(db)}
+def get_roots(db: Session = Depends(get_db_v2), access: ViewerAccess = Depends(get_viewer_access)):
+    return {"data": get_root_tabs_v2(db, access=access)}
 
 
 @router.get(
@@ -122,39 +118,29 @@ def get_component_by_link(link: str, db: Session = Depends(get_db_v2)):
     "ordered chain of ancestor sub-tab `document_id`s, and (if the "
     "component is a Super Block Note descendant) the ordered chain of "
     "ancestor SBN component `link`s, so the frontend can navigate there "
-    "and highlight the component. Fails closed (403) if the caller cannot "
-    "see the target component — this endpoint is reachable via links "
+    "and highlight the component. Fails closed (404, not 403 — plan §9) if "
+    "the caller cannot view the target component, so the response does not "
+    "confirm the component exists — this endpoint is reachable via links "
     "shared outside the app (email, chat), not just from within an "
     "already-authorized canvas.",
-    responses={
-        **COMMON_NOT_FOUND_RESPONSE,
-        403: {"description": "Caller cannot view this component"},
-    },
+    responses={**COMMON_NOT_FOUND_RESPONSE},
 )
 def get_component_location(
     link: str,
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     component = get_component_by_link_for_access_check_v2(db, link)
     if component is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
-    # The component's OWN access_control — exactly the rule
-    # `filter_widget_content_for_user` applies server-side to redact a
-    # restricted widget from a workspace response, applied here to the one
-    # endpoint that hands out a component's location instead of its
-    # content. It used to fall back to the nearest ancestor's resolved AC;
-    # there is no inheritance any more, so a component with no explicit AC
-    # is locatable, matching how such a widget is already served in full by
-    # every other read path.
-    roles = list(user.roles)
-    widget_ac = component.access_control
-    if (
-        widget_ac
-        and HUB_ADMIN_ROLE not in roles
-        and not _user_can_view_widget(widget_ac, user.email, roles)
-    ):
-        raise HTTPException(status_code=403, detail="You don't have access to this component")
+    # plan_access_control_algorithm_2026-08-27.md §9: a caller who cannot
+    # VIEW this component gets the same 404 as "does not exist" — not the
+    # 403 this endpoint used to return, which would have confirmed the
+    # component is real. Replaces the old per-widget access_control check
+    # (`_user_can_view_widget` against the component's own AC) with the new
+    # fold; `access.is_granted` already carries the Hub Admin bypass.
+    if not access.is_granted(("component", component.id)):
+        raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
     result = resolve_component_location_v2(db, link)
     if result is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
@@ -225,20 +211,19 @@ def update_component_content_endpoint(
 def get_workspace(
     document_id: str,
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
-    workspace = get_tab_workspace_v2(db, document_id)
+    # plan §8.1-8.4, §9: get_tab_workspace_v2 now does both jobs that used to
+    # live here — 404s a HIDDEN tab the same way it 404s a MISSING one
+    # (fail-closed, indistinguishable from outside), and filters
+    # page_content via the new fold instead of the old
+    # filter_widget_content_for_user(user.email, user.roles) call this
+    # replaced.
+    workspace = get_tab_workspace_v2(db, document_id, access=access)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
-
-    page_content = workspace.get("page_content")
-    if isinstance(page_content, dict):
-        raw_content = page_content.get("content")
-        filtered = filter_widget_content_for_user(raw_content, user.email, list(user.roles))
-        if filtered is not raw_content:
-            workspace = {**workspace, "page_content": {**page_content, "content": filtered}}
 
     return {"data": workspace}
 
@@ -249,10 +234,14 @@ def get_workspace(
     summary="Get direct child tabs (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
-def get_children(document_id: str, db: Session = Depends(get_db_v2)):
+def get_children(
+    document_id: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
-    children = get_tab_children_v2(db, document_id)
+    children = get_tab_children_v2(db, document_id, access=access)
     if children is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
@@ -265,13 +254,17 @@ def get_children(document_id: str, db: Session = Depends(get_db_v2)):
     summary="Get tab variants (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
-def get_variants(document_id: str, db: Session = Depends(get_db_v2)):
+def get_variants(
+    document_id: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     """A tab variant (TabV2.parent_tab_id) is a distinct, one-level nesting
     axis from /{document_id}/children above (which is gridstack-level
     nesting) — see gridstack_service.py's TabV2 docstring."""
     validate_document_id(document_id)
 
-    variants = get_tab_variants_v2(db, document_id)
+    variants = get_tab_variants_v2(db, document_id, access=access)
     if variants is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
@@ -332,10 +325,14 @@ def reorder_variants(document_id: str, request: ReorderTabVariantsRequest, db: S
     summary="Get tab page content (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
-def get_content(document_id: str, db: Session = Depends(get_db_v2)):
+def get_content(
+    document_id: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
-    content = get_tab_content_v2(db, document_id)
+    content = get_tab_content_v2(db, document_id, access=access)
     if content is None:
         raise HTTPException(status_code=404, detail="Tab or page content not found")
 

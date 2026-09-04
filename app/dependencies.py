@@ -28,6 +28,7 @@ from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
+from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services.rbac_graph_service import RbacClosures, effective_pairs
 from app.services.tab_service import HUB_ADMIN_ROLE
 
@@ -383,3 +384,32 @@ async def require_hub_admin(
     if not is_hub_admin(db, current):
         raise HTTPException(status_code=403, detail="Hub Admin access required")
     return current.info
+
+
+# ── Content visibility (plan §8.1-8.4, §10 item — closing project-ac-
+# enforcement-gap's item 1: wiring the read-time fold into the tab-serving
+# endpoints) ─────────────────────────────────────────────────────────────
+
+
+async def get_viewer_access(
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+) -> ViewerAccess:
+    """One ``ViewerAccess`` per request, shared by every tab-serving endpoint
+    that gates content on the new algorithm (§8.4 — compute once, not once
+    per node).
+
+    Builds ONE ``RbacClosures`` and passes it to both ``is_hub_admin`` and
+    ``resolve_viewer_access`` (§8.2 — the closure adjacency must not be
+    rebuilt per call in the same request), exactly the sharing pattern
+    ``resource_grants.py``'s routes already use for
+    ``assert_can_administer_node`` / ``assert_can_grant``.
+
+    Depends on ``get_current_hub_user``, not bare ``get_current_user`` — this
+    needs a ``hub_users`` row to query ``role_assignments``/``resource_grants``
+    against, the same reason ``require_hub_admin`` was widened to it in the
+    hub-admin-resolver session.
+    """
+    closures = RbacClosures(db)
+    admin = is_hub_admin(db, current, closures=closures)
+    return resolve_viewer_access(db, current.hub_user_id, is_admin=admin, closures=closures)

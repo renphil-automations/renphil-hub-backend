@@ -1000,6 +1000,110 @@ def list_inherited_grants(
 # ---------------------------------------------------------
 
 
+# ---------------------------------------------------------
+# Wiring — resolving a gridstack's own node, and one caller's access
+# for a whole request (plan §8.1 step 1, §8.3, §8.4)
+# ---------------------------------------------------------
+
+
+def resolve_gridstack_node(db: Session, gridstack: GridstackV2) -> NodeRef | None:
+    """The AC node THIS gridstack itself is, for a caller addressing it
+    directly by its own ``document_id`` (every ``tabs_v2.py`` route does).
+
+    Gridstacks hold no grants and are not a node kind (§3.2) — a root
+    gridstack's own node is the tab it belongs to (root or variant); a
+    sub-grid's own node is its representation component, the row its
+    access control was relocated onto by
+    ``migrate_subtab_access_control_to_components.py``. Both branches are
+    exactly ``_owner_of_gridstack``'s two branches, re-derived here as a
+    single-gridstack query rather than from the whole-tree bulk maps —
+    appropriate because a router resolves ONE gridstack per request (the one
+    named in the URL), not all of them.
+
+    ``None`` for a sub-grid with no representation row yet (a pre-backfill
+    row — see ``_owner_of_gridstack``'s own docstring on why this can exist)
+    and for a root gridstack with no ``parent_tab_id`` (schema-invalid, never
+    produced by the service layer). The caller must treat ``None`` as
+    INVISIBLE (§3.3), never as open — there is nothing here to grant.
+    """
+    if gridstack.parent_id is None:
+        return ("tab", gridstack.parent_tab_id) if gridstack.parent_tab_id is not None else None
+    representation = (
+        db.query(ComponentV2.id).filter(ComponentV2.current_grid_id == gridstack.id).first()
+    )
+    return ("component", representation[0]) if representation is not None else None
+
+
+class ViewerAccess(NamedTuple):
+    """One caller's access for a whole request — computed ONCE (§8.4) and
+    threaded through every tab-serving function that needs to gate content.
+
+    ``full_access=True`` BYPASSES THE FOLD ENTIRELY, and this is not
+    optional polish. Every other AC-gated surface in this codebase applies
+    the Hub Admin bypass first and unconditionally
+    (``resource_grants.py``'s own docstring says so in as many words), and
+    the reason is concrete here, not theoretical: ``role_assignments`` holds
+    exactly one row as of 2026-09-03. Without this bypass, wiring the fold
+    into a read endpoint would make every JWT-recognized Hub Admin who is
+    NOT that one row see a fully dark hub the moment this ships — which is
+    not what phase 2's parallel run (``dependencies.is_hub_admin``) is for.
+    Construct this via ``resolve_viewer_access`` below, never by hand.
+
+    For anyone else, ``visibility`` is the real ``VisibilityResult`` and the
+    fold runs exactly as designed — including D2: a non-admin with no
+    grants correctly sees nothing, which is this design's own stated
+    default, not a bug introduced here.
+    """
+
+    visibility: VisibilityResult | None
+    full_access: bool
+
+    def verdict(self, node: NodeRef | None) -> NodeVerdict:
+        if self.full_access:
+            return NodeVerdict(view=True, edit=True, revealed=False)
+        if node is None or self.visibility is None:
+            return INVISIBLE
+        return self.visibility.verdict(*node)
+
+    def is_granted(self, node: NodeRef | None) -> bool:
+        """Gates the PAYLOAD for one node — see ``NodeVerdict``'s own
+        docstring on why this is not just ``verdict(node).view``."""
+        if self.full_access:
+            return True
+        if node is None or self.visibility is None:
+            return False
+        return self.visibility.is_granted(*node)
+
+
+def resolve_viewer_access(
+    db: Session,
+    hub_user_id: int,
+    *,
+    is_admin: bool,
+    closures: RbacClosures | None = None,
+) -> ViewerAccess:
+    """Build one ``ViewerAccess`` for a request.
+
+    ``is_admin`` is supplied by the caller (``dependencies.is_hub_admin``)
+    rather than computed here, so this module never has to import
+    ``app.dependencies`` — that import would run backwards (a FastAPI
+    dependency module belongs above domain services, not below one) and
+    would risk the same kind of import cycle §6.8's own docstring already
+    warns about for the reverse direction.
+
+    Skips building a ``VisibilityResult`` at all when ``is_admin`` is true —
+    the fold's answer would be discarded by ``ViewerAccess.full_access``
+    regardless, and an admin is the caller most likely to hit every read
+    endpoint in one page load.
+    """
+    if is_admin:
+        return ViewerAccess(visibility=None, full_access=True)
+    return ViewerAccess(
+        visibility=compute_visibility(db, hub_user_id, closures=closures),
+        full_access=False,
+    )
+
+
 def list_visible_nodes(visibility: VisibilityResult) -> list[dict]:
     """Every node in ``visibility.visible``, each with its full §5.2 triple
     — §9's "what can this person access" panel, the per-user mirror of
