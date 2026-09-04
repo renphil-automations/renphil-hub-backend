@@ -1,18 +1,25 @@
 """Read-time visibility — the node tree and the two folds
 (plan_access_control_algorithm_2026-08-27.md §3, §5, §6.1, §8.1 steps 3-4).
 
-This is step 4, and it is **computed, never enforced**. Nothing here is wired
-into an endpoint, no response shape any client reads today is affected, and
-``require_hub_admin`` is untouched. It answers one question — *for this user,
-what is every node's verdict?* — and leaves acting on the answer to a later
-step.
+Originally written as step 4, "computed, never enforced" — nothing wired
+into an endpoint, no response shape any client read affected. That is no
+longer true and this paragraph is corrected rather than left to rot:
+``session_handoff_2026-09-04-tab-visibility-wiring.md`` wired ``ViewerAccess``
+into every ``/v2/tabs`` and ``/v2/nav-tabs`` READ endpoint, and
+project_ac_enforcement_gap.md item 2 (below, ``require_edit`` and
+``resolve_gridstack_parent_node``) wires ``edit(n)``/``edit(parent(n))`` into
+the WRITE endpoints — ``create_new_tab``, ``create_variant``,
+``reorder_tabs``, ``reorder_variants``, ``update_content``,
+``update_component_content_endpoint``, ``update_tab_metadata``, ``move_tab``,
+``delete_tab``. ``require_hub_admin`` is still untouched — §6.8's nav-tab/hub
+half is a separate, later step, blocked on this one.
 
-That separation is not tidiness, it is a safety property. ``role_assignments``
-and ``resource_grants`` are both EMPTY in production, so ``effective(U) = ∅``
-and every fold below correctly returns "nothing" for every real user (§10
-items 1-2, and D2's no-seeding decision). Flipping enforcement against that
-state takes the hub dark for everyone at once. Populate assignments, author
-grants, verify, and only then enforce — never the other order.
+``role_assignments`` and ``resource_grants`` are no longer empty in
+production (one Hub Admin assignment, and grants authored through the
+grant-editor UI as of 2026-09-03), but they are still sparse, and the Hub
+Admin bypass (``ViewerAccess.full_access``) remains load-bearing for exactly
+the reason §10 items 1-2 give: an ordinary user who has been granted nothing
+correctly sees, and can now change, nothing.
 
 WHAT THIS MODULE OWES ITS READER, in the order the surprises arrive:
 
@@ -1032,6 +1039,106 @@ def resolve_gridstack_node(db: Session, gridstack: GridstackV2) -> NodeRef | Non
         db.query(ComponentV2.id).filter(ComponentV2.current_grid_id == gridstack.id).first()
     )
     return ("component", representation[0]) if representation is not None else None
+
+
+def resolve_gridstack_parent_node(db: Session, gridstack: GridstackV2) -> NodeRef | None:
+    """The AC node ONE LEVEL ABOVE ``gridstack``'s own (``resolve_gridstack_node``'s
+    answer) — plan §6.3's ``parent(n)``, for a caller addressing ``n`` by its
+    own ``document_id`` the way every ``tabs_v2.py`` write route does
+    (project_ac_enforcement_gap.md item 2: delete / move / reorder → parent(n)).
+
+    Re-derived as a single-gridstack lookup rather than pulled from
+    ``NodeTree``, for the same reason ``resolve_gridstack_node`` is: a write
+    route resolves ONE node per request, not the whole tree.
+
+    Two branches, and the ROOT one has two cases inside it — exactly
+    ``NodeTree``'s own comment on why ``parent_tab_id`` must be read before
+    ``nav_tab_id`` (§3.1): a variant's parent is the tab it varies, not the
+    nav tab it happens to share a ``nav_tab_id`` with.
+
+    - ``gridstack.parent_id is None`` (a root gridstack — a root tab OR a
+      variant): its parent depends on which. A VARIANT's parent is the tab
+      it varies (``TabV2.parent_tab_id``); an ordinary root tab's parent is
+      its nav tab (``TabV2.nav_tab_id``).
+    - otherwise (a sub-grid): its parent is whatever AC node owns its own
+      PARENT gridstack — exactly what ``resolve_gridstack_node`` already
+      answers for any gridstack, so the sub-grid case is one recursive call
+      rather than a second case analysis.
+
+    ``None`` for an orphaned root (no owning ``TabV2`` row, or one with
+    neither ``parent_tab_id`` nor ``nav_tab_id`` set — §3.3's known
+    two-row anomaly, tabs id=71/73) and for a sub-grid whose own parent
+    gridstack row is gone. Callers must treat ``None`` as "cannot resolve —
+    fail closed", never as open, matching every other ``None`` in this
+    module (§3.3).
+    """
+    if gridstack.parent_id is None:
+        tab = db.query(TabV2).filter(TabV2.id == gridstack.parent_tab_id).first()
+        if tab is None:
+            return None
+        if tab.parent_tab_id is not None:
+            return ("tab", tab.parent_tab_id)
+        return ("nav_tab", tab.nav_tab_id) if tab.nav_tab_id is not None else None
+    parent_gridstack = db.query(GridstackV2).filter(GridstackV2.id == gridstack.parent_id).first()
+    if parent_gridstack is None:
+        return None
+    return resolve_gridstack_node(db, parent_gridstack)
+
+
+class AccessDeniedError(Exception):
+    """Base for the two ways ``require_edit`` below can refuse a write.
+    Carries the ``node`` that was being checked so a caller that wants to
+    log or report the refusal does not have to re-derive it."""
+
+    def __init__(self, node: NodeRef | None) -> None:
+        self.node = node
+        super().__init__(f"access denied for node {node!r}")
+
+
+class NodeNotViewableError(AccessDeniedError):
+    """The caller cannot even VIEW ``node``. §9's fail-closed convention,
+    carried from the read side to the write side: a router should map this
+    to 404 — indistinguishable from "does not exist", exactly like every
+    GET this plan's read step already wired (project_ac_enforcement_gap.md
+    item 1)."""
+
+
+class NodeNotEditableError(AccessDeniedError):
+    """The caller can VIEW ``node`` but lacks EDIT. A router should map this
+    to 403, not 404 — unlike the view case, the caller's own UI already
+    confirms the node exists (they can see it), so hiding that fact behind a
+    404 would not protect anything and would only be confusing."""
+
+
+def require_edit(access: ViewerAccess | None, node: NodeRef | None) -> None:
+    """Plan §6.3's ``edit(n)`` write gate — one call, shared by every
+    ``gridstack_service`` mutation project_ac_enforcement_gap.md item 2
+    gates (create/reorder/rename/move/delete/content writes).
+
+    Raises rather than returning a bool, matching
+    ``resource_grant_authz_service.assert_can_administer_node``'s shape: a
+    caller that forgets to check a return value cannot silently let a write
+    through.
+
+    ``access=None`` is NOT "deny" — it is "no check was requested", exactly
+    like every other ``access: ViewerAccess | None = None`` default already
+    threaded through this module's READ-side callers (§1 of
+    session_handoff_2026-09-04-tab-visibility-wiring.md): an internal caller
+    that never intended to gate this call (e.g. ``create_tab_v2``'s own
+    internal call into ``update_tab_content_v2`` to seed initial content)
+    keeps working unchanged. Every ``tabs_v2.py`` route that mutates content
+    passes a real ``ViewerAccess`` from ``Depends(get_viewer_access)``.
+
+    The Hub Admin bypass needs no special case here — ``ViewerAccess.verdict``
+    already returns ``edit=True`` unconditionally under ``full_access``.
+    """
+    if access is None:
+        return
+    verdict = access.verdict(node)
+    if not verdict.view:
+        raise NodeNotViewableError(node)
+    if not verdict.edit:
+        raise NodeNotEditableError(node)
 
 
 class ViewerAccess(NamedTuple):

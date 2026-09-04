@@ -30,7 +30,11 @@ from app.schemas.tab import (
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
-from app.services.access_visibility_service import ViewerAccess
+from app.services.access_visibility_service import (
+    AccessDeniedError,
+    NodeNotViewableError,
+    ViewerAccess,
+)
 from app.services.gridstack_service import (
     create_tab_v2,
     create_tab_variant_v2,
@@ -64,6 +68,40 @@ router = APIRouter(prefix="/v2/tabs", tags=["Tabs V2"], dependencies=[Depends(ge
 COMMON_BAD_REQUEST_RESPONSE = {400: {"description": "Bad request"}}
 COMMON_NOT_FOUND_RESPONSE = {404: {"description": "Requested tab or resource was not found"}}
 COMMON_CONFLICT_RESPONSE = {409: {"description": "Conflict"}}
+COMMON_FORBIDDEN_RESPONSE = {403: {"description": "You do not have edit access to this item"}}
+
+
+def _access_denied_to_http_exception(error: AccessDeniedError) -> HTTPException:
+    """plan_access_control_algorithm_2026-08-27.md §6.3's write gate
+    (project_ac_enforcement_gap.md item 2) maps to two different codes
+    depending on which half of `access_visibility_service.require_edit`
+    failed:
+
+    - `NodeNotViewableError` → 404, the SAME "Tab not found" every route
+      below already returns for a document_id that plain does not exist —
+      carried from the read side's §9 fail-closed convention
+      (session_handoff_2026-09-04-tab-visibility-wiring.md): a node this
+      caller cannot even see must not be distinguishable from one that
+      isn't there.
+    - `NodeNotEditableError` → 403, not 404. Unlike the view case, a caller
+      who can already VIEW the node knows it exists — their own UI got them
+      to this document_id — so hiding that behind a 404 protects nothing
+      and only confuses a legitimate "you can look but not touch" refusal.
+
+    This is a DIFFERENT convention from `resource_grants.py`'s
+    `_conflict`, which maps every `edit(n)` failure on the GRANTS surface to
+    409 uniformly, deliberately not distinguishing view-only from invisible
+    (that router's own docstring: "who can reach this" is itself sensitive
+    on an ADMINISTRATIVE surface). Ordinary content mutation is not that
+    surface — a rename or a canvas save is refused for an ordinary,
+    RESTful reason, not to keep an admin fact secret — so the split above,
+    not a blanket 409, is this task's judgement call.
+    """
+    if isinstance(error, NodeNotViewableError):
+        return HTTPException(status_code=404, detail="Tab not found")
+    return HTTPException(
+        status_code=403, detail="You do not have edit access to this item"
+    )
 
 
 @router.put("/root", include_in_schema=False)
@@ -165,19 +203,22 @@ omission. This endpoint touches one row and never deletes anything.
 to leave it unchanged. `type`, `access_control` and the layout fields are not
 accepted — see the request schema for why each one is absent.
 
-Authorization is login-only, **identical to the canvas save** — no grant check
-and no lock check. Both omissions are deliberate; see the service function's
-docstring.
+Authorization is `edit(n)` on the component itself
+(project_ac_enforcement_gap.md item 2) — still **no lock check**, matching
+the canvas save on that one axis; see the service function's docstring for
+why the two stay paired there.
 """,
     responses={
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
     },
 )
 def update_component_content_endpoint(
     link: str,
     request: UpdateComponentContentRequest,
     db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     # `model_fields_set` distinguishes "absent" from "explicitly null" — the
     # difference between preserving a title and clearing it. Same mechanism
@@ -192,7 +233,9 @@ def update_component_content_endpoint(
         updates["data"] = request.data
 
     try:
-        updated = update_component_content(db, link, **updates)
+        updated = update_component_content(db, link, access=access, **updates)
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -275,9 +318,19 @@ def get_variants(
     "/{document_id}/variants",
     response_model=TabSummaryResponse,
     summary="Create a tab variant (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def create_variant(document_id: str, request: CreateTabVariantRequest, db: Session = Depends(get_db_v2)):
+def create_variant(
+    document_id: str,
+    request: CreateTabVariantRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
     try:
@@ -292,7 +345,10 @@ def create_variant(document_id: str, request: CreateTabVariantRequest, db: Sessi
             title=request.title,
             access_control=access_control,
             order=request.order,
+            access=access,
         )
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -301,9 +357,14 @@ def create_variant(document_id: str, request: CreateTabVariantRequest, db: Sessi
     "/{document_id}/variants/reorder",
     response_model=TabSummaryListAPIResponse,
     summary="Reorder tab variants (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
 )
-def reorder_variants(document_id: str, request: ReorderTabVariantsRequest, db: Session = Depends(get_db_v2)):
+def reorder_variants(
+    document_id: str,
+    request: ReorderTabVariantsRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
     try:
@@ -311,10 +372,13 @@ def reorder_variants(document_id: str, request: ReorderTabVariantsRequest, db: S
             db=db,
             parent_document_id=document_id,
             ordered_document_ids=request.orderedDocumentIds,
+            access=access,
         )
         if reordered is None:
             raise HTTPException(status_code=404, detail="Parent tab not found")
         return {"data": reordered}
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -343,20 +407,25 @@ def get_content(
     "/{document_id}/content",
     response_model=PageContentAPIResponse,
     summary="Update tab page content (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
 )
 def update_content(
     document_id: str,
     request: UpdateTabContentRequest,
     db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
     try:
-        updated_content = update_tab_content_v2(db=db, document_id=document_id, content=request.content)
+        updated_content = update_tab_content_v2(
+            db=db, document_id=document_id, content=request.content, access=access
+        )
         if updated_content is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": updated_content}
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -365,9 +434,18 @@ def update_content(
     "/",
     response_model=TabSummaryResponse,
     summary="Create a new tab (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def create_new_tab(request: CreateTabRequest, db: Session = Depends(get_db_v2)):
+def create_new_tab(
+    request: CreateTabRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     try:
         access_control = (
             request.access_control.model_dump()
@@ -398,7 +476,10 @@ def create_new_tab(request: CreateTabRequest, db: Session = Depends(get_db_v2)):
             order=request.order,
             access_control=access_control,
             nav_tab_id=nav_tab_id,
+            access=access,
         )
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -407,15 +488,27 @@ def create_new_tab(request: CreateTabRequest, db: Session = Depends(get_db_v2)):
     "/reorder",
     response_model=TabSummaryListAPIResponse,
     summary="Reorder sibling tabs (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def reorder_tabs(request: ReorderTabsRequest, db: Session = Depends(get_db_v2)):
+def reorder_tabs(
+    request: ReorderTabsRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     try:
         reordered = reorder_tabs_by_document_id_v2(
             db=db,
             items=[item.model_dump() for item in request.items],
+            access=access,
         )
         return {"data": reordered}
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -484,9 +577,19 @@ def unlock_tab(
     "/{document_id}",
     response_model=TabWorkspaceAPIResponse,
     summary="Update tab metadata (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def update_tab_metadata(document_id: str, request: UpdateTabRequest, db: Session = Depends(get_db_v2)):
+def update_tab_metadata(
+    document_id: str,
+    request: UpdateTabRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
     try:
@@ -500,16 +603,24 @@ def update_tab_metadata(document_id: str, request: UpdateTabRequest, db: Session
         # carries locked/locked_by at all (see its docstring) — nothing to
         # pass through here, and update_tab_by_document_id_v2 no longer
         # accepts those parameters either.
+        #
+        # §11.2 (owner decision, 2026-09-04): rename is edit(n); reorder
+        # (the `order` field) is edit(parent(n)) per §6.3's table — the
+        # service function itself picks the right one per field present,
+        # see its own docstring.
         updated_workspace = update_tab_by_document_id_v2(
             db=db,
             document_id=document_id,
             title=request.title,
             order=request.order,
             access_control=access_control,
+            access=access,
         )
         if updated_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": updated_workspace}
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -518,9 +629,19 @@ def update_tab_metadata(document_id: str, request: UpdateTabRequest, db: Session
     "/{document_id}/move",
     response_model=TabWorkspaceAPIResponse,
     summary="Move tab (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def move_tab(document_id: str, request: MoveTabRequest, db: Session = Depends(get_db_v2)):
+def move_tab(
+    document_id: str,
+    request: MoveTabRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
     try:
@@ -529,10 +650,13 @@ def move_tab(document_id: str, request: MoveTabRequest, db: Session = Depends(ge
             document_id=document_id,
             new_parent_document_id=request.newParentDocumentId,
             order=request.order,
+            access=access,
         )
         if moved_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": moved_workspace}
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -577,15 +701,21 @@ def move_tab_to_nav_tab(
 @router.delete(
     "/{document_id}",
     summary="Delete tab subtree (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_RESPONSE},
 )
-def delete_tab(document_id: str, db: Session = Depends(get_db_v2)):
+def delete_tab(
+    document_id: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(document_id)
 
     try:
-        delete_result = delete_tab_subtree_by_document_id_v2(db=db, document_id=document_id)
+        delete_result = delete_tab_subtree_by_document_id_v2(db=db, document_id=document_id, access=access)
         if delete_result is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": delete_result}
+    except AccessDeniedError as e:
+        raise _access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
