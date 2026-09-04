@@ -68,7 +68,7 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
 from app.db_v2.models.hub_user import HubUserV2
-from app.dependencies import CurrentHubUser, get_current_hub_user, require_hub_admin
+from app.dependencies import CurrentHubUser, get_current_hub_user, is_hub_admin, require_hub_admin
 from app.schemas.resource_grants import (
     AudienceCountAPIResponse,
     CreateGrantRequest,
@@ -93,7 +93,6 @@ from app.services.resource_grant_authz_service import (
     assert_can_administer_node,
     assert_can_grant,
 )
-from app.services.tab_service import HUB_ADMIN_ROLE
 
 router = APIRouter(prefix="/v2/rbac", tags=["Access Control — Grants"])
 
@@ -120,23 +119,6 @@ def _conflict(error: RbacGraphError) -> HTTPException:
         status_code=409,
         detail={"code": error.code, "message": error.message, **error.details},
     )
-
-
-def _is_hub_admin(current: CurrentHubUser) -> bool:
-    """Reads the JWT's role names, exactly as `require_hub_admin` and
-    `rbac_assignments._is_hub_admin` do.
-
-    THE THIRD COPY, AND DELIBERATELY SO FOR NOW. §6.8 calls for a single
-    `is_hub_admin(db, current)` resolver so that §10 item 6's re-pointing at
-    `role_assignments` is one edit rather than a hunt — but that re-pointing
-    has an ordering requirement the plan calls "not negotiable" (re-point
-    BEFORE Airtable stops issuing roles into the JWT, never after) and it
-    belongs with the cutover, not here. Consolidating the three now would
-    move the gate without moving the sequencing, which is the half that
-    matters. Three greppable copies of one line are a better handover than
-    one shared helper that hides which surfaces the cutover has to visit.
-    """
-    return HUB_ADMIN_ROLE in (current.info.roles or [])
 
 
 # ---------------------------------------------------------
@@ -167,13 +149,17 @@ def list_node_grants(
     into this list.
     """
     # The NODE half of the gate only — a read has no principal to test.
+    # ONE SNAPSHOT (§8.2, §6.8), shared between the Hub Admin check and the
+    # edit(n) check rather than each building its own.
     try:
+        closures = RbacClosures(db)
         assert_can_administer_node(
             db,
             hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             node_kind=node_kind,
             node_id=node_id,
+            closures=closures,
         )
     except RbacGraphError as e:
         raise _conflict(e)
@@ -215,12 +201,14 @@ def list_node_inherited_grants(
     exists).
     """
     try:
+        closures = RbacClosures(db)
         assert_can_administer_node(
             db,
             hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             node_kind=node_kind,
             node_id=node_id,
+            closures=closures,
         )
     except RbacGraphError as e:
         raise _conflict(e)
@@ -334,7 +322,7 @@ def get_retained_access(
         assert_can_administer_node(
             db,
             hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             node_kind=grant["node_kind"],
             node_id=grant["node_id"],
             closures=closures,
@@ -405,15 +393,17 @@ def create_grant(
     measurement and the owner's decision.
     """
     try:
+        closures = RbacClosures(db)
         assert_can_grant(
             db,
             granter_hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             node_kind=request.node_kind,
             node_id=request.node_id,
             role_id=request.role_id,
             scope_id=request.scope_id,
             user_id=request.user_id,
+            closures=closures,
         )
         grant = grants.create_grant(
             db,
@@ -466,15 +456,17 @@ def delete_grant(
         raise HTTPException(status_code=404, detail="Grant not found")
 
     try:
+        closures = RbacClosures(db)
         assert_can_grant(
             db,
             granter_hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             node_kind=grant["node_kind"],
             node_id=grant["node_id"],
             role_id=grant["role_id"],
             scope_id=grant["scope_id"],
             user_id=grant["user_id"],
+            closures=closures,
         )
         grants.delete_grant(db, grant_id)
     except RbacGraphError as e:

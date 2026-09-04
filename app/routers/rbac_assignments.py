@@ -7,8 +7,12 @@ Assignments — who holds what, and delegating that to others. Distinct from
 whole surface is open to any authenticated user, gated instead by §6.1's
 delegation rule, evaluated per-request against the CALLER's own held
 assignments (plus the unconditional Hub Admin bypass, handoff §3.1). No
-route here uses `require_hub_admin` — see that dependency's own docstring
-for why assignments must not reuse it.
+route here uses the `require_hub_admin` DEPENDENCY — see its own docstring
+for why assignments must not reuse it. They do call the shared
+`is_hub_admin(db, current)` RESOLVER directly (§6.8, §10 item 6) to compute
+that bypass, since `require_hub_admin` and this router's bypass must resolve
+"is this caller a Hub Admin" identically even though only one of them is a
+FastAPI dependency.
 
 Every route depends on `get_current_hub_user`, not `get_current_user`: this
 is the surface that made hub_users auto-provisioning a hard prerequisite
@@ -28,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import CurrentHubUser, get_current_hub_user
+from app.dependencies import CurrentHubUser, get_current_hub_user, is_hub_admin
 from app.schemas.rbac_assignments import (
     AssignmentAPIResponse,
     AssignmentListAPIResponse,
@@ -37,8 +41,7 @@ from app.schemas.rbac_assignments import (
 )
 from app.services import rbac_assignment_service, rbac_service
 from app.services.rbac_delegation_service import assert_can_delegate
-from app.services.rbac_graph_service import RbacGraphError
-from app.services.tab_service import HUB_ADMIN_ROLE
+from app.services.rbac_graph_service import RbacClosures, RbacGraphError
 
 router = APIRouter(prefix="/v2/rbac", tags=["Permission Management"])
 
@@ -63,10 +66,6 @@ def _conflict(error: RbacGraphError) -> HTTPException:
         status_code=409,
         detail={"code": error.code, "message": error.message, **error.details},
     )
-
-
-def _is_hub_admin(current: CurrentHubUser) -> bool:
-    return HUB_ADMIN_ROLE in (current.info.roles or [])
 
 
 def _assert_not_public(role: dict, scope: dict) -> None:
@@ -156,7 +155,7 @@ def get_my_revocable(
     other admin granted. A Hub Admin gets everything, unconditionally."""
     return {
         "data": rbac_assignment_service.list_revocable(
-            db, current.hub_user_id, is_hub_admin=_is_hub_admin(current)
+            db, current.hub_user_id, is_hub_admin=is_hub_admin(db, current)
         )
     }
 
@@ -212,12 +211,16 @@ def create_assignment(
 
     try:
         _assert_not_public(role, scope)
+        # ONE SNAPSHOT (§8.2, §6.8): shared between the Hub Admin bypass and
+        # the delegation check below rather than each building its own.
+        closures = RbacClosures(db)
         assert_can_delegate(
             db,
             granter_hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             role_id=request.role_id,
             scope_id=request.scope_id,
+            closures=closures,
         )
         assignment = rbac_assignment_service.create_assignment(
             db,
@@ -264,12 +267,14 @@ def delete_assignment(
         raise HTTPException(status_code=404, detail="Assignment not found")
 
     try:
+        closures = RbacClosures(db)
         assert_can_delegate(
             db,
             granter_hub_user_id=current.hub_user_id,
-            is_hub_admin=_is_hub_admin(current),
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
             role_id=assignment.role_id,
             scope_id=assignment.scope_id,
+            closures=closures,
         )
         rbac_assignment_service.delete_assignment(db, assignment_id)
     except RbacGraphError as e:

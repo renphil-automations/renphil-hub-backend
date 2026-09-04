@@ -131,6 +131,7 @@ def assert_can_delegate(
     is_hub_admin: bool,
     role_id: int,
     scope_id: int,
+    closures: RbacClosures | None = None,
 ) -> None:
     """The full write-gate for an assignment create/revoke (session handoff
     2026-08-24 §3.1, §4): Hub Admin bypasses unconditionally; everyone else
@@ -146,10 +147,18 @@ def assert_can_delegate(
     required a `role_assignments` row to exist for the Hub Admin path too,
     the system would lock itself out of its own bootstrap with no way back
     in except direct DB access.
+
+    ``closures``, added for plan_access_control_algorithm_2026-08-27.md
+    §6.8: the caller (typically a router that also had to resolve
+    ``is_hub_admin`` via ``app.dependencies.is_hub_admin``, which itself
+    calls ``effective_pairs``) may pass a snapshot it is already holding so
+    this shares it rather than building a second one. Purely a cost
+    optimization — omitted, ``can_delegate`` builds its own exactly as
+    before.
     """
     if is_hub_admin:
         return
-    if can_delegate(db, granter_hub_user_id, role_id, scope_id):
+    if can_delegate(db, granter_hub_user_id, role_id, scope_id, closures=closures):
         return
     raise RbacGraphError(
         "not_delegable",
