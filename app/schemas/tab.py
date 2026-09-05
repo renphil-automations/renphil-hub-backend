@@ -151,6 +151,20 @@ class TabSummaryResponse(BaseModel):
     # GridCanvasContent.schemaVersion (the JSONB content-shape version).
     apiVersion: Literal["v1", "v2"] = "v1"
 
+    # The resource_grants node (plan_access_control_algorithm_2026-08-27.md
+    # §9) this row's "Manage Access" should actually edit — the same NodeRef
+    # `resolve_gridstack_node` already resolves to produce view/edit/revealed
+    # above, just also serialized. For a root tab or variant this equals
+    # `("tab", self.id)`; for a nested SGS sub-tab it is the SUB-GRID'S
+    # REPRESENTATION COMPONENT (§3.1), a different id than `id` above, which
+    # for a sub-tab is the gridstack's own id — there was previously no way
+    # for the frontend to resolve one from the other. `None` for v1 tabs
+    # (no resource_grants equivalent exists) and for an orphaned v2 row
+    # (§3.3 fail-closed). Independent of `access` — populated on every read,
+    # including internal mutation-response echoes that pass none.
+    node_kind: Literal["hub", "nav_tab", "tab", "component"] | None = None
+    node_id: int | None = None
+
     # Empty for reads; populated by v2 mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
@@ -192,6 +206,10 @@ class TabWorkspaceResponse(BaseModel):
 
     apiVersion: Literal["v1", "v2"] = "v1"
 
+    # See TabSummaryResponse's identical fields for what these mean.
+    node_kind: Literal["hub", "nav_tab", "tab", "component"] | None = None
+    node_id: int | None = None
+
     # Empty for reads; populated by v2 mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
@@ -224,6 +242,12 @@ class NavTabResponse(BaseModel):
     protected: StrictBool = False
 
     icon: StrictStr | None = None
+
+    # See TabSummaryResponse's identical fields — a nav tab maps straight to
+    # its own node (`("nav_tab", self.id)`), no gridstack indirection to
+    # resolve, unlike a tab/sub-grid.
+    node_kind: Literal["hub", "nav_tab", "tab", "component"] | None = None
+    node_id: int | None = None
 
     # Empty for reads; populated by mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)

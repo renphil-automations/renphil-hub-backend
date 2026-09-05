@@ -416,6 +416,14 @@ def _format_tab_summary(
     else:
         title = gridstack.name
 
+    # this session: resolved once here (whether or not a caller passes
+    # `access`) so every summary — including internal mutation-response
+    # echoes — carries the real resource_grants node to edit, not just the
+    # `id` above (which for a non-root gridstack is the SUB-GRID's own id,
+    # not its representation component's — see `node_kind`/`node_id`'s own
+    # doc comment on TabSummaryResponse).
+    ac_node = resolve_gridstack_node(db, gridstack)
+
     summary = {
         "id": node_id,
         "documentId": gridstack.document_id,
@@ -432,6 +440,8 @@ def _format_tab_summary(
         "navTabDocumentId": nav_tab_document_id,
         "navTabTitle": nav_tab_title,
         "apiVersion": "v2",
+        "node_kind": ac_node[0] if ac_node is not None else None,
+        "node_id": ac_node[1] if ac_node is not None else None,
     }
     # plan_access_control_algorithm_2026-08-27.md §5.2's triple. Only added
     # when a caller passes `access` — every internal caller that doesn't
@@ -439,7 +449,7 @@ def _format_tab_summary(
     # keeps returning exactly what it always has, `view`/`edit`/`revealed`
     # simply absent (the schema defaults them to None on the wire).
     if access is not None:
-        verdict = access.verdict(resolve_gridstack_node(db, gridstack))
+        verdict = access.verdict(ac_node)
         summary["view"] = verdict.view
         summary["edit"] = verdict.edit
         summary["revealed"] = verdict.revealed
@@ -1857,9 +1867,14 @@ def get_tab_workspace_v2(
     # router's existing `if workspace is None: raise 404` already produces
     # that response; returning None here for "exists but invisible" is what
     # makes the two indistinguishable from outside, as designed.
+    # this session: resolved unconditionally, same reasoning as
+    # `_format_tab_summary`'s identical line — the workspace response needs
+    # the real resource_grants node regardless of whether a caller passes
+    # `access`.
+    ac_node = resolve_gridstack_node(db, gridstack)
     own_verdict = None
     if access is not None:
-        own_verdict = access.verdict(resolve_gridstack_node(db, gridstack))
+        own_verdict = access.verdict(ac_node)
         if not own_verdict.view:
             return None
 
@@ -1923,6 +1938,8 @@ def get_tab_workspace_v2(
         "children": child_summaries,
         "has_variants": has_variants,
         "apiVersion": "v2",
+        "node_kind": ac_node[0] if ac_node is not None else None,
+        "node_id": ac_node[1] if ac_node is not None else None,
     }
     if own_verdict is not None:
         workspace["view"] = own_verdict.view

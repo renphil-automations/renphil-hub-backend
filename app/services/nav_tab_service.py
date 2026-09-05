@@ -112,6 +112,10 @@ def _format_nav_tab(nav_tab: NavTabV2, *, access: ViewerAccess | None = None) ->
         "access_control": _access_control_or_default(nav_tab.access_control),
         "protected": bool(nav_tab.protected),
         "icon": nav_tab.icon,
+        # this session: the resource_grants node "Manage Access" edits.
+        # Independent of `access` — set on every read.
+        "node_kind": "nav_tab",
+        "node_id": nav_tab.id,
     }
     if access is not None:
         # A nav tab maps straight to its own node — no gridstack indirection
