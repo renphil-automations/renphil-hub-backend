@@ -73,6 +73,7 @@ from app.services.resource_grant_service import (
     get_grant,
     list_grants_for_node,
     matching_grants,
+    resolve_node_labels,
     seeds_for_principal,
 )
 
@@ -1000,12 +1001,27 @@ def list_inherited_grants(
     for all three, so none of them needs a separate check here.
     """
     node_tree = tree if tree is not None else build_node_tree(db)
+    ancestors = node_tree.ancestors((node_kind, node_id))
+    by_ancestor = {ref: list_grants_for_node(db, ref[0], ref[1]) for ref in ancestors}
+    non_empty = [ref for ref, rows in by_ancestor.items() if rows]
+    # This session: one batched label lookup for every ancestor that has
+    # grants — not one query per ancestor (§8.2's "build once" convention,
+    # same reasoning `resolve_node_labels` itself already documents).
+    labels = resolve_node_labels(db, set(non_empty))
     entries: list[dict] = []
-    for ancestor_kind, ancestor_id in node_tree.ancestors((node_kind, node_id)):
-        rows = list_grants_for_node(db, ancestor_kind, ancestor_id)
+    for ancestor_kind, ancestor_id in ancestors:
+        ref = (ancestor_kind, ancestor_id)
+        rows = by_ancestor[ref]
         if not rows:
             continue
-        entries.append({"node_kind": ancestor_kind, "node_id": ancestor_id, "grants": rows})
+        entries.append(
+            {
+                "node_kind": ancestor_kind,
+                "node_id": ancestor_id,
+                "node_label": labels[ref],
+                "grants": rows,
+            }
+        )
     return entries
 
 

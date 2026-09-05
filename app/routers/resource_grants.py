@@ -274,7 +274,15 @@ def get_user_access(
         raise HTTPException(status_code=404, detail="Hub user not found")
 
     visibility = compute_visibility(db, user_id)
-    return {"data": {"user_id": user_id, "nodes": list_visible_nodes(visibility)}}
+    nodes = list_visible_nodes(visibility)
+    # this session: `list_visible_nodes` itself stays pure (see its own
+    # docstring) — the label is a router-level formatting concern, resolved
+    # here in one batched query per node kind rather than pushed into that
+    # function's signature.
+    labels = grants.resolve_node_labels(db, {(n["node_kind"], n["node_id"]) for n in nodes})
+    for n in nodes:
+        n["node_label"] = labels[(n["node_kind"], n["node_id"])]
+    return {"data": {"user_id": user_id, "nodes": nodes}}
 
 
 @router.get(

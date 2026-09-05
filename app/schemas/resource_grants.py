@@ -49,6 +49,14 @@ class ResourceGrantResponse(BaseModel):
     node_kind: NodeKind
     node_id: int
 
+    # This session: a display name for the node above ("Nav Tab: Test 1"
+    # instead of "Nav tab #7") — resolved by `resolve_node_labels`. `None`
+    # when the caller didn't resolve one (e.g. `list_node_grants`'s direct
+    # grants, where every row's node is already the one panel the caller is
+    # looking at — see `serialize_grant`'s own doc comment); always
+    # populated for `covering_grants`, which names an ancestor.
+    node_label: str | None = None
+
     # Exactly one FORM is populated: either both of role_id/scope_id, or
     # user_id alone. Enforced by `ck_resource_grants_one_principal`.
     #
@@ -200,6 +208,12 @@ class InheritedGrantsEntry(BaseModel):
 
     node_kind: NodeKind
     node_id: int
+    # This session: the ancestor's display name ("Nav Tab: Test 1"), same
+    # `resolve_node_labels` as `ResourceGrantResponse.node_label` — see that
+    # field's own doc comment for the format per kind. Always populated
+    # here (unlike that field, which is sometimes deliberately `None`):
+    # naming the ancestor is the entire point of this entry existing.
+    node_label: str
     grants: list[ResourceGrantResponse] = Field(default_factory=list)
 
 
@@ -249,6 +263,10 @@ class UserAccessNodeResponse(BaseModel):
 
     node_kind: NodeKind
     node_id: int
+    # This session: same `resolve_node_labels` as the other two surfaces —
+    # see `ResourceGrantResponse.node_label`'s doc comment for the format
+    # per kind. Always populated here (the router resolves one per node).
+    node_label: str
     view: bool
     edit: bool
     revealed: bool

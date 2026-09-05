@@ -126,20 +126,93 @@ def node_of(grant: ResourceGrantV2) -> tuple[str, int]:
     )
 
 
-def serialize_grant(grant: ResourceGrantV2, *, user_email: str | None = None) -> dict:
-    """`user_email` is resolved by the CALLER, never looked up in here — this
-    stays a one-row, no-query function so a caller serializing many grants
-    (``list_grants_for_node``, ``list_grants_by_ids``) can resolve every
-    email in one bulk query first (``_hub_user_email_map``) rather than
-    round-tripping per row. Pass ``None`` for a (role, scope)-form grant or
-    when the caller has not resolved it; the schema treats both the same
-    (handoff §4.1).
+def resolve_node_labels(db: Session, refs: set[tuple[str, int]]) -> dict[tuple[str, int], str]:
+    """Display name for each `(node_kind, node_id)` in `refs` — the thing
+    "Nav tab #7" was standing in for everywhere a UI names another node:
+    `list_inherited_grants`'s ancestor entries, a `covering_grants` row's
+    "already granted by ...", and the "what can this person access" panel.
+
+    Batched ONE QUERY PER KIND PRESENT in `refs`, not one per node — the
+    same "build once" reasoning `_hub_user_email_map` below already applies
+    to emails, generalized across four tables instead of one.
+
+    Format, by kind (owner's own call, this session):
+      hub       -- always "Hub". One row, no name column exists (HubV2 has
+                   none — see its own docstring).
+      nav_tab   -- its title.
+      tab       -- its title.
+      component -- "{type}: {title}" when it has a title (most don't — it's
+                   an optional field), else "{type}#{id}". The type is the
+                   one thing every component always has.
+
+    A ref whose row is gone by the time this runs (deleted between an
+    earlier query and this one) falls back to "{Kind} #{id}" — the exact
+    string this function exists to stop being the NORMAL case, kept only as
+    the race-condition fallback, matching `list_grants_by_ids`'s own
+    tolerance for the identical race ("a shorter list, not a failed
+    confirmation").
+    """
+    ids_by_kind: dict[str, set[int]] = {}
+    for kind, node_id in refs:
+        ids_by_kind.setdefault(kind, set()).add(node_id)
+
+    labels: dict[tuple[str, int], str] = {}
+
+    for node_id in ids_by_kind.get("hub", ()):
+        labels[("hub", node_id)] = "Hub"
+
+    nav_tab_ids = ids_by_kind.get("nav_tab", ())
+    if nav_tab_ids:
+        found = dict(
+            db.query(NavTabV2.id, NavTabV2.title).filter(NavTabV2.id.in_(nav_tab_ids)).all()
+        )
+        for node_id in nav_tab_ids:
+            labels[("nav_tab", node_id)] = found.get(node_id) or f"Nav tab #{node_id}"
+
+    tab_ids = ids_by_kind.get("tab", ())
+    if tab_ids:
+        found = dict(db.query(TabV2.id, TabV2.title).filter(TabV2.id.in_(tab_ids)).all())
+        for node_id in tab_ids:
+            labels[("tab", node_id)] = found.get(node_id) or f"Tab #{node_id}"
+
+    component_ids = ids_by_kind.get("component", ())
+    if component_ids:
+        rows = (
+            db.query(ComponentV2.id, ComponentV2.type, ComponentV2.title)
+            .filter(ComponentV2.id.in_(component_ids))
+            .all()
+        )
+        found = {row_id: (row_type, row_title) for row_id, row_type, row_title in rows}
+        for node_id in component_ids:
+            found_row = found.get(node_id)
+            if found_row is None:
+                labels[("component", node_id)] = f"Component #{node_id}"
+                continue
+            ctype, title = found_row
+            labels[("component", node_id)] = f"{ctype}: {title}" if title else f"{ctype}#{node_id}"
+
+    return labels
+
+
+def serialize_grant(
+    grant: ResourceGrantV2, *, user_email: str | None = None, node_label: str | None = None
+) -> dict:
+    """`user_email` and `node_label` are both resolved by the CALLER, never
+    looked up in here — this stays a one-row, no-query function so a caller
+    serializing many grants (``list_grants_for_node``, ``list_grants_by_ids``)
+    can resolve every email and every node label in one bulk query first
+    (``_hub_user_email_map``, ``resolve_node_labels``) rather than
+    round-tripping per row. Pass ``None`` for a (role, scope)-form grant, or
+    when the caller has not resolved a label; the schema treats an absent
+    label as "the caller didn't need one" (e.g. `list_node_grants`, where
+    every row's node is already known from context).
     """
     node_kind, node_id = node_of(grant)
     return {
         "id": grant.id,
         "node_kind": node_kind,
         "node_id": node_id,
+        "node_label": node_label,
         "role_id": grant.role_id,
         "scope_id": grant.scope_id,
         "user_id": grant.user_id,
@@ -332,10 +405,17 @@ def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
     rows = db.query(ResourceGrantV2).filter(ResourceGrantV2.id.in_(set(grant_ids))).all()
     by_id = {row.id: row for row in rows}
     emails = _hub_user_email_map(db, {row.user_id for row in rows if row.user_id is not None})
+    # `covering_grants` rows name an ANCESTOR, not the node the caller asked
+    # about (that's the whole point of "already granted by Nav 1") — so
+    # unlike `_serialize_many`, every row here can sit on a different node
+    # and each needs its own label. Harmless, if unused by the caller, for
+    # `responsible_grants` (same shape, same function serves both).
+    labels = resolve_node_labels(db, {node_of(row) for row in rows})
     return [
         serialize_grant(
             by_id[gid],
             user_email=emails.get(by_id[gid].user_id) if by_id[gid].user_id is not None else None,
+            node_label=labels.get(node_of(by_id[gid])),
         )
         for gid in grant_ids
         if gid in by_id
