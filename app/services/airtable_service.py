@@ -8007,26 +8007,31 @@ class AirtableService:
     async def _find_user_by_work_email(
         self, work_email: str
     ) -> dict[str, Any] | None:
-        """Find a user record by exact (case-insensitive) Work Email."""
+        """Find a user record by exact (case-insensitive) Work Email, falling
+        back to the Alias Email field when Work Email is empty or doesn't match."""
         normalized = (work_email or "").strip().lower()
         if not normalized:
             return None
-        email_field = self._settings.USERS_WORK_EMAIL_FIELD
-        formula = (
-            f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
-        )
+        escaped = self._escape(normalized)
         table = self._users_table()
-        try:
-            records = await asyncio.to_thread(
-                table.all, formula=formula, max_records=1
-            )
-        except RequestException as exc:
-            logger.error("Airtable user lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during user lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        return records[0] if records else None
+        for email_field in (
+            self._settings.USERS_WORK_EMAIL_FIELD,
+            self._settings.USERS_ALIAS_EMAIL_FIELD,
+        ):
+            formula = f"LOWER({{{email_field}}}) = '{escaped}'"
+            try:
+                records = await asyncio.to_thread(
+                    table.all, formula=formula, max_records=1
+                )
+            except RequestException as exc:
+                logger.error("Airtable user lookup failed: %s", exc)
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception("Unexpected Airtable error during user lookup")
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            if records:
+                return records[0]
+        return None
 
     async def get_user_by_work_email(self, work_email: str) -> UserRecord:
         """Return the user record matching the given Work Email."""
