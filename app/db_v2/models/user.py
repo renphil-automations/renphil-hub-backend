@@ -43,3 +43,4 @@ class UserV2(BaseV2):
     end_date = Column("EndDate", Date, nullable=True)
     manager_tech_stack_selections = Column(Text, nullable=True)
     add_to_website_date = Column(DateTime(timezone=True), nullable=True)
+    alias_email = Column(String, nullable=True)
