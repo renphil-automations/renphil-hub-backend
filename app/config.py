@@ -148,6 +148,7 @@ class Settings(BaseSettings):
     TEAMS_WORK_EMAIL_FIELD: str
     TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
+    USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
     USERS_FIRST_NAME_FIELD: str
     USERS_LAST_NAME_FIELD: str
