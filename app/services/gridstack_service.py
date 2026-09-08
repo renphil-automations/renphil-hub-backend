@@ -370,15 +370,20 @@ def _safe_locked_triple(
 ) -> tuple[bool, str, datetime | None]:
     """(locked, locked_by, locked_at). Was `_safe_locked_pair` — widened for
     plan §6.6 Fix 2 rather than adding a third parallel helper; both call
-    sites already destructure it right where they need `is_lock_stale`."""
+    sites already destructure it right where they need `is_lock_stale`.
+
+    edit-mode-gap follow-up (2026-09-07): a non-root gridstack (a
+    sub-gridstack) now carries its OWN locked/locked_by/locked_at, read
+    directly off its own row — independent of its owning root/variant's
+    TabV2-level lock and of any sibling sub-gridstack's. See
+    `lock_tab_by_document_id_v2` / `unlock_tab_by_document_id_v2`, the only
+    writers of either flavor of lock."""
     if _is_root(gridstack):
         tab = root_tab if root_tab is not _ROOT_TAB_NOT_FETCHED else _get_root_tab(db, gridstack)
         if tab is None:
             return False, "", None
         return bool(tab.locked), (tab.locked_by or ""), tab.locked_at
-    # Nested gridstacks have no lock columns — lock granularity is
-    # whole-tab-only in this schema (Phase 2 decision).
-    return False, "", None
+    return bool(gridstack.locked), (gridstack.locked_by or ""), gridstack.locked_at
 
 
 def _has_variants(db: Session, tab_id: int) -> bool:
@@ -453,6 +458,7 @@ def _format_tab_summary(
         summary["view"] = verdict.view
         summary["edit"] = verdict.edit
         summary["revealed"] = verdict.revealed
+        summary["edit_seed"] = verdict.edit_seed
     return summary
 
 
@@ -873,7 +879,16 @@ def _apply_visibility_to_content(
     like the function it replaces — BlockNote content and ``None`` pass
     through untouched, and so does anything already caught by
     ``access.full_access`` (the Hub Admin bypass — mirrors that function's
-    own "Hub admins bypass per-widget filtering" short-circuit).
+    own "Hub admins bypass per-widget filtering" short-circuit). Admins get
+    no `edit`/`node_kind`/`node_id` stamped below either, same as today's
+    tab/nav-tab responses under full_access — the frontend already ORs every
+    seed check with `isAdmin`.
+
+    Also stamps each SURVIVING widget's own `edit`/`node_kind`/`node_id` —
+    added for the component-level "seed" pencil
+    (plan_access_control_algorithm_2026-08-27.md §6.1/§9) — so the frontend
+    can tell a component-only edit grant from one merely inherited from the
+    owning canvas, the same way it already can for tabs/nav tabs.
 
     ``_serialize_gridstack_content`` keys ``widgets`` by
     ``str(component.id)`` (confirmed by reading it — NOT by ``link``), so
@@ -881,7 +896,12 @@ def _apply_visibility_to_content(
     with no lookup needed. A mirror's own key already reflects §3.4's
     conjunction (position AND target) because ``access.is_granted`` reads
     the fold's ``granted_view``, which ``_apply_mirror_substitution``
-    already adjusted — no separate mirror handling belongs here.
+    already adjusted — no separate mirror handling belongs here. The
+    redaction decision below MUST keep using ``is_granted``/``granted_view``
+    rather than ``verdict().view``/``visible``: ``_apply_mirror_substitution``
+    deliberately leaves ``visible`` untouched for a conjunction-failing
+    mirror (so it still renders as a `restricted` shell, not a hole in the
+    canvas) — reading `.view` here would show it in full instead.
     """
     if not isinstance(content, dict) or content.get("schemaVersion") != 2:
         return content
@@ -893,7 +913,6 @@ def _apply_visibility_to_content(
         return content
 
     filtered_widgets: dict[str, Any] = {}
-    changed = False
     for widget_id, widget_entry in widgets.items():
         try:
             component_id = int(widget_id)
@@ -903,14 +922,20 @@ def _apply_visibility_to_content(
             # "not a dict → leave it" defensiveness one line up.
             filtered_widgets[widget_id] = widget_entry
             continue
-        if access.is_granted(("component", component_id)):
-            filtered_widgets[widget_id] = widget_entry
+        node = ("component", component_id)
+        if access.is_granted(node):
+            filtered_widgets[widget_id] = {
+                **widget_entry,
+                # `.edit` also reads `granted_edit`, which the same mirror
+                # conjunction adjusts — safe to read via `verdict()` here
+                # since `is_granted` already gated the branch.
+                "edit": access.verdict(node).edit,
+                "node_kind": "component",
+                "node_id": component_id,
+            }
         else:
             filtered_widgets[widget_id] = {"type": "restricted", "data": None}
-            changed = True
 
-    if not changed:
-        return content
     return {**content, "widgets": filtered_widgets}
 
 
@@ -1945,6 +1970,7 @@ def get_tab_workspace_v2(
         workspace["view"] = own_verdict.view
         workspace["edit"] = own_verdict.edit
         workspace["revealed"] = own_verdict.revealed
+        workspace["edit_seed"] = own_verdict.edit_seed
     return workspace
 
 
@@ -2791,7 +2817,35 @@ def lock_tab_by_document_id_v2(db: Session, document_id: str, locked_by: str) ->
     still have a live claim on this lock". Re-entry by the same holder and a
     claim of a stale lock both refresh `locked_at`, which is what makes a
     lock that is actively being used never go stale out from under its own
-    holder."""
+    holder.
+
+    edit-mode-gap follow-up (2026-09-07): a non-root gridstack (a
+    sub-gridstack) is now ALSO lockable — independently of any SIBLING
+    sub-gridstack, on its own locked/locked_by/locked_at columns (see the
+    model's own comment on why those are real columns and not a
+    components.props JSONB key). Same ownership/staleness rule as the root
+    branch below, just applied to the gridstack row directly instead of
+    its owning TabV2 row — deliberately ONE function, not two, so the rule
+    cannot drift between the two lock flavors.
+
+    NOT independent of its OWNING root/variant, though — see
+    `_cascade_lock_to_nested_gridstacks` below. The two lock flavors used
+    to be entirely unaware of each other (found live, 2026-09-07): locking
+    a root/variant never touched its nested sub-gridstacks' own columns,
+    so a SECOND user could independently, successfully lock (and,
+    per §12, non-lock-enforced, WRITE to) a sub-gridstack while the first
+    user's whole-subtree lock believed it already owned exclusive access
+    to it — and symmetrically, locking a sub-gridstack never checked
+    whether its owning root/variant was already locked by someone else
+    either. Closed in both directions: acquiring a root/variant's lock now
+    also cascades onto every nested sub-gridstack beneath it (one level —
+    sub-gridstacks never nest further) and refuses if any of them is
+    already held, fresh, by someone else; acquiring a sub-gridstack's own
+    lock now also checks whether its owning root/variant is already held,
+    fresh, by someone else. Refuse-on-conflict in both directions, never
+    silent takeover — the same rule this function already applies to its
+    OWN lock, just extended across the two flavors instead of inventing a
+    new one."""
     try:
         locked_by = _validate_locked_by(locked_by)
         if not locked_by:
@@ -2801,21 +2855,45 @@ def lock_tab_by_document_id_v2(db: Session, document_id: str, locked_by: str) ->
         if gridstack is None:
             return None
 
-        if not _is_root(gridstack):
-            raise ValueError("Locking is only supported for top-level tabs in this schema version")
+        if _is_root(gridstack):
+            tab = _get_root_tab(db, gridstack)
+            if tab is None:
+                return None
 
-        tab = _get_root_tab(db, gridstack)
-        if tab is None:
-            return None
+            held_by_someone_else = tab.locked and tab.locked_by and tab.locked_by != locked_by
+            if held_by_someone_else and not is_lock_stale(tab.locked_at):
+                raise ValueError(f"Tab is already locked by {tab.locked_by}")
 
-        held_by_someone_else = tab.locked and tab.locked_by and tab.locked_by != locked_by
-        if held_by_someone_else and not is_lock_stale(tab.locked_at):
-            raise ValueError(f"Tab is already locked by {tab.locked_by}")
+            conflicting_holder = _find_conflicting_nested_lock(db, tab.id, locked_by)
+            if conflicting_holder is not None:
+                raise ValueError(f"A sub-grid inside this tab is already locked by {conflicting_holder}")
 
-        tab.locked = True
-        tab.locked_by = locked_by
-        tab.locked_at = _utc_now()
-        tab.updated_at = _utc_now()
+            now = _utc_now()
+            tab.locked = True
+            tab.locked_by = locked_by
+            tab.locked_at = now
+            tab.updated_at = now
+            _cascade_lock_to_nested_gridstacks(db, tab.id, locked_by, now)
+        else:
+            held_by_someone_else = (
+                gridstack.locked and gridstack.locked_by and gridstack.locked_by != locked_by
+            )
+            if held_by_someone_else and not is_lock_stale(gridstack.locked_at):
+                raise ValueError(f"Tab is already locked by {gridstack.locked_by}")
+
+            owning_tab = _get_root_tab(db, gridstack)
+            if (
+                owning_tab is not None
+                and owning_tab.locked
+                and owning_tab.locked_by
+                and owning_tab.locked_by != locked_by
+                and not is_lock_stale(owning_tab.locked_at)
+            ):
+                raise ValueError(f"The tab owning this sub-grid is already locked by {owning_tab.locked_by}")
+
+            gridstack.locked = True
+            gridstack.locked_by = locked_by
+            gridstack.locked_at = _utc_now()
 
         db.commit()
         return get_tab_workspace_v2(db, document_id)
@@ -2823,6 +2901,61 @@ def lock_tab_by_document_id_v2(db: Session, document_id: str, locked_by: str) ->
     except Exception:
         db.rollback()
         raise
+
+
+def _find_conflicting_nested_lock(db: Session, tab_id: int, locked_by: str) -> str | None:
+    """The holder's name if any sub-gridstack nested under `tab_id`'s own
+    canvas is currently locked, fresh, by someone other than `locked_by` —
+    else `None`. `parent_tab_id` is denormalized to the owning TabV2 row at
+    every depth (GridstackV2's own comment), so this is a flat query
+    regardless of how deep any one sub-gridstack happens to sit; live data
+    and product design both keep it to exactly one level in practice (see
+    `lock_tab_by_document_id_v2`'s own docstring)."""
+    nested = (
+        db.query(GridstackV2)
+        .filter(GridstackV2.parent_tab_id == tab_id, GridstackV2.parent_id.isnot(None))
+        .all()
+    )
+    for sub in nested:
+        if sub.locked and sub.locked_by and sub.locked_by != locked_by and not is_lock_stale(sub.locked_at):
+            return sub.locked_by
+    return None
+
+
+def _cascade_lock_to_nested_gridstacks(db: Session, tab_id: int, locked_by: str, locked_at: datetime) -> None:
+    """Mirrors `locked=True` onto every sub-gridstack nested under `tab_id`'s
+    own canvas — called only after `_find_conflicting_nested_lock` has
+    already confirmed none of them is held, fresh, by anyone else, so this
+    never overwrites a live conflicting claim. A stale or already-
+    same-holder lock on one of them is simply refreshed along with
+    everything else, matching re-entry's own semantics elsewhere in this
+    function."""
+    nested = (
+        db.query(GridstackV2)
+        .filter(GridstackV2.parent_tab_id == tab_id, GridstackV2.parent_id.isnot(None))
+        .all()
+    )
+    for sub in nested:
+        sub.locked = True
+        sub.locked_by = locked_by
+        sub.locked_at = locked_at
+
+
+def _cascade_unlock_nested_gridstacks(db: Session, tab_id: int, unlocked_by: str | None) -> None:
+    """The release-side mirror of `_cascade_lock_to_nested_gridstacks` — see
+    its call site's own comment on why this only clears a nested
+    sub-gridstack whose `locked_by` still matches `unlocked_by`, not every
+    nested sub-gridstack under `tab_id` unconditionally."""
+    nested = (
+        db.query(GridstackV2)
+        .filter(GridstackV2.parent_tab_id == tab_id, GridstackV2.parent_id.isnot(None))
+        .all()
+    )
+    for sub in nested:
+        if sub.locked and sub.locked_by == unlocked_by:
+            sub.locked = False
+            sub.locked_by = ""
+            sub.locked_at = None
 
 
 def unlock_tab_by_document_id_v2(
@@ -2870,24 +3003,43 @@ def unlock_tab_by_document_id_v2(
         if gridstack is None:
             return None
 
-        if not _is_root(gridstack):
-            raise ValueError("Locking is only supported for top-level tabs in this schema version")
+        # edit-mode-gap follow-up (2026-09-07): mirrors the lock-side branch
+        # in `lock_tab_by_document_id_v2` — see its docstring. No `and
+        # unlocked_by` short-circuit on either branch — see the docstring
+        # above. A falsy `unlocked_by` must never read as "match", only ever
+        # as "not proven to be the holder".
+        if _is_root(gridstack):
+            tab = _get_root_tab(db, gridstack)
+            if tab is None:
+                return None
 
-        tab = _get_root_tab(db, gridstack)
-        if tab is None:
-            return None
+            held_by_someone_else = tab.locked and tab.locked_by and tab.locked_by != unlocked_by
+            if not force and held_by_someone_else and not is_lock_stale(tab.locked_at):
+                raise ValueError(f"Tab is locked by {tab.locked_by}")
 
-        # No `and unlocked_by` short-circuit — see the docstring above. A
-        # falsy `unlocked_by` must never read as "match", only ever as
-        # "not proven to be the holder".
-        held_by_someone_else = tab.locked and tab.locked_by and tab.locked_by != unlocked_by
-        if not force and held_by_someone_else and not is_lock_stale(tab.locked_at):
-            raise ValueError(f"Tab is locked by {tab.locked_by}")
+            tab.locked = False
+            tab.locked_by = ""
+            tab.locked_at = None
+            tab.updated_at = _utc_now()
+            # Mirror the lock side's cascade — but only clear a nested
+            # sub-gridstack whose OWN `locked_by` still matches this unlock
+            # (normally every one of them, since the lock side only ever
+            # cascaded onto ones it could safely claim). Never blind-clear
+            # by tab id alone: a sub-gridstack whose lock went stale here
+            # and was independently, legitimately re-claimed by someone
+            # else in the meantime (`force` skips the check above, but not
+            # this one) must keep its own real holder's lock intact.
+            _cascade_unlock_nested_gridstacks(db, tab.id, unlocked_by)
+        else:
+            held_by_someone_else = (
+                gridstack.locked and gridstack.locked_by and gridstack.locked_by != unlocked_by
+            )
+            if not force and held_by_someone_else and not is_lock_stale(gridstack.locked_at):
+                raise ValueError(f"Tab is locked by {gridstack.locked_by}")
 
-        tab.locked = False
-        tab.locked_by = ""
-        tab.locked_at = None
-        tab.updated_at = _utc_now()
+            gridstack.locked = False
+            gridstack.locked_by = ""
+            gridstack.locked_at = None
 
         db.commit()
         return get_tab_workspace_v2(db, document_id)

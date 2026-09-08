@@ -122,17 +122,32 @@ class NodeVerdict(NamedTuple):
     reveal exposes the ancestor's existence and title. Sharing one widget out
     of a nav tab called "Board Compensation" tells the recipient that tab
     exists and what it is called.
+
+    ``edit_seed`` — added 2026-09-07 (edit-mode-gap follow-up), OUTSIDE
+    §5.2's own three-field spec, so it lives as a fourth field rather than
+    forcing it into one of the three above. ``seed_edit(n)`` from the fold's
+    own formula (``edit(n) = seed_edit(n) ∨ edit(parent(n))``) — TRUE iff a
+    resource_grant is written DIRECTLY on this exact node, independent of
+    whether an ancestor's grant ALSO makes ``edit`` true. Client-side
+    "frontier" placement (an inherited grant suppressing a descendant's own
+    pencil) used to be approximated from ``edit``/parent-``edit`` alone
+    (``isEditFrontier``); that conflates "no grant of my own" with "a grant
+    of my own that an ancestor's grant happens to also cover", which breaks
+    the moment TWO different nodes on the same path are each independently
+    seeded (the exact case a per-sub-gridstack lock now needs to tell apart).
+    Exposing the real bit removes the guesswork.
     """
 
     view: bool
     edit: bool
     revealed: bool
+    edit_seed: bool = False
 
 
 # The verdict every node that does not exist, or whose parent chain does not
 # reach the hub, evaluates to. §3.3: an orphan is INVISIBLE, not
 # "unreachable-therefore-open".
-INVISIBLE = NodeVerdict(view=False, edit=False, revealed=False)
+INVISIBLE = NodeVerdict(view=False, edit=False, revealed=False, edit_seed=False)
 
 
 # ---------------------------------------------------------
@@ -582,14 +597,22 @@ class VisibilityResult:
         granted_view: set[NodeRef],
         granted_edit: set[NodeRef],
         visible: set[NodeRef],
+        edit_seeds: set[NodeRef] = frozenset(),
     ) -> None:
         self.tree = tree
         self.granted_view = granted_view
         self.granted_edit = granted_edit
         self.visible = visible
+        # Raw, pre-fold, pre-mirror-substitution seed set — see
+        # ``NodeVerdict.edit_seed``'s own docstring. Deliberately NOT
+        # ``granted_edit`` (which is folded/inherited) and NOT touched by
+        # ``_apply_mirror_substitution`` (which only ever narrows
+        # ``granted_view``/``granted_edit``, never this).
+        self.edit_seeds = edit_seeds
 
     def verdict(self, node_kind: str, node_id: int) -> NodeVerdict:
-        """§5.2's triple for one node. ``INVISIBLE`` for an unknown node and
+        """§5.2's triple for one node (plus ``edit_seed``, outside the
+        spec — see ``NodeVerdict``). ``INVISIBLE`` for an unknown node and
         for an orphan — the same answer, deliberately, since "this node does
         not exist" and "this node is not reachable from the hub" must not be
         distinguishable from outside."""
@@ -611,6 +634,7 @@ class VisibilityResult:
             # construction, and the implication cannot come apart.
             edit=ref in self.granted_edit,
             revealed=not granted,
+            edit_seed=ref in self.edit_seeds,
         )
 
     def is_granted(self, node_kind: str, node_id: int) -> bool:
@@ -676,6 +700,7 @@ def fold(tree: NodeTree, seeds: list[GrantMatch]) -> VisibilityResult:
         granted_view=granted_view,
         granted_edit=granted_edit,
         visible=visible,
+        edit_seeds=edit_seeds,
     )
 
 
@@ -1219,7 +1244,11 @@ class ViewerAccess(NamedTuple):
 
     def verdict(self, node: NodeRef | None) -> NodeVerdict:
         if self.full_access:
-            return NodeVerdict(view=True, edit=True, revealed=False)
+            # Hub Admin bypass: `edit_seed=True` too, matching every other
+            # `isAdmin ||` bypass site in the frontend — an admin's pencil
+            # is never gated on "does a grant exist", the same way `edit`
+            # here isn't.
+            return NodeVerdict(view=True, edit=True, revealed=False, edit_seed=True)
         if node is None or self.visibility is None:
             return INVISIBLE
         return self.visibility.verdict(*node)

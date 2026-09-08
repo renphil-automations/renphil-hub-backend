@@ -114,6 +114,16 @@ class TabSummaryResponse(BaseModel):
     view: bool | None = None
     edit: bool | None = None
     revealed: bool | None = None
+    # `seed_edit(n)` — added 2026-09-07 (edit-mode-gap follow-up), alongside
+    # the §5.2 triple above but not part of it (see NodeVerdict.edit_seed).
+    # TRUE iff a resource_grant is written DIRECTLY on this node, regardless
+    # of whether an ancestor's grant also makes `edit` True. Drives pencil
+    # placement client-side — replaces the old client-derived
+    # `isEditFrontier(edit, parentEdit)` approximation, which could not tell
+    # "no grant of my own" apart from "my own grant that an ancestor's
+    # grant also happens to cover". None under the same conditions as the
+    # triple above (no `access` passed).
+    edit_seed: bool | None = None
 
     locked: StrictBool = False
     locked_by: StrictStr = ""
@@ -181,6 +191,7 @@ class TabWorkspaceResponse(BaseModel):
     view: bool | None = None
     edit: bool | None = None
     revealed: bool | None = None
+    edit_seed: bool | None = None
 
     parent: TabParentResponse | None = None
     page_content: PageContentWorkspaceResponse | None = None
