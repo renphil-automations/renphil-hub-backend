@@ -877,12 +877,23 @@ def _apply_visibility_to_content(
 
     Only processes grid-canvas content (``schemaVersion == 2``), exactly
     like the function it replaces — BlockNote content and ``None`` pass
-    through untouched, and so does anything already caught by
-    ``access.full_access`` (the Hub Admin bypass — mirrors that function's
-    own "Hub admins bypass per-widget filtering" short-circuit). Admins get
-    no `edit`/`node_kind`/`node_id` stamped below either, same as today's
-    tab/nav-tab responses under full_access — the frontend already ORs every
-    seed check with `isAdmin`.
+    through untouched.
+
+    Runs the per-widget loop below even under ``access.full_access`` (the
+    Hub Admin bypass) — unlike ``_format_tab_summary``/``_format_nav_tab``,
+    which stamp `node_kind`/`node_id` unconditionally, an earlier version of
+    this function short-circuited to `return content` for admins, on the
+    theory that "the frontend already ORs every seed check with `isAdmin`".
+    That's true for the pencil (gated on the owning canvas's `edit`, which
+    IS admin-bypassed upstream) but not for the per-widget "Manage access"
+    button (`TabGridCanvas.tsx`): it has no `isAdmin` of its own to OR in,
+    and there is no boolean substitute for a real integer `node_id` — the
+    modal needs one to fetch/write grants against. Skipping the loop left
+    every widget's `node_id` `undefined` for a Hub Admin, permanently
+    disabling that button with no error (a real live bug, found and fixed
+    2026-09-08). `access.is_granted`/`access.verdict` already special-case
+    `full_access=True` to report "granted"/"edit=True" unconditionally, so
+    running the loop for admins redacts nothing — it only adds the metadata.
 
     Also stamps each SURVIVING widget's own `edit`/`node_kind`/`node_id` —
     added for the component-level "seed" pencil
@@ -904,8 +915,6 @@ def _apply_visibility_to_content(
     canvas) — reading `.view` here would show it in full instead.
     """
     if not isinstance(content, dict) or content.get("schemaVersion") != 2:
-        return content
-    if access.full_access:
         return content
 
     widgets = content.get("widgets")
