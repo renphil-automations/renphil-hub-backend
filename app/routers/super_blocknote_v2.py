@@ -5,16 +5,36 @@ by ComponentV2.link (`{link}`), NOT by GridstackV2.document_id — a
 deliberately separate resource/prefix from tabs_v2.py to avoid any ambiguity
 between the two addressing schemes. Reuses the same Pydantic request/response
 schemas as tabs_v2.py (CreateTabRequest, TabWorkspaceAPIResponse, etc.), same
-design principle as the rest of v2: no new schema classes needed.
+design principle as the rest of v2: no new schema classes needed — including
+the §5.2 triple (`view`/`edit`/`revealed`/`edit_seed`) and `node_kind`/
+`node_id`, which `TabSummaryResponse`/`TabWorkspaceResponse` already declare
+as optional and this router now populates.
+
+ACCESS CONTROL, added 2026-09-09. Until then the router-level
+`Depends(get_current_user)` below was this family's ONLY gate: authenticated,
+never authorized. Because an SBN node is addressed by its own `link`, that
+made every sub-tab in the hub readable and writable by any signed-in caller,
+independent of the fold gating the tab it sits on — the largest hole left by
+the enforcement-wiring sessions, which covered `tabs_v2.py` and `nav_tabs.py`
+and never reached this file.
+
+Every route now takes `access: ViewerAccess = Depends(get_viewer_access)` and
+hands it to its service function, which owns the actual gate (same split as
+`tabs_v2.py`: routers thread, services enforce). Read routes fail closed via
+the existing `None -> 404` path, so an invisible node is indistinguishable
+from a missing one (§9); write routes raise `AccessDeniedError`, mapped by
+`tabs_v2.access_denied_to_http_exception` — imported rather than reimplemented
+so the 404-vs-403 split cannot drift between the two routers.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, get_viewer_access
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
+from app.routers.tabs_v2 import access_denied_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
     CreateTabRequest,
@@ -27,6 +47,7 @@ from app.schemas.tab import (
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
+from app.services.access_visibility_service import AccessDeniedError, ViewerAccess
 from app.services.super_blocknote_service import (
     create_sbn_node,
     delete_sbn_subtree,
@@ -46,6 +67,7 @@ router = APIRouter(prefix="/v2/sbn", tags=["Super Block Note V2"], dependencies=
 COMMON_BAD_REQUEST_RESPONSE = {400: {"description": "Bad request"}}
 COMMON_NOT_FOUND_RESPONSE = {404: {"description": "SBN node not found"}}
 COMMON_CONFLICT_RESPONSE = {409: {"description": "Conflict"}}
+COMMON_FORBIDDEN_RESPONSE = {403: {"description": "No edit access to this SBN node"}}
 
 
 @router.post("/reorder", include_in_schema=False)
@@ -66,9 +88,17 @@ def reorder_method_not_allowed():
     summary="Get an SBN node's workspace (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
-def get_workspace(link: str, db: Session = Depends(get_db_v2)):
+def get_workspace(
+    link: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(link)
-    workspace = get_sbn_workspace(db, link)
+    # §9: a deep link to a node this caller cannot see 404s exactly like one
+    # that does not exist — `get_sbn_workspace` returns None for both, so the
+    # pre-existing line below produces the fail-closed response with no
+    # branch of its own.
+    workspace = get_sbn_workspace(db, link, access=access)
     if workspace is None:
         raise HTTPException(status_code=404, detail="SBN node not found")
     return {"data": workspace}
@@ -80,9 +110,13 @@ def get_workspace(link: str, db: Session = Depends(get_db_v2)):
     summary="Get an SBN node's direct children (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
-def get_children(link: str, db: Session = Depends(get_db_v2)):
+def get_children(
+    link: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(link)
-    children = get_sbn_children(db, link)
+    children = get_sbn_children(db, link, access=access)
     if children is None:
         raise HTTPException(status_code=404, detail="SBN node not found")
     return {"data": children}
@@ -94,9 +128,17 @@ def get_children(link: str, db: Session = Depends(get_db_v2)):
     summary="Get an SBN node's content (v2)",
     responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
-def get_content(link: str, db: Session = Depends(get_db_v2)):
+def get_content(
+    link: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(link)
-    content = get_sbn_content(db, link)
+    # A REVEALED node (visible only because something in its subtree is
+    # granted) returns 200 with `content: null`, not a 404 — §5.2's shell.
+    # 404ing here would break navigation THROUGH the shell to the child that
+    # earned the reveal, which is the whole point of the upward fold.
+    content = get_sbn_content(db, link, access=access)
     if content is None:
         raise HTTPException(status_code=404, detail="SBN node not found")
     return {"data": content}
@@ -106,15 +148,26 @@ def get_content(link: str, db: Session = Depends(get_db_v2)):
     "/{link}/content",
     response_model=PageContentAPIResponse,
     summary="Update an SBN node's content (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def update_content(link: str, request: UpdateTabContentRequest, db: Session = Depends(get_db_v2)):
+def update_content(
+    link: str,
+    request: UpdateTabContentRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(link)
     try:
-        updated = update_sbn_content(db=db, link=link, content=request.content)
+        updated = update_sbn_content(db=db, link=link, content=request.content, access=access)
         if updated is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": updated}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -123,9 +176,18 @@ def update_content(link: str, request: UpdateTabContentRequest, db: Session = De
     "/",
     response_model=TabSummaryResponse,
     summary="Create a new SBN sub-tab (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def create_new_node(request: CreateTabRequest, db: Session = Depends(get_db_v2)):
+def create_new_node(
+    request: CreateTabRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     try:
         access_control = (
             request.access_control.model_dump()
@@ -139,8 +201,11 @@ def create_new_node(request: CreateTabRequest, db: Session = Depends(get_db_v2))
             content=request.content,
             order=request.order,
             access_control=access_control,
+            access=access,
         )
         return node
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -149,12 +214,25 @@ def create_new_node(request: CreateTabRequest, db: Session = Depends(get_db_v2))
     "/reorder",
     response_model=TabSummaryListAPIResponse,
     summary="Reorder sibling SBN sub-tabs (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def reorder_nodes(request: ReorderTabsRequest, db: Session = Depends(get_db_v2)):
+def reorder_nodes(
+    request: ReorderTabsRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     try:
-        reordered = reorder_sbn_siblings(db=db, items=[item.model_dump() for item in request.items])
+        reordered = reorder_sbn_siblings(
+            db=db, items=[item.model_dump() for item in request.items], access=access
+        )
         return {"data": reordered}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -170,6 +248,7 @@ def lock_node(
     request: LockTabRequest,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(link)
     try:
@@ -179,10 +258,12 @@ def lock_node(
         # own docstring in schemas/tab.py. Not an optional extension: the
         # field simply no longer exists on the shared schema.
         locked_by = (user.email or "").strip().lower()
-        locked = lock_sbn_node(db=db, link=link, locked_by=locked_by)
+        locked = lock_sbn_node(db=db, link=link, locked_by=locked_by, access=access)
         if locked is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": locked}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -198,6 +279,7 @@ def unlock_node(
     request: UnlockTabRequest,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(link)
     try:
@@ -205,10 +287,14 @@ def unlock_node(
         # closes the omission bypass for SBN nodes, for the same reason
         # UnlockTabRequest's docstring gives.
         unlocked_by = (user.email or "").strip().lower()
-        unlocked = unlock_sbn_node(db=db, link=link, unlocked_by=unlocked_by, force=request.force)
+        unlocked = unlock_sbn_node(
+            db=db, link=link, unlocked_by=unlocked_by, force=request.force, access=access
+        )
         if unlocked is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": unlocked}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -217,9 +303,19 @@ def unlock_node(
     "/{link}",
     response_model=TabWorkspaceAPIResponse,
     summary="Update an SBN node's metadata (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def update_node(link: str, request: UpdateTabRequest, db: Session = Depends(get_db_v2)):
+def update_node(
+    link: str,
+    request: UpdateTabRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(link)
     try:
         access_control = (
@@ -233,10 +329,13 @@ def update_node(link: str, request: UpdateTabRequest, db: Session = Depends(get_
             title=request.title,
             order=request.order,
             access_control=access_control,
+            access=access,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": updated}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -244,14 +343,24 @@ def update_node(link: str, request: UpdateTabRequest, db: Session = Depends(get_
 @router.delete(
     "/{link}",
     summary="Delete an SBN node and its descendants (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
 )
-def delete_node(link: str, db: Session = Depends(get_db_v2)):
+def delete_node(
+    link: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
     validate_document_id(link)
     try:
-        result = delete_sbn_subtree(db=db, link=link)
+        result = delete_sbn_subtree(db=db, link=link, access=access)
         if result is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": result}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
