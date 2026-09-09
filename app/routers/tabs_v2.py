@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, get_viewer_access
+from app.dependencies import get_current_user, get_edit_session, get_lock_view, get_viewer_access
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
@@ -30,6 +30,7 @@ from app.schemas.tab import (
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
+from app.services import edit_lock_service
 from app.services.access_visibility_service import (
     AccessDeniedError,
     NodeNotViewableError,
@@ -129,8 +130,12 @@ def reorder_method_not_allowed():
 
 
 @router.get("/root", response_model=TabSummaryListAPIResponse, summary="Get root tabs (v2)")
-def get_roots(db: Session = Depends(get_db_v2), access: ViewerAccess = Depends(get_viewer_access)):
-    return {"data": get_root_tabs_v2(db, access=access)}
+def get_roots(
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
+):
+    return {"data": get_root_tabs_v2(db, access=access, lock_view=lock_view)}
 
 
 @router.get(
@@ -219,6 +224,7 @@ def update_component_content_endpoint(
     request: UpdateComponentContentRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    user: UserInfo = Depends(get_current_user),
 ):
     # `model_fields_set` distinguishes "absent" from "explicitly null" — the
     # difference between preserving a title and clearing it. Same mechanism
@@ -233,7 +239,11 @@ def update_component_content_endpoint(
         updates["data"] = request.data
 
     try:
-        updated = update_component_content(db, link, access=access, **updates)
+        # plan_lock_propagation_2026-09-08.md §5.3 decision 6 — `holder`
+        # only, no session token: see update_component_content's own
+        # docstring.
+        holder = (user.email or "").strip().lower()
+        updated = update_component_content(db, link, access=access, holder=holder, **updates)
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
     except ValueError as e:
@@ -255,6 +265,7 @@ def get_workspace(
     document_id: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(document_id)
 
@@ -264,7 +275,7 @@ def get_workspace(
     # page_content via the new fold instead of the old
     # filter_widget_content_for_user(user.email, user.roles) call this
     # replaced.
-    workspace = get_tab_workspace_v2(db, document_id, access=access)
+    workspace = get_tab_workspace_v2(db, document_id, access=access, lock_view=lock_view)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
 
@@ -281,10 +292,11 @@ def get_children(
     document_id: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(document_id)
 
-    children = get_tab_children_v2(db, document_id, access=access)
+    children = get_tab_children_v2(db, document_id, access=access, lock_view=lock_view)
     if children is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
@@ -301,13 +313,14 @@ def get_variants(
     document_id: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     """A tab variant (TabV2.parent_tab_id) is a distinct, one-level nesting
     axis from /{document_id}/children above (which is gridstack-level
     nesting) — see gridstack_service.py's TabV2 docstring."""
     validate_document_id(document_id)
 
-    variants = get_tab_variants_v2(db, document_id, access=access)
+    variants = get_tab_variants_v2(db, document_id, access=access, lock_view=lock_view)
     if variants is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
@@ -330,6 +343,7 @@ def create_variant(
     request: CreateTabVariantRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
@@ -346,6 +360,7 @@ def create_variant(
             access_control=access_control,
             order=request.order,
             access=access,
+            session=session,
         )
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
@@ -364,15 +379,20 @@ def reorder_variants(
     request: ReorderTabVariantsRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    user: UserInfo = Depends(get_current_user),
 ):
     validate_document_id(document_id)
 
     try:
+        # plan_lock_propagation_2026-09-08.md §5.4 — session-EXEMPT
+        # (`holder` only, no token): see reorder_tab_variants_v2's own
+        # comment.
         reordered = reorder_tab_variants_v2(
             db=db,
             parent_document_id=document_id,
             ordered_document_ids=request.orderedDocumentIds,
             access=access,
+            holder=(user.email or "").strip().lower(),
         )
         if reordered is None:
             raise HTTPException(status_code=404, detail="Parent tab not found")
@@ -414,12 +434,13 @@ def update_content(
     request: UpdateTabContentRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
     try:
         updated_content = update_tab_content_v2(
-            db=db, document_id=document_id, content=request.content, access=access
+            db=db, document_id=document_id, content=request.content, access=access, session=session
         )
         if updated_content is None:
             raise HTTPException(status_code=404, detail="Tab not found")
@@ -445,6 +466,7 @@ def create_new_tab(
     request: CreateTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     try:
         access_control = (
@@ -477,6 +499,7 @@ def create_new_tab(
             access_control=access_control,
             nav_tab_id=nav_tab_id,
             access=access,
+            session=session,
         )
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
@@ -499,12 +522,15 @@ def reorder_tabs(
     request: ReorderTabsRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    user: UserInfo = Depends(get_current_user),
 ):
     try:
+        # plan_lock_propagation_2026-09-08.md §5.4 — session-EXEMPT.
         reordered = reorder_tabs_by_document_id_v2(
             db=db,
             items=[item.model_dump() for item in request.items],
             access=access,
+            holder=(user.email or "").strip().lower(),
         )
         return {"data": reordered}
     except AccessDeniedError as e:
@@ -532,7 +558,9 @@ def lock_tab(
         # request-body field — `LockTabRequest` no longer has one to read.
         # Same normalization dependencies.get_current_hub_user applies.
         locked_by = (user.email or "").strip().lower()
-        locked_workspace = lock_tab_by_document_id_v2(db=db, document_id=document_id, locked_by=locked_by)
+        locked_workspace = lock_tab_by_document_id_v2(
+            db=db, document_id=document_id, locked_by=locked_by, force=request.force
+        )
         if locked_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": locked_workspace}
@@ -589,6 +617,7 @@ def update_tab_metadata(
     request: UpdateTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
@@ -615,6 +644,7 @@ def update_tab_metadata(
             order=request.order,
             access_control=access_control,
             access=access,
+            session=session,
         )
         if updated_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
@@ -641,6 +671,7 @@ def move_tab(
     request: MoveTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
@@ -651,6 +682,7 @@ def move_tab(
             new_parent_document_id=request.newParentDocumentId,
             order=request.order,
             access=access,
+            session=session,
         )
         if moved_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
@@ -684,6 +716,7 @@ def move_tab_to_nav_tab(
     request: MoveTabToNavTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
@@ -693,6 +726,7 @@ def move_tab_to_nav_tab(
             tab_document_id=document_id,
             nav_tab_document_id=request.navTabDocumentId,
             access=access,
+            session=session,
         )
         if moved_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
@@ -712,11 +746,14 @@ def delete_tab(
     document_id: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
     try:
-        delete_result = delete_tab_subtree_by_document_id_v2(db=db, document_id=document_id, access=access)
+        delete_result = delete_tab_subtree_by_document_id_v2(
+            db=db, document_id=document_id, access=access, session=session
+        )
         if delete_result is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": delete_result}

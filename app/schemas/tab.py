@@ -136,6 +136,18 @@ class TabSummaryResponse(BaseModel):
     locked_at: datetime | None = None
     lock_is_stale: StrictBool = False
 
+    # plan_lock_propagation_2026-09-08.md §4.3 — ADDITIVE. The four fields
+    # above keep their exact existing meaning (this node's own row); these
+    # four are new and DERIVED across the whole ancestor/descendant chain
+    # (edit_lock_service.LockView.state_for), so no existing read path
+    # breaks mid-migration. `lock_state` is None under the same conditions
+    # `view`/`edit`/`revealed` above are — an internal mutation-response
+    # echo built with no LockView, never a real read endpoint.
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+
     has_children: StrictBool = False
     has_content: StrictBool = False
 
@@ -211,6 +223,23 @@ class TabWorkspaceResponse(BaseModel):
     locked_at: datetime | None = None
     lock_is_stale: StrictBool = False
 
+    # See TabSummaryResponse's identical fields for what these mean.
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+
+    # plan_lock_propagation_2026-09-08.md §4.1 — "return the token +
+    # expires_at". SENSITIVE, and deliberately narrow: populated ONLY by
+    # `lock_tab_by_document_id_v2`'s own response (the one place a caller
+    # who just acquired a session needs to learn their own token so they
+    # can present it back via `X-Edit-Tokens`), never by an ordinary
+    # workspace GET or any other write's echo — this field must never leak
+    # a token to a caller who merely has VIEW access to the tab. None
+    # everywhere else, matching every other "only when this specific
+    # caller populates it" field in this schema.
+    lock_token: StrictStr | None = None
+
     children: list[TabSummaryResponse] = Field(default_factory=list)
 
     has_variants: StrictBool = False
@@ -253,6 +282,29 @@ class NavTabResponse(BaseModel):
     protected: StrictBool = False
 
     icon: StrictStr | None = None
+
+    # plan_lock_propagation_2026-09-08.md §1/§3.1 decision 3 — a nav tab is
+    # now a real lock node (its edit-mode toggle acquires an actual lock,
+    # §6.7), not just an AC one. Own-row fields, new here (nav tabs had no
+    # lock columns at all before this plan) but the SAME shape/meaning as
+    # TabSummaryResponse's identical four; the four after them are the same
+    # additive derived state described there.
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
+
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+
+    # plan_lock_propagation_2026-09-08.md §8 phase 5 — SAME sensitive,
+    # narrow-population field as TabWorkspaceResponse.lock_token above (see
+    # that field's own comment): populated ONLY by
+    # `lock_nav_tab_by_document_id_v2`'s own response, never by an ordinary
+    # nav-tab list/read or any other write's echo. None everywhere else.
+    lock_token: StrictStr | None = None
 
     # See TabSummaryResponse's identical fields — a nav tab maps straight to
     # its own node (`("nav_tab", self.id)`), no gridstack indirection to
@@ -520,13 +572,23 @@ class LockTabRequest(StrictRequestModel):
     simply never used who the caller actually was. Removed rather than
     accepted-and-ignored: `StrictRequestModel` is `extra="forbid"`, so a
     client that still sends the field now gets a 422 — the loud failure
-    intended here, not a silent ignore. Body is `{}`.
+    intended here, not a silent ignore.
 
     Owner's decision, 2026-09-02 (carried into the 2026-09-03 locking
     session): both `renphil-hub-backend` and `renphil-hub-frontend` change
     in the same session and deploy together, so there is no transitional
     accept-and-ignore period — the field is gone outright on both sides.
-    Shipping only one half is a 422 on every lock."""
+    Shipping only one half is a 422 on every lock.
+
+    `force` — NEW, plan_lock_propagation_2026-09-08.md §4.2 decision 8.
+    Takes over `document_id`'s whole subtree in one transaction when
+    something in it is held fresh by someone else, instead of refusing —
+    replacing the old unlock(force) -> lock two-step, which had a real race
+    (someone else could grab the node between the two calls). Does NOT
+    reopen Fix 1 above: `force` is not an identity field, `locked_by` stays
+    JWT-derived. Body is now `{}` or `{"force": true}`."""
+
+    force: StrictBool = False
 
 
 class UnlockTabRequest(StrictRequestModel):

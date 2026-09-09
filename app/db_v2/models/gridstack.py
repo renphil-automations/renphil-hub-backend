@@ -55,3 +55,8 @@ class GridstackV2(BaseV2):
     locked = Column(Boolean, nullable=True, default=False)
     locked_by = Column(String(255), nullable=True, default="")
     locked_at = Column(DateTime, nullable=True)
+
+    # Added by scripts/migrate_lock_propagation_columns.py
+    # (plan_lock_propagation_2026-09-08.md §3.1) — same column, same
+    # rationale as TabV2.lock_token. See that model's own comment.
+    lock_token = Column(String(64), nullable=True)

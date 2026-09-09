@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -28,6 +28,7 @@ from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
+from app.services import edit_lock_service
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services.rbac_graph_service import RbacClosures, effective_pairs
 from app.services.tab_service import HUB_ADMIN_ROLE
@@ -413,3 +414,39 @@ async def get_viewer_access(
     closures = RbacClosures(db)
     admin = is_hub_admin(db, current, closures=closures)
     return resolve_viewer_access(db, current.hub_user_id, is_admin=admin, closures=closures)
+
+
+# ── Lock propagation (plan_lock_propagation_2026-09-08.md §4.3) ──────────
+
+
+async def get_lock_view(
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+) -> edit_lock_service.LockView:
+    """One ``LockView`` per request, mirroring ``get_viewer_access`` above —
+    same shape, same place, same convention (§4.3's own wording). Depends
+    on ``get_current_hub_user`` for the same reason ``get_viewer_access``
+    does: ``current.email`` is what tells a node's derived state apart as
+    "self" vs. a foreign holder."""
+    return edit_lock_service.resolve_lock_view(db, current.email)
+
+
+async def get_edit_session(
+    request: Request,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+) -> edit_lock_service.EditSession:
+    """§5.1. `X-Edit-Tokens: <token>[,<token>]` — a request HEADER, not a
+    body field, because the eight-plus mutating v2 schemas are all
+    `StrictRequestModel` (`extra="forbid"`), so a body field would mean
+    editing every one of them AND every client call site; a header is one
+    function on each side. Sends every token the caller holds (in practice
+    at most two — a root/ancestor session plus one surgical sub-grid
+    session) so no call site needs to know which of the caller's sessions
+    covers its own target — `require_live_session` checks all of them.
+
+    No dependency on `get_db_v2` — parsing the header needs nothing from
+    the database; only `require_live_session` (called downstream, inside
+    each service function) does."""
+    header = request.headers.get("X-Edit-Tokens", "")
+    tokens = frozenset(t.strip() for t in header.split(",") if t.strip())
+    return edit_lock_service.EditSession(holder=current.email, tokens=tokens)

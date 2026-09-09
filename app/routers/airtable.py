@@ -43,7 +43,9 @@ from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.dependencies import (
     get_airtable_service,
     get_current_user,
+    get_edit_session,
     get_gemini_service,
+    get_viewer_access,
 )
 from app.helpers.cache import airtable_cache, invalidates_cache
 from app.helpers.slack import (
@@ -153,7 +155,10 @@ from app.models.airtable import (
     OrganizationInfoUpdate,
 )
 from app.models.auth import UserInfo
+from app.routers.tabs_v2 import access_denied_to_http_exception
+from app.services.access_visibility_service import AccessDeniedError, ViewerAccess
 from app.services.airtable_service import AirtableService
+from app.services.edit_lock_service import EditSession
 from app.services.gemini_service import GeminiService
 from app.services.gridstack_service import (
     get_airtable_component_bundle,
@@ -279,6 +284,8 @@ def update_airtable_component_config_endpoint(
     background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_v2),
     _user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+    session: EditSession = Depends(get_edit_session),
 ):
     # `model_fields_set` distinguishes "absent" from "explicitly null" —
     # which is the difference between preserving and clearing the PAT.
@@ -296,7 +303,16 @@ def update_airtable_component_config_endpoint(
         updates["access_control"] = body.access_control
 
     try:
-        config = update_airtable_component_config(db, link, **updates)
+        # plan_lock_propagation_2026-09-08.md §5.3 — this endpoint had NO
+        # require_edit gate at all before this plan (called inside the Save
+        # wave, handleSave step 4, but never itself checked); "add both
+        # gates here, or a stale session keeps a live door into widget
+        # config." BOTH means the full mechanical pair, not decision 6's
+        # ancestor-only treatment — this write is part of the same save
+        # wave the canvas save's own token covers.
+        config = update_airtable_component_config(db, link, access=access, session=session, **updates)
+    except AccessDeniedError as exc:
+        raise access_denied_to_http_exception(exc)
     except ValueError as exc:
         # §4.2 (plan_airtable_chart_widget_2026-08-13.md) — an access_control
         # that widens past the widget's gridstack ceiling. Every other

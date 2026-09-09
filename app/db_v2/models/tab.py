@@ -45,6 +45,18 @@ class TabV2(BaseV2):
     # exactly the stranded locks this fix exists to release.
     locked_at = Column(DateTime, nullable=True)
 
+    # Added by scripts/migrate_lock_propagation_columns.py
+    # (plan_lock_propagation_2026-09-08.md §3.1). Opaque uuid4().hex, minted
+    # on acquire, rotated on force-takeover, cleared on release. Stored
+    # rather than derived (holder + locked_at) because it must be
+    # INVALIDATABLE: a derived token would revive after a takeover-then-
+    # re-lock, since holder/timestamp alone can't distinguish "this session"
+    # from "a later session with the same holder". NULL on every
+    # pre-existing locked row (no backfill) — validates as "no live
+    # session", the same fail-open-to-stale posture `locked_at IS NULL`
+    # already has. See app/services/edit_lock_service.py.
+    lock_token = Column(String(64), nullable=True)
+
     source_link = Column(String(255), nullable=True)
 
     parent_tab_id = Column(Integer, ForeignKey("tabs.id"), nullable=True, index=True)

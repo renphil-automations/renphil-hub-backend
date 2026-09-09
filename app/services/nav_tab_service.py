@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.tab import TabV2
 
+from app.services import edit_lock_service
 from app.services.access_visibility_service import (
     ViewerAccess,
     require_edit,
@@ -102,7 +103,12 @@ def _resolve_nav_slug(db: Session, title: str, exclude_id: int | None = None) ->
 # Formatting
 # ---------------------------------------------------------
 
-def _format_nav_tab(nav_tab: NavTabV2, *, access: ViewerAccess | None = None) -> dict[str, Any]:
+def _format_nav_tab(
+    nav_tab: NavTabV2,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: edit_lock_service.LockView | None = None,
+) -> dict[str, Any]:
     summary = {
         "id": nav_tab.id,
         "documentId": nav_tab.document_id,
@@ -116,6 +122,15 @@ def _format_nav_tab(nav_tab: NavTabV2, *, access: ViewerAccess | None = None) ->
         # Independent of `access` — set on every read.
         "node_kind": "nav_tab",
         "node_id": nav_tab.id,
+        # plan_lock_propagation_2026-09-08.md §3.1 decision 3 — this node's
+        # own raw lock row. New here (a nav tab had no lock columns before
+        # this plan); the acquire/release side isn't wired to any route
+        # until §8 phase 5, so these read as free/unlocked on every nav tab
+        # until then, same as the columns' own default.
+        "locked": bool(nav_tab.locked),
+        "locked_by": nav_tab.locked_by or "",
+        "locked_at": nav_tab.locked_at,
+        "lock_is_stale": bool(nav_tab.locked) and edit_lock_service.is_lock_stale(nav_tab.locked_at),
     }
     if access is not None:
         # A nav tab maps straight to its own node — no gridstack indirection
@@ -124,6 +139,15 @@ def _format_nav_tab(nav_tab: NavTabV2, *, access: ViewerAccess | None = None) ->
         summary["view"] = verdict.view
         summary["edit"] = verdict.edit
         summary["revealed"] = verdict.revealed
+
+    # §4.3 — additive, same "only when a caller passes one" convention as
+    # the triple above.
+    if lock_view is not None:
+        lock_node_state = lock_view.state_for(("nav_tab", nav_tab.id))
+        summary["lock_state"] = lock_node_state.state
+        summary["lock_holder"] = lock_node_state.holder
+        summary["lock_holder_node_label"] = lock_node_state.node_label
+        summary["lock_expires_at"] = lock_node_state.expires_at
     return summary
 
 
@@ -131,9 +155,14 @@ def _format_nav_tab(nav_tab: NavTabV2, *, access: ViewerAccess | None = None) ->
 # Read API
 # ---------------------------------------------------------
 
-def get_nav_tabs_v2(db: Session, *, access: ViewerAccess | None = None) -> list[dict[str, Any]]:
+def get_nav_tabs_v2(
+    db: Session,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: edit_lock_service.LockView | None = None,
+) -> list[dict[str, Any]]:
     nav_tabs = db.query(NavTabV2).order_by(NavTabV2.order, NavTabV2.id).all()
-    summaries = [_format_nav_tab(t, access=access) for t in nav_tabs]
+    summaries = [_format_nav_tab(t, access=access, lock_view=lock_view) for t in nav_tabs]
     # §5.2: an invisible nav tab is chrome nobody should see a row for.
     if access is not None:
         summaries = [s for s in summaries if s["view"]]
@@ -150,6 +179,53 @@ def get_dashboard_nav_tab(db: Session) -> NavTabV2 | None:
     the fallback nav_tab_id for a root-tab create that doesn't specify one,
     so any existing caller (frontend or otherwise) keeps working unchanged."""
     return db.query(NavTabV2).filter(NavTabV2.protected.is_(True)).first()
+
+
+# ---------------------------------------------------------
+# Locking — plan_lock_propagation_2026-09-08.md §8 phase 5 / §6.7 decision 3
+# ---------------------------------------------------------
+
+def lock_nav_tab_by_document_id_v2(
+    db: Session, document_id: str, locked_by: str, force: bool = False
+) -> dict[str, Any] | None:
+    """THIN WRAPPER, mirroring `gridstack_service.lock_tab_by_document_id_v2`
+    exactly — see that function's own docstring for why the conflict logic
+    lives in `edit_lock_service.acquire` rather than here. Simpler than the
+    tab version: a nav tab needs no gridstack indirection to find its lock
+    node — `("nav_tab", nav_tab.id)` already IS one, no
+    `resolve_lock_node` translation step required. `force` is §4.2 decision
+    8's subtree takeover, unchanged in meaning from the tab route."""
+    nav_tab = get_nav_tab_by_document_id(db, document_id)
+    if nav_tab is None:
+        return None
+
+    grant = edit_lock_service.acquire(db, ("nav_tab", nav_tab.id), locked_by, force=force)
+    formatted = _format_nav_tab(nav_tab)
+    # §4.1's "return the token + expires_at" — added ONLY here, matching
+    # TabWorkspaceResponse.lock_token's own "never leaks to a caller who
+    # merely has view access" convention (schemas/tab.py).
+    formatted["lock_token"] = grant.token
+    return formatted
+
+
+def unlock_nav_tab_by_document_id_v2(
+    db: Session,
+    document_id: str,
+    unlocked_by: str | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """THIN WRAPPER — see `lock_nav_tab_by_document_id_v2`'s own comment on
+    why the logic lives in `edit_lock_service.release`. `force` here is the
+    EXISTING unlock force (owner decision 2026-09-03: unrestricted, skips
+    ownership AND staleness) — the same flag
+    `gridstack_service.unlock_tab_by_document_id_v2` takes, unchanged by
+    this plan."""
+    nav_tab = get_nav_tab_by_document_id(db, document_id)
+    if nav_tab is None:
+        return None
+
+    edit_lock_service.release(db, ("nav_tab", nav_tab.id), unlocked_by or "", force=force)
+    return _format_nav_tab(nav_tab)
 
 
 # ---------------------------------------------------------
@@ -177,6 +253,13 @@ def create_nav_tab_v2(
         # row, not of anything the caller names. Checked before the slug
         # uniqueness/reserved-word query below, so a caller without edit
         # never learns whether a title collides.
+        #
+        # plan_lock_propagation_2026-09-08.md §9 item 1: NO session check
+        # here, deliberately — the hub is never lockable, and the owner's
+        # call is that creating a nav tab should never be blocked by
+        # someone editing a DIFFERENT one. No `session` parameter on this
+        # function at all, so there is nothing for a future call site to
+        # accidentally wire up here.
         require_edit(access, resolve_hub_node(db))
 
         slug = _resolve_nav_slug(db, title)
@@ -221,6 +304,7 @@ def update_nav_tab_v2(
     icon: Any = _UNSET,
     *,
     access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     """THREE OPERATIONS, ONE GATE EACH, project_ac_enforcement_gap.md's §6.8
     nav-tab/hub split — the same conflation
@@ -249,6 +333,20 @@ def update_nav_tab_v2(
 
         gate_node = resolve_hub_node(db) if order is not None else ("nav_tab", nav_tab.id)
         require_edit(access, gate_node)
+        # plan_lock_propagation_2026-09-08.md §5.4: mirrors
+        # gridstack_service.update_tab_by_document_id_v2's identical split.
+        # order present -> this PUT's own reorder shape, session-EXEMPT
+        # (refused only if THIS nav tab is held fresh by someone else).
+        # order absent -> rename/icon/AC-edit, §9 item 1's "nav-tab rename/
+        # icon/delete... require a live session on that nav tab" — full
+        # token check, and `gate_node` here already IS that nav tab (no
+        # hub-divergence the way delete below has).
+        if order is not None:
+            if session is not None:
+                edit_lock_service.refuse_if_any_held(db, [("nav_tab", nav_tab.id)], session.holder)
+        else:
+            if session is not None:
+                edit_lock_service.require_live_session(session, gate_node, db)
 
         if title is not None:
             if nav_tab.protected:
@@ -287,7 +385,11 @@ def update_nav_tab_v2(
 
 
 def reorder_nav_tabs_v2(
-    db: Session, ordered_document_ids: list[str], *, access: ViewerAccess | None = None
+    db: Session,
+    ordered_document_ids: list[str],
+    *,
+    access: ViewerAccess | None = None,
+    holder: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
         if not ordered_document_ids:
@@ -311,6 +413,19 @@ def reorder_nav_tabs_v2(
         if missing:
             raise ValueError(f"Nav tabs not found: {', '.join(missing)}")
 
+        # plan_lock_propagation_2026-09-08.md §5.4/§9 item 1: the hub-gated
+        # permission check above stays exactly as it is (creating/reordering
+        # nav tabs is edit(hub), and the hub is never lockable) — but §5.4's
+        # conflict check still applies uniformly across all four reorder
+        # surfaces, so a nav tab actually held fresh by someone else still
+        # refuses this.
+        if holder:
+            edit_lock_service.refuse_if_any_held(
+                db,
+                [("nav_tab", t.id) for t in nav_tabs_by_document_id.values()],
+                holder,
+            )
+
         for index, document_id in enumerate(ordered_document_ids):
             nav_tab = nav_tabs_by_document_id[document_id]
             nav_tab.order = index
@@ -325,7 +440,11 @@ def reorder_nav_tabs_v2(
 
 
 def delete_nav_tab_v2(
-    db: Session, document_id: str, *, access: ViewerAccess | None = None
+    db: Session,
+    document_id: str,
+    *,
+    access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     """Cascades: every root TabV2 under this nav tab is deleted (subtree and
     all) via delete_tab_subtree_by_document_id_v2 — which already handles
@@ -351,6 +470,16 @@ def delete_nav_tab_v2(
         if nav_tab is None:
             return None
         require_edit(access, resolve_hub_node(db))
+        # plan_lock_propagation_2026-09-08.md §9 item 1: the permission
+        # gate above stays edit(hub) (§6.3's own "delete n -> parent(n)"),
+        # UNCHANGED — but the hub has no lock node to check a session
+        # against (it is never lockable), so the SESSION check deliberately
+        # targets the nav tab being deleted itself, not its AC parent:
+        # "nav-tab rename/icon/delete... require a live session on that nav
+        # tab." This is the one call site in this module where the session
+        # target and the permission gate are NOT the same node.
+        if session is not None:
+            edit_lock_service.require_live_session(session, ("nav_tab", nav_tab.id), db)
         if nav_tab.protected:
             raise ValueError("The Dashboard nav tab cannot be deleted")
 
@@ -395,6 +524,7 @@ def move_tab_to_nav_tab_v2(
     nav_tab_document_id: str,
     *,
     access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     """Root tabs only — a sub-tab gridstack has no nav_tab_id of its own, and
     a variant follows its parent tab rather than moving independently."""
@@ -444,6 +574,13 @@ def move_tab_to_nav_tab_v2(
         # without crossing any AC boundary of their own.
         require_edit(access, ("nav_tab", tab.nav_tab_id) if tab.nav_tab_id is not None else None)
         require_edit(access, ("nav_tab", destination.id))
+        # A move is not a reorder — full session check on BOTH nav tabs,
+        # mirroring gridstack_service.move_tab_by_document_id_v2's own
+        # two-parent treatment.
+        if session is not None and tab.nav_tab_id is not None:
+            edit_lock_service.require_live_session(session, ("nav_tab", tab.nav_tab_id), db)
+        if session is not None:
+            edit_lock_service.require_live_session(session, ("nav_tab", destination.id), db)
 
         # Slug-based, not exact title: "Home" and "home" address the same
         # URL in the destination, so moving one next to the other would make

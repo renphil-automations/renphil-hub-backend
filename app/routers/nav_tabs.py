@@ -23,15 +23,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, get_viewer_access
+from app.dependencies import get_current_user, get_edit_session, get_lock_view, get_viewer_access
+from app.models.auth import UserInfo
 from app.schemas.tab import (
     CreateNavTabRequest,
+    LockTabRequest,
     NavTabListAPIResponse,
     NavTabResponse,
     ReorderNavTabsRequest,
     TabSummaryListAPIResponse,
+    UnlockTabRequest,
     UpdateNavTabRequest,
 )
+from app.services import edit_lock_service
 from app.services.access_visibility_service import AccessDeniedError, ViewerAccess
 from app.services.gridstack_service import get_root_tabs_v2
 from app.services.nav_tab_service import (
@@ -39,7 +43,9 @@ from app.services.nav_tab_service import (
     delete_nav_tab_v2,
     get_nav_tab_by_document_id,
     get_nav_tabs_v2,
+    lock_nav_tab_by_document_id_v2,
     reorder_nav_tabs_v2,
+    unlock_nav_tab_by_document_id_v2,
     update_nav_tab_v2,
 )
 from app.routers.tabs import value_error_to_http_exception
@@ -69,8 +75,12 @@ def reorder_method_not_allowed():
 
 
 @router.get("", response_model=NavTabListAPIResponse, summary="Get all nav tabs")
-def get_nav_tabs(db: Session = Depends(get_db_v2), access: ViewerAccess = Depends(get_viewer_access)):
-    return {"data": get_nav_tabs_v2(db, access=access)}
+def get_nav_tabs(
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
+):
+    return {"data": get_nav_tabs_v2(db, access=access, lock_view=lock_view)}
 
 
 @router.get(
@@ -83,6 +93,7 @@ def get_nav_tab_tabs(
     document_id: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(document_id)
 
@@ -95,7 +106,7 @@ def get_nav_tab_tabs(
     if not access.verdict(("nav_tab", nav_tab.id)).view:
         raise HTTPException(status_code=404, detail="Nav tab not found")
 
-    return {"data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id, access=access)}
+    return {"data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id, access=access, lock_view=lock_view)}
 
 
 @router.post(
@@ -139,11 +150,18 @@ def reorder_nav_tabs(
     request: ReorderNavTabsRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    user: UserInfo = Depends(get_current_user),
 ):
     try:
+        # plan_lock_propagation_2026-09-08.md §5.4/§9 item 1 — session-
+        # EXEMPT permission-wise (edit(hub)), but still refused if a
+        # reordered nav tab is held fresh by someone else.
         return {
             "data": reorder_nav_tabs_v2(
-                db=db, ordered_document_ids=request.orderedDocumentIds, access=access
+                db=db,
+                ordered_document_ids=request.orderedDocumentIds,
+                access=access,
+                holder=(user.email or "").strip().lower(),
             )
         }
     except AccessDeniedError as e:
@@ -168,6 +186,7 @@ def update_nav_tab(
     request: UpdateNavTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
@@ -189,6 +208,7 @@ def update_nav_tab(
             order=request.order,
             access_control=access_control,
             access=access,
+            session=session,
             **icon_kwargs,
         )
         if updated is None:
@@ -214,15 +234,83 @@ def delete_nav_tab(
     document_id: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(document_id)
 
     try:
-        delete_result = delete_nav_tab_v2(db=db, document_id=document_id, access=access)
+        delete_result = delete_nav_tab_v2(db=db, document_id=document_id, access=access, session=session)
         if delete_result is None:
             raise HTTPException(status_code=404, detail="Nav tab not found")
         return {"data": delete_result}
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+# ---------------------------------------------------------
+# Locking — plan_lock_propagation_2026-09-08.md §6.7/§8 phase 5, decision 3:
+# a nav tab's edit-mode toggle acquires a REAL lock. Endpoint-for-endpoint
+# mirror of tabs_v2.py's lock_tab/unlock_tab — same request schemas
+# (LockTabRequest/UnlockTabRequest have no tab-specific fields, so they are
+# reused as-is rather than duplicated), same identity-sourced holder (no
+# `locked_by`/`unlocked_by` body field, per those schemas' own Fix 1
+# docstrings), same "no access-control gate here" shape as the tab routes —
+# neither of those checks permission either; only rename/icon/delete
+# (`update_nav_tab`/`delete_nav_tab` above) require `edit(nav_tab)`.
+# ---------------------------------------------------------
+
+@router.put(
+    "/{document_id}/lock",
+    response_model=NavTabResponse,
+    summary="Lock nav tab (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+)
+def lock_nav_tab(
+    document_id: str,
+    request: LockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    validate_document_id(document_id)
+
+    try:
+        locked_by = (user.email or "").strip().lower()
+        locked = lock_nav_tab_by_document_id_v2(
+            db=db, document_id=document_id, locked_by=locked_by, force=request.force
+        )
+        if locked is None:
+            raise HTTPException(status_code=404, detail="Nav tab not found")
+        return locked
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+@router.put(
+    "/{document_id}/unlock",
+    response_model=NavTabResponse,
+    summary="Unlock nav tab (v2)",
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_CONFLICT_RESPONSE},
+)
+def unlock_nav_tab(
+    document_id: str,
+    request: UnlockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+):
+    validate_document_id(document_id)
+
+    try:
+        unlocked_by = (user.email or "").strip().lower()
+        unlocked = unlock_nav_tab_by_document_id_v2(
+            db=db,
+            document_id=document_id,
+            unlocked_by=unlocked_by,
+            force=request.force,
+        )
+        if unlocked is None:
+            raise HTTPException(status_code=404, detail="Nav tab not found")
+        return unlocked
     except ValueError as e:
         raise value_error_to_http_exception(e)

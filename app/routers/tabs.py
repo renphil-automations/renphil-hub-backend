@@ -18,6 +18,7 @@ from app.schemas.tab import (
     LockTabRequest,
     UnlockTabRequest,
 )
+from app.services.edit_lock_service import EditSessionError, LockConflictError
 from app.services.tab_service import (
     create_tab,
     filter_widget_content_for_user,
@@ -96,7 +97,34 @@ def validate_document_id(document_id: str) -> None:
 def value_error_to_http_exception(error: ValueError) -> HTTPException:
     """
     Convert service-layer ValueError into clear HTTP errors.
+
+    plan_lock_propagation_2026-09-08.md §5.5 — the dedicated error contract
+    lives HERE, centrally, rather than as a new `except` clause on every
+    v2 router: `EditSessionError` and `LockConflictError` are BOTH
+    `ValueError` subclasses specifically so every router's existing
+    `except ValueError as e: raise value_error_to_http_exception(e)`
+    already routes them here unchanged — this function is the one place
+    that needs to know the four codes exist. `detail` is a dict (not a
+    plain string) only for these two cases, so the frontend can switch on
+    `detail.code` instead of pattern-matching the message the way
+    `describeTabsApiError` does today for everything else.
     """
+    if isinstance(error, EditSessionError):
+        return HTTPException(status_code=409, detail={"code": error.code, "message": str(error)})
+
+    if isinstance(error, LockConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "NODE_LOCKED",
+                "message": str(error),
+                "blocking": [
+                    {"holder": b.holder, "node_label": b.node_label, "relation": b.relation}
+                    for b in error.blocking
+                ],
+            },
+        )
+
     message = str(error)
     lower_message = message.lower()
 
