@@ -15,6 +15,18 @@ one per internal query (plan §4.6). `/notifications/unread-count` is the
 one exception — it also needs the raw `Request`/`Response` for the
 `If-None-Match` / `ETag` pair (plan §4.5), which have no place in
 thread_service's plain-value return.
+
+ACCESS CONTROL, added plan_ac_enforcement_closeout_2026-09-09.md §4. Until
+then every route below carried `Depends(get_current_user)` and nothing
+else — `thread_service` gated view/post against the component's own legacy
+`access_control` JSONB, independent of the fold gating the tab the widget
+sits on. Every route that reaches `thread_service._check_view_access` or
+`_require_hub_admin` now also takes
+`access: ViewerAccess = Depends(get_viewer_access)` and passes it through —
+same split as `tabs_v2.py` and `super_blocknote_v2.py`: routers thread,
+services enforce. `/threads/mentionable-users` is the one exception — the
+mention directory has never been gated by widget access (it lists people,
+not thread content) and stays open to any authenticated caller.
 """
 
 from __future__ import annotations
@@ -26,7 +38,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, get_viewer_access
 from app.helpers.rate_limit import rate_limited
 from app.models.auth import UserInfo
 from app.schemas.thread import (
@@ -45,6 +57,7 @@ from app.schemas.thread import (
     VoteResponse,
 )
 from app.services import thread_service
+from app.services.access_visibility_service import ViewerAccess
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +102,11 @@ async def list_threads(
     cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.list_threads_for_link, db, link, cursor, user)
+    return await asyncio.to_thread(
+        thread_service.list_threads_for_link, db, link, cursor, user, access=access
+    )
 
 
 @router.post(
@@ -106,6 +122,7 @@ async def create_thread(
     link: str = Path(..., description="The thread widget component's stable `link`."),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
         thread_service.create_thread_for_link,
@@ -115,6 +132,7 @@ async def create_thread(
         payload.title,
         payload.content,
         payload.mentions,
+        access=access,
     )
 
 
@@ -128,8 +146,11 @@ async def get_thread(
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.get_thread_by_id, db, thread_id, user)
+    return await asyncio.to_thread(
+        thread_service.get_thread_by_id, db, thread_id, user, access=access
+    )
 
 
 @router.patch(
@@ -143,6 +164,7 @@ async def update_thread(
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
         thread_service.update_thread_by_id,
@@ -152,6 +174,7 @@ async def update_thread(
         payload.title,
         payload.content,
         payload.mentions,
+        access=access,
     )
 
 
@@ -164,9 +187,9 @@ async def update_thread(
 async def delete_thread(
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
-    await asyncio.to_thread(thread_service.delete_thread_by_id, db, thread_id, user)
+    await asyncio.to_thread(thread_service.delete_thread_by_id, db, thread_id, access=access)
 
 
 @router.put(
@@ -181,9 +204,10 @@ async def vote_on_thread(
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.vote_on_thread, db, thread_id, user, payload.value
+        thread_service.vote_on_thread, db, thread_id, user, payload.value, access=access
     )
 
 
@@ -203,9 +227,10 @@ async def list_comments(
     cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.list_comments_for_thread, db, thread_id, cursor, user
+        thread_service.list_comments_for_thread, db, thread_id, cursor, user, access=access
     )
 
 
@@ -222,6 +247,7 @@ async def create_comment(
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
         thread_service.create_comment_for_thread,
@@ -230,6 +256,7 @@ async def create_comment(
         user,
         payload.content,
         payload.mentions,
+        access=access,
     )
 
 
@@ -244,6 +271,7 @@ async def update_comment(
     comment_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
         thread_service.update_comment_by_id,
@@ -252,6 +280,7 @@ async def update_comment(
         user,
         payload.content,
         payload.mentions,
+        access=access,
     )
 
 
@@ -264,9 +293,9 @@ async def update_comment(
 async def delete_comment(
     comment_id: int = Path(...),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
-    await asyncio.to_thread(thread_service.delete_comment_by_id, db, comment_id, user)
+    await asyncio.to_thread(thread_service.delete_comment_by_id, db, comment_id, access=access)
 
 
 @router.put(
@@ -281,9 +310,10 @@ async def vote_on_comment(
     comment_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.vote_on_comment, db, comment_id, user, payload.value
+        thread_service.vote_on_comment, db, comment_id, user, payload.value, access=access
     )
 
 
@@ -303,9 +333,15 @@ async def list_notifications(
     unread_only: bool = Query(default=False),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.list_notifications_for_user, db, user, cursor, unread_only
+        thread_service.list_notifications_for_user,
+        db,
+        user,
+        cursor,
+        unread_only,
+        access=access,
     )
 
 
@@ -319,9 +355,10 @@ async def get_unread_notification_count(
     response: Response,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     count, etag = await asyncio.to_thread(
-        thread_service.get_unread_notification_count, db, user
+        thread_service.get_unread_notification_count, db, user, access=access
     )
     # plan §4.5 — "does not save a request, but it drops the body in the
     # overwhelmingly common unchanged case." A 304 carries no body by HTTP
@@ -342,9 +379,10 @@ async def mark_notification_read(
     notification_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     await asyncio.to_thread(
-        thread_service.mark_notification_read, db, notification_id, user
+        thread_service.mark_notification_read, db, notification_id, user, access=access
     )
 
 

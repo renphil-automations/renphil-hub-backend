@@ -550,6 +550,7 @@ def lock_tab(
     request: LockTabRequest,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
@@ -558,12 +559,16 @@ def lock_tab(
         # request-body field — `LockTabRequest` no longer has one to read.
         # Same normalization dependencies.get_current_hub_user applies.
         locked_by = (user.email or "").strip().lower()
+        # plan_ac_enforcement_closeout_2026-09-09.md §3: gates lock (and,
+        # via `force`, force-unlock's takeover) on `edit(n)`.
         locked_workspace = lock_tab_by_document_id_v2(
-            db=db, document_id=document_id, locked_by=locked_by, force=request.force
+            db=db, document_id=document_id, locked_by=locked_by, force=request.force, access=access
         )
         if locked_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": locked_workspace}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -579,6 +584,7 @@ def unlock_tab(
     request: UnlockTabRequest,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
@@ -588,15 +594,21 @@ def unlock_tab(
         # UnlockTabRequest's docstring — there is no longer a body field an
         # unlock could omit to skip the ownership check.
         unlocked_by = (user.email or "").strip().lower()
+        # plan_ac_enforcement_closeout_2026-09-09.md §3: force-unlock
+        # collapses to the same `edit(n)` check as lock — see
+        # lock_tab_by_document_id_v2's docstring for why.
         unlocked_workspace = unlock_tab_by_document_id_v2(
             db=db,
             document_id=document_id,
             unlocked_by=unlocked_by,
             force=request.force,
+            access=access,
         )
         if unlocked_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": unlocked_workspace}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 

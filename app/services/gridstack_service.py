@@ -1133,6 +1133,15 @@ class AirtableComponentBundle:
 
     Use `.data` for anything client-facing and `.pat` ONLY for the outbound
     Airtable call.
+
+    `component_id` (plan_ac_enforcement_closeout_2026-09-09.md §5.4) is the
+    component ROW's own `.id` — added so the six gated routes in
+    `app/routers/airtable.py` can ask `access.is_granted(("component",
+    bundle.component_id))` without a second `_airtable_component_by_link`
+    lookup. It is not secret and not a derived view of the raw blob (L12
+    above is only about the raw `page_content` blob); exposing it costs
+    nothing extra to compute since `get_airtable_component_bundle` already
+    holds the `ComponentV2` row when it builds every other field here.
     """
 
     #: Non-secret configuration — same shape as `get_airtable_component_config`.
@@ -1143,6 +1152,8 @@ class AirtableComponentBundle:
     data: dict[str, Any]
     #: One of AIRTABLE_LIKE_WIDGET_TYPES — the component ROW's own `.type`.
     widget_type: str
+    #: The component ROW's own `.id` — the access-control node's node_id.
+    component_id: int
 
 
 def get_airtable_component_bundle(
@@ -1177,6 +1188,7 @@ def get_airtable_component_bundle(
         pat=_airtable_pat_view(raw),
         data=_sanitised_component_data(component, raw),
         widget_type=component.type,
+        component_id=component.id,
     )
 
 
@@ -2966,7 +2978,7 @@ def _require_live_session(db: Session, session: Any, ac_node: tuple[str, int] | 
 
 
 def lock_tab_by_document_id_v2(
-    db: Session, document_id: str, locked_by: str, force: bool = False
+    db: Session, document_id: str, locked_by: str, force: bool = False, *, access: ViewerAccess | None = None
 ) -> dict[str, Any] | None:
     """THIN WRAPPER, plan_lock_propagation_2026-09-08.md §8 phase 2. The
     actual conflict logic now lives in `edit_lock_service.acquire` —
@@ -2989,12 +3001,26 @@ def lock_tab_by_document_id_v2(
     than refusing when something in it is held fresh by someone else — see
     `edit_lock_service.acquire`'s own docstring for exactly what it does
     and does not override (an ancestor's lock is never one of the things
-    it can take over)."""
+    it can take over).
+
+    plan_ac_enforcement_closeout_2026-09-09.md §3: lock/unlock and
+    force-unlock all collapse to a single `edit(n)` check — anyone holding
+    `edit(parent(n))` already holds `edit(n)` by the downward fold
+    (`edit(n) = seed_edit(n) ∨ edit(parent(n))`, algorithm §6.1), so there is
+    no separate parent-node check to add for `force`, and `force`'s subtree
+    takeover needs nothing extra either: `edit(n)` already propagates down to
+    all of `subtree(n)` (algorithm §5.1's downward fold), which is exactly
+    what a forced lock takes over. §3.3's trap: gate on the AC node
+    (`resolve_gridstack_node`), never the LOCK node (`resolve_lock_node`) —
+    a `("gridstack", id)` lock node is not a valid AC node kind and would
+    evaluate to fail-closed INVISIBLE for everyone but a Hub Admin."""
     from app.services import edit_lock_service  # local: see that module's own import comment
 
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
+
+    require_edit(access, resolve_gridstack_node(db, gridstack))
 
     grant = edit_lock_service.acquire(
         db, edit_lock_service.resolve_lock_node(gridstack), locked_by, force=force
@@ -3013,17 +3039,25 @@ def unlock_tab_by_document_id_v2(
     document_id: str,
     unlocked_by: str | None = None,
     force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
     """THIN WRAPPER — see `lock_tab_by_document_id_v2`'s own comment on why
     the logic moved to `edit_lock_service.release`. `force` here is the
     EXISTING unlock force (owner decision 2026-09-03: unrestricted, skips
     ownership AND staleness) — unchanged by this plan, and a different flag
-    from `lock_tab_by_document_id_v2`'s new one above."""
+    from `lock_tab_by_document_id_v2`'s new one above.
+
+    plan_ac_enforcement_closeout_2026-09-09.md §3: same single `edit(n)`
+    gate as lock, covering force-unlock too — see that function's docstring
+    for why the `edit(parent(n))` disjunct is redundant here."""
     from app.services import edit_lock_service  # local: see that module's own import comment
 
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
+
+    require_edit(access, resolve_gridstack_node(db, gridstack))
 
     edit_lock_service.release(
         db, edit_lock_service.resolve_lock_node(gridstack), unlocked_by or "", force=force

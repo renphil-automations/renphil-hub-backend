@@ -41,11 +41,14 @@ from fastapi import (
 from app.config import get_settings
 from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.dependencies import (
+    CurrentHubUser,
     get_airtable_service,
+    get_current_hub_user,
     get_current_user,
     get_edit_session,
     get_gemini_service,
     get_viewer_access,
+    is_hub_admin,
 )
 from app.helpers.cache import airtable_cache, invalidates_cache
 from app.helpers.slack import (
@@ -156,22 +159,147 @@ from app.models.airtable import (
 )
 from app.models.auth import UserInfo
 from app.routers.tabs_v2 import access_denied_to_http_exception
-from app.services.access_visibility_service import AccessDeniedError, ViewerAccess
+from app.services.access_visibility_service import (
+    AccessDeniedError,
+    ViewerAccess,
+    granted_single_node,
+)
 from app.services.airtable_service import AirtableService
 from app.services.edit_lock_service import EditSession
 from app.services.gemini_service import GeminiService
 from app.services.gridstack_service import (
+    AirtableComponentBundle,
     get_airtable_component_bundle,
     get_airtable_component_config,
     list_airtable_component_links,
     update_airtable_component_config,
 )
-from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
+from app.services.rbac_graph_service import RbacClosures
 from app.services import user_db_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["Data"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Access control for the six component-data routes below
+#   (plan_ac_enforcement_closeout_2026-09-09.md §5)
+#
+#   Two independent answers to "can you see this widget" used to exist: the
+#   canvas serializer's fold (redacting a hidden widget to the `restricted`
+#   sentinel) and this router's OWN legacy predicate against the component's
+#   raw `access_control` JSONB, where an empty blob meant open to everyone.
+#   A caller who already knew (or guessed) a widget's `link` could bypass the
+#   canvas fold entirely by hitting these six routes directly. This closes
+#   that gap by running the SAME fold the canvas uses, `is_granted` (payload,
+#   not `visible`/chrome — Airtable rows are content, exactly like SBN text
+#   and thread discussions), against a NOT-FOUND response rather than a
+#   FORBIDDEN one (matching `get_component_location`, tabs_v2.py:179-186 —
+#   a deep link to a hidden node must not confirm the node exists).
+# ══════════════════════════════════════════════════════════════════════
+class _LazyRbacClosures:
+    """A `RbacClosures` stand-in whose four eager queries (`__init__`'s own
+    role/scope-edge and is_public reads) are deferred until something on it
+    is actually used.
+
+    `_resolve_airtable_bundle_and_access` passes ONE of these to both
+    `is_hub_admin` and `granted_single_node`. If `is_hub_admin`'s branch 1
+    (the JWT role check — zero queries) already answers `True`, this is
+    never touched and the underlying `RbacClosures(db)` never gets built at
+    all. If branch 1 fails and branch 2 — or `granted_single_node`
+    afterward — actually calls a method on it, the real `RbacClosures` is
+    built ONCE, right here, and reused by whichever of the two reaches it
+    second. Passing bare `closures=None` to both instead (the previous
+    shape) built two independent snapshots for that path — this is the
+    fix for that.
+
+    DUCK-TYPED, NOT A SUBCLASS, AND DELIBERATELY SO. Every caller of a
+    `closures` object in this codebase (`effective_pairs`/`held_closures`
+    in `rbac_graph_service.py`, `granted_single_node` here) only ever
+    attribute-accesses it — `.role_descendants(...)`, `.scope_descendants(
+    ...)` — never `isinstance`-checks it (confirmed by grep before writing
+    this). `__getattr__` forwarding is therefore a safe, minimal way to
+    share one snapshot across two independent callers without changing
+    `RbacClosures`, `is_hub_admin`, or `effective_pairs`'s own signatures —
+    all three are shared by every other AC-gated surface in the app, so
+    changing any of them to support this would be a far bigger, riskier
+    edit than this file's own scope.
+    """
+
+    def __init__(self, db: Session) -> None:
+        self._db = db
+        self._real: RbacClosures | None = None
+
+    def __getattr__(self, name: str):
+        if self._real is None:
+            self._real = RbacClosures(self._db)
+        return getattr(self._real, name)
+
+
+def _resolve_airtable_bundle_and_access(
+    db: Session, link: str, current: CurrentHubUser
+) -> tuple[AirtableComponentBundle | None, bool]:
+    """Bundle fetch + access check, run TOGETHER in one `asyncio.to_thread`
+    call from each of the six routes below.
+
+    WHY THIS ISN'T JUST `Depends(get_viewer_access)`. That dependency
+    (`dependencies.py:395`) is `async def` with a fully SYNCHRONOUS body —
+    no `await` inside it at all — so FastAPI runs it straight on the shared
+    event loop. This file already goes to deliberate lengths to keep
+    synchronous SQLAlchemy work (the bundle fetch, right below) off that
+    loop, via `asyncio.to_thread`, with a comment naming the ~165ms Neon
+    round trip. Adding `Depends(get_viewer_access)` on top would reintroduce
+    exactly that class of blocking call a second time, on every one of these
+    six routes. Folding the access check into the SAME `to_thread` call the
+    bundle fetch already uses avoids a second blocking dependency without
+    duplicating `get_viewer_access`'s own three-line body — see
+    `access_visibility_service.granted_single_node`'s docstring for the
+    Option A vs. Option B measurement that also lives on this call.
+
+    Uses `granted_single_node` (Option B — a single-node O(depth) fast
+    path), not `resolve_viewer_access`/`compute_visibility` (Option A — the
+    whole-tree fold `get_viewer_access` builds). Measured against live Neon
+    before choosing: the whole-tree fold cost ~2.4s end to end for one
+    non-admin request, almost entirely five full-table scans that scale with
+    hub size; the single-node walk pays the same closure/grant cost but
+    replaces those scans with a walk bounded by THIS component's own depth.
+    See `scripts/profile_viewer_access.py` and that function's own
+    docstring for the numbers and the reasoning in full.
+
+    Returns `(None, False)` for an unknown link. Returns `(bundle, False)`
+    for a link that resolves to a component the caller cannot see — the
+    router turns BOTH into the identical 404, so neither response tells an
+    unauthorized caller which case they hit.
+
+    ONE `_LazyRbacClosures`, SHARED BETWEEN `is_hub_admin` AND
+    `granted_single_node`, BUILT AT MOST ONCE. `is_hub_admin`'s branch 1
+    (the JWT role — today's dominant path; `dependencies.py`'s own
+    docstring notes `role_assignments` still holds only a handful of rows)
+    short-circuits with ZERO queries and never touches the object at all,
+    so an admin caller here still builds nothing. A non-JWT-admin caller
+    reaches `is_hub_admin`'s branch 2, which builds the real `RbacClosures`
+    on first use; if that caller then also isn't found admin,
+    `granted_single_node` reuses the SAME already-built snapshot rather
+    than building a second one — the fix for the double-build the previous
+    shape of this function had (bare `closures=None` to both calls).
+    """
+    bundle = get_airtable_component_bundle(db, link)
+    if bundle is None:
+        return None, False
+
+    closures = _LazyRbacClosures(db)
+    if is_hub_admin(db, current, closures=closures):
+        return bundle, True
+
+    granted = granted_single_node(
+        db,
+        current.hub_user_id,
+        ("component", bundle.component_id),
+        is_admin=False,
+        closures=closures,
+    )
+    return bundle, granted
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -409,9 +537,11 @@ async def get_airtable_component_rows(
         description="Opaque next-page cursor from a previous response.",
     ),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    user = current.info
+
     # ONE bundle instead of three independent accessors: config + pat + data
     # each used to re-query the same ComponentV2 and PageContentV2 rows, so
     # this endpoint issued 6 queries to read 2 rows on EVERY request — cache
@@ -420,31 +550,22 @@ async def get_airtable_component_rows(
     #
     # Plain sync SQLAlchemy (finding #8) — off the event loop via to_thread
     # so this ~165ms Neon round trip doesn't stall every other in-flight
-    # request on the shared asyncio loop.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    # request on the shared asyncio loop. The access-control check (§5 of
+    # plan_ac_enforcement_closeout_2026-09-09.md) runs in the SAME thread —
+    # see `_resolve_airtable_bundle_and_access`'s own docstring for why it
+    # is not a second `Depends(get_viewer_access)`.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
+        # Same message and status for "no such widget" and "you cannot see
+        # this widget" — a deep link to a hidden node must not confirm the
+        # node exists (§5.4; matches get_component_location, tabs_v2.py:179).
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-
-    # Access control, matching the existing (deliberately narrow) pattern in
-    # tab_service.filter_widget_content_for_user: Hub Admins bypass, and only
-    # a widget's OWN explicit access_control is enforced. A widget with no
-    # explicit AC is readable by any authenticated caller here — it inherits
-    # from its tab, which nothing enforces server-side today. That residual
-    # gap is documented in
-    # AI Docs/plan_airtable_personalize_backend_enforcement.md.
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -505,28 +626,24 @@ aggregate.
 async def get_airtable_component_metric(
     link: str = Path(..., description="The component's stable `link`."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    # Same bundle/AC/source-url/pat shape as get_airtable_component_rows —
-    # see the comments there. Plain sync SQLAlchemy off the event loop
-    # (finding #8), same reasoning.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_rows
+    # — see the comments there, including why the access check rides the
+    # same to_thread call as the bundle fetch instead of a second
+    # Depends(get_viewer_access).
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -587,9 +704,11 @@ cache itself — see `AirtableService.preview_widget_chart`'s docstring.
 async def preview_airtable_component_chart(
     body: AirtableChartPreviewRequest = Body(...),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    user = current.info
+
     # Same two-shape resolution as preview_airtable_component — see the
     # comments there. Deliberately not extracted into a shared helper for
     # this first duplication (two call sites); a third would earn one.
@@ -607,22 +726,18 @@ async def preview_airtable_component_chart(
         link = None
 
     elif link:
-        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-        if bundle is None:
+        # §5 of plan_ac_enforcement_closeout_2026-09-09.md gates only THIS
+        # branch — the body-pat branch above never resolves a component and
+        # needs no fold, the caller supplied their own credential.
+        bundle, granted = await asyncio.to_thread(
+            _resolve_airtable_bundle_and_access, db, link, current
+        )
+        if bundle is None or not granted:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Airtable component not found",
             )
         config = bundle.config
-
-        roles = list(user.roles)
-        widget_ac = config.get("access_control")
-        if widget_ac and HUB_ADMIN_ROLE not in roles:
-            if not _user_can_view_widget(widget_ac, user.email, roles):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have access to this widget",
-                )
 
         stored_url = (config.get("sourceUrl") or "").strip()
 
@@ -696,27 +811,22 @@ aggregate. High-cardinality group-by fields are folded into a single
 async def get_airtable_component_chart(
     link: str = Path(..., description="The component's stable `link`."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    # Same bundle/AC/source-url/pat shape as get_airtable_component_metric —
-    # see the comments there.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_metric
+    # — see the comments there.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -784,27 +894,22 @@ Every case falls back to the paginated `/rows` view rather than erroring.
 async def get_airtable_component_rows_full(
     link: str = Path(..., description="The component's stable `link`."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    # Same bundle/AC/source-url/pat shape as get_airtable_component_rows and
-    # get_airtable_component_metric — see the comments there.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_rows
+    # and get_airtable_component_metric — see the comments there.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -1083,9 +1188,11 @@ when your own row set is empty; `rows` reflects what you would actually see.
 async def preview_airtable_component(
     body: AirtableEditorPreviewRequest = Body(...),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    user = current.info
+
     body_pat = (body.pat or "").strip()
     body_url = (body.sourceUrl or "").strip()
     link = (body.link or "").strip()
@@ -1101,25 +1208,21 @@ async def preview_airtable_component(
         url, api_key = body_url, body_pat
 
     elif link:
-        # config + pat from one resolve rather than two.
-        # Plain sync SQLAlchemy (finding #8) — off the event loop via
-        # to_thread, same as every other call site of this accessor.
-        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-        if bundle is None:
+        # config + pat + access from one resolve rather than two. Plain sync
+        # SQLAlchemy (finding #8) — off the event loop via to_thread, same
+        # as every other call site of this accessor. §5 of
+        # plan_ac_enforcement_closeout_2026-09-09.md gates only THIS
+        # branch — the body-pat branch above never resolves a component and
+        # needs no fold, the caller supplied their own credential.
+        bundle, granted = await asyncio.to_thread(
+            _resolve_airtable_bundle_and_access, db, link, current
+        )
+        if bundle is None or not granted:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Airtable component not found",
             )
         config = bundle.config
-
-        roles = list(user.roles)
-        widget_ac = config.get("access_control")
-        if widget_ac and HUB_ADMIN_ROLE not in roles:
-            if not _user_can_view_widget(widget_ac, user.email, roles):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have access to this widget",
-                )
 
         stored_url = (config.get("sourceUrl") or "").strip()
 

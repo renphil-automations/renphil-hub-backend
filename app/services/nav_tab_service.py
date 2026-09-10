@@ -186,7 +186,12 @@ def get_dashboard_nav_tab(db: Session) -> NavTabV2 | None:
 # ---------------------------------------------------------
 
 def lock_nav_tab_by_document_id_v2(
-    db: Session, document_id: str, locked_by: str, force: bool = False
+    db: Session,
+    document_id: str,
+    locked_by: str,
+    force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
     """THIN WRAPPER, mirroring `gridstack_service.lock_tab_by_document_id_v2`
     exactly — see that function's own docstring for why the conflict logic
@@ -194,10 +199,20 @@ def lock_nav_tab_by_document_id_v2(
     tab version: a nav tab needs no gridstack indirection to find its lock
     node — `("nav_tab", nav_tab.id)` already IS one, no
     `resolve_lock_node` translation step required. `force` is §4.2 decision
-    8's subtree takeover, unchanged in meaning from the tab route."""
+    8's subtree takeover, unchanged in meaning from the tab route.
+
+    plan_ac_enforcement_closeout_2026-09-09.md §3: gated on `edit(n)`, the
+    same single check that also covers force-unlock — see
+    `gridstack_service.lock_tab_by_document_id_v2`'s docstring for why the
+    `edit(parent(n))` disjunct and the subtree-takeover case both collapse
+    into it. No `resolve_lock_node`/`resolve_gridstack_node` split needed
+    here (§3.3's trap): `("nav_tab", nav_tab.id)` is already the correct AC
+    node, not a lock-tree-only ref."""
     nav_tab = get_nav_tab_by_document_id(db, document_id)
     if nav_tab is None:
         return None
+
+    require_edit(access, ("nav_tab", nav_tab.id))
 
     grant = edit_lock_service.acquire(db, ("nav_tab", nav_tab.id), locked_by, force=force)
     formatted = _format_nav_tab(nav_tab)
@@ -213,16 +228,23 @@ def unlock_nav_tab_by_document_id_v2(
     document_id: str,
     unlocked_by: str | None = None,
     force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
     """THIN WRAPPER — see `lock_nav_tab_by_document_id_v2`'s own comment on
     why the logic lives in `edit_lock_service.release`. `force` here is the
     EXISTING unlock force (owner decision 2026-09-03: unrestricted, skips
     ownership AND staleness) — the same flag
     `gridstack_service.unlock_tab_by_document_id_v2` takes, unchanged by
-    this plan."""
+    this plan.
+
+    plan_ac_enforcement_closeout_2026-09-09.md §3: same single `edit(n)`
+    gate as lock, covering force-unlock too."""
     nav_tab = get_nav_tab_by_document_id(db, document_id)
     if nav_tab is None:
         return None
+
+    require_edit(access, ("nav_tab", nav_tab.id))
 
     edit_lock_service.release(db, ("nav_tab", nav_tab.id), unlocked_by or "", force=force)
     return _format_nav_tab(nav_tab)

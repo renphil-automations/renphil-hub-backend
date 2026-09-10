@@ -1162,6 +1162,187 @@ def resolve_hub_node(db: Session) -> NodeRef | None:
     return ("hub", hub_ids[0]) if len(hub_ids) == 1 else None
 
 
+# ---------------------------------------------------------
+# §8.1 step 3 — the single-node PAYLOAD fast path (Option B,
+# plan_ac_enforcement_closeout_2026-09-09.md §5.3)
+# ---------------------------------------------------------
+
+
+def resolve_component_parent_node(db: Session, component: ComponentV2) -> NodeRef | None:
+    """Single-component re-derivation of ``_component_parent``'s three-branch
+    precedence (§3.1), as individual queries rather than the whole-tree bulk
+    maps ``build_node_tree`` builds from one full ``components``/``gridstacks``
+    scan each. Same pattern as ``resolve_gridstack_node`` /
+    ``resolve_gridstack_parent_node`` above, and for the same reason: a
+    caller here resolves ONE component's parent per request, not the whole
+    tree.
+
+    Read ``_component_parent``'s own docstring for why the branch order and
+    the root-representation special case exist — this function makes the
+    same three decisions, it just reads only the rows the chosen branch
+    actually needs instead of consulting a pre-loaded bulk map.
+    """
+    if component.super_blocknote_id is not None:
+        return ("component", component.super_blocknote_id)
+
+    if component.current_grid_id is not None:
+        grid = db.query(GridstackV2).filter(GridstackV2.id == component.current_grid_id).first()
+        if grid is None:
+            return None
+        if grid.parent_id is None:
+            # The representation component of a ROOT gridstack — see
+            # ``_component_parent``'s own comment on why this does not route
+            # through the tab's own representation row.
+            return ("tab", grid.parent_tab_id) if grid.parent_tab_id is not None else None
+        parent_grid = db.query(GridstackV2).filter(GridstackV2.id == grid.parent_id).first()
+        if parent_grid is None:
+            return None
+        return resolve_gridstack_node(db, parent_grid)
+
+    if component.gridstack_id is None:
+        return None
+    gridstack = db.query(GridstackV2).filter(GridstackV2.id == component.gridstack_id).first()
+    if gridstack is None:
+        return None
+    return resolve_gridstack_node(db, gridstack)
+
+
+def _parent_node(db: Session, node: NodeRef) -> NodeRef | None:
+    """One step up the AC tree from ``node``, dispatched by node kind — the
+    primitive ``granted_single_node``'s ancestor walk runs on. Every branch
+    re-derives, as a single lookup, a piece ``build_node_tree`` computes in
+    bulk for the whole tree (§3.1-§3.3); see that function and
+    ``resolve_component_parent_node`` for why each branch reads what it
+    reads. Returns ``None`` at the root (``hub``) or wherever the chain
+    cannot be resolved — §3.3's fail-closed orphan case, reached here node
+    by node instead of once per whole-tree build.
+    """
+    kind, node_id = node
+    if kind == "hub":
+        return None
+    if kind == "nav_tab":
+        # No ``nav_tabs.hub_id`` column — the link to the root is implicit,
+        # exactly as ``build_node_tree``'s own comment says.
+        return resolve_hub_node(db)
+    if kind == "tab":
+        tab = db.query(TabV2).filter(TabV2.id == node_id).first()
+        if tab is None:
+            return None
+        if tab.parent_tab_id is not None:
+            return ("tab", tab.parent_tab_id)
+        return ("nav_tab", tab.nav_tab_id) if tab.nav_tab_id is not None else None
+    if kind == "component":
+        component = db.query(ComponentV2).filter(ComponentV2.id == node_id).first()
+        if component is None:
+            return None
+        return resolve_component_parent_node(db, component)
+    return None  # an unrecognised node kind — fail closed, matching verdict()'s INVISIBLE
+
+
+def granted_single_node(
+    db: Session,
+    hub_user_id: int,
+    node: NodeRef | None,
+    *,
+    is_admin: bool,
+    closures: RbacClosures | None = None,
+) -> bool:
+    """§8.1 step 3's O(depth) fast path: ``granted(n) ⟺ (ancestors(n) ∪ {n})
+    ∩ S ≠ ∅`` — for ONE node, without building the whole tree.
+
+    plan_ac_enforcement_closeout_2026-09-09.md §5.3, Option B — chosen over
+    Option A (reusing ``get_viewer_access`` as-is) after measuring
+    ``compute_visibility`` against live Neon for a non-admin user
+    (scripts/profile_viewer_access.py, the plan's own "measure first" rule).
+    That measurement was ~2.4s end to end for ONE request — nowhere near the
+    plan's "tens of milliseconds" bar — almost entirely
+    ``build_node_tree``'s five full-table scans (hub / nav_tabs / tabs /
+    gridstacks / components; the last one alone was the single most
+    expensive query measured, and it only gets slower as the hub grows).
+    This function pays the SAME closure + grant-matching cost
+    (``RbacClosures`` + ``matching_grants`` — unavoidable for any correct
+    answer, Option A or B) but replaces the tree build with a short
+    parent-chain walk bounded by this ONE node's depth: flat cost regardless
+    of hub size, which is exactly what §8.1's own opening line argues for —
+    "Grants are far fewer than nodes. Do not walk the tree evaluating ACLs."
+
+    USE THIS ONLY FOR A SINGLE PAYLOAD CHECK (the ``is_granted`` question on
+    one node — Airtable component data today, airtable.py's six routes).
+    It answers ``granted``, never ``visible`` — there is no cheap
+    single-node equivalent of the upward ``visible`` fold (§5.1's second
+    line needs a node's WHOLE SUBTREE, which is exactly the walk this
+    function exists to avoid). A caller needing ``visible``, or needing more
+    than one node's verdict in the same request, wants
+    ``compute_visibility`` / ``resolve_viewer_access`` instead — calling
+    this once per node would be the same trap §8.4 already warns against for
+    the tree-wide case, paid one node at a time instead of once.
+
+    Iterative with a visited set (§3.3): an orphaned, or (should it ever
+    happen) cyclic, parent chain terminates in ``False``, never a hang.
+
+    MIRRORS (§3.4). If ``node`` is a ``mirror``-typed component, the real
+    rule is a CONJUNCTION, not a redirect — see
+    ``_apply_mirror_substitution``'s docstring for why:
+    ``granted(mirror) = granted(mirror's own position) AND granted(target)``.
+    Handled below: the walk already answers the first half, and only if that
+    holds does this recurse once more on the resolved target (itself
+    dangling, exactly as ``build_node_tree`` treats a mirror-of-mirror, if
+    the target is missing or is itself a mirror). In practice airtable.py's
+    six callers never reach this branch — plan §5.2 records that a mirrored
+    Airtable widget is rendered with the TARGET's own link, so the component
+    these six routes ever resolve is never itself a ``mirror`` row — but
+    this is a general ``access_visibility_service`` primitive, not an
+    airtable.py-only helper, and a future caller that does pass a mirror
+    node must get the correct answer, not a silent bypass.
+    """
+    if is_admin:
+        return True
+    if node is None:
+        return False
+
+    graph = closures if closures is not None else RbacClosures(db)
+    seeds = {(m.node_kind, m.node_id) for m in matching_grants(db, hub_user_id, closures=graph)}
+    if not seeds:
+        return False  # nothing this user reaches — no walk needed either way
+
+    def _reaches_a_seed(start: NodeRef | None) -> bool:
+        current = start
+        visited: set[NodeRef] = set()
+        while current is not None:
+            if current in seeds:
+                return True
+            if current in visited:
+                return False  # cycle guard — fail closed, §3.3
+            visited.add(current)
+            current = _parent_node(db, current)
+        return False
+
+    if not _reaches_a_seed(node):
+        return False
+
+    kind, node_id = node
+    if kind != "component":
+        return True
+    # One extra by-PK lookup on the mirror check, even on the (overwhelming)
+    # non-mirror path — accepted for the same reason ``resolve_gridstack_
+    # parent_node`` re-queries inside its own recursive call: a self-
+    # contained single-node resolver over a cheap primary-key read, not a
+    # bulk map worth threading through every caller to save one query.
+    component = db.query(ComponentV2).filter(ComponentV2.id == node_id).first()
+    if component is None or component.type != MIRROR_WIDGET_TYPE:
+        return True
+
+    target_link = (component.props or {}).get("target_link")
+    target = (
+        db.query(ComponentV2).filter(ComponentV2.link == target_link).first()
+        if target_link
+        else None
+    )
+    if target is None or target.type == MIRROR_WIDGET_TYPE:
+        return False  # dangling — same rule build_node_tree applies (§3.4)
+    return _reaches_a_seed(("component", target.id))
+
+
 class AccessDeniedError(Exception):
     """Base for the two ways ``require_edit`` below can refuse a write.
     Carries the ``node`` that was being checked so a caller that wants to
@@ -1237,6 +1418,19 @@ class ViewerAccess(NamedTuple):
     fold runs exactly as designed — including D2: a non-admin with no
     grants correctly sees nothing, which is this design's own stated
     default, not a bug introduced here.
+
+    ``full_access`` IS ALSO, TODAY, THE ENTIRE DEFINITION OF "IS HUB ADMIN"
+    FOR EVERY CALLER THAT USES IT AS AN IDENTITY GATE — not just a content
+    bypass. `thread_service._require_hub_admin`
+    (plan_ac_enforcement_closeout_2026-09-09.md §4.4) deletes a thread or
+    comment when `not access.full_access`, on the reasoning that this field
+    is *currently* true if and only if `dependencies.is_hub_admin` said so.
+    THAT COUPLING IS REAL AND SILENT: if a second reason to bypass the fold
+    is ever added here — for ANY purpose, on ANY surface — every such
+    identity gate widens to cover it too, with no change at any of those
+    call sites. Read every caller of `.full_access` before adding a second
+    reason to set it True; do not assume it is read only as "skip the
+    fold".
     """
 
     visibility: VisibilityResult | None

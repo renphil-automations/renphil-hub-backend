@@ -256,9 +256,11 @@ def delete_nav_tab(
 # (LockTabRequest/UnlockTabRequest have no tab-specific fields, so they are
 # reused as-is rather than duplicated), same identity-sourced holder (no
 # `locked_by`/`unlocked_by` body field, per those schemas' own Fix 1
-# docstrings), same "no access-control gate here" shape as the tab routes —
-# neither of those checks permission either; only rename/icon/delete
-# (`update_nav_tab`/`delete_nav_tab` above) require `edit(nav_tab)`.
+# docstrings). plan_ac_enforcement_closeout_2026-09-09.md §3 closed the gap
+# this comment used to describe: lock/unlock (and force-unlock, which
+# collapses to the same check — see lock_nav_tab_by_document_id_v2's own
+# docstring) now require `edit(nav_tab)`, same as rename/icon/delete
+# (`update_nav_tab`/`delete_nav_tab` above).
 # ---------------------------------------------------------
 
 @router.put(
@@ -272,17 +274,20 @@ def lock_nav_tab(
     request: LockTabRequest,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
     try:
         locked_by = (user.email or "").strip().lower()
         locked = lock_nav_tab_by_document_id_v2(
-            db=db, document_id=document_id, locked_by=locked_by, force=request.force
+            db=db, document_id=document_id, locked_by=locked_by, force=request.force, access=access
         )
         if locked is None:
             raise HTTPException(status_code=404, detail="Nav tab not found")
         return locked
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
 
@@ -298,6 +303,7 @@ def unlock_nav_tab(
     request: UnlockTabRequest,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     validate_document_id(document_id)
 
@@ -308,9 +314,12 @@ def unlock_nav_tab(
             document_id=document_id,
             unlocked_by=unlocked_by,
             force=request.force,
+            access=access,
         )
         if unlocked is None:
             raise HTTPException(status_code=404, detail="Nav tab not found")
         return unlocked
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
     except ValueError as e:
         raise value_error_to_http_exception(e)
