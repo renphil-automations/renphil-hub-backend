@@ -131,16 +131,16 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def get_current_hub_user(
-    user: UserInfo = Depends(get_current_user),
-    db: Session = Depends(get_db_v2),
-) -> CurrentHubUser:
-    """Resolve (and provision if needed) the caller's `hub_users` row.
+def _ensure_hub_user(db: Session, *, email: str, name: str) -> HubUserV2 | None:
+    """Look up or create the `hub_users` row for `email` (already normalized
+    by the caller). Extracted from `get_current_hub_user` below so a second
+    caller — the dev-only `/auth/dev-login` route
+    (session_handoff_2026-09-10-dev-login-tool.md) — can provision the same
+    row synchronously, before minting a token, instead of waiting for the
+    next authenticated request to trigger the lazy upsert. Pure extraction:
+    no behavior change to the upsert itself.
 
-    Normalizes emails with `.strip().lower()`, the same rule every other
-    email comparison in this codebase applies.
-
-    UNLIKE every other dependency in this module, this one commits. A GET
+    UNLIKE every other dependency in this module, this commits. A GET
     endpoint (e.g. "my assignments") never calls `db.commit()` itself, but
     provisioning has to survive past this request regardless of whether the
     route that triggered it writes anything — so the insert is committed
@@ -152,11 +152,9 @@ async def get_current_hub_user(
     one wins the UNIQUE constraint on `email`. The loser rolls back and
     re-reads rather than 500ing.
     """
-    email = (user.email or "").strip().lower()
-
     hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
     if hub_user is None:
-        hub_user = HubUserV2(email=email, name=user.name, is_active=True, created_at=_utc_now())
+        hub_user = HubUserV2(email=email, name=name, is_active=True, created_at=_utc_now())
         db.add(hub_user)
         try:
             db.commit()
@@ -165,6 +163,21 @@ async def get_current_hub_user(
             hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
         else:
             db.refresh(hub_user)
+    return hub_user
+
+
+async def get_current_hub_user(
+    user: UserInfo = Depends(get_current_user),
+    db: Session = Depends(get_db_v2),
+) -> CurrentHubUser:
+    """Resolve (and provision if needed) the caller's `hub_users` row.
+
+    Normalizes emails with `.strip().lower()`, the same rule every other
+    email comparison in this codebase applies.
+    """
+    email = (user.email or "").strip().lower()
+
+    hub_user = _ensure_hub_user(db, email=email, name=user.name)
 
     if hub_user is None:
         # Only reachable if the concurrent INSERT that won the race was
