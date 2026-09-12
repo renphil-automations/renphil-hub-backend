@@ -20,10 +20,12 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.db_v2.database import get_db_v2
 from app.dependencies import (
+    CurrentHubUser,
     _ensure_hub_user,
     get_airtable_service,
     get_auth_service,
     get_current_user,
+    is_hub_admin,
 )
 from app.models.auth import MeResponse, TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
@@ -51,6 +53,7 @@ async def callback(
     state: str = Query(..., description="OAuth state parameter (PKCE tie-back)"),
     auth_service: AuthService = Depends(get_auth_service),
     airtable_service: AirtableService = Depends(get_airtable_service),
+    db: Session = Depends(get_db_v2),
 ):
     """
     Google redirects here after the user consents.
@@ -61,12 +64,43 @@ async def callback(
     token_response, frontend_redirect_uri = await auth_service.handle_callback(
         code, state, airtable_service
     )
+
+    # findings_dev_login_live_testing_2026-09-12.md #1: the frontend never
+    # actually calls GET /me after this redirect (AuthCallbackPage.tsx builds
+    # `user` straight from these query params), so `is_hub_admin` has to ride
+    # along here to be seen at all — computed the same way `/dev-login` below
+    # computes it, via the real `is_hub_admin` closure (JWT roles OR a live
+    # `role_assignments` row), not the JWT-roles-only check the ~20 frontend
+    # call sites used to do. Provisions the `hub_users` row synchronously
+    # (same helper `/dev-login` uses) since this can be a brand-new user's
+    # very first request — nothing has provisioned it yet, and branch 2 of
+    # `is_hub_admin` needs a `hub_user_id` to check `role_assignments`
+    # against. `hub_user is None` is only reachable in an effectively
+    # unreachable concurrent-insert race (see `_ensure_hub_user`'s own
+    # docstring) — falling back to `admin=False` there rather than raising,
+    # so that edge case never breaks login itself over a nice-to-have flag.
+    normalized_email = token_response.email.strip().lower()
+    hub_user = _ensure_hub_user(db, email=normalized_email, name=token_response.name)
+    admin = False
+    if hub_user is not None:
+        current = CurrentHubUser(
+            info=UserInfo(
+                email=token_response.email,
+                name=token_response.name,
+                roles=token_response.roles,
+            ),
+            hub_user_id=hub_user.id,
+            email=normalized_email,
+        )
+        admin = is_hub_admin(db, current)
+
     params = urlencode(
         {
             "access_token": token_response.access_token,
             "email": token_response.email,
             "name": token_response.name,
             "roles": token_response.roles,
+            "is_hub_admin": str(admin).lower(),
             **({"picture": token_response.picture} if token_response.picture else {}),
         },
         doseq=True,
@@ -187,9 +221,19 @@ async def dev_login(
     except ValidationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid email: {email}") from exc
 
-    _ensure_hub_user(db, email=normalized_email, name=user.name)
+    hub_user = _ensure_hub_user(db, email=normalized_email, name=user.name)
 
     access_token = auth_service._create_access_token(user)
+
+    # Same `is_hub_admin` resolution the real /callback now does (see its
+    # own comment) — findings_dev_login_live_testing_2026-09-12.md #1. Since
+    # `roles` is forced to `[]` above, this can only ever come back `true`
+    # via branch 2 (a live `role_assignments` row), which is exactly the
+    # scenario this tool exists to exercise.
+    admin = False
+    if hub_user is not None:
+        current = CurrentHubUser(info=user, hub_user_id=hub_user.id, email=normalized_email)
+        admin = is_hub_admin(db, current)
 
     params = urlencode(
         {
@@ -197,6 +241,7 @@ async def dev_login(
             "email": user.email,
             "name": user.name,
             "roles": user.roles,
+            "is_hub_admin": str(admin).lower(),
         },
         doseq=True,
     )
