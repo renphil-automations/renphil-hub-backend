@@ -318,6 +318,15 @@ class NavTabResponse(BaseModel):
 
 class NavTabListAPIResponse(BaseModel):
     data: list[NavTabResponse] = Field(default_factory=list)
+    # findings_dev_login_live_testing_2026-09-12.md #4: the ONE signal the
+    # frontend had no channel for — "do I hold edit(hub)" — needed to gate
+    # nav-tab Delete/reorder correctly (§6.3: both are edit(parent(n)), a
+    # STRICTER gate than the plain edit(n) every `NavTabResponse.edit`
+    # already carries per row, which only ever answers for that one row).
+    # Sits on the list envelope, not per-row, since it is one caller-wide
+    # fact about the Hub, not something that varies row to row — and
+    # useNavTabs.ts already fetches this same list, so no second request.
+    hub_edit: bool = False
 
 
 # ---------------------------------------------------------

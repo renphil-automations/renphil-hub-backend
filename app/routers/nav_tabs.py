@@ -36,7 +36,7 @@ from app.schemas.tab import (
     UpdateNavTabRequest,
 )
 from app.services import edit_lock_service
-from app.services.access_visibility_service import AccessDeniedError, ViewerAccess
+from app.services.access_visibility_service import AccessDeniedError, ViewerAccess, resolve_hub_node
 from app.services.gridstack_service import get_root_tabs_v2
 from app.services.nav_tab_service import (
     create_nav_tab_v2,
@@ -80,7 +80,14 @@ def get_nav_tabs(
     access: ViewerAccess = Depends(get_viewer_access),
     lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
-    return {"data": get_nav_tabs_v2(db, access=access, lock_view=lock_view)}
+    # findings_dev_login_live_testing_2026-09-12.md #4: the frontend has no
+    # other way to learn whether the caller holds edit(hub) — needed to gate
+    # Delete/reorder correctly (§6.3: both are edit(parent(n)), not the
+    # plain edit(n) each row's own `edit` field already answers). One
+    # `verdict()` lookup against the SAME `access` already computed for
+    # this request — no extra query.
+    hub_edit = access.verdict(resolve_hub_node(db)).edit
+    return {"data": get_nav_tabs_v2(db, access=access, lock_view=lock_view), "hub_edit": hub_edit}
 
 
 @router.get(
