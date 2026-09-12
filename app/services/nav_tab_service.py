@@ -219,7 +219,21 @@ def lock_nav_tab_by_document_id_v2(
     # §4.1's "return the token + expires_at" — added ONLY here, matching
     # TabWorkspaceResponse.lock_token's own "never leaks to a caller who
     # merely has view access" convention (schemas/tab.py).
+    #
+    # findings_dev_login_live_testing_2026-09-12.md addendum: `expires_at`
+    # was the half of that comment's own promise this function never kept —
+    # `_format_nav_tab(nav_tab)` bare (no `lock_view`) never sets
+    # `lock_expires_at` at all (see its own docstring: additive, "only when
+    # a caller passes one"), so every nav-tab lock response came back with
+    # `lock_expires_at: null` regardless of a real, successful acquire.
+    # The frontend gates `setEditSession` on `lock_token && lock_expires_at`
+    # both being truthy (Sidebar.tsx), so that session was NEVER actually
+    # registered — meaning `X-Edit-Tokens` was never sent on the follow-up
+    # write, and every nav-tab rename/delete 409'd EDIT_SESSION_MISSING,
+    # lock conflict or not. `grant.expires_at` is already computed by
+    # `acquire` above — this was always available, just never assigned.
     formatted["lock_token"] = grant.token
+    formatted["lock_expires_at"] = grant.expires_at
     return formatted
 
 

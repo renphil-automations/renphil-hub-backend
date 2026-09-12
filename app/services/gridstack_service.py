@@ -3029,8 +3029,23 @@ def lock_tab_by_document_id_v2(
     # §4.1's "return the token" — added ONLY here, never by the plain
     # workspace GET (see TabWorkspaceResponse.lock_token's own comment on
     # why this must not leak to a caller who merely has view access).
+    #
+    # findings_dev_login_live_testing_2026-09-12.md addendum: `lock_expires_at`
+    # belongs alongside it and was missing — `get_tab_workspace_v2(db,
+    # document_id)` bare (no `lock_view`) never sets `lock_expires_at` at
+    # all (additive, "only when a caller passes one" — see its own body),
+    # so every root-tab lock response came back with `lock_expires_at: null`
+    # regardless of a real, successful acquire. `acquireRootLock`
+    # (DashboardV2Page.tsx) gates `setEditSession` on `lock_token &&
+    # lock_expires_at` both being truthy, so that session was NEVER
+    # actually registered — meaning `X-Edit-Tokens` was never sent on the
+    # follow-up write, and every root-tab rename/delete 409'd
+    # EDIT_SESSION_MISSING, lock conflict or not. `grant.expires_at` is
+    # already computed by `acquire` above — this was always available,
+    # just never assigned.
     if workspace is not None:
         workspace["lock_token"] = grant.token
+        workspace["lock_expires_at"] = grant.expires_at
     return workspace
 
 
