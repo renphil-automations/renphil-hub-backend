@@ -227,6 +227,182 @@ def get_assignment(db: Session, assignment_id: int) -> RoleAssignmentV2 | None:
     return db.query(RoleAssignmentV2).filter(RoleAssignmentV2.id == assignment_id).first()
 
 
+def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
+    """Every `hub_users` row, each carrying every `role_assignments` row it
+    holds directly (possibly none) — the data behind the Hub-Admin-only user
+    management table (owner decision, 2026-09-12). Unlike `search_hub_users`
+    (the target picker), this is neither filtered to `is_active` nor gated
+    by a search term: the privacy boundary here is `require_hub_admin`
+    itself (enforced by the router), not a query-length minimum.
+
+    Two queries total, not one-per-user: same N+1 avoidance as
+    `_hub_user_email_map` and `list_revocable`'s hoisted closure — at 182
+    hub_users rows, one-per-user would be 182 round-trips against Neon for a
+    single page load.
+    """
+    users = db.query(HubUserV2).order_by(HubUserV2.email).all()
+    all_assignments = db.query(RoleAssignmentV2).order_by(RoleAssignmentV2.created_at.desc()).all()
+
+    by_user_id: dict[int, list[RoleAssignmentV2]] = {}
+    for a in all_assignments:
+        by_user_id.setdefault(a.user_id, []).append(a)
+
+    return [
+        {
+            "id": u.id,
+            "email": u.email,
+            "name": u.name,
+            "is_active": u.is_active,
+            "assignments": [_serialize(a, u.email) for a in by_user_id.get(u.id, [])],
+        }
+        for u in users
+    ]
+
+
+def _assert_update_does_not_remove_last_hub_admin(
+    db: Session,
+    assignment: RoleAssignmentV2,
+    new_role_id: int,
+    new_scope_id: int,
+) -> None:
+    """The admin floor's update-shaped twin. `_assert_not_the_last_hub_admin`
+    above answers "is it safe to DELETE this row"; this answers "is it safe
+    to REPOINT this row at a different role/scope", which is not the same
+    question — an admin moving `(hub_admin, universal A)` to
+    `(hub_admin, universal B)` never stops being an admin pairing, and must
+    not be blocked just because it is momentarily the only row on the way to
+    still being one. So this only escalates when the EDIT itself would take
+    the row OUT of admin-pair status, exactly mirroring the delete guard's
+    "was this row the last one" check but computed against the row's
+    prospective new values rather than its absence.
+
+    Same non-negotiables as the delete-side guard (read its docstring): no
+    `is_hub_admin` bypass — only a Hub Admin can reach this code path at all
+    (the router requires it), so a bypass here would be decorative — and
+    this does not close the `role_assignments.user_id` CASCADE gap or
+    substitute for `BOOTSTRAP_ADMIN_EMAILS`.
+    """
+    hub_admin_role_id, universal_scope_ids = _hub_admin_pair_ids(db)
+    if hub_admin_role_id is None or not universal_scope_ids:
+        return
+
+    was_admin_pair = (
+        assignment.role_id == hub_admin_role_id and assignment.scope_id in universal_scope_ids
+    )
+    if not was_admin_pair:
+        return  # nothing protected about this row today; nothing to check
+
+    still_admin_pair = new_role_id == hub_admin_role_id and new_scope_id in universal_scope_ids
+    if still_admin_pair:
+        return  # moved between admin pairs (e.g. one universal scope to another) — fine
+
+    remaining = (
+        db.query(RoleAssignmentV2)
+        .filter(
+            RoleAssignmentV2.role_id == hub_admin_role_id,
+            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
+            RoleAssignmentV2.id != assignment.id,
+        )
+        .count()
+    )
+    if remaining == 0:
+        raise RbacGraphError(
+            "last_hub_admin",
+            (
+                "This is the only Hub Admin assignment on a hub-wide scope. "
+                "Changing its role or scope away from Hub Admin would leave "
+                "the hub with nobody who can administer it, and there is no "
+                "role above Hub Admin that could grant it back. Assign Hub "
+                "Admin to somebody else first, then change this one."
+            ),
+            assignment_id=assignment.id,
+            role_id=assignment.role_id,
+            scope_id=assignment.scope_id,
+        )
+
+    active_remaining = (
+        db.query(RoleAssignmentV2)
+        .join(HubUserV2, HubUserV2.id == RoleAssignmentV2.user_id)
+        .filter(
+            RoleAssignmentV2.role_id == hub_admin_role_id,
+            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
+            RoleAssignmentV2.id != assignment.id,
+            HubUserV2.is_active.is_(True),
+        )
+        .count()
+    )
+    if active_remaining == 0:
+        logger.warning(
+            "Admin floor is nominal: assignment %s was moved off Hub Admin "
+            "leaving %s hub-wide Hub Admin assignment(s), none of which "
+            "belong to an active hub user. Nobody who can sign in can "
+            "administer the hub. BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the "
+            "recovery path.",
+            assignment.id,
+            remaining,
+        )
+
+
+def update_assignment(
+    db: Session,
+    assignment_id: int,
+    *,
+    role_id: int | None,
+    scope_id: int | None,
+) -> dict | None:
+    """In-place edit of an existing assignment's role and/or scope (owner
+    decision, 2026-09-12 — the Hub-Admin management table's "update" action).
+    Caller (the router) must already have: validated `require_hub_admin`,
+    confirmed any provided `role_id`/`scope_id` exist, and refused a ⊥
+    (public) role or scope via `_assert_not_public`.
+
+    Deliberately a true in-place mutation — same `id`, same `created_at`,
+    same `granted_by_*` — rather than delete-and-recreate, so editing an
+    assignment's scope (say) does not rewrite who is on record as having
+    granted it or when. Whichever of `role_id`/`scope_id` is left `None`
+    keeps the assignment's current value, the same partial-update shape as
+    `rbac_service.update_role`/`update_scope`.
+
+    Returns `None` if the assignment does not exist, so the router can 404 —
+    matching `delete_assignment`'s shape below rather than raising.
+    """
+    assignment = get_assignment(db, assignment_id)
+    if assignment is None:
+        return None
+
+    new_role_id = role_id if role_id is not None else assignment.role_id
+    new_scope_id = scope_id if scope_id is not None else assignment.scope_id
+
+    if (new_role_id, new_scope_id) != (assignment.role_id, assignment.scope_id):
+        duplicate = (
+            db.query(RoleAssignmentV2)
+            .filter(
+                RoleAssignmentV2.user_id == assignment.user_id,
+                RoleAssignmentV2.role_id == new_role_id,
+                RoleAssignmentV2.scope_id == new_scope_id,
+                RoleAssignmentV2.id != assignment.id,
+            )
+            .first()
+        )
+        if duplicate is not None:
+            raise RbacGraphError(
+                "duplicate_assignment",
+                "This user already holds that role on that scope.",
+                user_id=assignment.user_id,
+                role_id=new_role_id,
+                scope_id=new_scope_id,
+            )
+
+    _assert_update_does_not_remove_last_hub_admin(db, assignment, new_role_id, new_scope_id)
+
+    assignment.role_id = new_role_id
+    assignment.scope_id = new_scope_id
+    db.flush()
+
+    email = _hub_user_email_map(db, {assignment.user_id}).get(assignment.user_id, "")
+    return _serialize(assignment, email)
+
+
 # ---------------------------------------------------------
 # Writes — delegation gate is asserted by the ROUTER, not here (see module
 # docstring); this module only knows how to insert/delete once cleared.

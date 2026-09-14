@@ -24,7 +24,7 @@ from app.dependencies import (
     _ensure_hub_user,
     get_airtable_service,
     get_auth_service,
-    get_current_user,
+    get_current_hub_user,
     is_hub_admin,
 )
 from app.models.auth import MeResponse, TokenResponse, UserInfo
@@ -110,15 +110,28 @@ async def callback(
 
 @router.get("/me", response_model=MeResponse, summary="Current user info")
 async def me(
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
+    db: Session = Depends(get_db_v2),
 ):
     """Return the authenticated user's profile.
 
     Includes ``scoped_roles``: per-assignment role info from the Access
     Control table, with each entry's ``role_name``, ``scope``, and
     ``fund_or_program_name`` (null when the role's scope is ``Hub``).
+
+    Also includes the real ``is_hub_admin(db, current)`` answer (JWT
+    `roles` OR a live `role_assignments` row) — NOT just whether "Hub
+    Admin" is in `roles`. This is the frontend's repair path for a
+    `localStorage`-cached `user.is_hub_admin` that has gone stale (e.g.
+    someone was granted or revoked admin after their last login): unlike
+    `/auth/callback` and `/auth/dev-login`, which only ever run once per
+    session, `/me` gets called again on every fresh page load, so
+    `AuthContext` can silently reconcile the flag instead of trusting a
+    value that can be arbitrarily old. See `AuthContext.tsx` and
+    `types/index.ts`'s `User.is_hub_admin`.
     """
+    user = current.info
     scoped_roles = await airtable_service.get_user_scoped_roles(user.email)
     return MeResponse(
         email=user.email,
@@ -126,6 +139,7 @@ async def me(
         picture=user.picture,
         roles=user.roles,
         scoped_roles=scoped_roles,
+        is_hub_admin=is_hub_admin(db, current),
     )
 
 

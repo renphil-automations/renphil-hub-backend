@@ -32,18 +32,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import CurrentHubUser, get_current_hub_user, is_hub_admin
+from app.dependencies import CurrentHubUser, get_current_hub_user, is_hub_admin, require_hub_admin
 from app.schemas.rbac_assignments import (
     AssignmentAPIResponse,
     AssignmentListAPIResponse,
     CreateAssignmentRequest,
+    HubUserAdminListAPIResponse,
     HubUserListAPIResponse,
+    UpdateAssignmentRequest,
 )
 from app.services import rbac_assignment_service, rbac_service
 from app.services.rbac_delegation_service import assert_can_delegate
 from app.services.rbac_graph_service import RbacClosures, RbacGraphError
 
 router = APIRouter(prefix="/v2/rbac", tags=["Permission Management"])
+
+ADMIN_ONLY = [Depends(require_hub_admin)]
 
 CONFLICT_RESPONSE = {
     409: {
@@ -53,6 +57,7 @@ CONFLICT_RESPONSE = {
         )
     }
 }
+FORBIDDEN_RESPONSE = {403: {"description": "Hub Admin access required"}}
 
 
 def _conflict(error: RbacGraphError) -> HTTPException:
@@ -68,7 +73,7 @@ def _conflict(error: RbacGraphError) -> HTTPException:
     )
 
 
-def _assert_not_public(role: dict, scope: dict) -> None:
+def _assert_not_public(role: dict | None, scope: dict | None) -> None:
     """⊥ IS NEVER VALID AS AN ASSIGNMENT
     (plan_access_control_algorithm_2026-08-27.md §4.4).
 
@@ -99,8 +104,15 @@ def _assert_not_public(role: dict, scope: dict) -> None:
     into the database — refusing to revoke it would strand it permanently,
     with the widest reach in the system and no way to remove it through the
     UI. Refuse the way in, never the way out.
+
+    `role`/`scope` are individually optional so the admin update endpoint
+    below can call this having looked up only whichever of role_id/scope_id
+    the request actually changed — a `None` here means "not part of this
+    write", not "checked and fine", and is simply skipped.
     """
     for kind, row, key in (("role", role, "role_id"), ("scope", scope, "scope_id")):
+        if row is None:
+            continue
         if row.get("is_public"):
             raise RbacGraphError(
                 "public_not_assignable",
@@ -280,3 +292,98 @@ def delete_assignment(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
+
+
+# ---------------------------------------------------------
+# Admin user-management table (owner decision, 2026-09-12) — every hub user
+# and every (role, scope) pair they hold, with in-place editing.
+#
+# THIS IS THE ONE PLACE IN THIS ROUTER GATED ON `require_hub_admin` RATHER
+# THAN `assert_can_delegate`, and that is a deliberate, narrow exception to
+# `app/dependencies.py`'s own note that assignment writes "must not reuse
+# this dependency" — that note is about the CREATE/DELETE surface above,
+# which stays exactly as delegation-gated as it always was. This is a
+# separate, explicitly Hub-Admin-only management surface added alongside
+# it, not a replacement: an admin here can edit ANY user's assignment
+# regardless of what the admin's own held pairs would otherwise delegate,
+# which is exactly what a management table is for and exactly why it must
+# not be reachable by an ordinary delegating user.
+#
+# The admin floor still applies in full to Hub Admins here — see
+# `rbac_assignment_service._assert_update_does_not_remove_last_hub_admin`,
+# the update-shaped twin of the guard `delete_assignment` already runs, and
+# note its docstring's reminder that this rule has no `is_hub_admin` bypass
+# by design.
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/admin/hub-users",
+    response_model=HubUserAdminListAPIResponse,
+    summary="Every hub user and every role/scope pair they hold (Hub Admin management table)",
+    responses=FORBIDDEN_RESPONSE,
+    dependencies=ADMIN_ONLY,
+)
+def list_hub_users_admin(db: Session = Depends(get_db_v2)):
+    """Unlike `/hub-users` above (the query-gated target picker), this
+    returns everyone — including the users holding zero assignments, which
+    is most of them — since the table this feeds exists precisely so an
+    admin can find and assign those people, not just search for ones who
+    already hold something."""
+    return {"data": rbac_assignment_service.list_all_hub_users_with_assignments(db)}
+
+
+@router.patch(
+    "/admin/assignments/{assignment_id}",
+    response_model=AssignmentAPIResponse,
+    summary="Update an assignment's role and/or scope in place (Hub Admin only)",
+    responses={
+        400: {"description": "Neither role_id nor scope_id was provided"},
+        404: {"description": "Assignment, role, or scope not found"},
+        **CONFLICT_RESPONSE,
+        **FORBIDDEN_RESPONSE,
+    },
+    dependencies=ADMIN_ONLY,
+)
+def update_assignment_admin(
+    assignment_id: int,
+    request: UpdateAssignmentRequest,
+    db: Session = Depends(get_db_v2),
+):
+    """404s for a bad `role_id`/`scope_id` are checked before the write,
+    matching `create_assignment`'s ordering, and `_assert_not_public` runs
+    only against whichever of the two was actually provided — see its
+    docstring's note on why `None` there means "not part of this write"."""
+    if not request.model_fields_set:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of role_id or scope_id must be provided.",
+        )
+
+    role = None
+    if request.role_id is not None:
+        role = rbac_service.get_role(db, request.role_id)
+        if role is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+
+    scope = None
+    if request.scope_id is not None:
+        scope = rbac_service.get_scope(db, request.scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail="Scope not found")
+
+    try:
+        _assert_not_public(role, scope)
+        updated = rbac_assignment_service.update_assignment(
+            db,
+            assignment_id,
+            role_id=request.role_id,
+            scope_id=request.scope_id,
+        )
+    except RbacGraphError as e:
+        raise _conflict(e)
+
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    db.commit()
+    return {"data": updated}
