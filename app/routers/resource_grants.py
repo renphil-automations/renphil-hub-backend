@@ -79,7 +79,7 @@ from app.schemas.resource_grants import (
     RetainedAccessAPIResponse,
     UserAccessAPIResponse,
 )
-from app.services import rbac_service
+from app.services import edit_lock_service, rbac_service
 from app.services import resource_grant_service as grants
 from app.services.access_visibility_service import (
     build_node_tree,
@@ -436,7 +436,7 @@ def create_grant(
     summary="Revoke a grant",
     responses={404: {"description": "Grant not found"}, **CONFLICT_RESPONSE},
 )
-def delete_grant(
+async def delete_grant(
     grant_id: int,
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
@@ -480,3 +480,12 @@ def delete_grant(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
+    # Same gap rbac_assignments.py's delete_assignment/update_assignment_admin
+    # close — a user edited mid-session, then revoked here via a grant
+    # instead of an assignment, would otherwise keep a fully live lock for
+    # the rest of the TTL. Best-effort: a bug here must never fail an
+    # otherwise-successful revoke (mirrors Sidebar.tsx's "Advisory unlock").
+    try:
+        await edit_lock_service.release_locks_now_unauthorized(db)
+    except Exception:
+        pass

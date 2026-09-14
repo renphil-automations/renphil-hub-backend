@@ -455,6 +455,157 @@ def release(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
 
 
 # ---------------------------------------------------------------------------
+# Revoke-triggered cleanup — locks and access are two separate systems
+# (this module's own docstring, "THE LOCK TREE IS NOT THE ACCESS-CONTROL
+# TREE"), and NOTHING before this normally keeps them in sync: revoking a
+# `role_assignments` row or a `resource_grants` row never touched a single
+# `locked`/`locked_by` column. A user edited mid-session, then revoked, kept
+# a fully live (non-stale) lock — on the node they were editing AND on every
+# ancestor they separately held — for the rest of the TTL, with no
+# automatic path back except an admin's manual force takeover (and that
+# takeover, on the DESCENDANT node alone, cannot even clear an ancestor's
+# own independently-held lock — `acquire`'s own docstring above: "only a
+# force call made ON that ancestor itself could do that"). This closes that
+# gap at the source: every REVOKE call site below calls this right after
+# its own commit, so a held lock the holder can no longer justify is
+# cleared the moment the revoke that invalidated it lands, not whenever
+# someone next happens to notice.
+async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
+    """Sweep every FRESH (non-stale) held lock in the system and force-
+    release any whose holder no longer has `edit()` on that lock's node
+    under the CURRENT database state. Returns the nodes actually released.
+
+    Whole-system sweep, not scoped to the specific write that triggered it
+    — deliberately, mirroring `resolve_lock_view`'s own reasoning ("~240
+    nodes total and, in practice, a handful of concurrent editors at most —
+    this is small"): a revoked `role_assignments` row can widen or narrow
+    access anywhere the resulting closure touches, and a `resource_grants`
+    row's effect passes through the mirror/fold machinery
+    (`access_visibility_service.py`) which does not map onto the lock tree
+    one-to-one (this module's own top docstring). Re-deriving "every node
+    this write could possibly have affected" through that fold would be far
+    more code than just re-checking the small number of things that are
+    actually held right now.
+
+    Best-effort in the same sense every other release path in this module
+    already is (`Sidebar.tsx`'s "Advisory unlock" convention, mirrored
+    here): a holder this can't resolve to a live `hub_users` row (deleted
+    account) is treated as no-longer-authorized and released too, matching
+    every other "fail closed on an orphan" rule in this codebase.
+
+    ══════════════════════════════════════════════════════════════════════
+    ASYMMETRIC FAIL-SAFE — READ BEFORE "SIMPLIFYING" THIS. Getting this
+    wrong in one direction (a lock stays stuck a little longer) just
+    annoys someone until the TTL or a manual takeover; getting it wrong in
+    the OTHER direction (a lock is force-released out from under someone
+    who was legitimately still allowed to hold it) can lose their unsaved
+    work with no warning at all — the exact hazard the takeover confirm
+    dialog exists to make an admin consciously accept ("Take over anyway?
+    Their unsaved changes may be lost."), except here nobody gets asked.
+    So every check below is written to require POSITIVE proof of "no
+    longer authorized" before releasing; anything uncertain is treated as
+    "still authorized" and left alone.
+
+    THIS IS WHY THE AIRTABLE CALL EXISTS AND MUST NOT BE REMOVED. `is_hub_
+    admin`'s branch 1 (the JWT `roles` claim, sourced from Airtable at
+    login) cannot be reconstructed from a stored `locked_by` — it is a
+    bare email, not a live token. `role_assignments` holds exactly 1 row
+    against 22 real Hub Admins as of the last parity survey
+    (project-ac-hub-admin-resolver), so "not a role_assignments admin" is
+    NOT "not an admin" — it is the common case for a real admin today.
+    Skipping the live Airtable check and trusting the DB-only closure
+    alone would silently force-release a genuine admin's lock the next
+    time ANYONE revokes ANYTHING ELSE, anywhere in the system, while that
+    admin is mid-edit — a strictly worse bug than the one this function
+    exists to fix. `AirtableService.is_hub_admin` is awaited here for
+    every holder the DB-only check doesn't already clear, and ANY failure
+    of that call (network, rate limit, timeout) is caught and treated the
+    same as "yes, admin" — never as "no, not admin" — for that holder.
+    ══════════════════════════════════════════════════════════════════════
+    """
+    # Local imports: `app.dependencies` and `access_visibility_service` both
+    # sit ABOVE this module in the dependency layering (`resolve_viewer_access`'s
+    # own docstring: "a FastAPI dependency module belongs above domain
+    # services, not below one") — a top-level import here would risk the
+    # exact cycle `gridstack_service.py`'s own local import of this module
+    # already has to dodge. See this file's own module docstring.
+    from app.dependencies import CurrentHubUser, get_airtable_service, is_hub_admin
+    from app.db_v2.models.hub_user import HubUserV2
+    from app.models.auth import UserInfo
+    from app.services.access_visibility_service import resolve_gridstack_node, resolve_viewer_access
+    from app.services.rbac_graph_service import RbacClosures
+
+    rows: list[tuple[LockNode, _TabOrGridstackOrNavTab]] = [
+        (("tab", row.id), row) for row in db.query(TabV2).filter(TabV2.locked.is_(True)).all()
+    ]
+    rows += [
+        (("gridstack", row.id), row)
+        for row in db.query(GridstackV2)
+        .filter(GridstackV2.locked.is_(True), GridstackV2.parent_id.isnot(None))
+        .all()
+    ]
+    rows += [
+        (("nav_tab", row.id), row) for row in db.query(NavTabV2).filter(NavTabV2.locked.is_(True)).all()
+    ]
+
+    released: list[LockNode] = []
+    if not rows:
+        return released
+
+    closures = RbacClosures(db)
+    airtable = get_airtable_service()
+    # Caches the FINAL "may still be an admin, leave them alone" verdict —
+    # true for a DB-closure admin, a live-Airtable admin, OR an unresolved
+    # Airtable call (fail-safe) — never just the fast DB-only half, and
+    # computed at most once per distinct holder regardless of how many
+    # locks they hold.
+    protected_by_hub_user_id: dict[int, bool] = {}
+
+    for node, row in rows:
+        _locked, holder, locked_at, _token = _locked_quad(row)
+        if not holder or is_lock_stale(locked_at):
+            # Already free in every way that matters (the ordinary silent-
+            # reclaim path already covers it) — not this sweep's job.
+            continue
+
+        hub_user = db.query(HubUserV2).filter(HubUserV2.email == holder).first()
+        if hub_user is None:
+            _force_break_lock(row)
+            released.append(node)
+            continue
+
+        if hub_user.id not in protected_by_hub_user_id:
+            synthetic = CurrentHubUser(
+                info=UserInfo(email=holder, name=hub_user.name or holder, roles=[]),
+                hub_user_id=hub_user.id,
+                email=holder,
+            )
+            is_db_admin = is_hub_admin(db, synthetic, closures=closures)
+            if is_db_admin:
+                protected = True
+            else:
+                try:
+                    protected = await airtable.is_hub_admin(holder)
+                except Exception:
+                    protected = True  # uncertain -> leave them alone
+            protected_by_hub_user_id[hub_user.id] = protected
+        if protected_by_hub_user_id[hub_user.id]:
+            continue
+
+        ac_node = resolve_gridstack_node(db, row) if node[0] == "gridstack" else node
+        access = resolve_viewer_access(db, hub_user.id, is_admin=False, closures=closures)
+        if access.verdict(ac_node).edit:
+            continue
+
+        _force_break_lock(row)
+        released.append(node)
+
+    if released:
+        db.commit()
+    return released
+
+
+# ---------------------------------------------------------------------------
 # Derived read state — §4.3. Mirrors ViewerAccess's resolve-once-and-thread
 # pattern: one `LockView` built per request, then every node's state comes
 # from three small precomputed maps instead of a query per node.

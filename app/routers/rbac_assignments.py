@@ -41,11 +41,25 @@ from app.schemas.rbac_assignments import (
     HubUserListAPIResponse,
     UpdateAssignmentRequest,
 )
-from app.services import rbac_assignment_service, rbac_service
+from app.services import edit_lock_service, rbac_assignment_service, rbac_service
 from app.services.rbac_delegation_service import assert_can_delegate
 from app.services.rbac_graph_service import RbacClosures, RbacGraphError
 
 router = APIRouter(prefix="/v2/rbac", tags=["Permission Management"])
+
+
+async def _release_now_unauthorized_locks(db: Session) -> None:
+    """Called after a revoke/narrow write's OWN commit has already landed —
+    a bug in here must never turn a successful revoke into a failed
+    request. Same "advisory, never blocks the primary action" convention as
+    every other release path in this codebase (`Sidebar.tsx`'s "Advisory
+    unlock"). See `edit_lock_service.release_locks_now_unauthorized`'s own
+    docstring for what this actually does, why it's `async` (a live
+    Airtable check, fail-safe), and why."""
+    try:
+        await edit_lock_service.release_locks_now_unauthorized(db)
+    except Exception:
+        pass
 
 ADMIN_ONLY = [Depends(require_hub_admin)]
 
@@ -257,7 +271,7 @@ def create_assignment(
         **CONFLICT_RESPONSE,
     },
 )
-def delete_assignment(
+async def delete_assignment(
     assignment_id: int,
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
@@ -292,6 +306,10 @@ def delete_assignment(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
+    # A user edited mid-session, then revoked here, would otherwise keep a
+    # fully live lock for the rest of the TTL with no automatic way back —
+    # see edit_lock_service.release_locks_now_unauthorized's own docstring.
+    await _release_now_unauthorized_locks(db)
 
 
 # ---------------------------------------------------------
@@ -345,7 +363,7 @@ def list_hub_users_admin(db: Session = Depends(get_db_v2)):
     },
     dependencies=ADMIN_ONLY,
 )
-def update_assignment_admin(
+async def update_assignment_admin(
     assignment_id: int,
     request: UpdateAssignmentRequest,
     db: Session = Depends(get_db_v2),
@@ -386,4 +404,7 @@ def update_assignment_admin(
     if updated is None:
         raise HTTPException(status_code=404, detail="Assignment not found")
     db.commit()
+    # Narrowing an assignment in place is just as much a revoke of the OLD
+    # (role, scope) pair as delete_assignment above — same gap, same fix.
+    await _release_now_unauthorized_locks(db)
     return {"data": updated}
