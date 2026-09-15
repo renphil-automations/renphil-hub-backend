@@ -28,7 +28,17 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str
     GOOGLE_CLIENT_SECRET: str
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
-    ALLOWED_EMAIL_DOMAIN: str = "renphil.org"
+    # Comma-separated list of email domains allowed to log in.
+    ALLOWED_EMAIL_DOMAIN: str = "renphil.org,centerforcivicfutures.org"
+
+    @property
+    def allowed_email_domains(self) -> list[str]:
+        """Parsed, lower-cased set of allowed login domains."""
+        return [
+            d.strip().lower()
+            for d in self.ALLOWED_EMAIL_DOMAIN.split(",")
+            if d.strip()
+        ]
 
     # ── JWT Tokens (issued after OAuth) ────────────────────────────────
     JWT_SECRET_KEY: str
@@ -138,6 +148,7 @@ class Settings(BaseSettings):
     TEAMS_WORK_EMAIL_FIELD: str
     TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
+    USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
     USERS_FIRST_NAME_FIELD: str
     USERS_LAST_NAME_FIELD: str
@@ -145,6 +156,7 @@ class Settings(BaseSettings):
     USERS_STATUS_FIELD: str
     USERS_DEPARTMENT_FIELD: str
     USERS_PROGRAM_FIELD: str
+    USERS_PROGRAM_NAMES_FIELD: str
     USERS_START_DATE_FIELD: str
     USERS_PERSONAL_EMAIL_FIELD: str
     USERS_POSITION_FIELD: str

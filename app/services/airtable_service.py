@@ -1225,6 +1225,98 @@ class AirtableService:
             field_types=field_types,
         )
 
+    async def fetch_widget_index_rows(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        selected_columns: list[str] | None = None,
+        filters: list[dict[str, Any]] | None = None,
+    ):
+        """Return one complete viewer-independent row set for shared indexing.
+
+        Unlike ``fetch_widget_full_rows_cached`` this path is intentionally
+        independent of the optional viewer cache.  It performs the same
+        filters-only Airtable walk used to warm that cache, honors the existing
+        hard row/byte caps, and never returns a partial result as complete.
+        """
+        from app.models.airtable import AirtableWidgetFullRowsResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+        formula, allowed = af.widget_formula(
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+            email="",
+        )
+        if not allowed:
+            # This should be unreachable because personalization is forced off,
+            # but fail closed if formula semantics ever change.
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=list(selected_columns or []),
+                field_types={},
+                rows=[],
+                personalize_blocked=True,
+                available=False,
+                page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+            )
+
+        fetch_fields = list(selected_columns) if selected_columns else None
+        api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
+        table = api.table(base_id, table_id)
+        rows, seen_fields, oversized = await self._walk_full_table(
+            api=api,
+            table=table,
+            view_id=view_id,
+            fetch_fields=fetch_fields,
+            formula=formula,
+        )
+
+        response_fields = (
+            list(selected_columns)
+            if selected_columns
+            else list(seen_fields)
+        )
+
+        if oversized:
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=response_fields,
+                field_types={},
+                rows=[],
+                personalize_blocked=False,
+                available=False,
+                page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+            )
+
+        field_set = set(response_fields)
+        projected_rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key == "id" or key in field_set
+            }
+            for row in rows
+        ]
+
+        return AirtableWidgetFullRowsResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=response_fields,
+            field_types={},
+            rows=projected_rows,
+            personalize_blocked=False,
+            available=True,
+            page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+        )
+
+
     async def fetch_widget_full_rows_cached(
         self,
         *,
@@ -4086,6 +4178,10 @@ class AirtableService:
                         first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
                         last_name=fields.get(s.USERS_LAST_NAME_FIELD),
                         work_email=email,
+                        office_location=fields.get(s.USERS_OFFICE_LOCATION_FIELD),
+                        programs=self._normalize_program_names(
+                            fields.get(s.USERS_PROGRAM_NAMES_FIELD)
+                        ),
                     )
                 )
                 continue
@@ -4166,6 +4262,43 @@ class AirtableService:
             names.append(name)
         return names
 
+    @staticmethod
+    def _normalize_program_names(value: Any) -> list[str]:
+        """Normalize a 'Program Names' lookup value into a list of names.
+
+        The lookup may return a list (one entry per linked record, each of
+        which may itself hold comma-separated values) or a single string.
+        Values are split on commas, trimmed and de-duplicated (first wins).
+        """
+        if not value:
+            return []
+
+        raw: list[str] = []
+        if isinstance(value, str):
+            raw = [value]
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    raw.append(item)
+                elif isinstance(item, dict):
+                    name = item.get("name")
+                    if isinstance(name, str):
+                        raw.append(name)
+
+        seen: set[str] = set()
+        names: list[str] = []
+        for chunk in raw:
+            for part in chunk.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                key = part.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(part)
+        return names
+
     async def _fetch_fellow_entries(
         self, *, include_names: bool = False
     ) -> list[tuple[str, dict[str, Any] | None]]:
@@ -4213,6 +4346,8 @@ class AirtableService:
                 s.USERS_FIRST_NAME_FIELD,
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
+                s.USERS_OFFICE_LOCATION_FIELD,
+                s.USERS_PROGRAM_NAMES_FIELD,
             ]
         user_records = await self._list_records(
             self._users_table(), formula=user_formula, fields=fields
@@ -4888,6 +5023,7 @@ class AirtableService:
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
                 s.USERS_EMPLOYMENT_TYPE_FIELD,
+                s.USERS_OFFICE_LOCATION_FIELD,
             ],
         )
         records = self._filter_by_employment_type(
@@ -4908,6 +5044,7 @@ class AirtableService:
                     first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
                     last_name=fields.get(s.USERS_LAST_NAME_FIELD),
                     work_email=fields.get(s.USERS_WORK_EMAIL_FIELD),
+                    office_location=fields.get(s.USERS_OFFICE_LOCATION_FIELD),
                 )
             )
         items.sort(
@@ -7870,26 +8007,31 @@ class AirtableService:
     async def _find_user_by_work_email(
         self, work_email: str
     ) -> dict[str, Any] | None:
-        """Find a user record by exact (case-insensitive) Work Email."""
+        """Find a user record by exact (case-insensitive) Work Email, falling
+        back to the Alias Email field when Work Email is empty or doesn't match."""
         normalized = (work_email or "").strip().lower()
         if not normalized:
             return None
-        email_field = self._settings.USERS_WORK_EMAIL_FIELD
-        formula = (
-            f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
-        )
+        escaped = self._escape(normalized)
         table = self._users_table()
-        try:
-            records = await asyncio.to_thread(
-                table.all, formula=formula, max_records=1
-            )
-        except RequestException as exc:
-            logger.error("Airtable user lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during user lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        return records[0] if records else None
+        for email_field in (
+            self._settings.USERS_WORK_EMAIL_FIELD,
+            self._settings.USERS_ALIAS_EMAIL_FIELD,
+        ):
+            formula = f"LOWER({{{email_field}}}) = '{escaped}'"
+            try:
+                records = await asyncio.to_thread(
+                    table.all, formula=formula, max_records=1
+                )
+            except RequestException as exc:
+                logger.error("Airtable user lookup failed: %s", exc)
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception("Unexpected Airtable error during user lookup")
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            if records:
+                return records[0]
+        return None
 
     async def get_user_by_work_email(self, work_email: str) -> UserRecord:
         """Return the user record matching the given Work Email."""
