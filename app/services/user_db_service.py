@@ -17,7 +17,7 @@ from datetime import date
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.user import UserV2
@@ -116,19 +116,13 @@ def _to_record(row: UserV2) -> UserRecord:
 
 
 def _find_user_by_work_email(db: Session, work_email: str) -> UserV2 | None:
-    """Find a user row by exact (case-insensitive) Work Email, falling back to
-    the Alias Email column when Work Email is empty or doesn't match."""
+    """Find a user row by exact (case-insensitive) Work Email."""
     normalized = (work_email or "").strip().lower()
     if not normalized:
         return None
     return (
         db.query(UserV2)
-        .filter(
-            or_(
-                func.lower(UserV2.work_email) == normalized,
-                func.lower(UserV2.alias_email) == normalized,
-            )
-        )
+        .filter(func.lower(UserV2.work_email) == normalized)
         .first()
     )
 
