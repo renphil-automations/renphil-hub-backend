@@ -72,6 +72,7 @@ from app.dependencies import CurrentHubUser, get_current_hub_user, is_hub_admin,
 from app.schemas.resource_grants import (
     AudienceCountAPIResponse,
     CreateGrantRequest,
+    HubNodeAPIResponse,
     InheritedGrantsAPIResponse,
     NodeKind,
     ResourceGrantAPIResponse,
@@ -86,6 +87,7 @@ from app.services.access_visibility_service import (
     compute_visibility,
     list_inherited_grants,
     list_visible_nodes,
+    resolve_hub_node,
     what_would_they_retain,
 )
 from app.services.rbac_graph_service import RbacClosures, RbacGraphError, audience_count
@@ -217,6 +219,36 @@ def list_node_inherited_grants(
         raise HTTPException(status_code=404, detail=f"No {node_kind} with id {node_id} exists")
 
     return {"data": list_inherited_grants(db, node_kind, node_id)}
+
+
+@router.get(
+    "/hub",
+    response_model=HubNodeAPIResponse,
+    dependencies=ADMIN_ONLY,
+    summary="Resolve the hub's own node identity",
+    responses={404: {"description": "No hub node found"}},
+)
+def get_hub_node(db: Session = Depends(get_db_v2)):
+    """Bootstraps `HubAccessPage` (frontend, admin section). Every other
+    "Manage Access" call site resolves a `nodeId` from a row already on
+    screen — a tab, a nav tab, a component. The hub node is not a row
+    anywhere, so this is the one lookup that resolves it, before the client
+    can call any of the node-scoped endpoints above with `node_kind="hub"`.
+
+    Same `ADMIN_ONLY` gate as `/audience` and `/hub-users/{id}/access`
+    below, for the same reason: there is no node yet to run `edit(n)`
+    against until this returns one.
+
+    404 if `resolve_hub_node` returns `None` — zero hub rows (a
+    fresh/misconfigured database) or more than one (a schema violation);
+    see `access_visibility_service.build_node_tree`'s own docstring for why
+    that fails closed rather than picking one arbitrarily.
+    """
+    node = resolve_hub_node(db)
+    if node is None:
+        raise HTTPException(status_code=404, detail="No hub node found")
+    node_kind, node_id = node
+    return {"data": {"node_kind": node_kind, "node_id": node_id}}
 
 
 @router.get(

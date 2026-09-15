@@ -152,6 +152,20 @@ class NodeRefResponse(BaseModel):
     node_id: int
 
 
+class HubNodeAPIResponse(BaseModel):
+    """`GET /v2/rbac/hub` — resolves the hub's own node identity.
+
+    Every other "Manage Access" call site already has a `nodeId` in hand
+    (it came from the row the admin clicked on). The hub node has no such
+    row anywhere in the UI, so `HubAccessPage` (frontend) needs a way to
+    resolve `("hub", <id>)` before it can call any of the node-scoped
+    endpoints above. Reuses `NodeRefResponse` rather than a bespoke shape —
+    this IS a node ref, nothing more.
+    """
+
+    data: NodeRefResponse
+
+
 class RetainedAccessResponse(BaseModel):
     """§6.2's revoke-time confirmation: *"what would this principal still
     retain?"*, answered for one grant that has NOT been deleted.
