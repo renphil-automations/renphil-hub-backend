@@ -33,6 +33,7 @@ from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.nav_tab import NavTabV2
 
 from app.services.access_visibility_service import (
+    NodeNotViewableError,
     ViewerAccess,
     require_edit,
     resolve_gridstack_node,
@@ -2395,11 +2396,33 @@ def update_tab_content_v2(
             # lives in `props` (see ComponentV2's docstring); it's persisted
             # via `_write_component_data` below instead.
             if widget_type == MIRROR_WIDGET_TYPE:
-                structural_props: dict[str, Any] = {
-                    "target_link": (widget_data or {}).get("targetLink")
+                target_link = (
+                    (widget_data or {}).get("targetLink")
                     if isinstance(widget_data, dict)
                     else None
-                }
+                )
+                if target_link and access is not None:
+                    target_component = (
+                        db.query(ComponentV2).filter(ComponentV2.link == target_link).first()
+                    )
+                    # A dangling link or one pointing at another mirror is left
+                    # to the existing dangling-target/cycle-prevention handling
+                    # elsewhere — nothing new to enforce here. A REAL target
+                    # the acting editor cannot view is the paste-link AC
+                    # bypass: the picker's browse mode only ever lists targets
+                    # that pass through a server-gated listing endpoint, but a
+                    # pasted link (or a hand-crafted request that skips the
+                    # picker entirely) does not, so it must be checked here
+                    # too — second layer, matching this codebase's existing
+                    # client-hides/server-re-checks pattern for mirror-of-
+                    # mirror cycle prevention.
+                    if (
+                        target_component is not None
+                        and target_component.type != MIRROR_WIDGET_TYPE
+                        and not access.is_granted(("component", target_component.id))
+                    ):
+                        raise NodeNotViewableError(("component", target_component.id))
+                structural_props: dict[str, Any] = {"target_link": target_link}
             else:
                 structural_props = {}
                 if layout_entry.get("minW") is not None:

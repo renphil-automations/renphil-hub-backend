@@ -143,10 +143,22 @@ def get_roots(
     summary="Resolve a component by its stable link (v2)",
     description="Backs the mirror target picker's 'paste a link' flow — "
     "resolves a component's current type/title/data directly by its stable "
-    "`link`, without needing to browse to the tab that contains it.",
+    "`link`, without needing to browse to the tab that contains it. Fails "
+    "closed (404, same §9 convention as the sibling `.../location` "
+    "endpoint) when the caller cannot view the target component, so a "
+    "pasted link cannot be used to read or mirror content outside the "
+    "caller's own access — unlike the browse flow, a pasted link never "
+    "passes through a server-gated listing endpoint on its way here.",
     responses={**COMMON_NOT_FOUND_RESPONSE},
 )
-def get_component_by_link(link: str, db: Session = Depends(get_db_v2)):
+def get_component_by_link(
+    link: str,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    component = get_component_by_link_for_access_check_v2(db, link)
+    if component is None or not access.is_granted(("component", component.id)):
+        raise HTTPException(status_code=404, detail="Component not found, or cannot be mirrored")
     result = get_component_by_link_v2(db, link)
     if result is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be mirrored")
