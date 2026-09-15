@@ -30,7 +30,6 @@ from app.services.gridstack_service import (
     _UNSET,
     _access_control_or_default,
     _component_ids_for_gridstack_tree,
-    _refresh_index_for_touched,
     _generate_id,
     _get_root_tab,
     _is_root,
