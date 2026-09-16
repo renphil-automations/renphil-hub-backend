@@ -17,6 +17,21 @@ INCR lets the write through, never blocks it" (§4.7) — a rate limiter is
 advisory in the same sense §13.5 uses that word: under-counting lets one
 extra write through, which is the correct failure direction for a control
 whose only job is to blunt an amplifier, not to gate access.
+
+**Two-phase check/consume, fixed 2026-08-24.** The original single-method
+`check()` INCRemented on every call, including calls that turned out to be
+for a request the handler went on to reject — a bad widget link (404), no
+view access (403), an over-cap mention list (400). A caller fumbling
+through failed attempts burned their limited quota on writes that never
+happened. Split into `check()` (a read-only peek — does NOT move the
+counter) and `consume()` (the actual INCR, called by `helpers/rate_limit.py`
+only after the wrapped handler returns without raising, i.e. only on a
+genuine success). This trades the old single-round-trip atomicity for two
+round trips and a small window where concurrent requests can both pass
+`check()` before either calls `consume()` — accepted deliberately, for the
+same "advisory, not a hard gate" reason the module fails open at all: this
+control's job is to blunt a notification-fan-out amplifier, not to enforce
+an exact ceiling down to the last request.
 """
 
 from __future__ import annotations
@@ -79,12 +94,25 @@ class RateLimitService:
             )
         return self._client
 
+    def _key(self, action: str, email: str, window_seconds: int, now: int) -> tuple[str, int]:
+        # The window bucket rides IN the key, not a separately-tracked start
+        # time — a request in a new bucket simply touches a key that has
+        # never existed (or has already expired), so there is nothing to
+        # reset and nothing that can drift. Shared by `check` and `consume`
+        # so the two always agree on which window a given `now` falls in.
+        window_bucket = now // window_seconds
+        return f"rl:{action}:{email}:{window_bucket}", window_bucket
+
     async def check(self, action: str, email: str) -> int | None:
-        """Returns the number of seconds the caller must wait before
-        retrying `action`, or `None` if the request is allowed. `None`
-        covers every failure mode alike — an unknown action, a disabled
-        service, or any Upstash error — because a limiter that cannot be
-        consulted must let the write through (plan §4.7)."""
+        """Read-only peek: returns the number of seconds the caller must
+        wait before `action` would be allowed again, or `None` if they are
+        currently under the limit. Does NOT consume a slot — call
+        `consume()` separately once the caller's request has actually
+        succeeded (see the module docstring's "two-phase check/consume").
+        `None` covers every non-blocking case alike — an unknown action, a
+        disabled service, an Upstash error, or genuinely being under the
+        limit — because a limiter that cannot be consulted must let the
+        write through (plan §4.7)."""
         limit = RATE_LIMITS.get(action)
         if limit is None:
             return None
@@ -95,17 +123,10 @@ class RateLimitService:
             return None
 
         now = int(time.time())
-        # The window bucket rides IN the key, not a separately-tracked
-        # start time — a request in a new bucket simply increments a key
-        # that has never existed (or has already expired), so there is
-        # nothing to reset and nothing that can drift.
-        window_bucket = now // window_seconds
-        key = f"rl:{action}:{email}:{window_bucket}"
+        key, window_bucket = self._key(action, email, window_seconds, now)
 
         try:
-            count = await client.eval(
-                _INCR_AND_EXPIRE_ON_FIRST_HIT_SCRIPT, [key], [str(window_seconds)]
-            )
+            raw = await client.get(key)
         except Exception:
             logger.warning(
                 "Rate limit check failed for action=%s email=%s — failing open",
@@ -115,10 +136,47 @@ class RateLimitService:
             )
             return None
 
-        if int(count) > max_requests:
+        count = int(raw) if raw is not None else 0
+        if count >= max_requests:
             window_end = (window_bucket + 1) * window_seconds
             return max(1, window_end - now)
         return None
+
+    async def consume(self, action: str, email: str) -> None:
+        """Increments the caller's counter for `action`'s current window by
+        one. Call this ONLY after the wrapped handler has completed
+        successfully — never before, and never for a request the handler
+        went on to reject (plan amendment 2026-08-24: a 403/404/400 must not
+        cost the caller one of their limited attempts). Swallows every
+        failure mode the same way `check` does: a lost increment just means
+        the caller effectively got one extra allowed request this window,
+        which matches this service's existing fail-open direction — it
+        never raises, and callers should not await a return value from it."""
+        limit = RATE_LIMITS.get(action)
+        if limit is None:
+            return
+        _, window_seconds = limit
+
+        client = self._redis()
+        if client is None:
+            return
+
+        now = int(time.time())
+        key, _ = self._key(action, email, window_seconds, now)
+
+        try:
+            await client.eval(
+                _INCR_AND_EXPIRE_ON_FIRST_HIT_SCRIPT, [key], [str(window_seconds)]
+            )
+        except Exception:
+            logger.warning(
+                "Rate limit consume failed for action=%s email=%s — the "
+                "caller's successful write will not count against their "
+                "quota this window",
+                action,
+                email,
+                exc_info=True,
+            )
 
 
 _service: RateLimitService | None = None

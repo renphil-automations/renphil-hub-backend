@@ -5,19 +5,16 @@ from app.db_v2.database import BaseV2
 
 
 class HubV2(BaseV2):
-    """The top of the access-control tree (see
-    AI Docs/plan_nav_tabs_phase2_2026-07-30.md). Exactly one row, ever — the
-    service reads `db.query(HubV2).order_by(HubV2.id).first()`, never by id.
+    """DORMANT. Exactly one row, ever — it was the top of the access-control
+    propagation tree (AI Docs/plan_nav_tabs_phase2_2026-07-30.md), the node
+    whose `access_control` cascaded down through every nav tab, tab, variant
+    and sub-tab gridstack.
 
-    A separate table rather than a `NavTabV2` or `TabV2` row: either would
-    make the top of the access tree a member of a collection it needs to sit
-    above — excluded from listings, reorder, slug uniqueness, and routing by
-    convention rather than by construction. See the plan's §4.1 for the full
-    per-collection breakdown of what would need to filter it out.
-
-    Its editors (`access_control`) may create/rename/reorder/delete nav tabs,
-    replacing the interim `Hub Admin` JWT gate (`require_hub_admin`) with a
-    real, evaluated access-control node — see `access_control_service`.
+    That engine has been removed ahead of a new access control algorithm, so
+    nothing in the application reads or writes this table any more. The
+    mapping and the row are deliberately kept rather than dropped: the stored
+    JSON is the record of what the old model granted, and a new algorithm may
+    well want a root node of its own.
 
     No relationship() here, matching every other model in db_v2/ — traversal
     is always a plain query."""

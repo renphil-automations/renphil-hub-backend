@@ -25,25 +25,21 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db_v2.models.tab import TabV2
 from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.nav_tab import NavTabV2
 
-from app.services.access_control_service import (
-    NodeRef,
-    apply_reparent_repair,
-    apply_write,
-    describe_write_plan,
-    node_summary,
-    plan_write,
-    principal_from_payload,
-    purge_principal,
-    reset_to_inherited,
-    resolved_ac_for_gridstack,
+from app.services.access_visibility_service import (
+    NodeNotViewableError,
+    ViewerAccess,
+    require_edit,
+    resolve_gridstack_node,
+    resolve_gridstack_parent_node,
 )
-from app.services.tab_service import DEFAULT_ACCESS_CONTROL, access_control_subset_violation
+from app.services.tab_service import DEFAULT_ACCESS_CONTROL
 
 
 # ---------------------------------------------------------
@@ -215,6 +211,40 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# plan_access_control_algorithm_2026-08-27.md §6.6 Fix 2 — shared by BOTH
+# lock systems: TabV2.locked_at (a real column, below) and an SBN node's
+# component.props["locked_at"] (a JSONB key, no column — see
+# super_blocknote_service.py). One helper, one TTL setting
+# (Settings.TAB_LOCK_TTL_SECONDS), so the two cannot drift onto different
+# staleness rules.
+def is_lock_stale(locked_at: datetime | None) -> bool:
+    """True if a lock taken at `locked_at` is old enough to be claimed by
+    anyone, without needing `force`.
+
+    `locked_at is None` returns True (STALE), not False. This covers every
+    lock taken before this column/key existed — including the live tab 42,
+    locked since 2026-08-07 with no `locked_at` at all — per the model
+    comment on TabV2.locked_at: a NULL lock predates the TTL concept
+    entirely, so there is no acquisition time to compare against, and
+    treating it as fresh would leave exactly the stranded locks this fix
+    exists to release. Same "missing timestamp ⇒ treat as stale, never as
+    fresh" convention `airtable_service._envelope_age_seconds` already uses
+    for cache envelopes.
+
+    Defends against a naive `locked_at` the same way
+    `airtable_service._envelope_age_seconds` does: SQLite (the test suite's
+    engine) does not round-trip tzinfo through a DateTime column, so a value
+    read back mid-test can be naive even though `_utc_now()` always writes
+    an aware one. Comparing a naive and an aware datetime raises at runtime
+    (hazard 7) — the exact place a TTL check would silently break."""
+    if locked_at is None:
+        return True
+    if locked_at.tzinfo is None:
+        locked_at = locked_at.replace(tzinfo=timezone.utc)
+    age_seconds = (_utc_now() - locked_at).total_seconds()
+    return age_seconds > get_settings().TAB_LOCK_TTL_SECONDS
+
+
 def _access_control_or_default(access_control: dict[str, Any] | None) -> dict[str, Any]:
     return access_control if access_control else DEFAULT_ACCESS_CONTROL
 
@@ -334,33 +364,51 @@ def _safe_access_control_for_gridstack(
     return _access_control_or_default(component.access_control if component else None)
 
 
-def _safe_locked_pair(
+def _safe_locked_triple(
     db: Session,
     gridstack: GridstackV2,
     root_tab: TabV2 | None = _ROOT_TAB_NOT_FETCHED,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, datetime | None]:
+    """(locked, locked_by, locked_at). Was `_safe_locked_pair` — widened for
+    plan §6.6 Fix 2 rather than adding a third parallel helper; both call
+    sites already destructure it right where they need `is_lock_stale`.
+
+    edit-mode-gap follow-up (2026-09-07): a non-root gridstack (a
+    sub-gridstack) now carries its OWN locked/locked_by/locked_at, read
+    directly off its own row — independent of its owning root/variant's
+    TabV2-level lock and of any sibling sub-gridstack's. See
+    `lock_tab_by_document_id_v2` / `unlock_tab_by_document_id_v2`, the only
+    writers of either flavor of lock."""
     if _is_root(gridstack):
         tab = root_tab if root_tab is not _ROOT_TAB_NOT_FETCHED else _get_root_tab(db, gridstack)
         if tab is None:
-            return False, ""
-        return bool(tab.locked), (tab.locked_by or "")
-    # Nested gridstacks have no lock columns — lock granularity is
-    # whole-tab-only in this schema (Phase 2 decision).
-    return False, ""
+            return False, "", None
+        return bool(tab.locked), (tab.locked_by or ""), tab.locked_at
+    return bool(gridstack.locked), (gridstack.locked_by or ""), gridstack.locked_at
 
 
 def _has_variants(db: Session, tab_id: int) -> bool:
     return db.query(TabV2.id).filter(TabV2.parent_tab_id == tab_id).first() is not None
 
 
-def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
+def _format_tab_summary(
+    db: Session,
+    gridstack: GridstackV2,
+    *,
+    access: ViewerAccess | None = None,
+    # Typed `Any`, not `edit_lock_service.LockView | None` — importing that
+    # module at top level here would be circular (edit_lock_service.py
+    # imports `is_lock_stale`/`_validate_locked_by` FROM this file; see its
+    # own comment). Every real caller passes an actual `LockView`.
+    lock_view: Any = None,
+) -> dict[str, Any]:
     is_root = _is_root(gridstack)
     # Fetched once here (only when root — non-root gridstacks never had this
     # query) and threaded into both helpers below instead of each re-fetching
     # the identical TabV2 row — see `_ROOT_TAB_NOT_FETCHED`'s doc comment.
     root_tab = _get_root_tab(db, gridstack) if is_root else None
 
-    locked, locked_by = _safe_locked_pair(db, gridstack, root_tab)
+    locked, locked_by, locked_at = _safe_locked_triple(db, gridstack, root_tab)
     node_id = gridstack.parent_tab_id if is_root else gridstack.id
     title = None
     order = gridstack.position if gridstack.position is not None else 0
@@ -382,13 +430,23 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
     else:
         title = gridstack.name
 
-    return {
+    # this session: resolved once here (whether or not a caller passes
+    # `access`) so every summary — including internal mutation-response
+    # echoes — carries the real resource_grants node to edit, not just the
+    # `id` above (which for a non-root gridstack is the SUB-GRID's own id,
+    # not its representation component's — see `node_kind`/`node_id`'s own
+    # doc comment on TabSummaryResponse).
+    ac_node = resolve_gridstack_node(db, gridstack)
+
+    summary = {
         "id": node_id,
         "documentId": gridstack.document_id,
         "title": title,
         "order": order,
         "locked": locked,
         "locked_by": locked_by,
+        "locked_at": locked_at,
+        "lock_is_stale": locked and is_lock_stale(locked_at),
         "has_children": _has_children(db, gridstack.id),
         "has_content": _has_content(db, gridstack.id),
         "has_variants": has_variants,
@@ -396,7 +454,33 @@ def _format_tab_summary(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
         "navTabDocumentId": nav_tab_document_id,
         "navTabTitle": nav_tab_title,
         "apiVersion": "v2",
+        "node_kind": ac_node[0] if ac_node is not None else None,
+        "node_id": ac_node[1] if ac_node is not None else None,
     }
+    # plan_access_control_algorithm_2026-08-27.md §5.2's triple. Only added
+    # when a caller passes `access` — every internal caller that doesn't
+    # (mutation-response echoes; see gridstack_service.py's own call sites)
+    # keeps returning exactly what it always has, `view`/`edit`/`revealed`
+    # simply absent (the schema defaults them to None on the wire).
+    if access is not None:
+        verdict = access.verdict(ac_node)
+        summary["view"] = verdict.view
+        summary["edit"] = verdict.edit
+        summary["revealed"] = verdict.revealed
+        summary["edit_seed"] = verdict.edit_seed
+
+    # plan_lock_propagation_2026-09-08.md §4.3 — additive, same "only when a
+    # caller passes one" convention as the §5.2 triple above. `resolve_lock_node`
+    # local-imported (see `lock_view`'s own param comment on why).
+    if lock_view is not None:
+        from app.services.edit_lock_service import resolve_lock_node
+
+        lock_node_state = lock_view.state_for(resolve_lock_node(gridstack))
+        summary["lock_state"] = lock_node_state.state
+        summary["lock_holder"] = lock_node_state.holder
+        summary["lock_holder_node_label"] = lock_node_state.node_label
+        summary["lock_expires_at"] = lock_node_state.expires_at
+    return summary
 
 
 # ---------------------------------------------------------
@@ -803,6 +887,88 @@ def _format_page_content(db: Session, gridstack: GridstackV2) -> dict[str, Any]:
     }
 
 
+def _apply_visibility_to_content(
+    content: dict[str, Any] | list[Any] | None, *, access: ViewerAccess
+) -> dict[str, Any] | list[Any] | None:
+    """New-model replacement for
+    ``tab_service.filter_widget_content_for_user`` — same guard, same
+    sentinel shape, driven by the resource_grants fold instead of Airtable
+    role names, so the frontend's existing `isRestrictedWidgetType` handling
+    needs no change.
+
+    Only processes grid-canvas content (``schemaVersion == 2``), exactly
+    like the function it replaces — BlockNote content and ``None`` pass
+    through untouched.
+
+    Runs the per-widget loop below even under ``access.full_access`` (the
+    Hub Admin bypass) — unlike ``_format_tab_summary``/``_format_nav_tab``,
+    which stamp `node_kind`/`node_id` unconditionally, an earlier version of
+    this function short-circuited to `return content` for admins, on the
+    theory that "the frontend already ORs every seed check with `isAdmin`".
+    That's true for the pencil (gated on the owning canvas's `edit`, which
+    IS admin-bypassed upstream) but not for the per-widget "Manage access"
+    button (`TabGridCanvas.tsx`): it has no `isAdmin` of its own to OR in,
+    and there is no boolean substitute for a real integer `node_id` — the
+    modal needs one to fetch/write grants against. Skipping the loop left
+    every widget's `node_id` `undefined` for a Hub Admin, permanently
+    disabling that button with no error (a real live bug, found and fixed
+    2026-09-08). `access.is_granted`/`access.verdict` already special-case
+    `full_access=True` to report "granted"/"edit=True" unconditionally, so
+    running the loop for admins redacts nothing — it only adds the metadata.
+
+    Also stamps each SURVIVING widget's own `edit`/`node_kind`/`node_id` —
+    added for the component-level "seed" pencil
+    (plan_access_control_algorithm_2026-08-27.md §6.1/§9) — so the frontend
+    can tell a component-only edit grant from one merely inherited from the
+    owning canvas, the same way it already can for tabs/nav tabs.
+
+    ``_serialize_gridstack_content`` keys ``widgets`` by
+    ``str(component.id)`` (confirmed by reading it — NOT by ``link``), so
+    the numeric id recovered from each key IS the component's AC node id
+    with no lookup needed. A mirror's own key already reflects §3.4's
+    conjunction (position AND target) because ``access.is_granted`` reads
+    the fold's ``granted_view``, which ``_apply_mirror_substitution``
+    already adjusted — no separate mirror handling belongs here. The
+    redaction decision below MUST keep using ``is_granted``/``granted_view``
+    rather than ``verdict().view``/``visible``: ``_apply_mirror_substitution``
+    deliberately leaves ``visible`` untouched for a conjunction-failing
+    mirror (so it still renders as a `restricted` shell, not a hole in the
+    canvas) — reading `.view` here would show it in full instead.
+    """
+    if not isinstance(content, dict) or content.get("schemaVersion") != 2:
+        return content
+
+    widgets = content.get("widgets")
+    if not isinstance(widgets, dict):
+        return content
+
+    filtered_widgets: dict[str, Any] = {}
+    for widget_id, widget_entry in widgets.items():
+        try:
+            component_id = int(widget_id)
+        except (TypeError, ValueError):
+            # Not a shape _serialize_gridstack_content ever produces; pass
+            # through rather than guess, matching the old function's own
+            # "not a dict → leave it" defensiveness one line up.
+            filtered_widgets[widget_id] = widget_entry
+            continue
+        node = ("component", component_id)
+        if access.is_granted(node):
+            filtered_widgets[widget_id] = {
+                **widget_entry,
+                # `.edit` also reads `granted_edit`, which the same mirror
+                # conjunction adjusts — safe to read via `verdict()` here
+                # since `is_granted` already gated the branch.
+                "edit": access.verdict(node).edit,
+                "node_kind": "component",
+                "node_id": component_id,
+            }
+        else:
+            filtered_widgets[widget_id] = {"type": "restricted", "data": None}
+
+    return {**content, "widgets": filtered_widgets}
+
+
 def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
     """Resolves a component by its stable `link` — backs the mirror picker's
     "paste a link" flow (as opposed to browsing tabs/children/workspace).
@@ -816,6 +982,14 @@ def get_component_by_link_v2(db: Session, link: str) -> dict[str, Any] | None:
     if component is None or component.type == MIRROR_WIDGET_TYPE:
         return None
     return {
+        # Added for session_handoff_2026-09-02-grant-editor.md §4.2: this was
+        # the only client-facing way to resolve a `link` (a string) and it
+        # returned no `id` (the integer `components.id`), so nothing could
+        # turn a pasted link into the numeric id a component-kind resource
+        # grant addresses. Additive — every existing caller (the mirror
+        # target picker) reads `type`/`title`/`data`/`sbn` and ignores unknown
+        # keys, so this changes nothing for them.
+        "id": component.id,
         "type": component.type,
         "title": component.title,
         "data": _resolve_component_data(db, component),
@@ -960,6 +1134,15 @@ class AirtableComponentBundle:
 
     Use `.data` for anything client-facing and `.pat` ONLY for the outbound
     Airtable call.
+
+    `component_id` (plan_ac_enforcement_closeout_2026-09-09.md §5.4) is the
+    component ROW's own `.id` — added so the six gated routes in
+    `app/routers/airtable.py` can ask `access.is_granted(("component",
+    bundle.component_id))` without a second `_airtable_component_by_link`
+    lookup. It is not secret and not a derived view of the raw blob (L12
+    above is only about the raw `page_content` blob); exposing it costs
+    nothing extra to compute since `get_airtable_component_bundle` already
+    holds the `ComponentV2` row when it builds every other field here.
     """
 
     #: Non-secret configuration — same shape as `get_airtable_component_config`.
@@ -970,6 +1153,8 @@ class AirtableComponentBundle:
     data: dict[str, Any]
     #: One of AIRTABLE_LIKE_WIDGET_TYPES — the component ROW's own `.type`.
     widget_type: str
+    #: The component ROW's own `.id` — the access-control node's node_id.
+    component_id: int
 
 
 def get_airtable_component_bundle(
@@ -1004,6 +1189,7 @@ def get_airtable_component_bundle(
         pat=_airtable_pat_view(raw),
         data=_sanitised_component_data(component, raw),
         widget_type=component.type,
+        component_id=component.id,
     )
 
 
@@ -1016,10 +1202,23 @@ def update_airtable_component_config(
     personalize_enabled: Any = _UNSET,
     personalize_column: Any = _UNSET,
     access_control: Any = _UNSET,
+    access: ViewerAccess | None = None,
+    session: Any = None,
 ) -> dict[str, Any] | None:
     """Write one or more protected fields. Arguments left at `_UNSET` are
     untouched, so a caller can update a single field without resending the
     rest (and, critically, without having to resend a PAT it cannot read).
+
+    plan_lock_propagation_2026-09-08.md §5.3 — this endpoint had NO
+    `require_edit` gate at all before this plan, despite being called
+    inside the canvas Save wave (`handleSave` step 4): "add both gates
+    here, or a stale session keeps a live door into widget config." BOTH
+    gates means the full mechanical pair (`require_edit` then
+    `require_live_session`), the same as every other mirrored site — NOT
+    decision 6's ancestor-only treatment (`update_component_content`'s own
+    docstring), because this write is part of the SAME save wave the
+    canvas save's own token already covers, not a standalone per-widget
+    editor with no session of its own.
 
     `pat` has three-way semantics, because "leave it alone" and "clear it"
     must be distinguishable in a write-only field:
@@ -1035,6 +1234,9 @@ def update_airtable_component_config(
     component = _airtable_component_by_link(db, link)
     if component is None:
         return None
+
+    require_edit(access, ("component", component.id))
+    _require_live_session(db, session, ("component", component.id))
 
     try:
         # RAW: this reads the blob in order to write it back. Reading the
@@ -1069,26 +1271,11 @@ def update_airtable_component_config(
 
         if access_control is not _UNSET:
             # §4.2 (plan_airtable_chart_widget_2026-08-13.md) — this endpoint
-            # is now the ONLY place an airtable-like widget's access_control
-            # can be written (the canvas save protects it, see
-            # AIRTABLE_PROTECTED_DATA_FIELDS), so it must enforce the same
-            # ceiling the canvas save enforces on every OTHER widget's AC
-            # (:1785-1794 below) — a value may only narrow the gridstack's
-            # own resolved ceiling, never widen it. Without this, moving a
-            # chart/table/metric widget's AC onto this endpoint (§4.1) would
-            # be a net security regression, not a fix.
-            if access_control:
-                gridstack = (
-                    db.query(GridstackV2)
-                    .filter(GridstackV2.id == component.gridstack_id)
-                    .first()
-                )
-                if gridstack is not None:
-                    violation = access_control_subset_violation(
-                        access_control, resolved_ac_for_gridstack(db, gridstack)
-                    )
-                    if violation is not None:
-                        raise ValueError(violation)
+            # is the ONLY place an airtable-like widget's access_control can
+            # be written (the canvas save protects it, see
+            # AIRTABLE_PROTECTED_DATA_FIELDS). It used to be checked against
+            # the gridstack's resolved ceiling; there is no ceiling any more,
+            # so the value is stored as given.
             component.access_control = access_control
 
         _write_component_data(db, component, data)
@@ -1100,6 +1287,230 @@ def update_airtable_component_config(
                 {"component_id": component.id, "action": "upsert"}
             ]
         return config
+
+    except Exception:
+        db.rollback()
+        raise
+
+
+def update_component_content(
+    db: Session,
+    link: str,
+    *,
+    title: Any = _UNSET,
+    description: Any = _UNSET,
+    data: Any = _UNSET,
+    access: ViewerAccess | None = None,
+    holder: str | None = None,
+) -> dict[str, Any] | None:
+    """Write one component's own content fields, addressed by its stable
+    `link`. Arguments left at `_UNSET` are untouched, so a caller can change
+    a title without resending the widget's whole data blob.
+
+    §6.7 of plan_access_control_algorithm_2026-08-27.md — THE RULE THIS
+    EXISTS FOR: *a caller whose edit region begins at a component writes
+    through a per-component endpoint, never through `PUT /{id}/content`.*
+
+    WHY THE CANVAS SAVE CANNOT BE USED FOR THIS. `update_tab_content_v2` is a
+    whole-gridstack diff: it compares EVERY component on the canvas against
+    the payload, and **components absent from the payload are deleted**.
+    Routing a component-scoped editor through it therefore puts every sibling
+    in the request body, which is wrong twice over — they can rewrite widgets
+    they hold no grant on, and they can delete those widgets by simply
+    omitting them. This function reads and writes exactly one row (plus that
+    row's own `page_content`), so a sibling cannot be touched by a request
+    that never mentions it, and nothing is ever deleted.
+
+    Same shape as `update_airtable_component_config` above, which §6.7 names
+    as the sanctioned precedent: named fields, one component, addressed by
+    `link`, `_UNSET` to keep "not sent" and "set to null" distinguishable.
+
+    ── WHAT IS DELIBERATELY NOT WRITABLE HERE ───────────────────────────────
+
+    `x` / `y` / `width` / `height` — **repositioning is NOT implemented, on
+    purpose.** §11.3 defers it pending team discussion and §6.7 says so
+    twice: position is a property of the canvas, and the canvas belongs to
+    the tab, so whether a one-widget editor may relocate their widget inside
+    someone else's arrangement is a product question that is not settled. It
+    is additive once this endpoint exists (a four-column write plus a
+    box-intersection check against siblings), so nothing is lost by leaving
+    it out. **Do not add it because a caller asks; it needs the decision
+    first.**
+
+    `access_control` — authorization, not content. §6.3 routes "edit `n`'s
+    grants" through the grants surface with its own delegation gate, not
+    through a content write. Adding it here would give a component-scoped
+    editor a second door to the very ACL that gates their own widget.
+    (Airtable-like widgets already have a single sanctioned door for theirs:
+    `update_airtable_component_config`.)
+
+    `type` — a type change re-interprets the stored blob, and it is the only
+    route by which the `restricted` redaction sentinel could reach
+    `components.type`. The request schema is `extra="forbid"`, so a client
+    that naively posts a whole serialized widget entry (which carries
+    `type`, `link` and the layout keys) gets a 422 rather than a partial
+    write. See the sentinel guard below, which is the second half of that.
+
+    ── AUTHORIZATION: EDIT(N), STILL NO LOCK CHECK ──────────────────────────
+
+    Updated by project_ac_enforcement_gap.md item 2, which is the "§10 flips
+    enforcement" trigger the paragraph below used to point at — this
+    function and `update_tab_content_v2` gained the grant check TOGETHER, as
+    promised, via the same `require_edit(access, node)` call shape. Kept
+    here rather than deleted, because the reasoning for what is STILL not
+    checked still matters:
+
+      * **Grant check: now live.** `require_edit` below raises
+        `NodeNotViewableError` (404) or `NodeNotEditableError` (403) against
+        this component's OWN node — `("component", component.id)` — the
+        §6.3 "change a canvas, widget config, or text → n" row. `access=None`
+        (every caller that predates this change, and any future internal
+        caller that never intended to gate its own write) is a no-op, so
+        this is additive for every caller that opts in by passing one.
+      * **Lock check, UPDATED plan_lock_propagation_2026-09-08.md §5.3
+        decision 6.** This paragraph used to say "no lock check, still
+        deliberate, paired with the canvas save" — no longer true as of
+        that plan. A component "checks ancestors but takes no lock" of its
+        own: no session TOKEN is required here (this endpoint holds no
+        session — a per-widget editor never acquires anything), but the
+        write is refused if the component's owning canvas, or any of ITS
+        ancestors, is held FRESH by someone else. This is what closes the
+        exact bypass §5.3 names: a canvas session is held, and without
+        this check someone else could still rewrite one of its widgets
+        through this door. `update_tab_content_v2` (the WHOLE-canvas save)
+        is a different case entirely — it IS the canvas write and gets the
+        full `require_live_session` token check, not this ancestor-only
+        one.
+
+    Returns the updated component view, or None for an unknown `link` (404 at
+    the router). Raises ValueError — 400 — for a link that resolves to
+    something with no content of its own to write.
+    """
+    link = (link or "").strip()
+    if not link:
+        return None
+
+    component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
+    if component is None:
+        return None
+
+    # Checked BEFORE the type-specific rejections below (sentinel/mirror/
+    # representation), not after: a caller who cannot edit this component
+    # should not learn what KIND of unwritable thing it is as a side effect
+    # of being refused. `("component", component.id)` is this row's own AC
+    # node regardless of its `type` — mirrors and gridstack-representation
+    # rows are still ordinary "component" nodes in the tree (§3.1), even
+    # though none of them accept a content write.
+    require_edit(access, ("component", component.id))
+
+    # plan_lock_propagation_2026-09-08.md §5.3 decision 6 — see this
+    # function's own docstring. No token required; refused only if the
+    # component's owning canvas or one of ITS ancestors is held fresh by
+    # someone else. `holder=None` (every pre-existing internal caller)
+    # skips this, matching `access=None`'s own "no check requested"
+    # convention — never reachable from a real router, which always
+    # passes the authenticated caller's email.
+    if holder:
+        from app.services import edit_lock_service
+
+        canvas_node = edit_lock_service.lock_node_of(db, ("component", component.id))
+        if canvas_node is not None:
+            edit_lock_service.refuse_if_any_held(
+                db, [canvas_node] + edit_lock_service.ancestors(db, canvas_node), holder
+            )
+
+    # THE REDACTION SENTINEL, GUARDED ON ITS OWN RATHER THAN INHERITED.
+    # `update_tab_content_v2` got its own guard on 2026-08-30, and §6.7 is
+    # explicit that each write path must hold independently ("the canvas save
+    # must hold on its own"), so this one does not lean on that one.
+    #
+    # Two halves, because the sentinel can arrive two ways:
+    #  - INBOUND, as `type: 'restricted'` in the body. Closed structurally:
+    #    `type` is not a field on the request schema and the schema forbids
+    #    extras, so such a body is a 422 before reaching here.
+    #  - STORED, as a row whose own type is already the sentinel. That row
+    #    should not exist — nothing persists it — but if one ever did,
+    #    writing content into it would be operating on a redaction artifact
+    #    and would make a real widget's replacement permanent. Refused.
+    #
+    # Note the trap this deliberately does NOT repeat: stripping sentinels
+    # client-side does not preserve a widget on the CANVAS path, it DELETES
+    # it, because the delete pass keys on a missing key. That trap is
+    # specific to the whole-canvas diff and cannot arise here — this function
+    # has no delete pass at all.
+    if component.type == RESTRICTED_WIDGET_TYPE:
+        raise ValueError(
+            "This component is a redaction sentinel and cannot be written to"
+        )
+
+    # A mirror holds no content of its own — its only persisted state is
+    # `target_link` in `props`, and everything it renders is resolved from
+    # its target at read time (`_serialize_component`). `_write_component_data`
+    # documents that it is never called for a mirror. Editing "a mirror's
+    # content" means editing the target, which the caller addresses by the
+    # TARGET's link.
+    if component.type == MIRROR_WIDGET_TYPE:
+        raise ValueError(
+            "This link points at a mirror, which has no content of its own — "
+            "write to the target component instead"
+        )
+
+    # A gridstack's self-representation row (`current_grid_id`) stands in for
+    # a sub-tab, not a widget. It is excluded from every canvas query and has
+    # no page_content; writing a data blob into it would invent content for
+    # something that never renders one.
+    if component.type in GRIDSTACK_REPRESENTATION_TYPES:
+        raise ValueError(
+            "This link points at a sub-tab representation, not a widget"
+        )
+
+    try:
+        before_signature = _component_persistence_signature(db, component)
+
+        if title is not _UNSET:
+            component.title = title
+
+        if description is not _UNSET:
+            component.description = description
+
+        if data is not _UNSET:
+            incoming = data if isinstance(data, dict) else {}
+            if component.type in AIRTABLE_LIKE_WIDGET_TYPES:
+                # NOT OPTIONAL, and the reason is the same one
+                # AIRTABLE_PROTECTED_DATA_FIELDS spells out at its
+                # definition: this path's authorization is edit(n) — same as
+                # the canvas save (project_ac_enforcement_gap.md item 2) — not
+                # a PAT-specific check. Without this, a plain content write
+                # would clobber the stored PAT with whatever the client sent (or
+                # with nothing), and would let a caller flip
+                # `personalizeEnabled` / `sourceUrl` — the fields that decide
+                # what rows the Airtable endpoints will serve. RAW, not the
+                # sanitised view: the sanitised one has `pat` stripped, so
+                # preserving from it would delete the token on every save.
+                incoming = _apply_airtable_protection(
+                    _raw_component_data(db, component), incoming
+                )
+            _write_component_data(db, component, incoming)
+
+        db.flush()
+        changed = before_signature != _component_persistence_signature(db, component)
+        db.commit()
+
+        response: dict[str, Any] = {
+            "link": component.link,
+            "type": component.type,
+            "title": component.title,
+            "description": component.description,
+            "data": _resolve_component_data(db, component),
+            "sbn": _sbn_node_info(db, component),
+        }
+        # Same convention as `update_sbn_content`, the other single-component
+        # content write: emit a receipt only when persisted state actually
+        # changed, so a no-op save does not churn the search index.
+        response["search_updates"] = (
+            _search_update_receipts({component.id: "upsert"}) if changed else []
+        )
+        return response
 
     except Exception:
         db.rollback()
@@ -1146,13 +1557,11 @@ def get_component_by_link_for_access_check_v2(db: Session, link: str) -> Compone
     alongside: a mirror is never a navigable "original", so it's never a
     visibility-checkable target either).
 
-    Lets a caller (the `.../location` router) run its own
-    `access_control_service.can_view` check against the component's own
-    `access_control` (falling back to `resolved_parent_ac` when unset)
-    BEFORE calling `resolve_component_location_v2` — keeping the
-    permission decision in the router, matching this codebase's existing
-    convention (see `move_tab_to_nav_tab`'s own `can_edit` checks) rather
-    than teaching the resolver itself about the caller's identity."""
+    Lets a caller (the `.../location` router) run its own visibility check
+    against the component's own `access_control` BEFORE calling
+    `resolve_component_location_v2` — keeping the permission decision in the
+    router rather than teaching the resolver itself about the caller's
+    identity."""
     link = (link or "").strip()
     if not link:
         return None
@@ -1239,7 +1648,13 @@ def resolve_component_location_v2(db: Session, link: str) -> dict[str, Any] | No
 # Read API
 # ---------------------------------------------------------
 
-def get_root_tabs_v2(db: Session, nav_tab_id: int | None = None) -> list[dict[str, Any]]:
+def get_root_tabs_v2(
+    db: Session,
+    nav_tab_id: int | None = None,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: Any = None,  # see `_format_tab_summary`'s identical param comment
+) -> list[dict[str, Any]]:
     # A root gridstack whose owning TabV2 itself has parent_tab_id set is a
     # tab variant, not a top-level tab — it must only ever surface via
     # get_tab_variants_v2, never duplicated into the main tab bar.
@@ -1256,17 +1671,35 @@ def get_root_tabs_v2(db: Session, nav_tab_id: int | None = None) -> list[dict[st
     if nav_tab_id is not None:
         query = query.filter(TabV2.nav_tab_id == nav_tab_id)
     root_gridstacks = query.all()
-    summaries = [_format_tab_summary(db, g) for g in root_gridstacks]
+    summaries = [_format_tab_summary(db, g, access=access, lock_view=lock_view) for g in root_gridstacks]
+    # §5.2: `visible` gates the CHROME — an invisible root tab must not
+    # appear in the tab bar at all, not merely render disabled. `access is
+    # None` (an internal caller with no user context) skips this filter
+    # entirely, matching every other caller of this function unchanged.
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
 
 
-def get_tab_variants_v2(db: Session, parent_document_id: str) -> list[dict[str, Any]] | None:
+def get_tab_variants_v2(
+    db: Session,
+    parent_document_id: str,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: Any = None,  # see `_format_tab_summary`'s identical param comment
+) -> list[dict[str, Any]] | None:
     parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
     if parent_gridstack is None or not _is_root(parent_gridstack):
         return None
     parent_tab = _get_root_tab(db, parent_gridstack)
     if parent_tab is None:
+        return None
+    # The parent itself must be visible, or listing its variants leaks more
+    # than the accepted §5.2 reveal does (it would expose "these variants
+    # exist" for a node the caller cannot even see the existence of). Same
+    # None-means-404 convention every other function below uses.
+    if access is not None and not access.verdict(("tab", parent_tab.id)).view:
         return None
 
     variant_tabs = db.query(TabV2).filter(TabV2.parent_tab_id == parent_tab.id).all()
@@ -1279,8 +1712,10 @@ def get_tab_variants_v2(db: Session, parent_document_id: str) -> list[dict[str, 
         )
         if variant_gridstack is None:
             continue
-        summaries.append(_format_tab_summary(db, variant_gridstack))
+        summaries.append(_format_tab_summary(db, variant_gridstack, access=access, lock_view=lock_view))
 
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
 
@@ -1347,6 +1782,9 @@ def create_tab_variant_v2(
     title: str,
     access_control: dict[str, Any] | None = None,
     order: int | None = None,
+    *,
+    access: ViewerAccess | None = None,
+    session: Any = None,
 ) -> dict[str, Any]:
     try:
         title = _validate_title(title)
@@ -1359,15 +1797,24 @@ def create_tab_variant_v2(
         if parent_gridstack is None or not _is_root(parent_gridstack):
             raise ValueError("Parent tab does not exist")
 
+        # plan §6.3 "create a child of n" → n: creating a variant is a new
+        # TAB node whose parent is the ROOT tab addressed by
+        # `parent_document_id` — structurally identical to the sub-tab
+        # branch of `create_tab_v2` below, just on the variant axis instead
+        # of the gridstack-nesting one (project_ac_enforcement_gap.md item 2
+        # §2's resolved reading: root vs. variant creation are the same
+        # case, both "create a child of n"). Checked before the sibling-title
+        # uniqueness query below so a caller without edit never learns
+        # whether a title collision exists.
+        require_edit(access, resolve_gridstack_node(db, parent_gridstack))
+        _require_live_session(db, session, resolve_gridstack_node(db, parent_gridstack))
+
         parent_tab = _get_root_tab(db, parent_gridstack)
         if parent_tab is None:
             raise ValueError("Parent tab does not exist")
 
         if parent_tab.parent_tab_id is not None:
             raise ValueError("A tab variant cannot itself have tab variants")
-
-        parent_ac = _access_control_or_default(parent_tab.access_control)
-        effective_ac = access_control if access_control is not None else parent_ac
 
         existing = (
             db.query(TabV2)
@@ -1390,10 +1837,10 @@ def create_tab_variant_v2(
             document_id=_generate_id(),
             title=title,
             order=order,
-            # Materialized below via apply_write, after the content
-            # migration (is_first_variant) so any re-parented descendants
-            # are already in this variant's subtree when it propagates.
-            access_control=None,
+            # Whatever the caller asked for, or nothing. A variant used to
+            # inherit its parent tab's access_control; there is no
+            # inheritance any more.
+            access_control=access_control,
             locked=False,
             locked_by="",
             parent_tab_id=parent_tab.id,
@@ -1424,8 +1871,6 @@ def create_tab_variant_v2(
         if is_first_variant:
             _migrate_root_content_to_variant(db, parent_gridstack, new_gridstack, new_tab)
 
-        apply_write(db, NodeRef("tab", new_tab.id), effective_ac)
-
         affected_component_ids = _component_ids_for_gridstack_tree(db, new_gridstack)
         db.commit()
         response = _format_tab_summary(db, new_gridstack)
@@ -1444,11 +1889,24 @@ def reorder_tab_variants_v2(
     db: Session,
     parent_document_id: str,
     ordered_document_ids: list[str],
+    *,
+    access: ViewerAccess | None = None,
+    holder: str | None = None,
 ) -> list[dict[str, Any]] | None:
     try:
         parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
         if parent_gridstack is None or not _is_root(parent_gridstack):
             return None
+
+        # plan §6.3 "reorder n → parent(n)": each variant's parent is the
+        # SAME root tab `create_tab_variant_v2` above checks edit(n) on — a
+        # variant-reorder touches only the ORDER column of existing sibling
+        # rows, never their own content, which is squarely "changes the
+        # parent's arrangement of its children" (project_ac_enforcement_gap.md
+        # item 2 §2). `resolve_gridstack_node` on `parent_gridstack` (a ROOT
+        # gridstack) already returns that tab's own node directly.
+        require_edit(access, resolve_gridstack_node(db, parent_gridstack))
+
         parent_tab = _get_root_tab(db, parent_gridstack)
         if parent_tab is None:
             return None
@@ -1460,6 +1918,22 @@ def reorder_tab_variants_v2(
         for doc_id in ordered_document_ids:
             if doc_id not in variants_by_document_id:
                 raise ValueError(f"{doc_id} is not a tab variant of this tab")
+
+        # plan_lock_propagation_2026-09-08.md §5.4, decision 9 — one of the
+        # two dedicated reorder endpoints named explicitly there: session-
+        # EXEMPT (no token), but refused if any variant BEING REORDERED
+        # (exactly `ordered_document_ids`, not necessarily every variant
+        # under the parent) is held fresh by someone else. `holder=None`
+        # (no check requested) matches every other optional identity/
+        # session param in this module.
+        if holder:
+            from app.services import edit_lock_service
+
+            edit_lock_service.refuse_if_any_held(
+                db,
+                [("tab", variants_by_document_id[doc_id].id) for doc_id in ordered_document_ids],
+                holder,
+            )
 
         for index, doc_id in enumerate(ordered_document_ids):
             variant_tab = variants_by_document_id[doc_id]
@@ -1483,9 +1957,19 @@ def reorder_tab_variants_v2(
         raise
 
 
-def get_tab_children_v2(db: Session, document_id: str) -> list[dict[str, Any]] | None:
+def get_tab_children_v2(
+    db: Session,
+    document_id: str,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: Any = None,  # see `_format_tab_summary`'s identical param comment
+) -> list[dict[str, Any]] | None:
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
+        return None
+    # Same fail-closed convention as get_tab_variants_v2 above: a caller who
+    # cannot see `gridstack` itself does not get to learn what is under it.
+    if access is not None and not access.verdict(resolve_gridstack_node(db, gridstack)).view:
         return None
 
     children = (
@@ -1493,22 +1977,53 @@ def get_tab_children_v2(db: Session, document_id: str) -> list[dict[str, Any]] |
         .filter(GridstackV2.parent_id == gridstack.id)
         .all()
     )
-    summaries = [_format_tab_summary(db, c) for c in children]
+    summaries = [_format_tab_summary(db, c, access=access, lock_view=lock_view) for c in children]
+    if access is not None:
+        summaries = [s for s in summaries if s["view"]]
     summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
     return summaries
 
 
-def get_tab_content_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+def get_tab_content_v2(
+    db: Session, document_id: str, *, access: ViewerAccess | None = None
+) -> dict[str, Any] | None:
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
-    return _format_page_content(db, gridstack)
+    if access is not None and not access.verdict(resolve_gridstack_node(db, gridstack)).view:
+        return None
+    content = _format_page_content(db, gridstack)
+    if access is not None:
+        content["content"] = _apply_visibility_to_content(content["content"], access=access)
+    return content
 
 
-def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+def get_tab_workspace_v2(
+    db: Session,
+    document_id: str,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: Any = None,  # see `_format_tab_summary`'s identical param comment
+) -> dict[str, Any] | None:
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
+
+    # plan §9: a deep link to a HIDDEN node fails closed as 404, same as one
+    # that does not exist, so it does not confirm the node's existence — the
+    # router's existing `if workspace is None: raise 404` already produces
+    # that response; returning None here for "exists but invisible" is what
+    # makes the two indistinguishable from outside, as designed.
+    # this session: resolved unconditionally, same reasoning as
+    # `_format_tab_summary`'s identical line — the workspace response needs
+    # the real resource_grants node regardless of whether a caller passes
+    # `access`.
+    ac_node = resolve_gridstack_node(db, gridstack)
+    own_verdict = None
+    if access is not None:
+        own_verdict = access.verdict(ac_node)
+        if not own_verdict.view:
+            return None
 
     is_root = _is_root(gridstack)
     # Fetched once here (only when root) and threaded into both
@@ -1544,33 +2059,50 @@ def get_tab_workspace_v2(db: Session, document_id: str) -> dict[str, Any] | None
         .filter(GridstackV2.parent_id == gridstack.id)
         .all()
     )
-    child_summaries = [_format_tab_summary(db, c) for c in children]
+    child_summaries = [_format_tab_summary(db, c, access=access, lock_view=lock_view) for c in children]
+    if access is not None:
+        child_summaries = [s for s in child_summaries if s["view"]]
     child_summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
 
-    locked, locked_by = _safe_locked_pair(db, gridstack, root_tab)
+    locked, locked_by, locked_at = _safe_locked_triple(db, gridstack, root_tab)
 
-    return {
+    page_content = _format_page_content(db, gridstack)
+    if access is not None:
+        page_content["content"] = _apply_visibility_to_content(page_content["content"], access=access)
+
+    workspace = {
         "id": node_id,
         "documentId": gridstack.document_id,
         "title": title,
         "order": order,
         "parent": parent,
-        "page_content": _format_page_content(db, gridstack),
+        "page_content": page_content,
         "access_control": _safe_access_control_for_gridstack(db, gridstack, root_tab),
-        # The effective (NULL-skipping resolved, landmine-14) AC of THIS
-        # node itself -- also, not coincidentally, the exact ceiling
-        # update_tab_content_v2 already validates each widget on this
-        # canvas against (§3.4). Exposed on read so the frontend's
-        # parent-scoped component picker (plan §6.1's last bullet, commit
-        # 8) has one source for that ceiling instead of re-implementing the
-        # walk-up in TypeScript.
-        "resolved_access_control": resolved_ac_for_gridstack(db, gridstack),
         "locked": locked,
         "locked_by": locked_by,
+        "locked_at": locked_at,
+        "lock_is_stale": locked and is_lock_stale(locked_at),
         "children": child_summaries,
         "has_variants": has_variants,
         "apiVersion": "v2",
+        "node_kind": ac_node[0] if ac_node is not None else None,
+        "node_id": ac_node[1] if ac_node is not None else None,
     }
+    if own_verdict is not None:
+        workspace["view"] = own_verdict.view
+        workspace["edit"] = own_verdict.edit
+        workspace["revealed"] = own_verdict.revealed
+        workspace["edit_seed"] = own_verdict.edit_seed
+
+    if lock_view is not None:
+        from app.services.edit_lock_service import resolve_lock_node
+
+        lock_node_state = lock_view.state_for(resolve_lock_node(gridstack))
+        workspace["lock_state"] = lock_node_state.state
+        workspace["lock_holder"] = lock_node_state.holder
+        workspace["lock_holder_node_label"] = lock_node_state.node_label
+        workspace["lock_expires_at"] = lock_node_state.expires_at
+    return workspace
 
 
 # ---------------------------------------------------------
@@ -1704,23 +2236,29 @@ def update_tab_content_v2(
     db: Session,
     document_id: str,
     content: dict[str, Any] | list[Any] | None,
+    *,
+    access: ViewerAccess | None = None,
+    session: Any = None,
 ) -> dict[str, Any] | None:
     try:
         gridstack = get_gridstack_by_document_id(db, document_id)
         if gridstack is None:
             return None
 
-        # Component subset rule (§3.4) — a widget's access_control may only
-        # narrow the gridstack's own resolved ceiling, never widen it. This is
-        # a BULK path (one save carries every widget on the canvas), so the
-        # ceiling is resolved once, lazily, rather than once per widget.
-        _widget_ac_ceiling: dict[str, Any] | None = None
-
-        def _resolved_widget_ac_ceiling() -> dict[str, Any]:
-            nonlocal _widget_ac_ceiling
-            if _widget_ac_ceiling is None:
-                _widget_ac_ceiling = resolved_ac_for_gridstack(db, gridstack)
-            return _widget_ac_ceiling
+        # plan §6.3 "change a canvas, widget config, or text → n": the
+        # canvas save's own node is whatever `resolve_gridstack_node`
+        # resolves this gridstack to (the tab itself for a root/variant
+        # canvas, the sub-grid's representation component for a nested one).
+        # `access=None` (every internal caller — e.g. `create_tab_v2` seeding
+        # a brand-new tab's initial content) is a no-op, matching every other
+        # `require_edit` call site.
+        require_edit(access, resolve_gridstack_node(db, gridstack))
+        # plan_lock_propagation_2026-09-08.md decision 4 / §7's advisory
+        # reversal: THIS is the canvas save §12 used to leave unenforced —
+        # `TestLockingStaysAdvisory` pinned that on purpose and is reversed
+        # by this exact call (see the class's new docstring in
+        # tests/test_tab_locking.py). `session=None` mirrors `access=None`.
+        _require_live_session(db, session, resolve_gridstack_node(db, gridstack))
 
         search_updates: dict[int, str] = {}
         incoming = content if isinstance(content, dict) else {}
@@ -1807,15 +2345,84 @@ def update_tab_content_v2(
             widget_type = widget_entry.get("type")
             widget_data = widget_entry.get("data")
 
+            # THE REDACTION SENTINEL IS NEVER PERSISTED — leave the stored
+            # component exactly as it is (algorithm plan §6.7, §10 item 7).
+            #
+            # `filter_widget_content_for_user` replaces a widget the caller
+            # may not see with `{type: 'restricted', data: null}` and KEEPS
+            # ITS KEY (tab_service.py:100), so the sentinel travels out in
+            # `GridCanvasContent.widgets` and comes straight back on the next
+            # save. Without this guard the loop below would treat it as an
+            # ordinary edit and write it through: `existing.type` becomes
+            # 'restricted', `title` and `description` become None, and
+            # `_write_component_data` overwrites the real content with `{}`.
+            # The widget the caller was not allowed to SEE is destroyed by the
+            # act of saving the canvas around it.
+            #
+            # `continue` is the whole fix, and the two things it does NOT do
+            # matter as much as the one it does:
+            #
+            #  - It does not remove `widget_id` from `incoming_ids`, which was
+            #    computed from the raw payload above. That is load-bearing:
+            #    the delete pass removes every existing component whose key is
+            #    ABSENT, so filtering these entries out of the payload — the
+            #    obvious client-side "fix" — would not preserve the widget, it
+            #    would DELETE it. The key must survive even though the entry
+            #    is ignored.
+            #  - It does not create a row when no component matches, so a
+            #    sentinel for an unknown key cannot insert a junk
+            #    'restricted' component either.
+            #
+            # PRESERVE-AND-CONTINUE RATHER THAN REFUSING THE REQUEST, which
+            # was the other reading of "reject `restricted` server-side". A
+            # hard failure would make the canvas unsaveable for anyone who
+            # holds edit on it and cannot see one widget on it — the very
+            # combination §6.7 says fine-grained grants make ORDINARY — and a
+            # merely stale client would trip it too. Ignoring one entry
+            # degrades gracefully and matches how this function already
+            # handles fields it must not clobber: an absent `access_control`
+            # means "preserve", not "overwrite with null", and Airtable's
+            # protected fields are carried over rather than rejected.
+            #
+            # This guard stands on its own and does not depend on any client
+            # stripping sentinels first (§6.7: "the canvas save must hold on
+            # its own"). Rare today only because redaction and edit rights
+            # almost never coincide; fine-grained edit grants remove that
+            # accident, which is why §10 orders this BEFORE they exist.
+            if widget_type == RESTRICTED_WIDGET_TYPE:
+                continue
+
             # Structural-metadata-only now — a widget's actual `data` never
             # lives in `props` (see ComponentV2's docstring); it's persisted
             # via `_write_component_data` below instead.
             if widget_type == MIRROR_WIDGET_TYPE:
-                structural_props: dict[str, Any] = {
-                    "target_link": (widget_data or {}).get("targetLink")
+                target_link = (
+                    (widget_data or {}).get("targetLink")
                     if isinstance(widget_data, dict)
                     else None
-                }
+                )
+                if target_link and access is not None:
+                    target_component = (
+                        db.query(ComponentV2).filter(ComponentV2.link == target_link).first()
+                    )
+                    # A dangling link or one pointing at another mirror is left
+                    # to the existing dangling-target/cycle-prevention handling
+                    # elsewhere — nothing new to enforce here. A REAL target
+                    # the acting editor cannot view is the paste-link AC
+                    # bypass: the picker's browse mode only ever lists targets
+                    # that pass through a server-gated listing endpoint, but a
+                    # pasted link (or a hand-crafted request that skips the
+                    # picker entirely) does not, so it must be checked here
+                    # too — second layer, matching this codebase's existing
+                    # client-hides/server-re-checks pattern for mirror-of-
+                    # mirror cycle prevention.
+                    if (
+                        target_component is not None
+                        and target_component.type != MIRROR_WIDGET_TYPE
+                        and not access.is_granted(("component", target_component.id))
+                    ):
+                        raise NodeNotViewableError(("component", target_component.id))
+                structural_props: dict[str, Any] = {"target_link": target_link}
             else:
                 structural_props = {}
                 if layout_entry.get("minW") is not None:
@@ -1826,25 +2433,6 @@ def update_tab_content_v2(
             access_control = widget_entry.get("access_control")
             title = widget_entry.get("title")
             description = widget_entry.get("description")
-
-            # NULL means inherit (§3.4) — nothing to check. Airtable's is
-            # protected (never actually written from this save path — no
-            # per-widget authorization check runs here, only login, so it
-            # can't be trusted with it; see AIRTABLE_PROTECTED_DATA_FIELDS
-            # above) and a mirror's stored value is inert (serialized access
-            # is derived from the mirror's target, never its own column) —
-            # validating either would reject values that are never actually
-            # enforced.
-            if (
-                access_control
-                and widget_type not in AIRTABLE_LIKE_WIDGET_TYPES
-                and widget_type != MIRROR_WIDGET_TYPE
-            ):
-                violation = access_control_subset_violation(
-                    access_control, _resolved_widget_ac_ceiling()
-                )
-                if violation is not None:
-                    raise ValueError(f"Widget '{widget_id}': {violation}")
 
             existing = existing_components.get(widget_id)
             before_signature = (
@@ -1888,8 +2476,9 @@ def update_tab_content_v2(
                 existing.height = layout_entry.get("h", existing.height)
                 # Three independent reasons to leave the stored AC alone.
                 # An airtable widget's access_control is protected — see
-                # AIRTABLE_PROTECTED_DATA_FIELDS. This save path runs no
-                # per-widget authorization check (login only), so letting it
+                # AIRTABLE_PROTECTED_DATA_FIELDS. This save path's `edit(n)`
+                # gate (project_ac_enforcement_gap.md item 2) is ONE check for
+                # the whole canvas, not per-widget, so letting it
                 # clear the AC would defeat the check on
                 # GET /data/airtable/component/{link}/rows. Changing it goes
                 # through the config endpoint instead — not because that
@@ -1958,8 +2547,8 @@ def update_tab_content_v2(
                     if widget_type in AIRTABLE_LIKE_WIDGET_TYPES:
                         # Nothing stored yet, so this drops every protected
                         # field rather than trusting the request body — this
-                        # save path checks login only, not per-widget
-                        # authorization.
+                        # save path's `edit(n)` gate is one check for the
+                        # whole canvas, not per-widget authorization.
                         data_to_write = _apply_airtable_protection(None, data_to_write)
                     _write_component_data(db, new_component, data_to_write)
                 search_updates[new_component.id] = "upsert"
@@ -2107,6 +2696,9 @@ def create_tab_v2(
     order: int | None = None,
     access_control: dict[str, Any] | None = None,
     nav_tab_id: int | None = None,
+    *,
+    access: ViewerAccess | None = None,
+    session: Any = None,
 ) -> dict[str, Any]:
     try:
         title = _validate_title(title)
@@ -2118,6 +2710,25 @@ def create_tab_v2(
             parent_gridstack = get_gridstack_by_document_id(db, parent_document_id)
             if parent_gridstack is None:
                 raise ValueError("Parent tab does not exist")
+
+        # plan §6.3 "create a child of n" → n. Two shapes, because a ROOT
+        # create's parent is a nav tab (no gridstack to resolve — the router
+        # already worked out `nav_tab_id`, falling back to the Dashboard nav
+        # tab per its own docstring) while a SUB-TAB create's parent is
+        # whatever node owns `parent_gridstack`. `nav_tab_id is None` here
+        # means the router found no Dashboard nav tab to fall back to either
+        # — an anomaly, not an open door, so it resolves to `None` and fails
+        # closed exactly like every other unresolvable node (§3.3).
+        create_node = (
+            resolve_gridstack_node(db, parent_gridstack)
+            if parent_gridstack is not None
+            else (("nav_tab", nav_tab_id) if nav_tab_id is not None else None)
+        )
+        require_edit(access, create_node)
+        # A root tab's create_node is a nav_tab — lockable (its edit-mode
+        # toggle acquires a real session, §8 phase 5); NOT the hub, so this
+        # is never one of §9 item 1's hub-exempt sites.
+        _require_live_session(db, session, create_node)
 
         now = _utc_now()
 
@@ -2131,22 +2742,14 @@ def create_tab_v2(
                     f"punctuation share one URL, so pick a more distinct name."
                 )
 
-            nav_tab_row = (
-                db.query(NavTabV2).filter(NavTabV2.id == nav_tab_id).first()
-                if nav_tab_id is not None
-                else None
-            )
-            parent_ac = _access_control_or_default(
-                nav_tab_row.access_control if nav_tab_row else None
-            )
-            effective_ac = access_control if access_control is not None else parent_ac
-
             new_tab = TabV2(
                 document_id=_generate_id(),
                 title=title,
                 order=order,
-                # Materialized below via apply_write.
-                access_control=None,
+                # Whatever the caller asked for, or nothing. A root tab used
+                # to inherit its nav tab's access_control; there is no
+                # inheritance any more.
+                access_control=access_control,
                 locked=False,
                 locked_by="",
                 nav_tab_id=nav_tab_id,
@@ -2167,21 +2770,12 @@ def create_tab_v2(
             db.add(new_gridstack)
             db.flush()
             created_gridstack_component = _create_gridstack_component(db, new_gridstack)
-
-            apply_write(db, NodeRef("tab", new_tab.id), effective_ac)
         else:
             existing = _gridstack_exists_under_parent(
                 db, title, parent_tab_id=parent_gridstack.parent_tab_id, parent_id=parent_gridstack.id
             )
             if existing is not None:
                 raise ValueError("A tab with this title already exists under the same parent")
-
-            # "The parent's" AC (§5.2) — the owning TabV2's AC for a "top"
-            # sub-tab directly on a root/variant's own canvas, or the parent
-            # sub-tab's own AC for a nested one; _safe_access_control_for_
-            # gridstack already implements exactly that distinction.
-            parent_ac = _safe_access_control_for_gridstack(db, parent_gridstack)
-            effective_ac = access_control if access_control is not None else parent_ac
 
             new_gridstack = GridstackV2(
                 document_id=_generate_id(),
@@ -2193,10 +2787,13 @@ def create_tab_v2(
             )
             db.add(new_gridstack)
             db.flush()
-            # Materialized below via apply_write.
-            created_gridstack_component = _create_gridstack_component(db, new_gridstack)
-
-            apply_write(db, NodeRef("gridstack", new_gridstack.id), effective_ac)
+            # A sub-tab's own access_control lives on its representation
+            # component, not on any TabV2 row. Whatever the caller asked
+            # for, or nothing — a sub-tab used to inherit the parent
+            # gridstack's value; there is no inheritance any more.
+            created_gridstack_component = _create_gridstack_component(
+                db, new_gridstack, access_control
+            )
 
         content_receipts: list[dict[str, Any]] = []
         if content:
@@ -2226,17 +2823,83 @@ def update_tab_by_document_id_v2(
     title: str | None = None,
     order: int | None = None,
     access_control: dict[str, Any] | None = None,
-    locked: bool | None = None,
-    locked_by: str | None = None,
+    *,
+    access: ViewerAccess | None = None,
+    session: Any = None,
 ) -> dict[str, Any] | None:
+    """NO `locked` / `locked_by` PARAMETERS — DELIBERATELY, NOT AN OVERSIGHT.
+
+    This is the generic tab-metadata PUT, and until
+    plan_access_control_algorithm_2026-08-27.md §6.6's locking session it
+    quietly accepted `locked`/`locked_by` here too, writing them onto `tab`
+    with NO ownership check at all — the "third door": anyone authenticated
+    could set `{locked: true, locked_by: "anyone"}` on any root tab, or
+    clear someone else's lock, without going near lock_tab_by_document_id_v2
+    / unlock_tab_by_document_id_v2 below.
+
+    Fixed by removing the fields from `UpdateTabRequest` (schemas/tab.py)
+    entirely rather than ignoring them here — StrictRequestModel's
+    `extra="forbid"` then 422s a client that still sends them, which is the
+    loud failure this door needs. Removing the PARAMETERS here too, not just
+    the call in tabs_v2.py that used to pass them, is the second half of
+    that: a future session cannot silently wire this door back open by
+    adding a keyword argument, the way the schema alone would still allow.
+
+    If you are re-adding lock/unlock here — DON'T, without first re-reading
+    this comment AND hazard 4's requirement that locking stay refused for a
+    nested gridstack (the `else` branch below has never accepted locked/
+    locked_by and must not start now).
+
+    THREE OPERATIONS, ONE GATE EACH, project_ac_enforcement_gap.md item 2
+    — this single PUT conflates §6.3's "rename" and "edit n's grants" rows
+    (both `edit(n)`) with its "reorder" row (`edit(parent(n))`, since
+    `order` is how a root tab's own sibling position is actually persisted
+    — see `reorder_tabs_by_document_id_v2`'s own comment on why). Rather
+    than gate each field separately and risk a half-applied write, this
+    checks the STRICTEST requirement any field present in the call implies,
+    once, before touching anything: `edit(parent(n))` if `order is not
+    None`, else `edit(n)`. That is sound because `edit(parent(n)) ⟹ edit(n)`
+    by construction (§6.1's fold: `edit(n) = seed_edit(n) ∨ edit(parent(n))`)
+    — the stricter check, when it is the one required, always also clears
+    the looser one, so title/access_control changes bundled into the same
+    request as an `order` change need no separate check.
+
+    §11.2's rename question — `n` or the stricter `parent(n)` — was asked of
+    the owner rather than assumed (2026-09-04): **`edit(n)`**, matching
+    §6.3's table literally. Unlike D4's edit-grant derivation question, a
+    rename gate is pure policy with no stored-data consequence, so this is
+    cheap to tighten later if that changes.
+    """
     try:
         title = _validate_title(title)
         order = _validate_order(order)
-        locked_by = _validate_locked_by(locked_by)
 
         gridstack = get_gridstack_by_document_id(db, document_id)
         if gridstack is None:
             return None
+
+        gate_node = (
+            resolve_gridstack_parent_node(db, gridstack)
+            if order is not None
+            else resolve_gridstack_node(db, gridstack)
+        )
+        require_edit(access, gate_node)
+        # plan_lock_propagation_2026-09-08.md §5.4: the `order is not None`
+        # branch is this generic PUT's own reorder shape (§5.4's own text
+        # names this exact split) — session-EXEMPT, refused only if THIS
+        # node is held fresh by someone else, not gated on a token. The
+        # `order is None` branch (rename / access-control edit) gets the
+        # full mechanical `require_live_session` check like everywhere
+        # else.
+        if order is not None:
+            if session is not None:
+                from app.services import edit_lock_service
+
+                edit_lock_service.refuse_if_any_held(
+                    db, [edit_lock_service.resolve_lock_node(gridstack)], session.holder
+                )
+        else:
+            _require_live_session(db, session, gate_node)
 
         if _is_root(gridstack):
             tab = _get_root_tab(db, gridstack)
@@ -2270,15 +2933,7 @@ def update_tab_by_document_id_v2(
                 tab.order = order
                 gridstack.position = order
             if access_control is not None:
-                # apply_write materializes the change through the whole
-                # propagation engine (§3.2) — this covers both a root tab
-                # and a variant uniformly; there is no longer a separate
-                # subset/cascade rule for variants (§5.2, §10 commit 3).
-                apply_write(db, NodeRef("tab", tab.id), access_control)
-            if locked is not None:
-                tab.locked = locked
-            if locked_by is not None:
-                tab.locked_by = locked_by
+                tab.access_control = access_control
             tab.updated_at = _utc_now()
         else:
             if title is not None:
@@ -2286,14 +2941,19 @@ def update_tab_by_document_id_v2(
             if order is not None:
                 gridstack.position = order
             if access_control is not None:
-                # write_ac's gridstack branch creates the representation
-                # component on demand (same fallback this call used to do
-                # by hand for a pre-backfill sub-tab gridstack).
-                apply_write(db, NodeRef("gridstack", gridstack.id), access_control)
-            if locked is not None or locked_by is not None:
-                raise ValueError(
-                    "Locking is only supported for top-level tabs in this schema version"
-                )
+                # A sub-tab's AC lives on its representation component,
+                # created on demand here for a pre-backfill gridstack that
+                # never had one.
+                component = _get_gridstack_component(db, gridstack.id)
+                if component is None:
+                    component = _create_gridstack_component(db, gridstack)
+                component.access_control = access_control
+            # Locking a nested gridstack through this path is refused by
+            # CONSTRUCTION now (see the module-level docstring above): there
+            # is no locked/locked_by parameter left to reach here at all.
+            # Hazard 4 stays satisfied by the function no longer having the
+            # capability, which is stronger than the runtime raise this
+            # branch used to do.
 
         # The indexed component payload reads the owning root/variant title
         # and access control, but never the visual order. A nested gridstack's
@@ -2324,36 +2984,97 @@ def update_tab_by_document_id_v2(
         raise
 
 
-def lock_tab_by_document_id_v2(db: Session, document_id: str, locked_by: str) -> dict[str, Any] | None:
-    try:
-        locked_by = _validate_locked_by(locked_by)
-        if not locked_by:
-            raise ValueError("locked_by is required")
+def _require_live_session(db: Session, session: Any, ac_node: tuple[str, int] | None) -> None:
+    """plan_lock_propagation_2026-09-08.md §5.2's mechanical placement rule
+    — called immediately after `require_edit(access, ac_node)` at every
+    mirrored site, with the SAME `ac_node` already computed for that call
+    (never re-resolved). `session=None` is "no check requested", the same
+    convention `access=None` already has — every real router passes an
+    actual `EditSession`. `session` is typed `Any` here, not
+    `edit_lock_service.EditSession | None` — importing that module at top
+    level in this file would be circular; see edit_lock_service.py's own
+    comment on why the import direction runs the other way. Local import,
+    same as `lock_tab_by_document_id_v2`/`unlock_tab_by_document_id_v2`
+    below use for the same reason."""
+    if session is None:
+        return
+    from app.services import edit_lock_service
 
-        gridstack = get_gridstack_by_document_id(db, document_id)
-        if gridstack is None:
-            return None
+    node = edit_lock_service.lock_node_of(db, ac_node)
+    if node is not None:
+        edit_lock_service.require_live_session(session, node, db)
 
-        if not _is_root(gridstack):
-            raise ValueError("Locking is only supported for top-level tabs in this schema version")
 
-        tab = _get_root_tab(db, gridstack)
-        if tab is None:
-            return None
+def lock_tab_by_document_id_v2(
+    db: Session, document_id: str, locked_by: str, force: bool = False, *, access: ViewerAccess | None = None
+) -> dict[str, Any] | None:
+    """THIN WRAPPER, plan_lock_propagation_2026-09-08.md §8 phase 2. The
+    actual conflict logic now lives in `edit_lock_service.acquire` —
+    tree-aware across the WHOLE ancestor/descendant chain, not just this
+    tab's own nested sub-grids — see that module's own docstring on why
+    locking moved out of here (it would otherwise need nav_tab awareness
+    this file has no business having). This function's only remaining job
+    is document_id -> LockNode translation and preserving the existing
+    workspace-shaped response, so every caller of this function keeps
+    working unchanged.
 
-        if tab.locked and tab.locked_by and tab.locked_by != locked_by:
-            raise ValueError(f"Tab is already locked by {tab.locked_by}")
+    Deleted from here: `_find_conflicting_nested_lock`,
+    `_cascade_lock_to_nested_gridstacks` — replaced by
+    `edit_lock_service.ancestors`/`descendants`, which also close the §1.1
+    hole those two never covered (a root's VARIANTS and their own
+    sub-grids): locking a root now genuinely blocks a variant's sub-grid
+    too, not just the root's own.
 
-        tab.locked = True
-        tab.locked_by = locked_by
-        tab.updated_at = _utc_now()
+    `force` (NEW, §4.2 decision 8): takes over the whole subtree rather
+    than refusing when something in it is held fresh by someone else — see
+    `edit_lock_service.acquire`'s own docstring for exactly what it does
+    and does not override (an ancestor's lock is never one of the things
+    it can take over).
 
-        db.commit()
-        return get_tab_workspace_v2(db, document_id)
+    plan_ac_enforcement_closeout_2026-09-09.md §3: lock/unlock and
+    force-unlock all collapse to a single `edit(n)` check — anyone holding
+    `edit(parent(n))` already holds `edit(n)` by the downward fold
+    (`edit(n) = seed_edit(n) ∨ edit(parent(n))`, algorithm §6.1), so there is
+    no separate parent-node check to add for `force`, and `force`'s subtree
+    takeover needs nothing extra either: `edit(n)` already propagates down to
+    all of `subtree(n)` (algorithm §5.1's downward fold), which is exactly
+    what a forced lock takes over. §3.3's trap: gate on the AC node
+    (`resolve_gridstack_node`), never the LOCK node (`resolve_lock_node`) —
+    a `("gridstack", id)` lock node is not a valid AC node kind and would
+    evaluate to fail-closed INVISIBLE for everyone but a Hub Admin."""
+    from app.services import edit_lock_service  # local: see that module's own import comment
 
-    except Exception:
-        db.rollback()
-        raise
+    gridstack = get_gridstack_by_document_id(db, document_id)
+    if gridstack is None:
+        return None
+
+    require_edit(access, resolve_gridstack_node(db, gridstack))
+
+    grant = edit_lock_service.acquire(
+        db, edit_lock_service.resolve_lock_node(gridstack), locked_by, force=force
+    )
+    workspace = get_tab_workspace_v2(db, document_id)
+    # §4.1's "return the token" — added ONLY here, never by the plain
+    # workspace GET (see TabWorkspaceResponse.lock_token's own comment on
+    # why this must not leak to a caller who merely has view access).
+    #
+    # findings_dev_login_live_testing_2026-09-12.md addendum: `lock_expires_at`
+    # belongs alongside it and was missing — `get_tab_workspace_v2(db,
+    # document_id)` bare (no `lock_view`) never sets `lock_expires_at` at
+    # all (additive, "only when a caller passes one" — see its own body),
+    # so every root-tab lock response came back with `lock_expires_at: null`
+    # regardless of a real, successful acquire. `acquireRootLock`
+    # (DashboardV2Page.tsx) gates `setEditSession` on `lock_token &&
+    # lock_expires_at` both being truthy, so that session was NEVER
+    # actually registered — meaning `X-Edit-Tokens` was never sent on the
+    # follow-up write, and every root-tab rename/delete 409'd
+    # EDIT_SESSION_MISSING, lock conflict or not. `grant.expires_at` is
+    # already computed by `acquire` above — this was always available,
+    # just never assigned.
+    if workspace is not None:
+        workspace["lock_token"] = grant.token
+        workspace["lock_expires_at"] = grant.expires_at
+    return workspace
 
 
 def unlock_tab_by_document_id_v2(
@@ -2361,34 +3082,30 @@ def unlock_tab_by_document_id_v2(
     document_id: str,
     unlocked_by: str | None = None,
     force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
-    try:
-        unlocked_by = _validate_locked_by(unlocked_by)
+    """THIN WRAPPER — see `lock_tab_by_document_id_v2`'s own comment on why
+    the logic moved to `edit_lock_service.release`. `force` here is the
+    EXISTING unlock force (owner decision 2026-09-03: unrestricted, skips
+    ownership AND staleness) — unchanged by this plan, and a different flag
+    from `lock_tab_by_document_id_v2`'s new one above.
 
-        gridstack = get_gridstack_by_document_id(db, document_id)
-        if gridstack is None:
-            return None
+    plan_ac_enforcement_closeout_2026-09-09.md §3: same single `edit(n)`
+    gate as lock, covering force-unlock too — see that function's docstring
+    for why the `edit(parent(n))` disjunct is redundant here."""
+    from app.services import edit_lock_service  # local: see that module's own import comment
 
-        if not _is_root(gridstack):
-            raise ValueError("Locking is only supported for top-level tabs in this schema version")
+    gridstack = get_gridstack_by_document_id(db, document_id)
+    if gridstack is None:
+        return None
 
-        tab = _get_root_tab(db, gridstack)
-        if tab is None:
-            return None
+    require_edit(access, resolve_gridstack_node(db, gridstack))
 
-        if not force and tab.locked and tab.locked_by and unlocked_by and tab.locked_by != unlocked_by:
-            raise ValueError(f"Tab is locked by {tab.locked_by}")
-
-        tab.locked = False
-        tab.locked_by = ""
-        tab.updated_at = _utc_now()
-
-        db.commit()
-        return get_tab_workspace_v2(db, document_id)
-
-    except Exception:
-        db.rollback()
-        raise
+    edit_lock_service.release(
+        db, edit_lock_service.resolve_lock_node(gridstack), unlocked_by or "", force=force
+    )
+    return get_tab_workspace_v2(db, document_id)
 
 
 def get_descendant_gridstack_ids(db: Session, gridstack_id: int) -> list[int]:
@@ -2417,6 +3134,9 @@ def move_tab_by_document_id_v2(
     document_id: str,
     new_parent_document_id: str | None = None,
     order: int | None = None,
+    *,
+    access: ViewerAccess | None = None,
+    session: Any = None,
 ) -> dict[str, Any] | None:
     try:
         new_parent_document_id = _validate_document_id_value(new_parent_document_id, "newParentDocumentId")
@@ -2439,6 +3159,28 @@ def move_tab_by_document_id_v2(
             if _is_descendant_of(db, new_parent.id, gridstack.id):
                 raise ValueError("A tab cannot be moved under one of its descendants")
 
+            # plan §6.3 "move n → parent(n)" — but a move has TWO parents,
+            # and the table (written with delete/reorder, which only ever
+            # have one) does not say which. project_ac_enforcement_gap.md
+            # item 2's judgement call: require edit on BOTH the OLD parent
+            # (content is leaving it) and the NEW one (content is arriving
+            # in it) — the same bar a file-system move would set for source
+            # and destination directories. Checked after the structural
+            # validations above (self/descendant), so a caller without edit
+            # never learns those checks passed. `gridstack` is never itself
+            # a root here (raised above), so `resolve_gridstack_parent_node`
+            # always takes its sub-grid branch — this is the ONE call site
+            # in this module where that is guaranteed rather than merely
+            # possible.
+            require_edit(access, resolve_gridstack_parent_node(db, gridstack))
+            require_edit(access, resolve_gridstack_node(db, new_parent))
+            # A move is NOT a reorder — it changes actual tree structure
+            # (which canvas owns the sub-grid), not just sibling order — so
+            # it gets the mechanical full session check on BOTH parents,
+            # mirroring the two require_edit calls immediately above.
+            _require_live_session(db, session, resolve_gridstack_parent_node(db, gridstack))
+            _require_live_session(db, session, resolve_gridstack_node(db, new_parent))
+
             gridstack.parent_id = new_parent.id
             gridstack.parent_tab_id = new_parent.parent_tab_id
             for descendant_id in get_descendant_gridstack_ids(db, gridstack.id):
@@ -2446,12 +3188,7 @@ def move_tab_by_document_id_v2(
                 if descendant is not None:
                     descendant.parent_tab_id = new_parent.parent_tab_id
 
-            # This reparents a sub-tab gridstack exactly like
-            # nav_tab_service.move_tab_to_nav_tab_v2 reparents a root tab —
-            # same landmine 3 shape (both invariants can break in one
-            # write), just not analyzed by the plan text. Same repair.
             db.flush()
-            apply_reparent_repair(db, NodeRef("gridstack", gridstack.id))
         else:
             raise ValueError("Moving a sub-tab to root is not supported in this schema version")
 
@@ -2473,7 +3210,13 @@ def move_tab_by_document_id_v2(
         raise
 
 
-def reorder_tabs_by_document_id_v2(db: Session, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def reorder_tabs_by_document_id_v2(
+    db: Session,
+    items: list[dict[str, Any]],
+    *,
+    access: ViewerAccess | None = None,
+    holder: str | None = None,
+) -> list[dict[str, Any]]:
     try:
         if not items:
             raise ValueError("Reorder items cannot be empty")
@@ -2516,6 +3259,36 @@ def reorder_tabs_by_document_id_v2(db: Session, items: list[dict[str, Any]]) -> 
             if len(nav_tab_ids) != 1:
                 raise ValueError("All reordered tabs must belong to the same nav tab")
 
+        # plan §6.3 "reorder n → parent(n)", per item rather than assuming
+        # one shared parent — project_ac_enforcement_gap.md item 2's own
+        # finding while reading this function: `parent_id is None` covers
+        # BOTH root tabs (whose true AC parent is their nav tab) AND
+        # variants (whose gridstack is ALSO root-level — `parent_id=None` —
+        # but whose true AC parent is the tab they vary), and the
+        # `nav_tab_ids` check just above only constrains root tabs' shared
+        # nav tab; it says nothing about a variant mixed into the same
+        # batch. `resolve_gridstack_parent_node` already makes the root-vs-
+        # variant distinction correctly per gridstack, so resolving it per
+        # item and gating on the resulting SET (rather than hand-deriving
+        # one shared node) is correct for both this endpoint's two real
+        # shapes (root-level, sub-grid-level) and the batch this validation
+        # does not actually rule out. For the common case — every item at
+        # the same level under the same true parent — the set collapses to
+        # one node and this is one check, not several.
+        for parent_node in {resolve_gridstack_parent_node(db, g) for g in gridstacks}:
+            require_edit(access, parent_node)
+
+        # plan_lock_propagation_2026-09-08.md §5.4, decision 9 — the other
+        # dedicated reorder endpoint named explicitly there: session-EXEMPT,
+        # refused only if one of THESE gridstacks (the reordered set) is
+        # held fresh by someone else.
+        if holder:
+            from app.services import edit_lock_service
+
+            edit_lock_service.refuse_if_any_held(
+                db, [edit_lock_service.resolve_lock_node(g) for g in gridstacks], holder
+            )
+
         for document_id, order in zip(document_ids, orders):
             gridstack = by_document_id[document_id]
             gridstack.position = order
@@ -2544,11 +3317,30 @@ def reorder_tabs_by_document_id_v2(db: Session, items: list[dict[str, Any]]) -> 
         raise
 
 
-def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[str, Any] | None:
+def delete_tab_subtree_by_document_id_v2(
+    db: Session, document_id: str, *, access: ViewerAccess | None = None, session: Any = None
+) -> dict[str, Any] | None:
     try:
         gridstack = get_gridstack_by_document_id(db, document_id)
         if gridstack is None:
             return None
+
+        # plan §6.3 "delete n → parent(n)". Checked ONCE, at the boundary
+        # being crossed, not per descendant: §5.5's D3 already makes a grant
+        # unconditional for everything beneath it, and the same reasoning
+        # runs the other way for delete — being entrusted with `parent(n)`
+        # is being entrusted with `n`'s entire subtree, cascade included.
+        # Variants (below) are the one exception, because a variant is not
+        # IN this gridstack's subtree — it hangs off `TabV2.parent_tab_id`,
+        # a separate axis (§3.1) — so cascading into one crosses a SECOND
+        # boundary the first check does not cover, and the recursive call
+        # re-checks accordingly.
+        require_edit(access, resolve_gridstack_parent_node(db, gridstack))
+        # A session on parent(n) covers n's whole subtree by construction
+        # (edit_lock_service.ancestors), so this — like the require_edit
+        # right above it — is defense in depth for the recursive variant
+        # call below, not a new bar to clear.
+        _require_live_session(db, session, resolve_gridstack_parent_node(db, gridstack))
 
         deleted_tabs: list[dict[str, Any]] = []
         deleted_component_ids: list[int] = []
@@ -2571,7 +3363,16 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
                 for variant_tab in variant_tabs:
                     if not variant_tab.document_id:
                         continue
-                    variant_result = delete_tab_subtree_by_document_id_v2(db, variant_tab.document_id)
+                    # `access=access`, not the default: a variant's own
+                    # parent(n) is the ROOT TAB being deleted (its true AC
+                    # parent per §3.1), not the nav tab checked above. The
+                    # fold makes this pass automatically whenever the outer
+                    # check did — `edit(nav_tab)` implies `edit(root_tab)`
+                    # implies this variant's own gate — so this is defense
+                    # in depth, not a new bar to clear.
+                    variant_result = delete_tab_subtree_by_document_id_v2(
+                        db, variant_tab.document_id, access=access, session=session
+                    )
                     if variant_result:
                         deleted_tabs.extend(variant_result.get("deleted_tabs", []))
                         deleted_component_ids.extend(
@@ -2653,100 +3454,6 @@ def delete_tab_subtree_by_document_id_v2(db: Session, document_id: str) -> dict[
             ],
         }
 
-    except Exception:
-        db.rollback()
-        raise
-
-
-# ---------------------------------------------------------
-# Preview / purge / reset (§5.4, §6.3, §6.4) — for a tab-family node (root,
-# variant, or sub-tab gridstack) addressed by its document_id. Resolves to
-# the same NodeRef("tab", ...) / NodeRef("gridstack", ...) split
-# update_tab_by_document_id_v2 already makes; factored out here since these
-# three new functions and that existing one all need it.
-# ---------------------------------------------------------
-
-
-def resolve_tab_ref_by_document_id_v2(db: Session, document_id: str) -> NodeRef | None:
-    gridstack = get_gridstack_by_document_id(db, document_id)
-    if gridstack is None:
-        return None
-    if _is_root(gridstack):
-        tab = _get_root_tab(db, gridstack)
-        if tab is None:
-            return None
-        return NodeRef("tab", tab.id)
-    return NodeRef("gridstack", gridstack.id)
-
-
-def preview_tab_access_v2(
-    db: Session, document_id: str, access_control: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """Read-only — backs the preview modal. Never writes."""
-    ref = resolve_tab_ref_by_document_id_v2(db, document_id)
-    if ref is None:
-        return None
-    plan = plan_write(db, ref, access_control)
-    return describe_write_plan(db, plan)
-
-
-def _refresh_index_for_touched(db: Session, touched: list[NodeRef]) -> list[dict[str, Any]]:
-    """Purge/reset can touch many nodes across the tree in one call — but,
-    matching update_tab_by_document_id_v2's own comment, only a ROOT/variant
-    TabV2's access_control is embedded in the indexed component payload; a
-    sub-tab's is resolved live by component-link navigation and was never
-    indexed. So only the "tab" kind entries among `touched` (root or
-    variant) need their component subtrees reindexed."""
-    search_updates: list[dict[str, Any]] = []
-    for ref in touched:
-        if ref.kind != "tab":
-            continue
-        tab = db.query(TabV2).filter(TabV2.id == ref.id).first()
-        if tab is None or tab.document_id is None:
-            continue
-        gridstack = get_gridstack_by_document_id(db, tab.document_id)
-        if gridstack is None:
-            continue
-        for component_id in _component_ids_for_gridstack_tree(db, gridstack):
-            search_updates.append({"component_id": component_id, "action": "upsert"})
-    return search_updates
-
-
-def purge_tab_principal_v2(
-    db: Session, document_id: str, principal_payload: dict[str, Any]
-) -> dict[str, Any] | None:
-    try:
-        ref = resolve_tab_ref_by_document_id_v2(db, document_id)
-        if ref is None:
-            return None
-        principal = principal_from_payload(principal_payload)
-        touched = purge_principal(db, ref, principal)
-        search_updates = _refresh_index_for_touched(db, touched)
-        db.commit()
-        return {
-            "touched": [node_summary(db, r) for r in touched],
-            "search_updates": search_updates,
-        }
-    except Exception:
-        db.rollback()
-        raise
-
-
-def reset_tab_access_v2(db: Session, document_id: str) -> dict[str, Any] | None:
-    """Discards this node's own access_control and re-derives it from its
-    resolved parent (§6.4's "match the parent again" — the drift-repair
-    tool for landmine 2)."""
-    try:
-        ref = resolve_tab_ref_by_document_id_v2(db, document_id)
-        if ref is None:
-            return None
-        touched = reset_to_inherited(db, ref)
-        search_updates = _refresh_index_for_touched(db, touched)
-        db.commit()
-        return {
-            "touched": [node_summary(db, r) for r in touched],
-            "search_updates": search_updates,
-        }
     except Exception:
         db.rollback()
         raise

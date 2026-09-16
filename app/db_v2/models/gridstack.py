@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db_v2.database import BaseV2
@@ -36,3 +36,27 @@ class GridstackV2(BaseV2):
 
     parent_id = Column(Integer, ForeignKey("gridstacks.id"), nullable=True, index=True)
     parent_tab_id = Column(Integer, ForeignKey("tabs.id"), nullable=False, index=True)
+
+    # Added 2026-09-07 (edit-mode-gap follow-up): independent locking for a
+    # NON-root gridstack (parent_id IS NOT NULL — a sub-gridstack; live data
+    # never nests one inside another, so this is always exactly one level
+    # below a root/variant's own canvas). A root gridstack's OWN top-level
+    # canvas (parent_id IS NULL) keeps using its owning TabV2 row's
+    # locked/locked_by/locked_at instead — see gridstack_service._is_root /
+    # _safe_locked_triple. Same three-column shape as TabV2's own lock
+    # columns (mirrored deliberately, not independently designed) and the
+    # same `is_lock_stale` TTL helper, so the two "flavors" of lock (whole
+    # TabV2 row vs. one sub-gridstack) cannot drift onto different rules.
+    # Deliberately real columns, not a components.props JSONB key (unlike
+    # Super Block Note's own node-level lock) — every sub-gridstack already
+    # has its own row here, so there is no JSONB-blob workaround to reach
+    # for, and a typed/indexable column matches the TabV2 precedent instead
+    # of inventing a third lock shape.
+    locked = Column(Boolean, nullable=True, default=False)
+    locked_by = Column(String(255), nullable=True, default="")
+    locked_at = Column(DateTime, nullable=True)
+
+    # Added by scripts/migrate_lock_propagation_columns.py
+    # (plan_lock_propagation_2026-09-08.md §3.1) — same column, same
+    # rationale as TabV2.lock_token. See that model's own comment.
+    lock_token = Column(String(64), nullable=True)

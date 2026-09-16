@@ -67,7 +67,7 @@ from app.schemas.thread import (
     ThreadSummary,
     VoteResponse,
 )
-from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
+from app.services.access_visibility_service import ViewerAccess
 
 logger = logging.getLogger(__name__)
 
@@ -176,27 +176,58 @@ def _require_comment_thread_and_component(
 
 
 # ---------------------------------------------------------
-# Access control — plan §4.1: view gates read+post, authorship gates edit,
-# Hub Admin gates delete. Same check shape as airtable.py:417-430 (plan
-# §1.4): Hub Admins bypass; otherwise a widget with no explicit
-# access_control is open to any authenticated caller (the inherited,
-# documented gap — tab-level AC isn't enforced server-side anywhere yet).
+# Access control — plan §4.1 (thread plan): view gates read+post, authorship
+# gates edit, Hub Admin gates delete. RE-GATED by
+# plan_ac_enforcement_closeout_2026-09-09.md §4: view/post now run through
+# the read-time visibility fold (plan_access_control_algorithm_2026-08-27.md
+# §5) via `ViewerAccess.is_granted` — the PAYLOAD gate, not the chrome one
+# (§5.2: `granted` gates content, `visible` gates a shell's title/nav
+# presence; a node that is merely REVEALED — visible only because some
+# descendant is granted — must not serve its discussion, exactly as the
+# canvas serializer already returns `content: None` for a revealed
+# component). This REPLACES the legacy per-widget `access_control` JSONB
+# blob this file used to read — that column is no longer consulted here at
+# all. `airtable.py`'s six component endpoints have NOT been migrated to the
+# fold as of this step (plan_ac_enforcement_closeout_2026-09-09.md §7 scopes
+# that to a separate step) — the two surfaces' checks have diverged; do not
+# assume they still match, and do not "fix" airtable.py to match this file
+# outside its own step.
+#
+# `access: ViewerAccess | None` — `None` means "no check requested", the
+# same convention `access_visibility_service.require_edit` already
+# documents (an internal caller that never intended a gate keeps working
+# unchanged). Every route in `threads.py` always supplies a real
+# `ViewerAccess` from `Depends(get_viewer_access)`.
 # ---------------------------------------------------------
 
 
-def _check_view_access(component: ComponentV2, user: UserInfo) -> None:
-    roles = list(user.roles)
-    widget_ac = component.access_control
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "You do not have access to this discussion",
-            )
+def _check_view_access(component: ComponentV2, access: ViewerAccess | None) -> None:
+    if access is not None and not access.is_granted(("component", component.id)):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You do not have access to this discussion",
+        )
 
 
-def _require_hub_admin(user: UserInfo) -> None:
-    if HUB_ADMIN_ROLE not in list(user.roles):
+def _require_hub_admin(access: ViewerAccess | None) -> None:
+    """`ViewerAccess.full_access` IS the answer to "is this caller a Hub
+    Admin", by construction — `resolve_viewer_access` sets it from
+    `dependencies.is_hub_admin`'s result, computed once per request in
+    `get_viewer_access`. Routing through it here costs no second closure
+    query (plan §6.8's "do not make it its own query"); importing
+    `dependencies.is_hub_admin` directly would run backwards (a domain
+    service depending on a FastAPI dependency module), the same reasoning
+    `access_visibility_service` already gives for refusing that import.
+
+    THE COUPLING IS REAL AND MUST STAY WATCHED: `full_access` means
+    "bypasses the fold", which is TODAY true if and only if the caller is a
+    Hub Admin. If a second reason to bypass the fold is ever added to
+    `ViewerAccess.full_access`, this delete gate silently widens to cover it
+    too, with nothing here changing. The warning belongs on
+    `ViewerAccess.full_access`'s own definition
+    (`access_visibility_service.py`) — see that field's docstring — not only
+    at this call site."""
+    if access is not None and not access.full_access:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Hub Admin access required")
 
 
@@ -564,13 +595,31 @@ def _to_notification_entry(
 
 
 def list_notifications_for_user(
-    db: Session, user: UserInfo, cursor: str | None, unread_only: bool
+    db: Session,
+    user: UserInfo,
+    cursor: str | None,
+    unread_only: bool,
+    *,
+    access: ViewerAccess | None = None,
 ) -> NotificationListResponse:
     """`GET /notifications` (plan §4.1) — self only, newest first, pages of
     `NOTIFICATIONS_PAGE_SIZE`. `thread_title` / `component_link` are joined
     live rather than stored (see `NotificationEntry`'s own docstring for
     why) — safe unconditionally because a notification cannot outlive its
-    thread or component (`ON DELETE CASCADE`, plan §3.4)."""
+    thread or component (`ON DELETE CASCADE`, plan §3.4).
+
+    plan_ac_enforcement_closeout_2026-09-09.md §4.2 — a third gap alongside
+    the 9 `_check_view_access` sites: get mentioned in a thread, lose the
+    grant that made it visible, and the notification (excerpt included)
+    stayed in the bell indefinitely before this. Post-filtered by
+    `access.is_granted(("component", n.component_id))` AFTER the page is
+    already bounded by `NOTIFICATIONS_PAGE_SIZE` — a post-filter, not a
+    subquery. This makes a page carrying an ungranted row SHORT (fewer than
+    `NOTIFICATIONS_PAGE_SIZE` items), not WRONG — acceptable for a bell
+    dropdown; do not "fix" this into a subquery/join later. `next_cursor` is
+    computed from the UNFILTERED page (before this filter runs), so
+    pagination continuity tracks where the DB scan actually left off, not
+    what survives the filter."""
     email = _norm_email(user.email)
     query = (
         db.query(NotificationV2, ThreadV2.title, ComponentV2.link)
@@ -596,64 +645,112 @@ def list_notifications_for_user(
     )
     has_more = len(rows) > NOTIFICATIONS_PAGE_SIZE
     page = rows[:NOTIFICATIONS_PAGE_SIZE]
-
-    items = [
-        _to_notification_entry(notification, title, link)
-        for notification, title, link in page
-    ]
     next_cursor = (
         _encode_cursor(page[-1][0].created_at, page[-1][0].id)
         if has_more and page
         else None
     )
+
+    if access is not None:
+        page = [
+            row for row in page if access.is_granted(("component", row[0].component_id))
+        ]
+
+    items = [
+        _to_notification_entry(notification, title, link)
+        for notification, title, link in page
+    ]
     return NotificationListResponse(items=items, next_cursor=next_cursor)
 
 
-def get_unread_notification_count(db: Session, user: UserInfo) -> tuple[int, str]:
+def get_unread_notification_count(
+    db: Session, user: UserInfo, *, access: ViewerAccess | None = None
+) -> tuple[int, str]:
     """`GET /notifications/unread-count` (plan §4.5) — "one query, both
     values", derived every time, never cached. Returns `(count, etag)`; the
-    router honours `If-None-Match` against the etag and 304s on a hit. The
-    partial index on `(recipient_email) WHERE read_at IS NULL` (plan §3.4)
-    is what keeps this an index-only scan over a handful of rows regardless
-    of table growth."""
+    router honours `If-None-Match` against the etag and 304s on a hit.
+
+    Without `access`, the partial index on `(recipient_email) WHERE
+    read_at IS NULL` (plan §3.4) keeps this an index-only scan regardless of
+    table growth. With `access` (every real caller, as of
+    plan_ac_enforcement_closeout_2026-09-09.md §4.2), the count MUST agree
+    with `list_notifications_for_user`'s own filter — otherwise the bell
+    badge and the dropdown it opens visibly disagree — which costs the
+    index-only-scan property: `component_id` has to be read per row to
+    filter with, not just aggregated. Still bounded by how many
+    notifications one person has unread, not by the whole table."""
     email = _norm_email(user.email)
-    count, max_id = (
-        db.query(func.count(NotificationV2.id), func.max(NotificationV2.id))
+    if access is None:
+        count, max_id = (
+            db.query(func.count(NotificationV2.id), func.max(NotificationV2.id))
+            .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
+            .one()
+        )
+        count = int(count or 0)
+        etag = f'"{count}-{int(max_id) if max_id is not None else 0}"'
+        return count, etag
+
+    rows = (
+        db.query(NotificationV2.id, NotificationV2.component_id)
         .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
-        .one()
+        .all()
     )
-    count = int(count or 0)
-    etag = f'"{count}-{int(max_id) if max_id is not None else 0}"'
+    granted_ids = [
+        notification_id
+        for notification_id, component_id in rows
+        if access.is_granted(("component", component_id))
+    ]
+    count = len(granted_ids)
+    max_id = max(granted_ids) if granted_ids else None
+    etag = f'"{count}-{max_id if max_id is not None else 0}"'
     return count, etag
 
 
-def mark_notification_read(db: Session, notification_id: int, user: UserInfo) -> None:
+def mark_notification_read(
+    db: Session, notification_id: int, user: UserInfo, *, access: ViewerAccess | None = None
+) -> None:
     """`POST /notifications/{id}/read` (plan §4.5) — idempotent (the
     `read_at IS NULL` predicate makes a repeat call a no-op: 0 rows match,
     nothing changes) and scoped to the recipient (the IDOR guard plan §4.5
     calls out explicitly — without the `recipient_email` predicate, any
     authenticated caller could mark another user's notification read by
-    id). Deliberately does not distinguish "already read", "not yours" and
-    "does not exist" in its response — all three look identical from the
-    caller's side, which is the point of the IDOR guard, not an
-    oversight."""
+    id). Deliberately does not distinguish "already read", "not yours",
+    "does not exist" — and, as of plan_ac_enforcement_closeout_2026-09-09.md
+    §4.2, "no longer granted" — in its response: all four look identical
+    from the caller's side, which is the point of the IDOR guard extended to
+    cover access, not an oversight."""
     email = _norm_email(user.email)
-    (
+    notification = (
         db.query(NotificationV2)
         .filter(
             NotificationV2.id == notification_id,
             NotificationV2.recipient_email == email,
             NotificationV2.read_at.is_(None),
         )
-        .update({NotificationV2.read_at: _utc_now()}, synchronize_session=False)
+        .first()
     )
+    if notification is None:
+        return
+    if access is not None and not access.is_granted(("component", notification.component_id)):
+        return
+    notification.read_at = _utc_now()
     db.commit()
 
 
 def mark_all_notifications_read(db: Session, user: UserInfo) -> int:
     """`POST /notifications/read-all` (plan §4.1). Returns the number of
     rows actually flipped, for callers that want it; the endpoint itself
-    doesn't need to expose it."""
+    doesn't need to expose it.
+
+    NOT access-gated. plan_ac_enforcement_closeout_2026-09-09.md §4.2 names
+    exactly three functions needing `access` threaded for the notification
+    gap (`list_notifications_for_user`, `get_unread_notification_count`,
+    `mark_notification_read`) — this one is not among them. Marking an
+    ungranted notification read flips a flag on the caller's own row, not a
+    content read — no excerpt is served — so the harm the other three close
+    (a stale excerpt sitting in the bell) does not apply here. Left as a
+    known, deliberate asymmetry rather than silently extended to match; flag
+    it to the owner if that turns out to be wrong."""
     email = _norm_email(user.email)
     updated = (
         db.query(NotificationV2)
@@ -763,12 +860,17 @@ def _to_comment_summary(comment: ThreadCommentV2, my_vote: int) -> CommentSummar
 
 
 def list_threads_for_link(
-    db: Session, link: str, cursor: str | None, user: UserInfo
+    db: Session,
+    link: str,
+    cursor: str | None,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None = None,
 ) -> ThreadListResponse:
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
-    _check_view_access(component, user)
+    _check_view_access(component, access)
 
     query = db.query(ThreadV2).filter(
         ThreadV2.component_id == component.id,
@@ -807,11 +909,13 @@ def create_thread_for_link(
     title: str,
     content: str,
     mentions: list[MentionInput] | None = None,
+    *,
+    access: ViewerAccess | None = None,
 ) -> ThreadDetail:
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
-    _check_view_access(component, user)
+    _check_view_access(component, access)
 
     # Resolve mentions BEFORE constructing the row — a 400 from the cap
     # (plan §4.7) must not leave a half-built thread behind (nothing is
@@ -853,7 +957,9 @@ def create_thread_for_link(
     return _to_thread_detail(thread, my_vote=0)
 
 
-def get_thread_by_id(db: Session, thread_id: int, user: UserInfo) -> ThreadDetail:
+def get_thread_by_id(
+    db: Session, thread_id: int, user: UserInfo, *, access: ViewerAccess | None = None
+) -> ThreadDetail:
     """Fetch one thread's full content — any viewer with the widget's own
     view access, NOT author-only (session handoff 2026-08-20 §0/addendum:
     the Phase 2 frontend worked around this endpoint not existing by
@@ -864,7 +970,7 @@ def get_thread_by_id(db: Session, thread_id: int, user: UserInfo) -> ThreadDetai
     every thread is 'approved' by construction, so this is a no-op filter,
     not a behavior change."""
     thread, component = _require_thread_and_component(db, thread_id)
-    _check_view_access(component, user)
+    _check_view_access(component, access)
     if thread.status != THREAD_STATUS_APPROVED:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
     my_vote = _my_vote_for_thread(db, thread.id, user.email)
@@ -878,12 +984,14 @@ def update_thread_by_id(
     title: str | None,
     content: str | None,
     mentions: list[MentionInput] | None = None,
+    *,
+    access: ViewerAccess | None = None,
 ) -> ThreadDetail:
     thread, component = _require_thread_and_component(db, thread_id)
     # A caller who has lost view access to the widget since posting must
     # not still be able to edit through this endpoint (defense in depth —
     # not spelled out explicitly in the plan, called out in the handoff).
-    _check_view_access(component, user)
+    _check_view_access(component, access)
     _require_author(thread.author_email, user)
 
     # Validate against the EFFECTIVE content — the new content if this PATCH
@@ -930,8 +1038,10 @@ def update_thread_by_id(
     return _to_thread_detail(thread, my_vote)
 
 
-def delete_thread_by_id(db: Session, thread_id: int, user: UserInfo) -> None:
-    _require_hub_admin(user)
+def delete_thread_by_id(
+    db: Session, thread_id: int, *, access: ViewerAccess | None = None
+) -> None:
+    _require_hub_admin(access)
     thread = _get_thread(db, thread_id)
     if thread is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
@@ -948,10 +1058,15 @@ def delete_thread_by_id(db: Session, thread_id: int, user: UserInfo) -> None:
 
 
 def list_comments_for_thread(
-    db: Session, thread_id: int, cursor: str | None, user: UserInfo
+    db: Session,
+    thread_id: int,
+    cursor: str | None,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None = None,
 ) -> CommentListResponse:
     _thread, component = _require_thread_and_component(db, thread_id)
-    _check_view_access(component, user)
+    _check_view_access(component, access)
 
     query = db.query(ThreadCommentV2).filter(ThreadCommentV2.thread_id == thread_id)
     if cursor:
@@ -993,9 +1108,11 @@ def create_comment_for_thread(
     user: UserInfo,
     content: str,
     mentions: list[MentionInput] | None = None,
+    *,
+    access: ViewerAccess | None = None,
 ) -> CommentSummary:
     thread, component = _require_thread_and_component(db, thread_id)
-    _check_view_access(component, user)
+    _check_view_access(component, access)
 
     # Resolve BEFORE the lock/recompute below — a 400 from the cap must not
     # leave a half-built comment or a bumped comment_count behind.
@@ -1059,9 +1176,11 @@ def update_comment_by_id(
     user: UserInfo,
     content: str | None,
     mentions: list[MentionInput] | None = None,
+    *,
+    access: ViewerAccess | None = None,
 ) -> CommentSummary:
     comment, _thread, component = _require_comment_thread_and_component(db, comment_id)
-    _check_view_access(component, user)
+    _check_view_access(component, access)
     _require_author(comment.author_email, user)
 
     # Same effective-content reasoning as update_thread_by_id.
@@ -1094,8 +1213,10 @@ def update_comment_by_id(
     return _to_comment_summary(comment, my_vote)
 
 
-def delete_comment_by_id(db: Session, comment_id: int, user: UserInfo) -> None:
-    _require_hub_admin(user)
+def delete_comment_by_id(
+    db: Session, comment_id: int, *, access: ViewerAccess | None = None
+) -> None:
+    _require_hub_admin(access)
     comment = _get_comment(db, comment_id)
     if comment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Comment not found")
@@ -1185,7 +1306,7 @@ def _cast_vote(
     )
     # Mutate the already-loaded ORM object directly rather than a bulk
     # `Query.update()` — matches this codebase's convention elsewhere
-    # (access_control_service.write_ac, gridstack_service) and sidesteps
+    # (gridstack_service) and sidesteps
     # `synchronize_session` entirely: the row `target` refers to is the
     # SAME identity-mapped object the FOR UPDATE query above resolved to,
     # so this write is guaranteed visible to anything reading `target`
@@ -1202,9 +1323,16 @@ def _cast_vote(
     )
 
 
-def vote_on_thread(db: Session, thread_id: int, user: UserInfo, value: int) -> VoteResponse:
+def vote_on_thread(
+    db: Session,
+    thread_id: int,
+    user: UserInfo,
+    value: int,
+    *,
+    access: ViewerAccess | None = None,
+) -> VoteResponse:
     thread, component = _require_thread_and_component(db, thread_id)
-    _check_view_access(component, user)
+    _check_view_access(component, access)
 
     # Serialize competing writers on this thread BEFORE the recompute runs
     # (plan §4.4) — under READ COMMITTED each statement takes a fresh
@@ -1223,10 +1351,15 @@ def vote_on_thread(db: Session, thread_id: int, user: UserInfo, value: int) -> V
 
 
 def vote_on_comment(
-    db: Session, comment_id: int, user: UserInfo, value: int
+    db: Session,
+    comment_id: int,
+    user: UserInfo,
+    value: int,
+    *,
+    access: ViewerAccess | None = None,
 ) -> VoteResponse:
     comment, _thread, component = _require_comment_thread_and_component(db, comment_id)
-    _check_view_access(component, user)
+    _check_view_access(component, access)
 
     db.query(ThreadCommentV2).filter(ThreadCommentV2.id == comment_id).with_for_update().first()
 

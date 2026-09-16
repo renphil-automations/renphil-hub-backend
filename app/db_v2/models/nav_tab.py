@@ -23,9 +23,12 @@ class NavTabV2(BaseV2):
     Phase 2 flips this to False with a one-row UPDATE and needs no routing
     change at all.
 
-    `access_control` is stored and editable in phase 1 but read by nothing —
-    present now so phase 2 (access-control propagation, the `hub` object)
-    needs no second migration.
+    `access_control` is stored and editable, but read by nothing server-side
+    — only the frontend consults it, to decide what to show. Phase 2's
+    propagation engine used to cascade this value through the whole tab
+    family; that engine has been removed ahead of a new access control
+    algorithm, so the column is now a plain per-node value with no
+    relationship to any other node's.
 
     `icon` is a lucide-react icon name (kebab-case, e.g. "layout-grid"),
     looked up client-side via `lucide-react/dynamic`'s `DynamicIcon` — never
@@ -51,6 +54,22 @@ class NavTabV2(BaseV2):
     protected = Column(Boolean, nullable=False, default=False)
 
     icon = Column(String(64), nullable=True)
+
+    # Added by scripts/migrate_lock_propagation_columns.py
+    # (plan_lock_propagation_2026-09-08.md §1/§3.1, decision 3): a nav tab
+    # is now a real lock node, not just an AC node — its edit-mode toggle
+    # acquires an actual lock (Sidebar.tsx's onToggleEditMode), and locking
+    # it blocks its whole subtree (every root tab and variant under it, and
+    # their sub-grids). Same three-column shape as TabV2/GridstackV2's own
+    # lock columns, deliberately mirrored rather than independently
+    # designed, plus `lock_token` — see those models' own comments and
+    # app/services/edit_lock_service.py. No pre-existing rows to worry
+    # about staying consistent with (nav tabs were never lockable before
+    # this column existed), so every row starts free.
+    locked = Column(Boolean, nullable=True, default=False)
+    locked_by = Column(String(255), nullable=True, default="")
+    locked_at = Column(DateTime, nullable=True)
+    lock_token = Column(String(64), nullable=True)
 
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True)
