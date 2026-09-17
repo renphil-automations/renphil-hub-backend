@@ -283,6 +283,31 @@ def lock_nav_tab_by_document_id_v2(
     return formatted
 
 
+def renew_nav_tab_lock_by_document_id_v2(
+    db: Session,
+    document_id: str,
+    *,
+    session: edit_lock_service.EditSession,
+    access: ViewerAccess | None = None,
+) -> dict[str, Any] | None:
+    """THIN WRAPPER over `edit_lock_service.renew`, mirroring
+    `gridstack_service.renew_tab_lock_by_document_id_v2` exactly — see
+    that function and `renew`'s own docstring for why a save preflight
+    must VALIDATE rather than re-`acquire`. Same `edit(n)` gate as
+    lock/unlock, same `lock_token`/`lock_expires_at` echo on success."""
+    nav_tab = get_nav_tab_by_document_id(db, document_id)
+    if nav_tab is None:
+        return None
+
+    require_edit(access, ("nav_tab", nav_tab.id))
+
+    grant = edit_lock_service.renew(db, session, ("nav_tab", nav_tab.id))
+    formatted = _format_nav_tab(nav_tab)
+    formatted["lock_token"] = grant.token
+    formatted["lock_expires_at"] = grant.expires_at
+    return formatted
+
+
 def unlock_nav_tab_by_document_id_v2(
     db: Session,
     document_id: str,

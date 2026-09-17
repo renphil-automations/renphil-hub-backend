@@ -33,6 +33,7 @@ from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.nav_tab import NavTabV2
 
 from app.services.access_visibility_service import (
+    AccessDeniedError,
     NodeNotViewableError,
     ViewerAccess,
     require_edit,
@@ -1302,6 +1303,7 @@ def update_component_content(
     data: Any = _UNSET,
     access: ViewerAccess | None = None,
     holder: str | None = None,
+    session: Any = None,
 ) -> dict[str, Any] | None:
     """Write one component's own content fields, addressed by its stable
     `link`. Arguments left at `_UNSET` are untouched, so a caller can change
@@ -1351,7 +1353,7 @@ def update_component_content(
     `type`, `link` and the layout keys) gets a 422 rather than a partial
     write. See the sentinel guard below, which is the second half of that.
 
-    ── AUTHORIZATION: EDIT(N), STILL NO LOCK CHECK ──────────────────────────
+    ── AUTHORIZATION: EDIT(N), THEN A LIVE SESSION (NON-SBN) ────────────────
 
     Updated by project_ac_enforcement_gap.md item 2, which is the "§10 flips
     enforcement" trigger the paragraph below used to point at — this
@@ -1367,20 +1369,35 @@ def update_component_content(
         (every caller that predates this change, and any future internal
         caller that never intended to gate its own write) is a no-op, so
         this is additive for every caller that opts in by passing one.
-      * **Lock check, UPDATED plan_lock_propagation_2026-09-08.md §5.3
-        decision 6.** This paragraph used to say "no lock check, still
-        deliberate, paired with the canvas save" — no longer true as of
-        that plan. A component "checks ancestors but takes no lock" of its
-        own: no session TOKEN is required here (this endpoint holds no
-        session — a per-widget editor never acquires anything), but the
-        write is refused if the component's owning canvas, or any of ITS
-        ancestors, is held FRESH by someone else. This is what closes the
-        exact bypass §5.3 names: a canvas session is held, and without
-        this check someone else could still rewrite one of its widgets
-        through this door. `update_tab_content_v2` (the WHOLE-canvas save)
-        is a different case entirely — it IS the canvas write and gets the
-        full `require_live_session` token check, not this ancestor-only
-        one.
+      * **Lock check, UPDATED AGAIN 2026-09-16 (TTL fix) — decision 6 is
+        superseded for non-SBN widgets.** Decision 6 ("checks ancestors
+        but takes no lock", no token required) was written when the
+        per-widget editor genuinely held nothing. It no longer does:
+        `ComponentContentEditModal` acquires the widget's owning canvas
+        lock for its own lifetime (session_handoff_2026-09-16 §4, after a
+        real concurrent-edit data-loss repro), so this door now sits
+        behind a real session — and a session that is never validated on
+        write is one whose TTL means nothing. The 2026-09-16 live test
+        showed exactly that: a modal whose lock had expired an hour ago
+        still saved, because the only check here was "is someone ELSE
+        holding it fresh," which one's own stale lock can never fail.
+
+        So, for an ordinary canvas widget (`super_blocknote_id IS NULL`),
+        this is now the SAME `require_live_session` gate the whole-canvas
+        save gets, on the widget's owning canvas node via `lock_node_of`
+        (an ancestor session — a root session covering a sub-grid widget —
+        passes, exactly as it does for the canvas write): a missing,
+        expired, or taken-over token is refused with its own §5.5 code so
+        the client can offer re-acquire & retry.
+
+        **SBN-descendant widgets (`super_blocknote_id IS NOT NULL`) keep
+        decision 6 verbatim** — tokenless, ancestor-only foreign-hold
+        check. The SBN editor deliberately takes no lock (owner's own
+        scope-out, twice: the 2026-09-16 handoff §1 and §4; the modal's
+        `disableComponentLock`), and this function must not 409 every SBN
+        widget save for a session that, by explicit decision, is never
+        acquired. When that decision is revisited, drop the branch below
+        and the SBN case falls under the same gate automatically.
 
     Returns the updated component view, or None for an unknown `link` (404 at
     the router). Raises ValueError — 400 — for a link that resolves to
@@ -1403,21 +1420,28 @@ def update_component_content(
     # though none of them accept a content write.
     require_edit(access, ("component", component.id))
 
-    # plan_lock_propagation_2026-09-08.md §5.3 decision 6 — see this
-    # function's own docstring. No token required; refused only if the
-    # component's owning canvas or one of ITS ancestors is held fresh by
-    # someone else. `holder=None` (every pre-existing internal caller)
-    # skips this, matching `access=None`'s own "no check requested"
-    # convention — never reachable from a real router, which always
-    # passes the authenticated caller's email.
-    if holder:
-        from app.services import edit_lock_service
+    # See "Lock check, UPDATED AGAIN 2026-09-16" in this function's own
+    # docstring. Two branches, split on `super_blocknote_id`:
+    #
+    #  - SBN descendant: decision 6 verbatim — no token, refused only if
+    #    the owning canvas or one of ITS ancestors is held fresh by someone
+    #    else. `holder=None` (every pre-existing internal caller) skips it,
+    #    matching `access=None`'s own "no check requested" convention.
+    #  - Everything else: the same live-session gate the canvas save has.
+    #    `session=None` is the same internal-caller no-op. When a real
+    #    session passes, the canvas is by definition held fresh by THIS
+    #    caller, so the foreign-hold check is subsumed — not repeated.
+    if component.super_blocknote_id is not None:
+        if holder:
+            from app.services import edit_lock_service
 
-        canvas_node = edit_lock_service.lock_node_of(db, ("component", component.id))
-        if canvas_node is not None:
-            edit_lock_service.refuse_if_any_held(
-                db, [canvas_node] + edit_lock_service.ancestors(db, canvas_node), holder
-            )
+            canvas_node = edit_lock_service.lock_node_of(db, ("component", component.id))
+            if canvas_node is not None:
+                edit_lock_service.refuse_if_any_held(
+                    db, [canvas_node] + edit_lock_service.ancestors(db, canvas_node), holder
+                )
+    else:
+        _require_live_session(db, session, ("component", component.id))
 
     # THE REDACTION SENTINEL, GUARDED ON ITS OWN RATHER THAN INHERITED.
     # `update_tab_content_v2` got its own guard on 2026-08-30, and §6.7 is
@@ -2608,6 +2632,18 @@ def update_tab_content_v2(
         db.commit()
 
         response = _format_page_content(db, gridstack)
+        # Every GET path (get_tab_content_v2, get_tab_workspace_v2, ...)
+        # stamps node_id/node_kind/edit onto each widget via
+        # _apply_visibility_to_content — this write path echoed the raw,
+        # unstamped content back instead, so a widget's Manage-access/enter-
+        # edit-mode affordances (both gated on those fields) went dark for
+        # every widget on the canvas until the next reload. `access` is
+        # always real on the actual HTTP path (tabs_v2.py's
+        # `Depends(get_viewer_access)`); the one internal `access=None`
+        # caller (create_tab_v2 seeding a brand-new tab) stays a no-op,
+        # matching every other `if access is not None` gate in this module.
+        if access is not None:
+            response["content"] = _apply_visibility_to_content(response["content"], access=access)
         response["search_updates"] = _search_update_receipts(search_updates)
         return response
 
@@ -3005,8 +3041,59 @@ def _require_live_session(db: Session, session: Any, ac_node: tuple[str, int] | 
         edit_lock_service.require_live_session(session, node, db)
 
 
+def _require_edit_for_lock_action(
+    db: Session,
+    gridstack: GridstackV2,
+    access: ViewerAccess | None,
+    component_link: str | None,
+) -> None:
+    """The lock/unlock gate, shared by `lock_tab_by_document_id_v2` and
+    `unlock_tab_by_document_id_v2`. session_handoff_2026-09-16 follow-up:
+    `edit(resolve_gridstack_node(gridstack))` alone — the ONLY check before
+    this — requires `edit` on the whole tab (or, for a sub-grid, its own
+    representation component). Edit only folds DOWN the tree
+    (`edit(n) = seed_edit(n) ∨ edit(parent(n))`), so a grant seeded on ONE
+    widget living on/inside this canvas never satisfies that, even though
+    `update_component_content` (the write this lock exists to protect) is
+    perfectly happy to let that same caller write. That mismatch is exactly
+    what made `ComponentContentEditModal`'s new lock-on-open 403 for a
+    narrow, component-only grant holder.
+
+    `component_link`, when given, is the EXACT component the caller named —
+    same addressing `update_component_content` uses, deliberately NOT "any
+    component under this gridstack the caller can edit" (that would let a
+    grant on one unrelated widget justify locking the whole canvas, and
+    there is no existing "any editable descendant" query to build it on
+    safely — mirrors, SBN boundaries, and nested sub-grid boundaries would
+    all need to be re-derived correctly). It must actually belong to THIS
+    gridstack or it proves nothing — a component from a different canvas
+    the caller can edit must never justify locking this one.
+
+    Tried in this order: the existing whole-canvas check first (so the
+    common case — a full editor or admin — never pays for an extra query),
+    falling back to `edit(component)` only if that fails AND a link was
+    given. Raises the ORIGINAL exception when the fallback doesn't pan out,
+    since "you can't edit this canvas" is the truer reason over "you didn't
+    name a component I could check"."""
+    try:
+        require_edit(access, resolve_gridstack_node(db, gridstack))
+    except AccessDeniedError:
+        if component_link:
+            component = db.query(ComponentV2).filter(ComponentV2.link == component_link).first()
+            if component is not None and component.gridstack_id == gridstack.id:
+                require_edit(access, ("component", component.id))
+                return
+        raise
+
+
 def lock_tab_by_document_id_v2(
-    db: Session, document_id: str, locked_by: str, force: bool = False, *, access: ViewerAccess | None = None
+    db: Session,
+    document_id: str,
+    locked_by: str,
+    force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
+    component_link: str | None = None,
 ) -> dict[str, Any] | None:
     """THIN WRAPPER, plan_lock_propagation_2026-09-08.md §8 phase 2. The
     actual conflict logic now lives in `edit_lock_service.acquire` —
@@ -3041,14 +3128,21 @@ def lock_tab_by_document_id_v2(
     what a forced lock takes over. §3.3's trap: gate on the AC node
     (`resolve_gridstack_node`), never the LOCK node (`resolve_lock_node`) —
     a `("gridstack", id)` lock node is not a valid AC node kind and would
-    evaluate to fail-closed INVISIBLE for everyone but a Hub Admin."""
+    evaluate to fail-closed INVISIBLE for everyone but a Hub Admin.
+
+    `component_link` (NEW, session_handoff_2026-09-16 follow-up): an
+    additional, OPTIONAL way to satisfy this same gate — see
+    `_require_edit_for_lock_action`'s own docstring for the full reasoning.
+    The LOCK NODE itself (`edit_lock_service.resolve_lock_node`, below) is
+    unchanged either way — still the whole tab/gridstack — so this only
+    widens WHO may acquire it, never what it covers once held."""
     from app.services import edit_lock_service  # local: see that module's own import comment
 
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
 
-    require_edit(access, resolve_gridstack_node(db, gridstack))
+    _require_edit_for_lock_action(db, gridstack, access, component_link)
 
     grant = edit_lock_service.acquire(
         db, edit_lock_service.resolve_lock_node(gridstack), locked_by, force=force
@@ -3077,6 +3171,44 @@ def lock_tab_by_document_id_v2(
     return workspace
 
 
+def renew_tab_lock_by_document_id_v2(
+    db: Session,
+    document_id: str,
+    *,
+    session: Any,
+    access: ViewerAccess | None = None,
+    component_link: str | None = None,
+) -> dict[str, Any] | None:
+    """THIN WRAPPER over `edit_lock_service.renew` — the save-preflight's
+    validate door (2026-09-16 TTL fix; see `renew`'s own docstring for why
+    this is NOT `lock_tab_by_document_id_v2`, which silently resurrects a
+    stale self-held lock and therefore cannot serve as a preflight).
+
+    Same `_require_edit_for_lock_action` gate (and the same optional
+    `component_link` alternate path) as lock/unlock — a caller who could
+    not have acquired this session cannot renew it either, and auth runs
+    before the session check (§5.2's ordering) so an ungranted caller
+    never learns the row's lock state. Same workspace-shaped response as
+    `lock_tab_by_document_id_v2`, with `lock_token`/`lock_expires_at`
+    populated for the same reason and under the same "only on this exact
+    response" rule. `session` is typed `Any` for the same circular-import
+    reason `_require_live_session` gives."""
+    from app.services import edit_lock_service  # local: see that module's own import comment
+
+    gridstack = get_gridstack_by_document_id(db, document_id)
+    if gridstack is None:
+        return None
+
+    _require_edit_for_lock_action(db, gridstack, access, component_link)
+
+    grant = edit_lock_service.renew(db, session, edit_lock_service.resolve_lock_node(gridstack))
+    workspace = get_tab_workspace_v2(db, document_id)
+    if workspace is not None:
+        workspace["lock_token"] = grant.token
+        workspace["lock_expires_at"] = grant.expires_at
+    return workspace
+
+
 def unlock_tab_by_document_id_v2(
     db: Session,
     document_id: str,
@@ -3084,6 +3216,7 @@ def unlock_tab_by_document_id_v2(
     force: bool = False,
     *,
     access: ViewerAccess | None = None,
+    component_link: str | None = None,
 ) -> dict[str, Any] | None:
     """THIN WRAPPER — see `lock_tab_by_document_id_v2`'s own comment on why
     the logic moved to `edit_lock_service.release`. `force` here is the
@@ -3093,14 +3226,20 @@ def unlock_tab_by_document_id_v2(
 
     plan_ac_enforcement_closeout_2026-09-09.md §3: same single `edit(n)`
     gate as lock, covering force-unlock too — see that function's docstring
-    for why the `edit(parent(n))` disjunct is redundant here."""
+    for why the `edit(parent(n))` disjunct is redundant here.
+
+    `component_link` — same `_require_edit_for_lock_action` fallback as
+    `lock_tab_by_document_id_v2`, and NOT optional in practice for that
+    caller: without it, a component-only grant holder who successfully
+    locked (by passing `link` there) could never release their own lock,
+    leaving it held for its full TTL every single time."""
     from app.services import edit_lock_service  # local: see that module's own import comment
 
     gridstack = get_gridstack_by_document_id(db, document_id)
     if gridstack is None:
         return None
 
-    require_edit(access, resolve_gridstack_node(db, gridstack))
+    _require_edit_for_lock_action(db, gridstack, access, component_link)
 
     edit_lock_service.release(
         db, edit_lock_service.resolve_lock_node(gridstack), unlocked_by or "", force=force

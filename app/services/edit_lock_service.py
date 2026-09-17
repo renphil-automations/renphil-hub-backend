@@ -800,12 +800,29 @@ def lock_node_of(db: Session, ac_node: tuple[str, int] | None) -> LockNode | Non
     raise ValueError(f"Unknown AC node kind: {kind!r}")
 
 
-def require_live_session(session: EditSession | None, node: LockNode, db: Session) -> None:
+def require_live_session(
+    session: EditSession | None, node: LockNode, db: Session, *, self_only: bool = False
+) -> datetime | None:
     """§5.2's gate. Passes iff some token in `session.tokens` matches a
     lock row where ALL of: the row is `node` itself OR an ancestor of it
     (the session covers `node`'s subtree); the row's `locked_by ==
     session.holder` (a leaked token is useless to another identity); the
     row is not stale.
+
+    `self_only=True` (the `renew` door below, 2026-09-16 TTL fix) narrows
+    the chain to `node`'s OWN row — no ancestor walk. A write gate wants
+    "does ANY session I hold cover this node" (an ancestor session
+    legitimately covers a descendant write); a session RENEWAL wants "is
+    THIS specific session still live" — letting a fresh root session
+    vouch for a stale sub-grid session would silently mark the sub-grid
+    session renewed on the client while its own row stayed stale, which
+    is exactly the kind of client/server disagreement the renew door
+    exists to eliminate.
+
+    Returns the renewed row's new `locked_at` on success (so a caller can
+    derive `expires_at` without re-reading the row); `None` only for the
+    `session=None` no-check case. Every existing write-gate caller ignores
+    the return value — additive.
 
     `session=None` is "no check was requested" — the SAME convention
     `require_edit`'s `access=None` already uses (access_visibility_service.py)
@@ -866,14 +883,14 @@ def require_live_session(session: EditSession | None, node: LockNode, db: Sessio
     only the descendant case can preserve it for free.
     """
     if session is None:
-        return
+        return None
 
     if not session.tokens:
         raise EditSessionError(
             "This action requires an active editing session.", code="EDIT_SESSION_MISSING"
         )
 
-    chain = [node] + ancestors(db, node)
+    chain = [node] if self_only else [node] + ancestors(db, node)
 
     for candidate in chain:
         row = _node_row(db, candidate)
@@ -886,8 +903,9 @@ def require_live_session(session: EditSession | None, node: LockNode, db: Sessio
             continue
         if is_lock_stale(locked_at):
             continue
-        row.locked_at = _utc_now()  # decision 5: renewal is a side effect of THIS write
-        return  # a live, matching, self-held session covers `node`
+        renewed_at = _utc_now()
+        row.locked_at = renewed_at  # decision 5: renewal is a side effect of THIS write
+        return renewed_at  # a live, matching, self-held session covers `node`
 
     for candidate in chain:
         row = _node_row(db, candidate)
@@ -908,6 +926,51 @@ def require_live_session(session: EditSession | None, node: LockNode, db: Sessio
 
     raise EditSessionError(
         "This action requires an active editing session.", code="EDIT_SESSION_MISSING"
+    )
+
+
+def renew(db: Session, session: EditSession, node: LockNode) -> LockGrant:
+    """The save-preflight's VALIDATE door (plan §6.2 "validate/renew the
+    session once, up front") — added 2026-09-16 after a live TTL test
+    showed the preflight could never actually fail on expiry.
+
+    WHY THIS IS NOT `acquire`. The frontend's preflight used to call the
+    plain lock endpoint (`acquire`) on every held session. `acquire`
+    treats a same-holder re-entry as never conflicting, FRESH OR STALE
+    (§4.1 — deliberately, so a holder can reclaim their own lock after a
+    crash) — it keeps the token and stamps `locked_at = now`. Used as a
+    preflight, that silently RESURRECTED an expired session moments
+    before the content write reached `require_live_session`, so
+    `EDIT_SESSION_EXPIRED` was unreachable through a normal save and
+    decision 7's "expired save keeps local changes and offers re-acquire
+    & retry" modal never fired. This door only ever VALIDATES: it passes
+    (and renews, per decision 5) iff `node`'s OWN row is a fresh,
+    self-held session whose token the caller presented; otherwise it
+    raises the same `EditSessionError` codes every write gate raises —
+    and it never mints, reclaims, or touches any row on failure. The
+    client's "Re-acquire & Retry" still goes through `acquire`, which is
+    exactly where the reclaim belongs: an explicit user choice, not a
+    side effect of pressing Save.
+
+    `self_only=True`: see `require_live_session`'s own note — a session
+    renewal is about THIS row, never about an ancestor that happens to
+    cover it."""
+    try:
+        renewed_at = require_live_session(session, node, db, self_only=True)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = _node_row(db, node)
+    # `renewed_at` is non-None here: `session` is never None on this path
+    # (the router always passes a real `EditSession`), and every failure
+    # branch raised above.
+    assert renewed_at is not None and row is not None
+    return LockGrant(
+        token=row.lock_token or "",
+        holder=session.holder,
+        node=node,
+        expires_at=renewed_at + timedelta(seconds=_ttl_seconds()),
     )
 
 
