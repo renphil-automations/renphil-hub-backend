@@ -180,7 +180,7 @@ _ML_LOOKUP_PROJECT_FIELDS = [
     "Initiative Type",
     "Focus Area(s)",
     "Program Lead/Fellow",
-    "Status",
+    "Fund Status",
     "Program Summary",
     "Internal Notes",
     "Can we talk about it publicly",
