@@ -25,13 +25,22 @@ the existing `None -> 404` path, so an invisible node is indistinguishable
 from a missing one (§9); write routes raise `AccessDeniedError`, mapped by
 `tabs_v2.access_denied_to_http_exception` — imported rather than reimplemented
 so the 404-vs-403 split cannot drift between the two routers.
+
+EDIT SESSIONS, added 2026-09-17 (plan_component_locking_and_sbn_2026-09-17.md
+§6). Every write route now also takes `session: EditSession =
+Depends(get_edit_session)` (the caller's `X-Edit-Tokens`) and every read
+route `lock_view = Depends(get_lock_view)`, threaded to the service exactly
+as `tabs_v2.py` does — an SBN node is a real lock node now, so an SBN write
+without a live session is a 409 `EDIT_SESSION_*`, and `PUT /{link}/lock`
+returns the token the client must present back. `LockTabRequest.force` is
+honoured here too (subtree takeover).
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, get_viewer_access
+from app.dependencies import get_current_user, get_edit_session, get_lock_view, get_viewer_access
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.routers.tabs_v2 import access_denied_to_http_exception
@@ -47,6 +56,7 @@ from app.schemas.tab import (
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
+from app.services import edit_lock_service
 from app.services.access_visibility_service import AccessDeniedError, ViewerAccess
 from app.services.super_blocknote_service import (
     create_sbn_node,
@@ -92,13 +102,14 @@ def get_workspace(
     link: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(link)
     # §9: a deep link to a node this caller cannot see 404s exactly like one
     # that does not exist — `get_sbn_workspace` returns None for both, so the
     # pre-existing line below produces the fail-closed response with no
     # branch of its own.
-    workspace = get_sbn_workspace(db, link, access=access)
+    workspace = get_sbn_workspace(db, link, access=access, lock_view=lock_view)
     if workspace is None:
         raise HTTPException(status_code=404, detail="SBN node not found")
     return {"data": workspace}
@@ -114,9 +125,10 @@ def get_children(
     link: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(link)
-    children = get_sbn_children(db, link, access=access)
+    children = get_sbn_children(db, link, access=access, lock_view=lock_view)
     if children is None:
         raise HTTPException(status_code=404, detail="SBN node not found")
     return {"data": children}
@@ -152,6 +164,7 @@ def get_content(
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
         **COMMON_FORBIDDEN_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
     },
 )
 def update_content(
@@ -159,10 +172,13 @@ def update_content(
     request: UpdateTabContentRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(link)
     try:
-        updated = update_sbn_content(db=db, link=link, content=request.content, access=access)
+        updated = update_sbn_content(
+            db=db, link=link, content=request.content, access=access, session=session
+        )
         if updated is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": updated}
@@ -187,6 +203,7 @@ def create_new_node(
     request: CreateTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     try:
         access_control = (
@@ -202,6 +219,7 @@ def create_new_node(
             order=request.order,
             access_control=access_control,
             access=access,
+            session=session,
         )
         return node
     except AccessDeniedError as e:
@@ -225,10 +243,16 @@ def reorder_nodes(
     request: ReorderTabsRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     try:
+        # Session-exempt (decision 9) — threaded for its holder identity
+        # only; see `reorder_sbn_siblings`.
         reordered = reorder_sbn_siblings(
-            db=db, items=[item.model_dump() for item in request.items], access=access
+            db=db,
+            items=[item.model_dump() for item in request.items],
+            access=access,
+            session=session,
         )
         return {"data": reordered}
     except AccessDeniedError as e:
@@ -256,9 +280,13 @@ def lock_node(
         # plan §6.6 Fix 1 (identity-sourced holder, no client-supplied
         # locked_by) applies here too automatically — see LockTabRequest's
         # own docstring in schemas/tab.py. Not an optional extension: the
-        # field simply no longer exists on the shared schema.
+        # field simply no longer exists on the shared schema. `force` is
+        # §4.2 decision 8's subtree takeover, honoured here since
+        # 2026-09-17 (an SBN node is a real lock node now).
         locked_by = (user.email or "").strip().lower()
-        locked = lock_sbn_node(db=db, link=link, locked_by=locked_by, access=access)
+        locked = lock_sbn_node(
+            db=db, link=link, locked_by=locked_by, force=request.force, access=access
+        )
         if locked is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": locked}
@@ -315,6 +343,7 @@ def update_node(
     request: UpdateTabRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(link)
     try:
@@ -330,6 +359,7 @@ def update_node(
             order=request.order,
             access_control=access_control,
             access=access,
+            session=session,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
@@ -347,16 +377,18 @@ def update_node(
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
         **COMMON_FORBIDDEN_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
     },
 )
 def delete_node(
     link: str,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     validate_document_id(link)
     try:
-        result = delete_sbn_subtree(db=db, link=link, access=access)
+        result = delete_sbn_subtree(db=db, link=link, access=access, session=session)
         if result is None:
             raise HTTPException(status_code=404, detail="SBN node not found")
         return {"data": result}

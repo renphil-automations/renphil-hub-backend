@@ -341,6 +341,31 @@ class TabWorkspaceAPIResponse(BaseModel):
     data: TabWorkspaceResponse
 
 
+class ComponentLockResponse(BaseModel):
+    """Body of the three per-component lock doors
+    (`PUT /v2/tabs/components/by-link/{link}/lock`, `/lock/renew`,
+    `/unlock` — plan_component_locking_and_sbn_2026-09-17.md §5.1).
+    Deliberately small: no content, no workspace — the per-widget modal
+    already holds the widget's data and only needs to learn its session.
+
+    `lock_token`/`lock_expires_at` are populated ONLY on lock and renew,
+    never on unlock — the same sensitive, narrow-population rule
+    `TabWorkspaceResponse.lock_token`'s comment sets. `locked`/`locked_by`
+    are the row's own raw state, same meaning as everywhere else."""
+
+    link: StrictStr | None = None
+    type: StrictStr | None = None
+    title: StrictStr | None = None
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    lock_token: StrictStr | None = None
+    lock_expires_at: datetime | None = None
+
+
+class ComponentLockAPIResponse(BaseModel):
+    data: ComponentLockResponse
+
+
 class BreadcrumbAPIResponse(BaseModel):
     data: list[BreadcrumbItemResponse] = Field(default_factory=list)
 

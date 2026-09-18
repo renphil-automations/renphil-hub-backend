@@ -57,6 +57,13 @@ MAX_ORDER_VALUE = 2147483647
 RESTRICTED_WIDGET_TYPE = "restricted"
 MIRROR_WIDGET_TYPE = "mirror"
 
+# A Super Block Note's own top-level widget row (super_blocknote_service.py
+# re-exports this as `SBN_ROOT_TYPE`; defined HERE because that module
+# imports from this one, so this is the only direction that isn't circular).
+# The one widget type that is itself a container of further AC nodes — see
+# `_apply_visibility_to_content`'s revealed-root branch.
+SBN_ROOT_WIDGET_TYPE = "super_block_note"
+
 # A component row that represents a gridstack itself (see ComponentV2's
 # current_grid_id), not a real widget on any canvas. Every gridstack gets
 # exactly one, created alongside it. Starts as GRIDSTACK_WIDGET_TYPE; flips
@@ -935,6 +942,30 @@ def _apply_visibility_to_content(
     deliberately leaves ``visible`` untouched for a conjunction-failing
     mirror (so it still renders as a `restricted` shell, not a hole in the
     canvas) — reading `.view` here would show it in full instead.
+
+    THE ONE EXCEPTION to that rule (plan_component_locking_and_sbn_2026-09-17
+    §5.5, finding 9): a REVEALED-not-granted ``super_block_note`` root. A
+    Super Block Note is the one widget type that is itself a container of
+    further AC nodes — its sub-tabs are ``("component", …)`` nodes whose
+    parent chain runs through the root. A viewer whose only grant is on
+    sub-tab ``s1`` makes the root *revealed* (``_reveal_ancestors`` walks
+    ``s1`` → root → tab → …) but never *granted*, so the ``is_granted``
+    branch redacted the whole widget to the sentinel, the widget never
+    mounted, and ``s1`` — the very thing they were granted — was
+    unreachable from the canvas. The SBN service's own §5.2 shell
+    (``_sbn_content_for`` → ``content: None``, children filtered on
+    ``view``) was correct one hop too late. So that ONE type, when
+    ``verdict(node).view`` holds, keeps its entry as a shell (``edit:
+    False``, ``revealed: True``) so the widget mounts and the SBN service's
+    reveal logic takes over. Deliberately NOT extended to any other type:
+    reading ``.view`` for a mirror is exactly the conjunction hole the
+    paragraph above warns about, and ``test_position_granted_but_target_
+    not_redacts_the_mirror`` pins that it stays closed. The canvas-save
+    round-trip hazard (§10 item 7) does not bite here: a revealed root
+    always has at least one sub-tab (that is what revealed it), so its own
+    content was already transplanted to "Overview" and its ``data`` is
+    empty; and only a holder of ``edit(canvas)`` can save the canvas, who
+    is granted everything beneath it and never receives this shell.
     """
     if not isinstance(content, dict) or content.get("schemaVersion") != 2:
         return content
@@ -961,6 +992,23 @@ def _apply_visibility_to_content(
                 # conjunction adjusts — safe to read via `verdict()` here
                 # since `is_granted` already gated the branch.
                 "edit": access.verdict(node).edit,
+                "node_kind": "component",
+                "node_id": component_id,
+            }
+        elif (
+            isinstance(widget_entry, dict)
+            and widget_entry.get("type") == SBN_ROOT_WIDGET_TYPE
+            and access.verdict(node).view
+        ):
+            # §5.5 shell for the one widget type that is itself a container
+            # of further AC nodes: keep the entry so the widget mounts and
+            # its own service-level reveal logic (content None, children
+            # filtered) takes over. NOT is_granted — that is exactly what a
+            # revealed node fails. See the docstring's "ONE EXCEPTION".
+            filtered_widgets[widget_id] = {
+                **widget_entry,
+                "edit": False,
+                "revealed": True,
                 "node_kind": "component",
                 "node_id": component_id,
             }
@@ -1302,7 +1350,6 @@ def update_component_content(
     description: Any = _UNSET,
     data: Any = _UNSET,
     access: ViewerAccess | None = None,
-    holder: str | None = None,
     session: Any = None,
 ) -> dict[str, Any] | None:
     """Write one component's own content fields, addressed by its stable
@@ -1353,7 +1400,7 @@ def update_component_content(
     `type`, `link` and the layout keys) gets a 422 rather than a partial
     write. See the sentinel guard below, which is the second half of that.
 
-    ── AUTHORIZATION: EDIT(N), THEN A LIVE SESSION (NON-SBN) ────────────────
+    ── AUTHORIZATION: EDIT(N), THEN A LIVE SESSION ──────────────────────────
 
     Updated by project_ac_enforcement_gap.md item 2, which is the "§10 flips
     enforcement" trigger the paragraph below used to point at — this
@@ -1369,35 +1416,24 @@ def update_component_content(
         (every caller that predates this change, and any future internal
         caller that never intended to gate its own write) is a no-op, so
         this is additive for every caller that opts in by passing one.
-      * **Lock check, UPDATED AGAIN 2026-09-16 (TTL fix) — decision 6 is
-        superseded for non-SBN widgets.** Decision 6 ("checks ancestors
-        but takes no lock", no token required) was written when the
-        per-widget editor genuinely held nothing. It no longer does:
-        `ComponentContentEditModal` acquires the widget's owning canvas
-        lock for its own lifetime (session_handoff_2026-09-16 §4, after a
-        real concurrent-edit data-loss repro), so this door now sits
-        behind a real session — and a session that is never validated on
-        write is one whose TTL means nothing. The 2026-09-16 live test
-        showed exactly that: a modal whose lock had expired an hour ago
-        still saved, because the only check here was "is someone ELSE
-        holding it fresh," which one's own stale lock can never fail.
-
-        So, for an ordinary canvas widget (`super_blocknote_id IS NULL`),
-        this is now the SAME `require_live_session` gate the whole-canvas
-        save gets, on the widget's owning canvas node via `lock_node_of`
-        (an ancestor session — a root session covering a sub-grid widget —
-        passes, exactly as it does for the canvas write): a missing,
+      * **Lock check — one gate for every row, since 2026-09-17.** The
+        2026-09-16 TTL fix put an ordinary widget's write behind the same
+        `require_live_session` gate the whole-canvas save has (a session
+        that is never validated on write is one whose TTL means nothing —
+        a modal whose lock had expired an hour ago still saved), and kept
+        decision 6's tokenless ancestor-only check for SBN descendants
+        because the SBN editor took no lock. plan_component_locking_and_sbn
+        _2026-09-17.md reverses that scope-out: every real component — SBN
+        members included — is now its own lock node (decision A), every
+        SBN write carries a session, and the branch is gone exactly as its
+        own last sentence anticipated. The gate is on THIS component's own
+        node; `lock_node_of` resolves it to the row itself, so the session
+        chain is `[component, (SBN parents…), canvas, tab, nav_tab]` — a
+        narrow editor's own widget token passes, an SBN root/sub-tab
+        session covers its subtree, and an admin's canvas-edit-mode token
+        one hop up passes as it always has for sub-grid widgets. A missing,
         expired, or taken-over token is refused with its own §5.5 code so
         the client can offer re-acquire & retry.
-
-        **SBN-descendant widgets (`super_blocknote_id IS NOT NULL`) keep
-        decision 6 verbatim** — tokenless, ancestor-only foreign-hold
-        check. The SBN editor deliberately takes no lock (owner's own
-        scope-out, twice: the 2026-09-16 handoff §1 and §4; the modal's
-        `disableComponentLock`), and this function must not 409 every SBN
-        widget save for a session that, by explicit decision, is never
-        acquired. When that decision is revisited, drop the branch below
-        and the SBN case falls under the same gate automatically.
 
     Returns the updated component view, or None for an unknown `link` (404 at
     the router). Raises ValueError — 400 — for a link that resolves to
@@ -1419,29 +1455,10 @@ def update_component_content(
     # rows are still ordinary "component" nodes in the tree (§3.1), even
     # though none of them accept a content write.
     require_edit(access, ("component", component.id))
-
-    # See "Lock check, UPDATED AGAIN 2026-09-16" in this function's own
-    # docstring. Two branches, split on `super_blocknote_id`:
-    #
-    #  - SBN descendant: decision 6 verbatim — no token, refused only if
-    #    the owning canvas or one of ITS ancestors is held fresh by someone
-    #    else. `holder=None` (every pre-existing internal caller) skips it,
-    #    matching `access=None`'s own "no check requested" convention.
-    #  - Everything else: the same live-session gate the canvas save has.
-    #    `session=None` is the same internal-caller no-op. When a real
-    #    session passes, the canvas is by definition held fresh by THIS
-    #    caller, so the foreign-hold check is subsumed — not repeated.
-    if component.super_blocknote_id is not None:
-        if holder:
-            from app.services import edit_lock_service
-
-            canvas_node = edit_lock_service.lock_node_of(db, ("component", component.id))
-            if canvas_node is not None:
-                edit_lock_service.refuse_if_any_held(
-                    db, [canvas_node] + edit_lock_service.ancestors(db, canvas_node), holder
-                )
-    else:
-        _require_live_session(db, session, ("component", component.id))
+    # See "Lock check — one gate for every row" in this function's own
+    # docstring. `session=None` is the internal-caller no-op, same as
+    # `access=None` above.
+    _require_live_session(db, session, ("component", component.id))
 
     # THE REDACTION SENTINEL, GUARDED ON ITS OWN RATHER THAN INHERITED.
     # `update_tab_content_v2` got its own guard on 2026-08-30, and §6.7 is
@@ -3245,6 +3262,130 @@ def unlock_tab_by_document_id_v2(
         db, edit_lock_service.resolve_lock_node(gridstack), unlocked_by or "", force=force
     )
     return get_tab_workspace_v2(db, document_id)
+
+
+# ---------------------------------------------------------
+# Component lock doors — plan_component_locking_and_sbn_2026-09-17.md §5.1
+# ---------------------------------------------------------
+
+
+def _lockable_component_by_link(
+    db: Session, link: str, access: ViewerAccess | None
+) -> ComponentV2 | None:
+    """Shared resolve+gate for the three component lock doors below. `None`
+    for an unknown link (404 at the router). `require_edit` on the
+    component's OWN AC node — checked BEFORE the type refusals, for the
+    same reason `update_component_content` orders them that way: a caller
+    who cannot edit this component must not learn what kind of unlockable
+    thing it is. Then two refusals (400) for rows that are never lock nodes:
+    a sub-grid's representation row (lock the sub-tab through its own tab
+    route — `lock_node_of` would silently redirect this to the gridstack,
+    and a caller who addressed a component must not end up holding a
+    canvas) and a restricted sentinel (a redaction artifact, not a widget;
+    same guard `update_component_content` has)."""
+    link = (link or "").strip()
+    if not link:
+        return None
+    component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
+    if component is None:
+        return None
+
+    require_edit(access, ("component", component.id))
+
+    if component.current_grid_id is not None or component.type in GRIDSTACK_REPRESENTATION_TYPES:
+        raise ValueError(
+            "This link points at a sub-tab representation, not a widget — "
+            "lock the sub-tab through its own tab route"
+        )
+    if component.type == RESTRICTED_WIDGET_TYPE:
+        raise ValueError("This component is a redaction sentinel and cannot be locked")
+    return component
+
+
+def _component_lock_response(component: ComponentV2, grant: Any = None) -> dict[str, Any]:
+    """`ComponentLockResponse` — deliberately small (no content, no
+    workspace): the modal already holds the widget's data; it only needs
+    to learn its session. `lock_token`/`lock_expires_at` are populated ONLY
+    when a `grant` is passed (lock/renew), never on unlock — the same
+    narrow-population rule `TabWorkspaceResponse.lock_token`'s comment
+    sets."""
+    response: dict[str, Any] = {
+        "link": component.link,
+        "type": component.type,
+        "title": component.title,
+        "locked": bool(component.locked),
+        "locked_by": component.locked_by or "",
+        "lock_token": None,
+        "lock_expires_at": None,
+    }
+    if grant is not None:
+        response["lock_token"] = grant.token
+        response["lock_expires_at"] = grant.expires_at
+    return response
+
+
+def lock_component_by_link(
+    db: Session,
+    link: str,
+    locked_by: str,
+    force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
+) -> dict[str, Any] | None:
+    """THIN WRAPPER over `edit_lock_service.acquire` on `("component", id)`
+    — the per-widget modal's own lock (plan §7.3; it used to lock the whole
+    owning canvas via `lock_tab_by_document_id_v2` + `link`, which is what
+    made two narrow editors on one canvas mutually exclusive and blocked
+    every other widget, the SGS bar and any SBN on that canvas). `acquire`
+    does the tree work: refused while the canvas/tab/nav tab above is held
+    fresh by someone else, or (for an SBN root) while any sub-tab beneath is;
+    a sibling widget's session never conflicts. `force` is §4.2 decision 8's
+    subtree takeover, same as the tab door."""
+    from app.services import edit_lock_service  # local: see that module's own import comment
+
+    component = _lockable_component_by_link(db, link, access)
+    if component is None:
+        return None
+    grant = edit_lock_service.acquire(db, ("component", component.id), locked_by, force=force)
+    db.refresh(component)
+    return _component_lock_response(component, grant)
+
+
+def renew_component_lock_by_link(
+    db: Session, link: str, *, session: Any, access: ViewerAccess | None = None
+) -> dict[str, Any] | None:
+    """THIN WRAPPER over `edit_lock_service.renew` — the modal's save
+    preflight (see `renew_tab_lock_by_document_id_v2` for why a preflight
+    must validate, never acquire). `session` typed `Any` for the same
+    circular-import reason `_require_live_session` gives."""
+    from app.services import edit_lock_service  # local: see that module's own import comment
+
+    component = _lockable_component_by_link(db, link, access)
+    if component is None:
+        return None
+    grant = edit_lock_service.renew(db, session, ("component", component.id))
+    db.refresh(component)
+    return _component_lock_response(component, grant)
+
+
+def unlock_component_by_link(
+    db: Session,
+    link: str,
+    unlocked_by: str | None = None,
+    force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
+) -> dict[str, Any] | None:
+    """THIN WRAPPER over `edit_lock_service.release` — same ownership rule
+    and same unrestricted `force` as `unlock_tab_by_document_id_v2`."""
+    from app.services import edit_lock_service  # local: see that module's own import comment
+
+    component = _lockable_component_by_link(db, link, access)
+    if component is None:
+        return None
+    edit_lock_service.release(db, ("component", component.id), unlocked_by or "", force=force)
+    db.refresh(component)
+    return _component_lock_response(component)
 
 
 def get_descendant_gridstack_ids(db: Session, gridstack_id: int) -> list[int]:

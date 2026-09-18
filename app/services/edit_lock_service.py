@@ -1,25 +1,32 @@
-"""Edit-lock propagation — plan_lock_propagation_2026-09-08.md.
+"""Edit-lock propagation — plan_lock_propagation_2026-09-08.md, extended by
+plan_component_locking_and_sbn_2026-09-17.md (components become lock nodes).
 
 THE LOCK TREE IS NOT THE ACCESS-CONTROL TREE (plan §2). The two look
-similar enough to be conflated, so this module is deliberately separate from
+similar enough to be conflated — and MORE so now that components sit in
+both — so this module is deliberately separate from
 `access_visibility_service.build_node_tree` / `NodeTree.ancestors()` /
 `NodeTree.descendants()` rather than reusing them:
 
   | | AC tree | Lock tree |
   |---|---|---|
   | sub-grid | not a node (transparent; represented by a component) | a node — GridstackV2 owns the lock columns |
-  | component | a node (grants live there) | not a node — checks ancestors, takes no lock |
+  | sub-grid's representation row (`current_grid_id` set) | a node (the sub-grid's grants live there) | NOT a node — `lock_node_of` maps it to the gridstack |
+  | real component (`current_grid_id IS NULL`) | a node | a node — an ordinary widget or SBN member IS a lock node (2026-09-17 decision A; reverses lock-propagation decision 6) |
   | hub | the root | not lockable at all |
 
-So a `LockNode` has exactly three kinds — "nav_tab", "tab", "gridstack" — and
-NO "component" or "hub" case, the mirror image of `NodeRef`
-(access_visibility_service.py) which has "hub"/"nav_tab"/"tab"/"component"
-and no "gridstack".
+So a `LockNode` has exactly four kinds — "nav_tab", "tab", "gridstack",
+"component" — and NO "hub" case. "gridstack" has no AC-tree counterpart;
+"hub" has no lock-tree one; and "component" means something narrower here
+than in `NodeRef` (a representation row is a `("component", …)` AC node but
+never a `("component", …)` lock node).
 
-This phase (§8 phase 1) only builds the tree resolver — `resolve_lock_node`,
-`ancestors`, `descendants` — with no behaviour change: nothing here is
-called by `lock_tab_by_document_id_v2` / `unlock_tab_by_document_id_v2` yet.
-Acquire/release move onto this tree in phase 2.
+The tree, top to bottom: nav_tab -> tab [-> tab, a variant] -> gridstack
+(a sub-grid; a root/variant canvas has no lock node of its own, its TabV2
+row is the node) -> component -> component (an SBN sub-tab) -> ... Every
+real component under a canvas — root canvases included — is that canvas's
+descendant, so an admin entering canvas edit mode is refused while any
+widget or SBN node beneath is held, and `force` breaks the whole subtree
+(plan_component_locking §2.1 row 4).
 """
 
 from __future__ import annotations
@@ -45,14 +52,15 @@ from app.db_v2.models.tab import TabV2
 # import this would otherwise create.
 from app.services.gridstack_service import _validate_locked_by, is_lock_stale  # noqa: F401
 
-_TabOrGridstackOrNavTab = Union[TabV2, GridstackV2, NavTabV2]
+_LockRow = Union[TabV2, GridstackV2, NavTabV2, ComponentV2]
 
-# ("nav_tab" | "tab" | "gridstack", id). Deliberately the same shape as
-# access_visibility_service.NodeRef (a 2-tuple of kind + id) — same
-# convention, different domain; the kind strings do not overlap ("gridstack"
-# has no AC-tree counterpart, "component"/"hub" have no lock-tree one), so a
-# LockNode and a NodeRef are never confusable in practice even though both
-# are typed as plain tuples.
+# ("nav_tab" | "tab" | "gridstack" | "component", id). Deliberately the same
+# shape as access_visibility_service.NodeRef (a 2-tuple of kind + id) — same
+# convention, different domain. "gridstack" has no AC-tree counterpart and
+# "hub" has no lock-tree one; "component" appears in BOTH, and for a real
+# component (`current_grid_id IS NULL`) the two tuples are literally equal —
+# which is fine, `lock_node_of` is the one sanctioned crossing point and it
+# refuses to let a representation row through as a lock node.
 LockNode = tuple[str, int]
 
 
@@ -72,21 +80,54 @@ def resolve_lock_node(gridstack: GridstackV2) -> LockNode:
 
 def ancestors(db: Session, node: LockNode) -> list[LockNode]:
     """Every node whose subtree contains `node`, nearest first. Each hop is
-    a single denormalized column read — no recursive walk, because the tree
-    is fixed-depth: gridstack -> tab -> [tab ->] nav_tab, at most three hops
-    even through a variant.
+    a single denormalized column read — no recursive walk above the
+    component level, because that part of the tree is fixed-depth:
+    gridstack -> tab -> [tab ->] nav_tab, at most three hops even through a
+    variant. The ONE exception is the component level (2026-09-17): an SBN
+    sub-tab's chain first climbs `super_blocknote_id` link by link to its
+    SBN root — unbounded in principle, "chains four deep" live — before
+    reaching its canvas and the fixed part above.
 
     A missing row (id no longer exists) yields an empty remaining chain
     rather than raising — this mirrors every other "fail closed, not open"
     convention in this codebase (access_visibility_service.py §3.3): a
     caller checking "is any ancestor held" against a dangling reference
     should see no ancestors, not an exception, since there is nothing left
-    above it to be held.
+    above it to be held. An SBN chain that loops back on itself (a corrupt
+    `super_blocknote_id` cycle — the AC tree guards the same case,
+    `test_an_sbn_cycle_terminates_and_fails_closed`) terminates at the
+    repeat rather than walking forever.
     """
     kind, node_id = node
 
     if kind == "nav_tab":
         return []
+
+    if kind == "component":
+        component = db.query(ComponentV2).filter(ComponentV2.id == node_id).first()
+        if component is None:
+            return []
+        chain: list[LockNode] = []
+        # The SBN chain first: each `super_blocknote_id` hop is itself a
+        # ("component", …) lock node. `gridstack_id` is cascaded onto every
+        # SBN member (`_cascade_gridstack_id_to_sbn_descendants`), so it is
+        # the same canvas at every depth and we only need to read it once,
+        # off the node itself — no need to reach the root to learn it.
+        seen: set[int] = {component.id}
+        parent_id = component.super_blocknote_id
+        while parent_id is not None and parent_id not in seen:
+            seen.add(parent_id)
+            chain.append(("component", parent_id))
+            parent = db.query(ComponentV2).filter(ComponentV2.id == parent_id).first()
+            if parent is None:
+                # Dangling — fail closed: nothing above it exists to be held.
+                return chain
+            parent_id = parent.super_blocknote_id
+        gridstack = db.query(GridstackV2).filter(GridstackV2.id == component.gridstack_id).first()
+        if gridstack is None:
+            return chain
+        canvas_node = resolve_lock_node(gridstack)
+        return chain + [canvas_node] + ancestors(db, canvas_node)
 
     if kind == "tab":
         tab = db.query(TabV2).filter(TabV2.id == node_id).first()
@@ -112,12 +153,63 @@ def ancestors(db: Session, node: LockNode) -> list[LockNode]:
     raise ValueError(f"Unknown lock node kind: {kind!r}")
 
 
+def _components_under_gridstacks(db: Session, gridstack_ids: list[int]) -> list[LockNode]:
+    """Every REAL component on any of `gridstack_ids` — `current_grid_id IS
+    NULL`, so a sub-grid's representation row is never returned (it is not
+    a lock node; its gridstack is). SBN members are included by
+    construction: `gridstack_id` is cascaded onto every node of an SBN tree
+    (`_cascade_gridstack_id_to_sbn_descendants`), so one flat query over
+    the canvas ids reaches every depth of every SBN on those canvases with
+    no `super_blocknote_id` walk. Mirrors and restricted-sentinel rows are
+    included too — they are never locked, so they are harmless here, and
+    excluding them would mean re-deriving the canvas serializer's own type
+    filters in a second place."""
+    if not gridstack_ids:
+        return []
+    rows = (
+        db.query(ComponentV2.id)
+        .filter(ComponentV2.gridstack_id.in_(gridstack_ids), ComponentV2.current_grid_id.is_(None))
+        .all()
+    )
+    return [("component", row.id) for row in rows]
+
+
+def _sbn_subtree(db: Session, component_id: int) -> list[LockNode]:
+    """Every component reachable from `component_id` via `super_blocknote_id`,
+    at any depth — adapted from `gridstack_service._collect_sbn_descendant_ids`
+    (plan §4) with a visited set so a corrupt cycle terminates instead of
+    recursing forever (same posture as `ancestors`' own SBN walk above)."""
+    result: list[LockNode] = []
+    seen: set[int] = {component_id}
+    frontier = [component_id]
+    while frontier:
+        children = (
+            db.query(ComponentV2.id).filter(ComponentV2.super_blocknote_id.in_(frontier)).all()
+        )
+        frontier = []
+        for (child_id,) in children:
+            if child_id in seen:
+                continue
+            seen.add(child_id)
+            result.append(("component", child_id))
+            frontier.append(child_id)
+    return result
+
+
 def descendants(db: Session, node: LockNode) -> list[LockNode]:
-    """Every node in `node`'s subtree, in no particular order. 2-3 flat
-    queries, never recursive — sub-grids never nest (a permanent tree-shape
-    rule, confirmed by the owner 2026-09-07), so a gridstack is always a
-    leaf and a tab's own descendants are always exactly one or two levels
-    down.
+    """Every node in `node`'s subtree, in no particular order. A few flat
+    queries, never recursive above the component level — sub-grids never
+    nest (a permanent tree-shape rule, confirmed by the owner 2026-09-07),
+    so a tab's own gridstacks are always exactly one or two levels down.
+
+    A GRIDSTACK IS NO LONGER A LEAF (2026-09-17, decision A): its
+    descendants are the real components on it, SBN members included. And a
+    tab's/nav tab's component query must run over EVERY gridstack under it
+    — root/variant canvases included — not just the sub-grids that are lock
+    nodes in their own right: a root canvas has no lock node of its own
+    (its TabV2 row is the node), but the widgets ON it are its descendants
+    all the same, and filtering to `parent_id IS NOT NULL` for the component
+    query would drop every widget on every root/variant canvas.
 
     THE §1.1 HOLE THIS CLOSES: a root tab's descendants include not just its
     own sub-grids but every VARIANT's sub-grids too. Today's
@@ -129,8 +221,13 @@ def descendants(db: Session, node: LockNode) -> list[LockNode]:
     """
     kind, node_id = node
 
+    if kind == "component":
+        # An ordinary widget has no SBN subtree — empty. An SBN root or
+        # sub-tab: its whole subtree, each as its own lock node.
+        return _sbn_subtree(db, node_id)
+
     if kind == "gridstack":
-        return []
+        return _components_under_gridstacks(db, [node_id])
 
     if kind == "tab":
         tab = db.query(TabV2).filter(TabV2.id == node_id).first()
@@ -141,50 +238,49 @@ def descendants(db: Session, node: LockNode) -> list[LockNode]:
             # A variant: its own sub-grids only. Variants can never
             # themselves have variants (enforced in gridstack_service.py),
             # so there is no further "variant of a variant" branch here.
-            subgrids = (
-                db.query(GridstackV2.id)
-                .filter(GridstackV2.parent_tab_id == node_id, GridstackV2.parent_id.isnot(None))
-                .all()
-            )
-            return [("gridstack", sg.id) for sg in subgrids]
+            owning_tab_ids = [node_id]
+            variant_ids: list[int] = []
+        else:
+            # A root: its variants, its own sub-grids, AND every variant's
+            # sub-grids (the §1.1 hole).
+            variants = db.query(TabV2.id).filter(TabV2.parent_tab_id == node_id).all()
+            variant_ids = [v.id for v in variants]
+            owning_tab_ids = [node_id] + variant_ids
 
-        # A root: its variants, its own sub-grids, AND every variant's
-        # sub-grids (the §1.1 hole).
-        variants = db.query(TabV2.id).filter(TabV2.parent_tab_id == node_id).all()
-        variant_ids = [v.id for v in variants]
-
-        owning_tab_ids = [node_id] + variant_ids
-        subgrids = (
-            db.query(GridstackV2.id)
-            .filter(
-                GridstackV2.parent_tab_id.in_(owning_tab_ids),
-                GridstackV2.parent_id.isnot(None),
-            )
+        # ALL gridstacks under the owning tabs, root canvases included —
+        # the sub-grid ones become lock nodes, every one feeds the
+        # component query.
+        all_gridstacks = (
+            db.query(GridstackV2.id, GridstackV2.parent_id)
+            .filter(GridstackV2.parent_tab_id.in_(owning_tab_ids))
             .all()
         )
 
-        result: list[LockNode] = [("tab", v.id) for v in variants]
-        result.extend(("gridstack", sg.id) for sg in subgrids)
+        result: list[LockNode] = [("tab", v_id) for v_id in variant_ids]
+        result.extend(("gridstack", g.id) for g in all_gridstacks if g.parent_id is not None)
+        result.extend(_components_under_gridstacks(db, [g.id for g in all_gridstacks]))
         return result
 
     if kind == "nav_tab":
         # Every TabV2 under this nav tab — roots AND variants
         # (create_tab_variant_v2 copies the parent's nav_tab_id, so a
         # variant is just as much "under" the nav tab as its root is) —
-        # plus every sub-grid under any of them.
+        # plus every sub-grid under any of them, plus every real component
+        # on any canvas under any of them.
         tabs = db.query(TabV2.id).filter(TabV2.nav_tab_id == node_id).all()
         tab_ids = [t.id for t in tabs]
 
-        subgrids = (
-            db.query(GridstackV2.id)
-            .filter(GridstackV2.parent_tab_id.in_(tab_ids), GridstackV2.parent_id.isnot(None))
+        all_gridstacks = (
+            db.query(GridstackV2.id, GridstackV2.parent_id)
+            .filter(GridstackV2.parent_tab_id.in_(tab_ids))
             .all()
             if tab_ids
             else []
         )
 
         result = [("tab", t.id) for t in tabs]
-        result.extend(("gridstack", sg.id) for sg in subgrids)
+        result.extend(("gridstack", g.id) for g in all_gridstacks if g.parent_id is not None)
+        result.extend(_components_under_gridstacks(db, [g.id for g in all_gridstacks]))
         return result
 
     raise ValueError(f"Unknown lock node kind: {kind!r}")
@@ -192,11 +288,11 @@ def descendants(db: Session, node: LockNode) -> list[LockNode]:
 
 # ---------------------------------------------------------------------------
 # Row access — one place that knows how to read/write the lock quadruple
-# regardless of which of the three tables `node` addresses.
+# regardless of which of the four tables `node` addresses.
 # ---------------------------------------------------------------------------
 
 
-def _node_row(db: Session, node: LockNode) -> _TabOrGridstackOrNavTab | None:
+def _node_row(db: Session, node: LockNode) -> _LockRow | None:
     kind, node_id = node
     if kind == "tab":
         return db.query(TabV2).filter(TabV2.id == node_id).first()
@@ -204,37 +300,69 @@ def _node_row(db: Session, node: LockNode) -> _TabOrGridstackOrNavTab | None:
         return db.query(GridstackV2).filter(GridstackV2.id == node_id).first()
     if kind == "nav_tab":
         return db.query(NavTabV2).filter(NavTabV2.id == node_id).first()
+    if kind == "component":
+        return db.query(ComponentV2).filter(ComponentV2.id == node_id).first()
     raise ValueError(f"Unknown lock node kind: {kind!r}")
 
 
-def _locked_quad(row: _TabOrGridstackOrNavTab) -> tuple[bool, str, datetime | None, str | None]:
+def _node_rows(db: Session, nodes: list[LockNode]) -> list[tuple[LockNode, _LockRow]]:
+    """Batch form of `_node_row` — one `IN` query per kind instead of one
+    query per node, preserving `nodes`' order and dropping the missing.
+    Added 2026-09-17 with components as lock nodes: `acquire`'s descendant
+    walk used to touch a handful of tab/gridstack rows, and now reaches
+    every widget under the node (144 real components under one nav tab on
+    live, 21 under the largest root tab). At ~165ms per Neon round trip
+    (`_serialize_gridstack_content`'s own profiling note) a per-row loop
+    would turn an admin's canvas edit-mode entry into a multi-second wait;
+    this keeps it at four queries regardless of subtree size."""
+    by_kind: dict[str, list[int]] = {}
+    for kind, node_id in nodes:
+        by_kind.setdefault(kind, []).append(node_id)
+    model_for = {"tab": TabV2, "gridstack": GridstackV2, "nav_tab": NavTabV2, "component": ComponentV2}
+    found: dict[LockNode, _LockRow] = {}
+    for kind, ids in by_kind.items():
+        model = model_for.get(kind)
+        if model is None:
+            raise ValueError(f"Unknown lock node kind: {kind!r}")
+        for row in db.query(model).filter(model.id.in_(ids)).all():
+            found[(kind, row.id)] = row
+    return [(node, found[node]) for node in nodes if node in found]
+
+
+def _locked_quad(row: _LockRow) -> tuple[bool, str, datetime | None, str | None]:
     return bool(row.locked), (row.locked_by or ""), row.locked_at, row.lock_token
 
 
-def _label_for(node: LockNode, row: _TabOrGridstackOrNavTab) -> str:
+def _label_for(node: LockNode, row: _LockRow) -> str:
     """A sub-grid's human name lives on `GridstackV2.name`; a tab's or nav
-    tab's on `.title` — same split `_format_tab_summary` already reads."""
+    tab's on `.title` — same split `_format_tab_summary` already reads. A
+    component's is `.title`, falling back to its `.type`: widgets very often
+    have no title at all, and `'"" is being edited by …'` must never be
+    emitted — "text is being edited by bob@…" at least names the kind of
+    thing that is held."""
     kind, _ = node
     if kind == "gridstack":
         return row.name or ""
+    if kind == "component":
+        return row.title or row.type or ""
     return row.title or ""
 
 
-def _clear_lock(row: _TabOrGridstackOrNavTab) -> None:
+def _clear_lock(row: _LockRow) -> None:
     row.locked = False
     row.locked_by = ""
     row.locked_at = None
     row.lock_token = None
 
 
-def _write_lock(row: _TabOrGridstackOrNavTab, holder: str, now: datetime, token: str) -> None:
+def _write_lock(row: _LockRow, holder: str, now: datetime, token: str) -> None:
     row.locked = True
     row.locked_by = holder
     row.locked_at = now
     row.lock_token = token
 
 
-def _force_break_lock(row: _TabOrGridstackOrNavTab) -> None:
+def _force_break_lock(row: _LockRow) -> None:
     """The descendant-clearing half of a force takeover — DELIBERATELY NOT
     `_clear_lock`. `locked` still flips to False (the row reads as free —
     decision 2's single-lock-row-per-subtree holds again the instant the
@@ -365,12 +493,8 @@ def acquire(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
         # refused (non-force) acquire can name everyone force would kick
         # (§4.2's own requirement: "a refused acquire returns the full
         # conflicting-holder list").
-        descendant_rows: list[tuple[LockNode, _TabOrGridstackOrNavTab]] = []
-        for desc in descendants(db, node):
-            desc_row = _node_row(db, desc)
-            if desc_row is None:
-                continue
-            descendant_rows.append((desc, desc_row))
+        descendant_rows = _node_rows(db, descendants(db, node))
+        for desc, desc_row in descendant_rows:
             d_locked, d_holder, d_locked_at, _d_token = _locked_quad(desc_row)
             if d_locked and d_holder and d_holder != holder and not is_lock_stale(d_locked_at):
                 conflicts.append(BlockingHolder(d_holder, _label_for(desc, desc_row), "descendant"))
@@ -454,6 +578,38 @@ def release(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
         raise
 
 
+def _held_rows(db: Session) -> list[tuple[LockNode, _LockRow]]:
+    """Every `locked == True` row in the whole system, as (lock node, row)
+    — the shared row source for BOTH whole-system sweeps below
+    (`release_locks_now_unauthorized`, `resolve_lock_view`), so the two can
+    never disagree about which tables count. Four queries, one per lock
+    node kind. A root/variant canvas's `GridstackV2` row is skipped
+    (`parent_id IS NULL` — not a lock node; its TabV2 row is), and so is a
+    sub-grid's representation component (`current_grid_id IS NOT NULL` —
+    not a lock node either; its gridstack is). Neither is ever written by
+    `acquire`, so this is belt-and-braces against a hand-edited row
+    misreporting as a live session."""
+    rows: list[tuple[LockNode, _LockRow]] = [
+        (("tab", row.id), row) for row in db.query(TabV2).filter(TabV2.locked.is_(True)).all()
+    ]
+    rows += [
+        (("gridstack", row.id), row)
+        for row in db.query(GridstackV2)
+        .filter(GridstackV2.locked.is_(True), GridstackV2.parent_id.isnot(None))
+        .all()
+    ]
+    rows += [
+        (("nav_tab", row.id), row) for row in db.query(NavTabV2).filter(NavTabV2.locked.is_(True)).all()
+    ]
+    rows += [
+        (("component", row.id), row)
+        for row in db.query(ComponentV2)
+        .filter(ComponentV2.locked.is_(True), ComponentV2.current_grid_id.is_(None))
+        .all()
+    ]
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Revoke-triggered cleanup — locks and access are two separate systems
 # (this module's own docstring, "THE LOCK TREE IS NOT THE ACCESS-CONTROL
@@ -535,18 +691,7 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
     from app.services.access_visibility_service import resolve_gridstack_node, resolve_viewer_access
     from app.services.rbac_graph_service import RbacClosures
 
-    rows: list[tuple[LockNode, _TabOrGridstackOrNavTab]] = [
-        (("tab", row.id), row) for row in db.query(TabV2).filter(TabV2.locked.is_(True)).all()
-    ]
-    rows += [
-        (("gridstack", row.id), row)
-        for row in db.query(GridstackV2)
-        .filter(GridstackV2.locked.is_(True), GridstackV2.parent_id.isnot(None))
-        .all()
-    ]
-    rows += [
-        (("nav_tab", row.id), row) for row in db.query(NavTabV2).filter(NavTabV2.locked.is_(True)).all()
-    ]
+    rows = _held_rows(db)
 
     released: list[LockNode] = []
     if not rows:
@@ -592,6 +737,11 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
         if protected_by_hub_user_id[hub_user.id]:
             continue
 
+        # A gridstack lock node's AC node is its representation component
+        # (`resolve_gridstack_node`); a component lock node IS its own AC
+        # node — a real component's `("component", id)` is the same tuple
+        # in both trees (`_held_rows` never returns a representation row);
+        # a tab's/nav tab's is itself.
         ac_node = resolve_gridstack_node(db, row) if node[0] == "gridstack" else node
         access = resolve_viewer_access(db, hub_user.id, is_admin=False, closures=closures)
         if access.verdict(ac_node).edit:
@@ -684,26 +834,15 @@ class LockView(NamedTuple):
 
 
 def resolve_lock_view(db: Session, viewer: str) -> LockView:
-    """Three queries — every currently-`locked == True` row across all
-    three tables — then STALE ones are dropped (a stale lock is "no live
-    session" everywhere else in this design; the read side is no
+    """Four queries — every currently-`locked == True` row across all four
+    tables (`_held_rows`) — then STALE ones are dropped (a stale lock is
+    "no live session" everywhere else in this design; the read side is no
     exception, even though the node's own raw `locked`/`locked_by`/
     `locked_at`/`lock_is_stale` fields keep showing the true row state
     regardless — see those fields' own docstring in schemas/tab.py)."""
     viewer = (viewer or "").strip().lower()
 
-    rows: list[tuple[LockNode, _TabOrGridstackOrNavTab]] = [
-        (("tab", row.id), row) for row in db.query(TabV2).filter(TabV2.locked.is_(True)).all()
-    ]
-    rows += [
-        (("gridstack", row.id), row)
-        for row in db.query(GridstackV2)
-        .filter(GridstackV2.locked.is_(True), GridstackV2.parent_id.isnot(None))
-        .all()
-    ]
-    rows += [
-        (("nav_tab", row.id), row) for row in db.query(NavTabV2).filter(NavTabV2.locked.is_(True)).all()
-    ]
+    rows = _held_rows(db)
 
     ttl = timedelta(seconds=_ttl_seconds())
     active: list[_ActiveLock] = []
@@ -765,13 +904,24 @@ def lock_node_of(db: Session, ac_node: tuple[str, int] | None) -> LockNode | Non
     `tab` map straight onto themselves (already the same shape a lock node
     is). `hub` maps to `None` — the hub is never lockable (§9 item 1) — a
     caller must not call `require_live_session` at all for a hub-gated
-    write, never pass this `None` through to it. `component` is the one
-    real translation: a component that IS a sub-grid's own representation
-    row (`current_grid_id` set — see that column's own model comment) maps
-    to THAT sub-grid; an ordinary widget component maps to the canvas it
-    lives on (`gridstack_id`) — either way, `resolve_lock_node` on the
-    resolved gridstack gives the answer, exactly mirroring how
-    `resolve_gridstack_node` derives the AC node in the first place.
+    write, never pass this `None` through to it.
+
+    `component` splits on `current_grid_id` (see that column's own model
+    comment): a component that IS a sub-grid's own representation row maps
+    to THAT sub-grid via `resolve_lock_node` — exactly mirroring how
+    `resolve_gridstack_node` derives the AC node in the first place — and
+    is never a lock node itself. A REAL component (`current_grid_id IS
+    NULL`) maps to ITSELF, `("component", id)` (2026-09-17 decision A).
+    This one branch is the pivot that reroutes every
+    `_require_live_session(db, session, ("component", …))` call site —
+    `update_component_content`, `update_airtable_component_config`, and
+    (phase B) every SBN write — onto the component's own row with no
+    per-call edits: the session chain becomes `[component, (SBN parents…),
+    canvas, tab, nav_tab]`, so a narrow editor's own token on the widget
+    passes, and so does an admin's canvas-edit-mode token one hop up (an
+    ancestor session covers a descendant write, as it always has for
+    sub-grids). Until the modal locks the widget itself (phase C) it still
+    holds the canvas, and that ancestor hop is what keeps it working.
 
     `None` is also this function's own fail-closed answer for an orphaned
     reference (dangling component/gridstack id) — same convention as
@@ -790,10 +940,9 @@ def lock_node_of(db: Session, ac_node: tuple[str, int] | None) -> LockNode | Non
         component = db.query(ComponentV2).filter(ComponentV2.id == node_id).first()
         if component is None:
             return None
-        owning_gridstack_id = (
-            component.current_grid_id if component.current_grid_id is not None else component.gridstack_id
-        )
-        gridstack = db.query(GridstackV2).filter(GridstackV2.id == owning_gridstack_id).first()
+        if component.current_grid_id is None:
+            return ("component", component.id)
+        gridstack = db.query(GridstackV2).filter(GridstackV2.id == component.current_grid_id).first()
         if gridstack is None:
             return None
         return resolve_lock_node(gridstack)
@@ -840,9 +989,10 @@ def require_live_session(
     `require_edit(access, X)`, as `require_live_session(session,
     lock_node_of(X), db)` — auth first (403), then session (409), so a
     caller with no edit grant never learns whether the node happens to be
-    locked.** `lock_node_of` is `resolve_lock_node` for a gridstack, or the
-    AC node's own kind/id unchanged for a tab/nav_tab (they're already the
-    same shape a lock node is — no gridstack indirection to resolve).
+    locked.** `lock_node_of` is `resolve_lock_node` for a representation
+    row's gridstack, or the AC node's own kind/id unchanged for a
+    tab/nav_tab/real component (they're already the same shape a lock node
+    is — no gridstack indirection to resolve).
 
     ON SUCCESS, renews the matched row's `locked_at` (decision 5: "TTL is
     renewed by saving, not by a heartbeat") — sets the attribute only, no
