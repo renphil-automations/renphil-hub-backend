@@ -153,7 +153,7 @@ _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "Active Program"
 _STATUS_PUBLICLY_LAUNCHED = "Publicly Launched"
-_STATUS_FELLOWSHIP_SCOPING = "Fellowship (Scoping)"
+_STATUS_FELLOWSHIP = "Fellowship"
 _ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
@@ -3434,7 +3434,7 @@ class AirtableService:
         """Count distinct fellows sourced from the Master List.
 
         Fellows are derived from the Master List: records whose Status
-        equals 'Fellowship (Scoping)' contribute their 'Program Lead/Fellow'
+        equals 'Fellowship' contribute their 'Program Lead/Fellow'
         name(s). Names are resolved to Users by matching the 'Name' field;
         each matched user contributes its (lower-cased) Work Email to the
         distinct set, and each unmatched name contributes its (lower-cased)
@@ -3569,7 +3569,7 @@ class AirtableService:
     ) -> list[tuple[str, dict[str, Any] | None]]:
         """Return one entry per Program Lead/Fellow, matched to a User when possible.
 
-        1. Query MASTER_LIST for records with Status = 'Fellowship (Scoping)',
+        1. Query MASTER_LIST for records with Status = 'Fellowship',
            projecting the 'Program Lead/Fellow' field.
         2. Extract the list of unique lead/fellow names.
         3. Query USERS matching those names against the 'Name' field,
@@ -3579,8 +3579,8 @@ class AirtableService:
         """
         s = self._settings
 
-        # Step 1: pull Fellowship (Scoping) programs from the Master List.
-        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP_SCOPING)
+        # Step 1: pull Fellowship programs from the Master List.
+        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP)
         program_records = await self._list_records(
             self._master_list_table(),
             formula=program_formula,
