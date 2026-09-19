@@ -28,6 +28,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -50,10 +51,17 @@ class ThreadV2(BaseV2):
     how the mention read when it was posted, so a chip renders without a
     lookup. That is not the ``{email, user_id}`` pair dropped 2026-08-19 —
     ``user_id`` was an identity anchor nothing could populate; see plan §3.6.
-    ``status`` is always ``'approved'`` in Phase 1 (plan D5) — the
-    column exists now, and the list endpoint already filters on it, purely
-    so the future moderation queue is a write-path change only, never a
-    migration.
+    ``status`` gained a real moderation lifecycle in
+    ``plan_thread_moderation_2026-09-18.md`` §2 (phase 2a): ``'pending'`` for
+    a viewer's post awaiting an editor's decision, ``'approved'`` for an
+    editor's own post or a decided pending one, ``'rejected'`` for a
+    declined one — never any other value (``ck_threads_status``).
+    ``reviewed_by_email``/``reviewed_by_name``/``reviewed_at`` are NULL for
+    every pre-phase-2a row and for an auto-approved editor post, and set
+    together the moment an editor decides (plan §5.3) — a thread's own
+    identity columns follow the same email-is-identity /
+    name-is-a-display-snapshot split as ``author_email``/``author_name``
+    (plan §3.6).
     """
 
     __tablename__ = "threads"
@@ -95,10 +103,20 @@ class ThreadV2(BaseV2):
     # Always [] until Phase 3 exists to populate it.
     mentions = Column(JSONB, nullable=False, default=list)
 
-    # D5's moderation hook. Always 'approved' until the deferred approval
-    # workflow (gated on the access-control rework) exists to write anything
-    # else.
+    # D5's moderation hook. 'pending' for a viewer's post, 'approved' for an
+    # editor's own post or a decided pending one, 'rejected' for a declined
+    # one (plan_thread_moderation_2026-09-18.md §2, §3.1). The CHECK below
+    # is new; the column itself is unchanged from Phase 1.
     status = Column(String(16), nullable=False, default="approved")
+
+    # Moderation decision (plan_thread_moderation_2026-09-18.md §3.1). All
+    # three NULL for an auto-approved editor post and for every pre-phase-2a
+    # row — M5: History lists only threads with an EXPLICIT decision. Email
+    # is identity, name is a display snapshot — same terms as
+    # author_email/author_name above (plan §3.6).
+    reviewed_by_email = Column(String(320), nullable=True)
+    reviewed_by_name = Column(String(255), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
     # Two separate columns, never a single net score — see the plan's own
     # note on why (losing "controversial" to a collapsed net number is a
@@ -126,6 +144,36 @@ class ThreadV2(BaseV2):
             "component_id",
             created_at.desc(),
             id.desc(),
+        ),
+        # The status lifecycle (plan §2) — no other value is ever written.
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="ck_threads_status",
+        ),
+        # The moderation queue: WHERE component_id IN (...) AND status =
+        # 'pending' ORDER BY created_at, id. PARTIAL — only pending rows, so
+        # it stays tiny however large the table grows (same reasoning as
+        # notifications' own unread-only index). sqlite_where mirrors
+        # postgresql_where so the SQLite test harness exercises the same
+        # shape the live Postgres index does.
+        Index(
+            "ix_threads_pending_created_id",
+            "component_id",
+            "created_at",
+            "id",
+            postgresql_where=text("status = 'pending'"),
+            sqlite_where=text("status = 'pending'"),
+        ),
+        # History: WHERE reviewed_at IS NOT NULL ORDER BY reviewed_at DESC,
+        # id DESC. PARTIAL on reviewed rows only — a legacy or editor
+        # auto-approved thread never appears in history (M5) and never
+        # bloats this index either.
+        Index(
+            "ix_threads_reviewed_at_id",
+            reviewed_at.desc(),
+            id.desc(),
+            postgresql_where=text("reviewed_at IS NOT NULL"),
+            sqlite_where=text("reviewed_at IS NOT NULL"),
         ),
     )
 

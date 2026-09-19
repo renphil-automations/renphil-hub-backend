@@ -18,6 +18,14 @@ one exception — it also needs the raw `Request`/`Response` for the
 `If-None-Match` / `ETag` pair (plan §4.5), which have no place in
 thread_service's plain-value return.
 
+MODERATION (plan_thread_moderation_2026-09-18.md phase 2a). `POST
+/threads/{id}/approve` and `.../reject` gate on `edit(n)` for the thread's
+own component — an editor of the widget OR of any ancestor (a root-tab
+editor approves every thread widget under that root), never Hub-Admin-only
+by analogy with delete (landmine 8). The three static `/threads/moderation/
+*` routes (`pending`, `history`, `summary`) are declared ABOVE
+`/threads/{thread_id}`, same convention as the mention directory above.
+
 ACCESS CONTROL, added plan_ac_enforcement_closeout_2026-09-09.md §4. Until
 then every route below carried `Depends(get_current_user)` and nothing
 else — `thread_service` gated view/post against the component's own legacy
@@ -61,6 +69,9 @@ from app.schemas.thread import (
     ThreadCreateRequest,
     ThreadDetail,
     ThreadListResponse,
+    ThreadModerationListResponse,
+    ThreadModerationRow,
+    ThreadModerationSummary,
     ThreadUpdateRequest,
     UnreadCountResponse,
     VoteRequest,
@@ -182,6 +193,99 @@ async def create_thread(
         payload.content,
         payload.mentions,
         access=access,
+    )
+
+
+# ---------------------------------------------------------
+# Moderation (plan_thread_moderation_2026-09-18.md §4.2) — approve/reject,
+# the pending queue, the history list, and the sidebar's polled summary.
+# The three static `/threads/moderation/*` paths are declared ABOVE
+# `/threads/{thread_id}` below, same convention as the mention directory.
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/threads/moderation/pending",
+    response_model=ThreadModerationListResponse,
+    summary="The caller's pending-thread moderation queue, oldest first",
+)
+async def list_pending_threads(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.list_pending_threads, db, cursor, access=access)
+
+
+@router.get(
+    "/threads/moderation/history",
+    response_model=ThreadModerationListResponse,
+    summary="Threads the caller moderates that have an explicit decision, most recent first",
+)
+async def list_thread_history(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.list_thread_history, db, cursor, access=access)
+
+
+@router.get(
+    "/threads/moderation/summary",
+    response_model=ThreadModerationSummary,
+    summary="Whether the caller moderates anything, and how many threads are pending",
+)
+async def get_moderation_summary(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    summary, etag = await asyncio.to_thread(thread_service.moderation_summary, db, access=access)
+    # Same 304-on-unchanged shape as `/notifications/unread-count` above.
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    return summary
+
+
+@router.post(
+    "/threads/{thread_id}/approve",
+    response_model=ThreadModerationRow,
+    summary="Approve a pending thread — an editor of its widget or any ancestor",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        409: {"description": "Thread has already been reviewed"},
+    },
+)
+async def approve_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.decide_thread, db, thread_id, user, approve=True, access=access
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/reject",
+    response_model=ThreadModerationRow,
+    summary="Reject a pending thread — an editor of its widget or any ancestor",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        409: {"description": "Thread has already been reviewed"},
+    },
+)
+async def reject_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.decide_thread, db, thread_id, user, approve=False, access=access
     )
 
 

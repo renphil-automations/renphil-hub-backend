@@ -50,7 +50,10 @@ from app.services.gridstack_service import (
 # like a data bug, so it is rejected at the source instead.
 #   App.tsx — matched ABOVE the /* catch-all: login, auth, aixscience
 #   HomePage.tsx — sidebar sections + /profile: profile, fundraising,
-#   tracking, tracking-airtable, funders, tickets, workflows, knowledge, admin
+#   tracking, tracking-airtable, funders, tickets, workflows, knowledge,
+#   admin, threads (Threads Management — plan_thread_moderation_2026-09-18.md
+#   §7.3; verified against live nav tab slugs 2026-09-19 before reserving it —
+#   neither 'threads' nor 'moderation' was taken)
 # 'dashboard' is deliberately ABSENT: it is a real nav tab (the protected
 # Dashboard row), not a reserved word.
 #
@@ -71,6 +74,7 @@ RESERVED_NAV_SLUGS = frozenset(
         "workflows",
         "knowledge",
         "admin",
+        "threads",
     }
 )
 
