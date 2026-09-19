@@ -66,7 +66,8 @@ class MentionEntry(BaseModel):
 
 
 class MentionableUser(BaseModel):
-    """One row of `GET /threads/mentionable-users` (plan §5.1)."""
+    """One row of `GET /threads/component/{link}/mentionable-users` (plan
+    §5.1; per-widget since plan_thread_moderation_2026-09-18.md M9)."""
 
     token: str
     name: str

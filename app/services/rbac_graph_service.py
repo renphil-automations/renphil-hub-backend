@@ -247,6 +247,16 @@ class RbacClosures:
             self._scope_descendant_cache[scope_id] = cached
         return set(cached)
 
+    # -- the universal scope(s), already loaded by __init__ -----------
+
+    def universal_scope_ids(self) -> set[int]:
+        """The ``is_universal`` scope ids this snapshot loaded — a copy, so
+        a caller cannot mutate the snapshot. Exposed so
+        ``hub_admin_target_ids`` can skip its own ``scopes`` query when a
+        request already holds a snapshot (moderation plan 2m: the mention
+        directory is a per-keystroke path and every round trip counts)."""
+        return set(self._universal_scope_ids)
+
     # -- ancestors: no cache, no ⊥ (see the free functions) --------
 
     def role_ancestors(self, role_id: int) -> set[int]:
@@ -424,45 +434,67 @@ def effective_pairs(
     return pairs
 
 
-def audience_count(
-    db: Session, role_id: int, scope_id: int, *, closures: RbacClosures | None = None
-) -> int:
-    """§0.2 / plan §9 — how many distinct people a grant stored on
-    ``(role_id, scope_id)`` would reach right now.
+def audience_user_ids(
+    db: Session,
+    pairs: set[tuple[int, int]],
+    *,
+    closures: RbacClosures | None = None,
+) -> set[int]:
+    """Every ``hub_users`` id whose assignments reach AT LEAST ONE of the
+    object ``pairs`` — ``audience_count``'s loop, generalised from one pair
+    to a set and returning the ids instead of ``len()``
+    (plan_thread_moderation_2026-09-18.md §5.9, M9).
 
     THE REVERSE OF ``effective_pairs``. That function starts from one user
     and expands every assignment row into the pairs they reach; this starts
-    from one fixed OBJECT pair and asks which ``role_assignments`` ROWS
-    reach it — §4.2's match direction, run in the audience direction instead
-    of the seed direction:
+    from a set of fixed OBJECT pairs and asks which ``role_assignments`` ROWS
+    reach any of them — §4.2's match direction, run in the audience
+    direction instead of the seed direction:
 
-        a held row (R_h, S_h) reaches the object pair (role_id, scope_id)
-        iff role_id in role_descendants(R_h) and scope_id in scope_descendants(R_h)
+        a held row (R_h, S_h) reaches the object pair (r, s)
+        iff r in role_descendants(R_h) and s in scope_descendants(S_h)
 
-    which is exactly ``grants_matching_pairs``'s per-row membership test,
-    asked about a pair that may not be attached to any grant yet — this is
-    the picker's live preview (§9), computed BEFORE a grant is written, not
-    read back off one that already exists.
+    which is exactly ``grants_matching_pairs``'s per-row membership test.
+    The two directions MUST agree — ``u ∈ audience_user_ids({p})`` ⟺
+    ``p ∈ effective_pairs(u)`` — and ``tests/test_thread_mentions_scoping.py``'s
+    property test pins that over random org shapes, because the mention
+    directory now depends on this loop answering the same question the
+    read-time fold answers for the caller.
+
+    WHY A SET OF PAIRS AND NOT ONE CALL PER PAIR. A node's root path
+    carries a bag of grants (§7), and the audience of the bag is the UNION
+    of each pair's audience. Taking the set here means the assignment table
+    is read ONCE per node rather than once per grant on its chain; the
+    membership test is ``any(...)`` over the pairs for each row, and the
+    closures are memoised per held id inside ``RbacClosures``, so the cost is
+    rows × pairs set-membership checks over sets of tens of ids.
 
     ⊥ NEEDS NO SPECIAL CASE HERE, and that is worth calling out because
     every other place ⊥ appears in this codebase does. ``role_descendants`` /
     ``scope_descendants`` already union the public id in unconditionally
-    (§4.4), so if ``role_id`` is the public role, `role_id in
+    (§4.4), so if a pair's role is the public role, `r in
     role_descendants(R_h)` is true for every ``R_h`` — every row matches on
-    that axis, which is exactly "everyone" for a grant written on
-    ``(⊥role, scope)``. Same for the universal scope on the OTHER side:
-    `scope_descendants(R_h's scope)` is every scope only when that held
-    scope IS universal, so a grant on ``(role, All Scopes)`` correctly
-    counts only hub-wide assignees (§4.3) with no extra logic.
+    that axis, which is exactly "everyone WITH AN ASSIGNMENT" for a grant
+    written on ``(⊥role, scope)``. Same for the universal scope on the OTHER
+    side: `scope_descendants(S_h)` is every scope only when that held scope
+    IS universal, so a grant on ``(role, All Scopes)`` correctly reaches only
+    hub-wide assignees (§4.3) with no extra logic.
 
-    Counts DISTINCT users — someone with two assignment rows that both reach
-    the pair is one person, not two.
+    "EVERYONE WITH AN ASSIGNMENT" IS NOT "EVERYONE". A ``hub_users`` row with
+    zero ``role_assignments`` rows never appears in this loop and so never
+    reaches ANY pair, ⊥ included — identical to the forward direction, where
+    such a user's ``effective_pairs`` is empty. Do not special-case ⊥ to
+    every ``hub_users`` row here (moderation plan §11.13): that would make
+    the reverse answer "yes" for someone the forward fold answers "no" for,
+    i.e. name someone as reachable who cannot open the node.
 
-    Does not validate that ``role_id`` / ``scope_id`` exist; the router does
-    that the same way ``create_assignment`` does (a plain 404 via
-    ``rbac_service.get_role`` / ``get_scope``), so a bad id never reaches
-    here at all.
+    An empty ``pairs`` returns an empty set without touching the database.
+
+    Does not validate that the ids in ``pairs`` exist — a pair that names an
+    unknown role or scope simply matches no row.
     """
+    if not pairs:
+        return set()
     graph = closures if closures is not None else RbacClosures(db)
     rows = db.query(
         RoleAssignmentV2.user_id, RoleAssignmentV2.role_id, RoleAssignmentV2.scope_id
@@ -472,11 +504,130 @@ def audience_count(
     for user_id, held_role_id, held_scope_id in rows:
         if user_id in reached:
             continue
-        if role_id in graph.role_descendants(held_role_id) and scope_id in graph.scope_descendants(
-            held_scope_id
-        ):
+        role_reach = graph.role_descendants(held_role_id)
+        scope_reach = graph.scope_descendants(held_scope_id)
+        if any(r in role_reach and s in scope_reach for r, s in pairs):
             reached.add(user_id)
-    return len(reached)
+    return reached
+
+
+def audience_count(
+    db: Session, role_id: int, scope_id: int, *, closures: RbacClosures | None = None
+) -> int:
+    """§0.2 / plan §9 — how many distinct people a grant stored on
+    ``(role_id, scope_id)`` would reach right now: the picker's live preview,
+    computed BEFORE a grant is written, not read back off one that already
+    exists.
+
+    Defined as ``len(audience_user_ids(db, {(role_id, scope_id)}))`` — one
+    loop, two readers — so the picker's preview and the mention directory's
+    reverse fold can never disagree about who a pair reaches. Everything
+    about the match direction, ⊥ and the universal scope is documented on
+    ``audience_user_ids``.
+
+    Counts DISTINCT users — someone with two assignment rows that both reach
+    the pair is one person, not two.
+
+    Does not validate that ``role_id`` / ``scope_id`` exist; the router does
+    that the same way ``create_assignment`` does (a plain 404 via
+    ``rbac_service.get_role`` / ``get_scope``), so a bad id never reaches
+    here at all.
+    """
+    return len(audience_user_ids(db, {(role_id, scope_id)}, closures=closures))
+
+
+# ---------------------------------------------------------
+# The virtual Hub Admin grant — (hub_admin, universal scope)
+# ---------------------------------------------------------
+
+# `roles.key` of the role whose holders (at the universal scope) are Hub
+# Admins. NOT the JWT display name "Hub Admin" (`tab_service.HUB_ADMIN_ROLE`),
+# which is an Airtable-sourced string in a different namespace entirely.
+# `app.dependencies` re-exports this so its own `is_hub_admin` and the
+# lookup below cannot drift; `rbac_assignment_service` deliberately keeps a
+# separate copy for the admin-floor guard (an INTEGRITY rule with literal
+# semantics — see that module's `_hub_admin_pair_ids`), and that separation
+# is documented there, not an oversight here.
+HUB_ADMIN_ROLE_KEY = "hub_admin"
+
+
+def hub_admin_target_ids(
+    db: Session, *, closures: RbacClosures | None = None
+) -> tuple[int | None, set[int]]:
+    """`(hub_admin role id, universal scope ids)` — the pair `is_hub_admin`
+    treats as a virtual grant on the hub node (plan §6.5's "an `edit` grant
+    on the `hub` node of `(Hub Admin, All Scopes)`").
+
+    MOVED HERE FROM ``app.dependencies`` (moderation plan §5.9) so a domain
+    service — ``hub_admin_user_ids`` below, the mention directory's consumer
+    — can ask the question without importing the FastAPI dependency module
+    backwards, the same rule ``access_visibility_service`` already states
+    for refusing that import direction. ``dependencies._hub_admin_target_ids``
+    is now a thin alias of this function.
+
+    Universal scope ids come back as a SET even though at most one row can
+    ever have `is_universal=true` (`uq_scopes_single_universal`) — the same
+    defensive shape `RbacClosures` and the admin-floor guard both use for
+    ⊥/universal ids, and for the same reason: unioning a set of any size is
+    the same operation, and this code should not independently assume what
+    the index already guarantees.
+
+    Pass ``closures`` to skip the ``scopes`` query — a snapshot already
+    loaded every scope's ``is_universal`` in its own constructor, and the
+    two answers cannot differ inside one transaction. One query instead of
+    two per call, on a path the mention directory hits per keystroke.
+    """
+    role_row = db.query(RoleV2.id).filter(RoleV2.key == HUB_ADMIN_ROLE_KEY).first()
+    if closures is not None:
+        universal_ids = closures.universal_scope_ids()
+    else:
+        universal_ids = {
+            row[0] for row in db.query(ScopeV2.id).filter(ScopeV2.is_universal.is_(True)).all()
+        }
+    return (role_row[0] if role_row else None), universal_ids
+
+
+def hub_admin_pairs(db: Session, *, closures: RbacClosures | None = None) -> set[tuple[int, int]]:
+    """The virtual ``(hub_admin, universal)`` pair(s) as an object-pair set —
+    what ``hub_admin_user_ids`` feeds to ``audience_user_ids``, exposed so a
+    caller that is ALREADY about to read the assignments table for other
+    pairs can fold the admin pair into the same read instead of paying a
+    second one (``access_visibility_service.users_granted_on_node``). Empty
+    when the role or the universal scope does not exist."""
+    hub_admin_role_id, universal_scope_ids = hub_admin_target_ids(db, closures=closures)
+    if hub_admin_role_id is None or not universal_scope_ids:
+        return set()
+    return {(hub_admin_role_id, scope_id) for scope_id in universal_scope_ids}
+
+
+def hub_admin_user_ids(db: Session, *, closures: RbacClosures | None = None) -> set[int]:
+    """Every ``hub_users`` id that is a Hub Admin BY ASSIGNMENT — the
+    audience of the virtual ``(hub_admin, universal)`` pair, resolved the
+    same way ``dependencies.is_hub_admin``'s branch 2 resolves it for the
+    caller (closure membership, owner-confirmed 2026-09-03), but for every
+    user at once (moderation plan M10).
+
+    THIS IS THE ONE SEAM FOR "WHO ELSE IS AN ADMIN", and it is deliberately
+    incomplete today. ``is_hub_admin`` has a branch 1 — the caller's own JWT
+    role names, sourced from Airtable at login — and nothing server-side can
+    ask that question about ANY OTHER user. So a JWT-only admin (17 of the 22
+    Airtable admins on the 2026-09-19 parity run — `scripts/survey_hub_admin_
+    parity.py`; it was 21 of 22 on 2026-09-03) is invisible here: not
+    mentionable on a widget they hold no grant on, even though they can open
+    every thread.
+    That is the AC cutover's data gap (project_ac_cutover_state) surfacing in
+    a new place, not a bug in this function, and the fix is data (backfill
+    the admin assignments) plus, when phase 3's ``BOOTSTRAP_ADMIN_EMAILS``
+    lands, a union HERE — in this one function — so every consumer picks it
+    up at once. ``tests/test_thread_mentions_scoping.py::HubAdminByAssignment``
+    pins the gap so the day the backstop lands the test goes red and someone
+    has to look.
+
+    Empty when the ``hub_admin`` role or the universal scope does not exist,
+    matching ``is_hub_admin``'s own early return — the shape of a
+    fresh/misconfigured database, not an error.
+    """
+    return audience_user_ids(db, hub_admin_pairs(db, closures=closures), closures=closures)
 
 
 # ---------------------------------------------------------

@@ -45,7 +45,7 @@ forbid it.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -366,6 +366,37 @@ def list_grants_for_node(db: Session, node_kind: str, node_id: int) -> list[dict
         .all()
     )
     return _serialize_many(db, rows)
+
+
+def grants_on_nodes(db: Session, refs: Iterable[tuple[str, int]]) -> list[ResourceGrantV2]:
+    """Every stored grant sitting on ANY of ``refs`` — raw rows, ONE query.
+
+    The read the reverse fold needs (plan_thread_moderation_2026-09-18.md
+    §5.9, ``access_visibility_service.users_granted_on_node``): a node's root
+    path is a handful of ``(kind, id)`` refs, and §7's "a node carries a bag
+    of grants" makes the path's bag the union of each node's. Issued as one
+    ``OR`` over the four node columns, each ``IN`` its kind's ids, rather
+    than ``list_grants_for_node`` once per ancestor — that function
+    serialises for the grants UI and would be N round trips for an N-deep
+    chain, on a path the mention menu hits per debounced keystroke.
+
+    Returns model rows, not the serialised dicts the UI functions return: the
+    only consumer wants ``user_id`` / ``role_id`` / ``scope_id`` to split the
+    bag into its two principal forms, and serialising would cost a
+    ``hub_users`` email lookup nobody asked for. Both grant levels are
+    returned — a caller asking "who is GRANTED here" wants view AND edit,
+    since edit implies view (§6.1); a caller wanting only editors filters
+    ``level`` itself.
+
+    Empty ``refs`` returns ``[]`` without touching the database.
+    """
+    ids_by_kind: dict[str, set[int]] = {}
+    for kind, node_id in refs:
+        ids_by_kind.setdefault(kind, set()).add(node_id)
+    if not ids_by_kind:
+        return []
+    clauses = [_node_column(kind).in_(sorted(ids)) for kind, ids in ids_by_kind.items()]
+    return db.query(ResourceGrantV2).filter(or_(*clauses)).all()
 
 
 def get_grant(db: Session, grant_id: int) -> dict | None:

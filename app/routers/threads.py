@@ -1,9 +1,11 @@
 """Thread widget router (plan_thread_widget_2026-08-17.md) — Phase 1
 (threads/comments/votes) + Phase 3 (mentions) + Phase 4 (notifications).
 
-`/threads/mentionable-users` (the directory endpoint) lives here, and so
-now does `/notifications*` (list, unread-count, mark-read, read-all — plan
-§4.1). Thread/comment create and every vote endpoint carry a
+`/threads/component/{link}/mentionable-users` (the directory endpoint —
+per thread widget since plan_thread_moderation_2026-09-18.md phase 2m,
+M9) lives here, and so does `/notifications*` (list, unread-count,
+mark-read, read-all — plan §4.1). Thread/comment create and every vote
+endpoint carry a
 `@rate_limited(...)` decorator (`helpers/rate_limit.py`, plan §4.7 control
 2) — it runs BEFORE the handler body, so a rate-limited caller never
 reaches the DB at all.
@@ -24,9 +26,11 @@ sits on. Every route that reaches `thread_service._check_view_access` or
 `_require_hub_admin` now also takes
 `access: ViewerAccess = Depends(get_viewer_access)` and passes it through —
 same split as `tabs_v2.py` and `super_blocknote_v2.py`: routers thread,
-services enforce. `/threads/mentionable-users` is the one exception — the
-mention directory has never been gated by widget access (it lists people,
-not thread content) and stays open to any authenticated caller.
+services enforce. The mention directory is the one route gated
+DIFFERENTLY, not left ungated: it is polled per keystroke, so it takes
+`get_current_hub_user` + `granted_single_node` (the `airtable.py` fast-path
+shape) instead of the whole-tree `ViewerAccess` — see
+`_list_mentionable_users_sync` below and moderation plan §5.9.3.
 """
 
 from __future__ import annotations
@@ -34,11 +38,17 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, get_viewer_access
+from app.dependencies import (
+    CurrentHubUser,
+    get_current_hub_user,
+    get_current_user,
+    get_viewer_access,
+    is_hub_admin,
+)
 from app.helpers.rate_limit import rate_limited
 from app.models.auth import UserInfo
 from app.schemas.thread import (
@@ -57,7 +67,8 @@ from app.schemas.thread import (
     VoteResponse,
 )
 from app.services import thread_service
-from app.services.access_visibility_service import ViewerAccess
+from app.services.access_visibility_service import ViewerAccess, granted_single_node
+from app.services.rbac_graph_service import RbacClosures
 
 logger = logging.getLogger(__name__)
 
@@ -65,25 +76,63 @@ router = APIRouter(prefix="/data", tags=["Threads"])
 
 
 # ---------------------------------------------------------
-# Mentions (plan §5.1) — a static path segment ("mentionable-users"),
-# declared ahead of the dynamic `/threads/{thread_id}` GET below. FastAPI/
-# Starlette would still fall through to this route even if it came second
-# (an `int` path-converter failure on "mentionable-users" just skips that
-# route rather than erroring), but ordering it first avoids relying on that.
+# Mentions (plan §5.1, scoped per plan_thread_moderation_2026-09-18.md M9 /
+# §4.1 / §5.9). The directory is PER THREAD WIDGET now — the old un-scoped
+# `/threads/mentionable-users` is REMOVED, not kept beside: a directory with
+# no component is exactly the thing D7's amendment forbids. That static
+# path now falls through to `GET /threads/{thread_id}` and fails its `int`
+# validation (422), which the tests pin.
 # ---------------------------------------------------------
 
 
+def _list_mentionable_users_sync(
+    db: Session, link: str, q: str | None, current: CurrentHubUser
+) -> list[MentionableUser]:
+    """Resolve + gate + list, in ONE `asyncio.to_thread` call — the
+    `airtable.py` shape (`_resolve_airtable_bundle_and_access`), for the
+    same reason: this route is hit once per debounced keystroke in the
+    composer, and gating it with `Depends(get_viewer_access)` would put the
+    ~2.4 s whole-tree fold on every one of those requests for a non-admin
+    (moderation plan §5.9.3, landmine 16). `granted_single_node` is the
+    O(depth) single-node fast path built for exactly this shape of call.
+
+    ONE `RbacClosures`, shared by the caller's gate (`is_hub_admin` branch
+    2 + `granted_single_node`) and the audience loop inside the service
+    (§8.2's rule — build once per request). An admin caller short-circuits
+    `is_hub_admin` on branch 1 with zero queries, but the reverse fold
+    below needs the closures regardless, so a real snapshot (not
+    airtable.py's lazy one) is the right shape here.
+
+    404 for an unknown link or a non-thread component (the module's "wrong
+    type reads as not found" rule); 403 for a caller not granted on the
+    widget — the same wording `thread_service._check_view_access` uses, so
+    the composer's error handling sees nothing new.
+    """
+    component = thread_service.resolve_thread_widget_component(db, link)
+    closures = RbacClosures(db)
+    if not is_hub_admin(db, current, closures=closures) and not granted_single_node(
+        db, current.hub_user_id, ("component", component.id), is_admin=False, closures=closures
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You do not have access to this discussion")
+    return thread_service.list_mentionable_users(db, component, q, closures=closures)
+
+
 @router.get(
-    "/threads/mentionable-users",
+    "/threads/component/{link}/mentionable-users",
     response_model=list[MentionableUser],
-    summary="Search the mention directory (plan §5.1) — any authenticated caller",
+    summary="Search the mention directory for one thread widget (plan §5.1, scoped per M9)",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "No thread widget with this link"},
+    },
 )
 async def list_mentionable_users(
+    link: str = Path(..., description="The thread widget component's stable `link`."),
     q: str | None = Query(default=None, description="Search prefix/substring, matched accent-insensitively."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
 ):
-    return await asyncio.to_thread(thread_service.list_mentionable_users, db, q)
+    return await asyncio.to_thread(_list_mentionable_users_sync, db, link, q, current)
 
 
 # ---------------------------------------------------------

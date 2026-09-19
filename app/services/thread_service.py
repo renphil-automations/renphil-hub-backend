@@ -4,7 +4,12 @@
 Threads + comments + votes: access-checked, `link`-addressed reads/writes,
 keyset pagination, and recompute-from-source counters. Mentions (plan §5)
 are validated and stored — see `derive_mention_token`,
-`list_mentionable_users` and `_validate_and_resolve_mentions` below.
+`list_mentionable_users` and `_validate_and_resolve_mentions` below — and,
+as of plan_thread_moderation_2026-09-18.md phase 2m (M9), SCOPED to the
+people who can open the thread: the directory is per thread widget and
+both it and the validator intersect the roster with
+`_granted_emails_on_component`, the read-time fold's `granted_view`
+inverted for that one node (`access_visibility_service.users_granted_on_node`).
 Notifications (plan §3.4, §4.5, §5.7, §7) are now live end to end: the
 "Notifications" section below fans rows out on thread/comment create and
 edit (`_notify_mentions`, plan §5.7's exact trigger rules), generates the
@@ -67,7 +72,9 @@ from app.schemas.thread import (
     ThreadSummary,
     VoteResponse,
 )
-from app.services.access_visibility_service import ViewerAccess
+from app.services.access_visibility_service import ViewerAccess, users_granted_on_node
+from app.services.rbac_graph_service import RbacClosures
+from app.services.resource_grant_service import _hub_user_email_map
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +143,18 @@ def _get_thread_widget_component(db: Session, link: str) -> ComponentV2 | None:
     component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
     if component is None or component.type != THREAD_WIDGET_TYPE:
         return None
+    return component
+
+
+def resolve_thread_widget_component(db: Session, link: str) -> ComponentV2:
+    """`_get_thread_widget_component` with the 404 every `link` route in
+    this module raises on a miss — public so the mention-directory route,
+    which gates the caller in the router rather than in here (moderation
+    plan §5.9.3), resolves the widget through the same rule instead of
+    reaching into a private helper."""
+    component = _get_thread_widget_component(db, link)
+    if component is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
     return component
 
 
@@ -291,13 +310,17 @@ MENTIONABLE_USERS_LIMIT = 8
 
 
 def _eligible_mentionable_users_query(db: Session):
-    """The one eligibility rule (plan D7 as amended by D13, §5.1):
-    `EndDate IS NULL OR EndDate > current_date`, `status` deliberately
-    ignored, plus the structural exclusion of rows with no `work_email`
-    (mentions are email-keyed). Shared by the directory endpoint AND
-    mention validation below so the two definitions can never drift apart —
-    the plan's own test list (§10) explicitly checks the directory and
-    validation agree on who's eligible."""
+    """The ROSTER half of the eligibility rule (plan D7 as amended by D13,
+    §5.1): `EndDate IS NULL OR EndDate > current_date`, `status`
+    deliberately ignored, plus the structural exclusion of rows with no
+    `work_email` (mentions are email-keyed). Shared by the directory endpoint
+    AND mention validation below so the two definitions can never drift
+    apart — the plan's own test list (§10) explicitly checks the directory
+    and validation agree on who's eligible.
+
+    The ACCESS half — M9, plan_thread_moderation_2026-09-18.md §5.9 — is
+    `_granted_emails_on_component` below, applied by the same two callers
+    for the same reason."""
     today = func.current_date()
     return db.query(UserV2).filter(
         or_(UserV2.end_date.is_(None), UserV2.end_date > today),
@@ -306,12 +329,81 @@ def _eligible_mentionable_users_query(db: Session):
     )
 
 
-def list_mentionable_users(db: Session, q: str | None) -> list[MentionableUser]:
-    """`GET /threads/mentionable-users` (plan §5.1). Eligibility filter runs
-    in SQL; the accent-insensitive substring/prefix match runs in Python
-    over that (small, ≤175-row) result set, per §5.1's own reasoning for why
-    that split is the simplest correct thing at this table size."""
-    rows = _eligible_mentionable_users_query(db).all()
+def _granted_emails_on_component(
+    db: Session, component: ComponentV2, *, closures: RbacClosures | None = None
+) -> set[str]:
+    """M9 (plan_thread_moderation_2026-09-18.md §0.1(5), §5.9): the
+    normalised emails of every `hub_users` row that is GRANTED on this thread
+    widget — a direct user grant or a matching `(role, scope)` grant on the
+    component or any ancestor, view or edit level, or a Hub Admin by
+    assignment. This is the definition of "can open the thread", and it
+    amends the original plan's D7 ("you may mention anyone in that list
+    even without access to the tab") by owner decision — not a proposal.
+
+    ONE HELPER, TWO CALLERS (landmine 15): the directory
+    (`list_mentionable_users`) and the validator
+    (`_validate_and_resolve_mentions`) both intersect the roster with THIS
+    set. A validator looser than the menu would let a hand-typed `@Token`
+    mention someone the menu wouldn't offer; a stricter one would make the
+    menu offer people whose mention then silently vanishes on submit.
+
+    The set comes from `access_visibility_service.users_granted_on_node` —
+    the read-time fold's `granted_view` inverted for one node — so it agrees
+    exactly with the `is_granted` gate every thread read already applies to
+    the caller; its property test is what makes that claim safe. A mirror
+    never reaches here: a mirrored ThreadWidget posts to its TARGET's link
+    (M8), and every resolver in this module refuses a non-thread type, so
+    the same rule is asserted rather than "handled".
+
+    Ids become emails through `resource_grant_service._hub_user_email_map`
+    (one query). A roster row with no `hub_users` row — someone who has
+    never signed in — is simply absent from the map: not mentionable, which
+    is correct, since with no `hub_users` row they can hold no assignment
+    and no grant and therefore cannot open the thread either.
+
+    KNOWN GAP, NOT A BUG HERE (M10, plan §11.12): a Hub Admin recognised
+    only by the Airtable role in their own JWT is invisible to this set on
+    any widget they hold no grant on — nothing server-side can read another
+    user's JWT. `rbac_graph_service.hub_admin_user_ids` is the single seam
+    where the phase-3 `BOOTSTRAP_ADMIN_EMAILS` backstop gets unioned in.
+    """
+    if component.type != THREAD_WIDGET_TYPE:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
+    user_ids = users_granted_on_node(db, ("component", component.id), closures=closures)
+    if not user_ids:
+        return set()
+    return {_norm_email(email) for email in _hub_user_email_map(db, user_ids).values()}
+
+
+def list_mentionable_users(
+    db: Session,
+    component: ComponentV2,
+    q: str | None,
+    *,
+    closures: RbacClosures | None = None,
+) -> list[MentionableUser]:
+    """`GET /threads/component/{link}/mentionable-users` (plan §5.1, scoped
+    per M9 — moderation plan §4.1/§5.9.1). The roster eligibility filter
+    runs in SQL; the access filter (`_granted_emails_on_component`) and the
+    accent-insensitive substring/prefix match run in Python over that
+    (small, ≤175-row) result set, per §5.1's own reasoning for why that
+    split is the simplest correct thing at this table size. The cap of 8
+    applies AFTER both filters, so an ungranted roster row can never eat a
+    slot.
+
+    The caller's OWN access to `component` is the router's job
+    (`granted_single_node`, not `get_viewer_access` — moderation plan
+    §5.9.3 / landmine 16); this function lists people, it does not gate the
+    caller. `closures` is the request's shared `RbacClosures` (§8.2).
+    """
+    granted_emails = _granted_emails_on_component(db, component, closures=closures)
+    if not granted_emails:
+        return []
+    rows = [
+        row
+        for row in _eligible_mentionable_users_query(db).all()
+        if _norm_email(row.work_email) in granted_emails
+    ]
     q_folded = _fold_for_search(q) if q else ""
 
     results: list[MentionableUser] = []
@@ -341,18 +433,38 @@ def list_mentionable_users(db: Session, q: str | None) -> list[MentionableUser]:
 
 
 def _validate_and_resolve_mentions(
-    db: Session, claimed: list[MentionInput], content: str
+    db: Session,
+    claimed: list[MentionInput],
+    content: str,
+    *,
+    component: ComponentV2,
+    closures: RbacClosures | None = None,
 ) -> list[dict[str, str]]:
     """plan §5.3 — the server does not trust the client's `mentions` array.
     For each claimed email: (1) it must belong to an eligible `users` row
     (the SAME eligibility rule the directory applies — `_eligible_
-    mentionable_users_query`), and (2) the token the SERVER derives from
-    that row's name must actually occur in `content` as `@<token>` at a
-    word boundary. Anything failing either check is silently dropped
-    (never a 4xx for the whole request — plan §5.3: "this closes the
-    obvious hole"). `name`/`token` on the returned entries always come from
-    the matched `users` row, never from `claimed` — a client cannot make a
-    chip render someone else's name.
+    mentionable_users_query`), (1b) that person must be GRANTED on
+    `component` (M9 — the SAME access rule the directory applies,
+    `_granted_emails_on_component`; moderation plan §5.9.2), and (2) the
+    token the SERVER derives from that row's name must actually occur in
+    `content` as `@<token>` at a word boundary. Anything failing any check
+    is silently dropped (never a 4xx for the whole request — plan §5.3:
+    "this closes the obvious hole"); an ungranted roster user is dropped
+    exactly as a non-roster email always has been. `name`/`token` on the
+    returned entries always come from the matched `users` row, never from
+    `claimed` — a client cannot make a chip render someone else's name.
+
+    Consequence worth knowing (moderation plan §11.14): an author editing an
+    OLD post resends its stored mentions, and anyone who has since lost
+    access to the widget is dropped from the stored array on that edit —
+    the literal `@Token` stays in the text, unstyled, and they are not
+    re-notified. Correct under M9; surprising on first sight.
+
+    `component` is the thread widget the post lives on — every caller has
+    it in hand already. `closures` is optional: the four write paths hold a
+    `ViewerAccess`, not an `RbacClosures`, so the reverse fold builds its
+    own snapshot here (one extra closure load per WRITE, not per keystroke;
+    the directory route is the hot path and shares its own).
 
     De-duplicates by normalized email, preserving first-occurrence order
     (plan §5.2: rendering resolves a token collision by "array order,
@@ -382,13 +494,22 @@ def _validate_and_resolve_mentions(
         .filter(func.lower(UserV2.work_email).in_(ordered_emails))
         .all()
     )
-    eligible_by_email = {_norm_email(row.work_email): row for row in eligible_rows}
+    if not eligible_rows:
+        return []  # nothing survived check 1 — no reason to run the fold
+    # Check 1b (M9): the same access set the directory offers, computed
+    # once per request rather than once per claimed email.
+    granted_emails = _granted_emails_on_component(db, component, closures=closures)
+    eligible_by_email = {
+        _norm_email(row.work_email): row
+        for row in eligible_rows
+        if _norm_email(row.work_email) in granted_emails
+    }
 
     resolved: list[dict[str, str]] = []
     for email in ordered_emails:
         row = eligible_by_email.get(email)
         if row is None:
-            continue  # check 1 failed — not an eligible users row
+            continue  # check 1 or 1b failed — not an eligible, granted users row
         token = derive_mention_token(row.name)
         if not _token_occurs_in_content(content, token):
             continue  # check 2 failed — token isn't actually in the text
@@ -920,7 +1041,7 @@ def create_thread_for_link(
     # Resolve mentions BEFORE constructing the row — a 400 from the cap
     # (plan §4.7) must not leave a half-built thread behind (nothing is
     # `db.add`ed yet at this point).
-    resolved = _validate_and_resolve_mentions(db, mentions or [], content)
+    resolved = _validate_and_resolve_mentions(db, mentions or [], content, component=component)
 
     now = _utc_now()
     thread = ThreadV2(
@@ -1002,7 +1123,9 @@ def update_thread_by_id(
     if mentions is not None:
         effective_content = content if content is not None else thread.content
         previous_mentions = thread.mentions
-        resolved = _validate_and_resolve_mentions(db, mentions, effective_content)
+        resolved = _validate_and_resolve_mentions(
+            db, mentions, effective_content, component=component
+        )
         thread.mentions = resolved
         # plan §5.7 — "on edit: notify only newly added mentions". Read
         # BEFORE the reassignment above overwrites it.
@@ -1116,7 +1239,7 @@ def create_comment_for_thread(
 
     # Resolve BEFORE the lock/recompute below — a 400 from the cap must not
     # leave a half-built comment or a bumped comment_count behind.
-    resolved = _validate_and_resolve_mentions(db, mentions or [], content)
+    resolved = _validate_and_resolve_mentions(db, mentions or [], content, component=component)
 
     # Lock the parent thread before the recompute below, same reasoning as
     # the vote recipe (plan §4.4): the recompute's snapshot must be taken
@@ -1187,7 +1310,9 @@ def update_comment_by_id(
     if mentions is not None:
         effective_content = content if content is not None else comment.content
         previous_mentions = comment.mentions
-        resolved = _validate_and_resolve_mentions(db, mentions, effective_content)
+        resolved = _validate_and_resolve_mentions(
+            db, mentions, effective_content, component=component
+        )
         comment.mentions = resolved
         # plan §5.7 — same "only newly added mentions" rule as thread edits.
         _notify_newly_added_mentions(
