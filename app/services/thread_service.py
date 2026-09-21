@@ -102,9 +102,16 @@ THREADS_PAGE_SIZE = 20
 COMMENTS_PAGE_SIZE = 50
 NOTIFICATIONS_PAGE_SIZE = 20
 
-# D6 — the only two notification triggers.
+# Notification triggers. D6 (plan_thread_widget_2026-08-17.md) fixed the
+# first two as "the only two"; plan_thread_moderation_2026-09-18.md §3.2 +
+# M1 (owner-approved 2026-09-19, phase 2d) added the two decision types —
+# the AUTHOR of a moderated thread is told when an editor approves or
+# rejects it. Same `notifications` row shape for all four; `type` is a
+# `String(32)` with no CHECK, so the new values needed no migration.
 NOTIFICATION_TYPE_MENTION = "mention"
 NOTIFICATION_TYPE_THREAD_COMMENT = "thread_comment"
+NOTIFICATION_TYPE_THREAD_APPROVED = "thread_approved"
+NOTIFICATION_TYPE_THREAD_REJECTED = "thread_rejected"
 
 # Thread status values (D5, lifecycle in plan_thread_moderation_2026-09-18.md
 # §2). An editor's own post, or a decided pending one, is 'approved'; a
@@ -723,6 +730,53 @@ def _notify_new_thread_comment(
             thread_id=thread_id,
             comment_id=comment_id,
             excerpt=generate_notification_excerpt(content),
+            read_at=None,
+            created_at=_utc_now(),
+        )
+    )
+
+
+def _notify_thread_decision(
+    db: Session,
+    thread: ThreadV2,
+    *,
+    reviewer: UserInfo,
+    approved: bool,
+    component_id: int,
+) -> None:
+    """plan_thread_moderation_2026-09-18.md §3.2 / M1 (owner-approved
+    2026-09-19) — tell the AUTHOR that an editor decided their pending
+    thread. One recipient (the author), one row, `type` chosen by
+    `approved`; `actor_*` is the REVIEWER (they made the decision), the
+    `excerpt` is the thread's own, `comment_id` is NULL because the event
+    is about the thread body, not a comment.
+
+    Self-exclusion copies `_notify_new_thread_comment`'s shape — "skip when
+    the RECIPIENT is the actor" — NOT `_notify_mentions`' (which skips the
+    actor inside a loop over recipients). Here the recipient is the author
+    and the actor is the reviewer, so the comparison is written out
+    explicitly against those two. The only way this fires is an editor
+    deciding a thread they themselves posted back when they were a viewer
+    (the create route auto-approves an editor's post, so an editor's own
+    thread can only be `pending` if their grant arrived after they posted);
+    the "no self-pings" rule both existing writers follow applies.
+
+    Does not commit — the caller (`decide_thread`) owns the transaction,
+    same convention as every other write function in this module."""
+    recipient = _norm_email(thread.author_email)
+    reviewer_email = _norm_email(reviewer.email)
+    if recipient == reviewer_email:
+        return
+    db.add(
+        NotificationV2(
+            recipient_email=recipient,
+            type=NOTIFICATION_TYPE_THREAD_APPROVED if approved else NOTIFICATION_TYPE_THREAD_REJECTED,
+            actor_email=reviewer_email,
+            actor_name=reviewer.name,
+            component_id=component_id,
+            thread_id=thread.id,
+            comment_id=None,
+            excerpt=generate_notification_excerpt(thread.content),
             read_at=None,
             created_at=_utc_now(),
         )
@@ -1500,9 +1554,14 @@ def decide_thread(
             comment_id=None,
             content=thread.content,
         )
-    # M1 (notify the AUTHOR of the decision) is phase 2d, pending owner
-    # sign-off (plan §0.2) — `_notify_thread_decision(db, thread,
-    # reviewer=user, approved=approve)` belongs here once approved.
+    # M1 (plan §3.2, owner-approved 2026-09-19): tell the author, for BOTH
+    # outcomes — the helper picks the type. Sits AFTER the pending check
+    # above so a 409 (already reviewed) writes no second row, after the
+    # mention fan-out so the two kinds of row land in the order the events
+    # happened, and before the commit so it shares the transaction.
+    _notify_thread_decision(
+        db, thread, reviewer=user, approved=approve, component_id=component.id
+    )
 
     db.commit()
     db.refresh(thread)
