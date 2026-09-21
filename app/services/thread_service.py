@@ -57,7 +57,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, func, or_, tuple_
+from sqlalchemy import and_, case, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
@@ -85,6 +85,7 @@ from app.schemas.thread import (
     ThreadModerationRow,
     ThreadModerationSummary,
     ThreadSummary,
+    ThreadWidgetCounts,
     VoteResponse,
 )
 from app.services.access_visibility_service import (
@@ -1682,6 +1683,48 @@ def moderation_summary(
             pending_count=count,
         ),
         etag,
+    )
+
+
+def thread_widget_counts(
+    db: Session, link: str, *, access: ViewerAccess | None = None
+) -> ThreadWidgetCounts:
+    """`GET /threads/component/{link}/counts` (followups plan §4.2) — the
+    widget-removal confirmation's true-totals check. Gated `resolve` (404)
+    → `_check_view_access` (403) → editor-only (403), same order as every
+    other gated read in this module. Deliberately NOT `_require_component_
+    editor`: that helper's message ("...can approve or reject threads") is
+    about a different action, and would be a wrong description of a 403 on
+    a read-only counts request — the check (`_is_component_editor`) is
+    reused, the wording is not.
+
+    ONE query, across ALL statuses — unlike every list endpoint here, which
+    scopes to `approved OR (own AND pending/rejected)` (2a's deliberate
+    widget/moderation authority split). The gate is what makes that safe:
+    only a component editor (or an ancestor tab/nav-tab editor, via
+    `_is_component_editor`'s `verdict(...).edit` fold) can see the true
+    total, including other authors' pending/rejected rows."""
+    component = resolve_thread_widget_component(db, link)
+    _check_view_access(component, access)
+    if not _is_component_editor(component, access):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only an editor of this discussion can view its thread counts",
+        )
+
+    thread_count, comment_total, pending_total = (
+        db.query(
+            func.count(ThreadV2.id),
+            func.coalesce(func.sum(ThreadV2.comment_count), 0),
+            func.coalesce(func.sum(case((ThreadV2.status == THREAD_STATUS_PENDING, 1), else_=0)), 0),
+        )
+        .filter(ThreadV2.component_id == component.id)
+        .one()
+    )
+    return ThreadWidgetCounts(
+        thread_count=int(thread_count or 0),
+        comment_count=int(comment_total or 0),
+        pending_count=int(pending_total or 0),
     )
 
 

@@ -266,6 +266,20 @@ class ThreadModerationSummary(BaseModel):
     pending_count: int
 
 
+class ThreadWidgetCounts(BaseModel):
+    """`GET /threads/component/{link}/counts` (followups plan §4.2) — an
+    editor-only, all-status aggregate (unlike every list endpoint in this
+    module, which scopes to `approved OR (own AND pending/rejected)`), for
+    the widget-removal typed-confirmation dialog: it needs the TRUE totals,
+    including other authors' pending/rejected threads that `ON DELETE
+    CASCADE` would destroy along with the widget but that the widget's own
+    list never shows the caller."""
+
+    thread_count: int
+    comment_count: int
+    pending_count: int
+
+
 class CommentSummary(BaseModel):
     id: int
     thread_id: int

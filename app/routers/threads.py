@@ -73,6 +73,7 @@ from app.schemas.thread import (
     ThreadModerationRow,
     ThreadModerationSummary,
     ThreadUpdateRequest,
+    ThreadWidgetCounts,
     UnreadCountResponse,
     VoteRequest,
     VoteResponse,
@@ -144,6 +145,23 @@ async def list_mentionable_users(
     current: CurrentHubUser = Depends(get_current_hub_user),
 ):
     return await asyncio.to_thread(_list_mentionable_users_sync, db, link, q, current)
+
+
+@router.get(
+    "/threads/component/{link}/counts",
+    response_model=ThreadWidgetCounts,
+    summary="All-status thread/comment totals for one widget (followups plan §4.2)",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        404: {"description": "No thread widget with this link"},
+    },
+)
+async def get_thread_widget_counts(
+    link: str = Path(..., description="The thread widget component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.thread_widget_counts, db, link, access=access)
 
 
 # ---------------------------------------------------------
