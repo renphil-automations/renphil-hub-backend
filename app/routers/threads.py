@@ -243,9 +243,19 @@ async def get_moderation_summary(
 ):
     summary, etag = await asyncio.to_thread(thread_service.moderation_summary, db, access=access)
     # Same 304-on-unchanged shape as `/notifications/unread-count` above.
+    # `Cache-Control: no-store` on both the 200 and the 304 (followups plan
+    # §1) so the browser's own HTTP cache never stores this body — that
+    # cache is keyed by URL, not by bearer token, so without `no-store` a
+    # user switch in one browser could revalidate against the *previous*
+    # user's cached response. With nothing stored, the only 304s left are
+    # the ones JS asks for with its own `If-None-Match`.
     if request.headers.get("if-none-match") == etag:
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
     response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
     return summary
 
 
@@ -517,9 +527,15 @@ async def get_unread_notification_count(
     # overwhelmingly common unchanged case." A 304 carries no body by HTTP
     # definition, so the bell's poll saves the transfer even though it
     # still costs the same DB round trip.
+    # `Cache-Control: no-store` on both responses — same reasoning as
+    # `get_moderation_summary` above (followups plan §1).
     if request.headers.get("if-none-match") == etag:
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
     response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
     return UnreadCountResponse(count=count)
 
 

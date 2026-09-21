@@ -1645,19 +1645,24 @@ def moderation_summary(
 ) -> tuple[ThreadModerationSummary, str]:
     """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
     top of the `ViewerAccess` the dependency already built; polled like the
-    notification bell, same ETag shape (`"{count}-{max_id}"`,
-    `get_unread_notification_count`). A Hub Admin with zero thread widgets
-    still gets `can_moderate=True` — the section is part of their admin
-    surface regardless of whether any widget currently has a thread on it."""
+    notification bell. The ETag covers every field the body carries —
+    `"{1 if can_moderate else 0}-{len(component_ids)}-{count}-{max_id}"` —
+    so a viewer and an editor with zero pending threads never collide on
+    the same tag (followups plan §1: a shared `"0-0"` used to let the
+    browser's own HTTP cache revalidate one user's request against
+    another's cached body). A Hub Admin with zero thread widgets still gets
+    `can_moderate=True` — the section is part of their admin surface
+    regardless of whether any widget currently has a thread on it."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
+    can_moderate_flag = 1 if can_moderate else 0
 
     if not component_ids:
         return (
             ThreadModerationSummary(
                 can_moderate=can_moderate, moderated_component_count=0, pending_count=0
             ),
-            '"0-0"',
+            f'"{can_moderate_flag}-0-0-0"',
         )
 
     count, max_id = (
@@ -1666,7 +1671,10 @@ def moderation_summary(
         .one()
     )
     count = int(count or 0)
-    etag = f'"{count}-{int(max_id) if max_id is not None else 0}"'
+    etag = (
+        f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
+        f'{int(max_id) if max_id is not None else 0}"'
+    )
     return (
         ThreadModerationSummary(
             can_moderate=can_moderate,
