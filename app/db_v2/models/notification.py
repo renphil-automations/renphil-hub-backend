@@ -19,8 +19,11 @@ from app.db_v2.database import BaseV2
 
 
 class NotificationV2(BaseV2):
-    """One fan-out event: someone was @-mentioned, or someone commented on
-    their thread (D6 — the only two triggers, no others planned)."""
+    """One fan-out event. Four triggers: someone was @-mentioned, someone
+    commented on their thread (D6's original two), or an editor approved /
+    rejected their pending thread (plan_thread_moderation_2026-09-18.md
+    §3.2, M1 — owner-approved 2026-09-19, phase 2d). Every trigger writes
+    the same row shape; only `type` and who `actor_*` names differ."""
 
     __tablename__ = "notifications"
 
@@ -33,7 +36,10 @@ class NotificationV2(BaseV2):
     # cost is accepted deliberately (plan §3.6, §12.10).
     recipient_email = Column(String(320), nullable=False, index=True)
 
-    # 'mention' | 'thread_comment' (D6).
+    # 'mention' | 'thread_comment' (D6) | 'thread_approved' |
+    # 'thread_rejected' (plan_thread_moderation §3.2, M1). No CHECK — the
+    # service's NOTIFICATION_TYPE_* constants are the source of truth, and
+    # the two moderation values (15 chars) fit without a column change.
     type = Column(String(32), nullable=False)
 
     actor_email = Column(String(320), nullable=True)

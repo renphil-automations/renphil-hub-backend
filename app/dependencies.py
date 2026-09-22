@@ -19,8 +19,6 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db_v2.database import get_db_v2
 from app.db_v2.models.hub_user import HubUserV2
-from app.db_v2.models.role import RoleV2
-from app.db_v2.models.scope import ScopeV2
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
@@ -30,7 +28,12 @@ from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
 from app.services import edit_lock_service
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
-from app.services.rbac_graph_service import RbacClosures, effective_pairs
+from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_KEY is re-exported, see below
+    HUB_ADMIN_ROLE_KEY,
+    RbacClosures,
+    effective_pairs,
+    hub_admin_target_ids,
+)
 from app.services.tab_service import HUB_ADMIN_ROLE
 
 _bearer_scheme = HTTPBearer()
@@ -212,34 +215,25 @@ async def get_current_hub_user(
 # would move the gate without moving the cutover's sequencing, and that
 # sequencing is exactly what this section now implements). All three call
 # sites now call `is_hub_admin(db, current)` below.
-HUB_ADMIN_ROLE_KEY = "hub_admin"  # `roles.key`. NOT `HUB_ADMIN_ROLE` above, which
-# is "Hub Admin" — a JWT DISPLAY NAME sourced from Airtable, a different
-# namespace entirely (same split `rbac_assignment_service.HUB_ADMIN_ROLE_KEY`
-# documents for the admin-floor guard; that module's copy of this same
-# role/universal-scope lookup is intentionally not imported from here — it
-# is five lines serving a differently-scoped rule (an INTEGRITY check with
-# its own, deliberately LITERAL semantics, see below), and importing across
-# would couple this identity gate to that guard's private plumbing for no
-# real gain).
-
-
-def _hub_admin_target_ids(db: Session) -> tuple[int | None, set[int]]:
-    """`(hub_admin role id, universal scope ids)` — the pair `is_hub_admin`
-    treats as a virtual grant on the hub node (plan §6.5's "an `edit` grant
-    on the `hub` node of `(Hub Admin, All Scopes)`").
-
-    Universal scope ids come back as a SET even though at most one row can
-    ever have `is_universal=true` (`uq_scopes_single_universal`) — the same
-    defensive shape `RbacClosures` and the admin-floor guard both use for
-    ⊥/universal ids, and for the same reason: unioning a set of any size is
-    the same operation, and this code should not independently assume what
-    the index already guarantees.
-    """
-    role_row = db.query(RoleV2.id).filter(RoleV2.key == HUB_ADMIN_ROLE_KEY).first()
-    universal_ids = {
-        row[0] for row in db.query(ScopeV2.id).filter(ScopeV2.is_universal.is_(True)).all()
-    }
-    return (role_row[0] if role_row else None), universal_ids
+# `HUB_ADMIN_ROLE_KEY` is `roles.key` ("hub_admin"). NOT `HUB_ADMIN_ROLE`
+# above, which is "Hub Admin" — a JWT DISPLAY NAME sourced from Airtable, a
+# different namespace entirely (same split
+# `rbac_assignment_service.HUB_ADMIN_ROLE_KEY` documents for the admin-floor
+# guard; that module's copy of this same role/universal-scope lookup is
+# intentionally not imported from here — it is five lines serving a
+# differently-scoped rule (an INTEGRITY check with its own, deliberately
+# LITERAL semantics, see below), and importing across would couple this
+# identity gate to that guard's private plumbing for no real gain).
+#
+# Both the constant and the lookup itself now LIVE IN `rbac_graph_service`
+# (plan_thread_moderation_2026-09-18.md §5.9): the mention directory's
+# reverse fold (`rbac_graph_service.hub_admin_user_ids`) needs the same
+# `(hub_admin, universal)` pair from a domain service, and a domain service
+# must not import this module backwards. `HUB_ADMIN_ROLE_KEY` is imported
+# above and re-exported unchanged; the lookup keeps its old private name
+# here as an alias, so `is_hub_admin` below and this module's readers are
+# unchanged.
+_hub_admin_target_ids = hub_admin_target_ids
 
 
 def is_hub_admin(
@@ -321,7 +315,7 @@ def is_hub_admin(
     if HUB_ADMIN_ROLE in (current.info.roles or []):
         return True
 
-    hub_admin_role_id, universal_scope_ids = _hub_admin_target_ids(db)
+    hub_admin_role_id, universal_scope_ids = _hub_admin_target_ids(db, closures=closures)
     if hub_admin_role_id is None or not universal_scope_ids:
         # No `hub_admin` role row, or no universal scope: the pair this
         # function looks for cannot exist, so branch 2 cannot admit anyone.

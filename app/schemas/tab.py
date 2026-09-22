@@ -341,6 +341,31 @@ class TabWorkspaceAPIResponse(BaseModel):
     data: TabWorkspaceResponse
 
 
+class ComponentLockResponse(BaseModel):
+    """Body of the three per-component lock doors
+    (`PUT /v2/tabs/components/by-link/{link}/lock`, `/lock/renew`,
+    `/unlock` — plan_component_locking_and_sbn_2026-09-17.md §5.1).
+    Deliberately small: no content, no workspace — the per-widget modal
+    already holds the widget's data and only needs to learn its session.
+
+    `lock_token`/`lock_expires_at` are populated ONLY on lock and renew,
+    never on unlock — the same sensitive, narrow-population rule
+    `TabWorkspaceResponse.lock_token`'s comment sets. `locked`/`locked_by`
+    are the row's own raw state, same meaning as everywhere else."""
+
+    link: StrictStr | None = None
+    type: StrictStr | None = None
+    title: StrictStr | None = None
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    lock_token: StrictStr | None = None
+    lock_expires_at: datetime | None = None
+
+
+class ComponentLockAPIResponse(BaseModel):
+    data: ComponentLockResponse
+
+
 class BreadcrumbAPIResponse(BaseModel):
     data: list[BreadcrumbItemResponse] = Field(default_factory=list)
 
@@ -595,9 +620,20 @@ class LockTabRequest(StrictRequestModel):
     replacing the old unlock(force) -> lock two-step, which had a real race
     (someone else could grab the node between the two calls). Does NOT
     reopen Fix 1 above: `force` is not an identity field, `locked_by` stays
-    JWT-derived. Body is now `{}` or `{"force": true}`."""
+    JWT-derived. Body is now `{}` or `{"force": true}`.
+
+    `link` — NEW, session_handoff_2026-09-16 follow-up. A caller whose edit
+    grant begins at exactly one component (never `edit(n)` on `document_id`
+    itself — edit only folds DOWN the tree, never up) names that component
+    here so the service can check `edit(component)` as an alternate path to
+    the SAME whole-canvas lock a full editor acquires. Optional and additive:
+    every existing full-canvas/sub-grid caller (who already holds `edit(n)`
+    on `document_id`) omits it and is unaffected. See
+    `lock_tab_by_document_id_v2`'s own docstring for the verification this
+    performs (the named component must actually belong to `document_id`)."""
 
     force: StrictBool = False
+    link: StrictStr | None = None
 
 
 class UnlockTabRequest(StrictRequestModel):
@@ -617,9 +653,36 @@ class UnlockTabRequest(StrictRequestModel):
 
     `force` is UNCHANGED (owner decision, 2026-09-03): still present, still
     unrestricted — see `unlock_tab_by_document_id_v2`'s docstring in
-    gridstack_service.py for why."""
+    gridstack_service.py for why.
+
+    `link` — NEW, same reasoning and same optional/additive shape as
+    `LockTabRequest.link` above. A component-only editor's own release must
+    pass the same alternate `edit(component)` check its acquire did, or it
+    would lock successfully and then be unable to ever unlock its own
+    session."""
 
     force: StrictBool = False
+    link: StrictStr | None = None
+
+
+class RenewLockRequest(StrictRequestModel):
+    """Body of `PUT /v2/tabs/{id}/lock/renew` and
+    `PUT /v2/nav-tabs/{id}/lock/renew` — the save preflight's VALIDATE
+    door (2026-09-16 TTL fix; see `edit_lock_service.renew`). The session
+    being renewed is identified by the `X-Edit-Tokens` header, exactly as
+    on every other token-checked write — never by a body field. No
+    `force`: a renewal has nothing to take over; it either finds the
+    caller's own live session on this node or refuses with one of the
+    §5.5 codes.
+
+    `link` — same optional alternate `edit(component)` path as
+    `LockTabRequest.link`, and NOT optional in practice for
+    `ComponentContentEditModal`: a component-only editor who could only
+    acquire by naming their component must name it again to renew, or
+    this 403s before the session is even looked at. Ignored by the
+    nav-tab route (a nav tab has no component-scoped acquire path)."""
+
+    link: StrictStr | None = None
 
 
 # ---------------------------------------------------------

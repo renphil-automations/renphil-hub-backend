@@ -50,7 +50,10 @@ from app.services.gridstack_service import (
 # like a data bug, so it is rejected at the source instead.
 #   App.tsx — matched ABOVE the /* catch-all: login, auth, aixscience
 #   HomePage.tsx — sidebar sections + /profile: profile, fundraising,
-#   tracking, tracking-airtable, funders, tickets, workflows, knowledge, admin
+#   tracking, tracking-airtable, funders, tickets, workflows, knowledge,
+#   admin, threads (Threads Management — plan_thread_moderation_2026-09-18.md
+#   §7.3; verified against live nav tab slugs 2026-09-19 before reserving it —
+#   neither 'threads' nor 'moderation' was taken)
 # 'dashboard' is deliberately ABSENT: it is a real nav tab (the protected
 # Dashboard row), not a reserved word.
 #
@@ -71,6 +74,7 @@ RESERVED_NAV_SLUGS = frozenset(
         "workflows",
         "knowledge",
         "admin",
+        "threads",
     }
 )
 
@@ -278,6 +282,31 @@ def lock_nav_tab_by_document_id_v2(
     # write, and every nav-tab rename/delete 409'd EDIT_SESSION_MISSING,
     # lock conflict or not. `grant.expires_at` is already computed by
     # `acquire` above — this was always available, just never assigned.
+    formatted["lock_token"] = grant.token
+    formatted["lock_expires_at"] = grant.expires_at
+    return formatted
+
+
+def renew_nav_tab_lock_by_document_id_v2(
+    db: Session,
+    document_id: str,
+    *,
+    session: edit_lock_service.EditSession,
+    access: ViewerAccess | None = None,
+) -> dict[str, Any] | None:
+    """THIN WRAPPER over `edit_lock_service.renew`, mirroring
+    `gridstack_service.renew_tab_lock_by_document_id_v2` exactly — see
+    that function and `renew`'s own docstring for why a save preflight
+    must VALIDATE rather than re-`acquire`. Same `edit(n)` gate as
+    lock/unlock, same `lock_token`/`lock_expires_at` echo on success."""
+    nav_tab = get_nav_tab_by_document_id(db, document_id)
+    if nav_tab is None:
+        return None
+
+    require_edit(access, ("nav_tab", nav_tab.id))
+
+    grant = edit_lock_service.renew(db, session, ("nav_tab", nav_tab.id))
+    formatted = _format_nav_tab(nav_tab)
     formatted["lock_token"] = grant.token
     formatted["lock_expires_at"] = grant.expires_at
     return formatted

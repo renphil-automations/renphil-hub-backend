@@ -1,9 +1,11 @@
 """Thread widget router (plan_thread_widget_2026-08-17.md) — Phase 1
 (threads/comments/votes) + Phase 3 (mentions) + Phase 4 (notifications).
 
-`/threads/mentionable-users` (the directory endpoint) lives here, and so
-now does `/notifications*` (list, unread-count, mark-read, read-all — plan
-§4.1). Thread/comment create and every vote endpoint carry a
+`/threads/component/{link}/mentionable-users` (the directory endpoint —
+per thread widget since plan_thread_moderation_2026-09-18.md phase 2m,
+M9) lives here, and so does `/notifications*` (list, unread-count,
+mark-read, read-all — plan §4.1). Thread/comment create and every vote
+endpoint carry a
 `@rate_limited(...)` decorator (`helpers/rate_limit.py`, plan §4.7 control
 2) — it runs BEFORE the handler body, so a rate-limited caller never
 reaches the DB at all.
@@ -16,6 +18,14 @@ one exception — it also needs the raw `Request`/`Response` for the
 `If-None-Match` / `ETag` pair (plan §4.5), which have no place in
 thread_service's plain-value return.
 
+MODERATION (plan_thread_moderation_2026-09-18.md phase 2a). `POST
+/threads/{id}/approve` and `.../reject` gate on `edit(n)` for the thread's
+own component — an editor of the widget OR of any ancestor (a root-tab
+editor approves every thread widget under that root), never Hub-Admin-only
+by analogy with delete (landmine 8). The three static `/threads/moderation/
+*` routes (`pending`, `history`, `summary`) are declared ABOVE
+`/threads/{thread_id}`, same convention as the mention directory above.
+
 ACCESS CONTROL, added plan_ac_enforcement_closeout_2026-09-09.md §4. Until
 then every route below carried `Depends(get_current_user)` and nothing
 else — `thread_service` gated view/post against the component's own legacy
@@ -24,9 +34,11 @@ sits on. Every route that reaches `thread_service._check_view_access` or
 `_require_hub_admin` now also takes
 `access: ViewerAccess = Depends(get_viewer_access)` and passes it through —
 same split as `tabs_v2.py` and `super_blocknote_v2.py`: routers thread,
-services enforce. `/threads/mentionable-users` is the one exception — the
-mention directory has never been gated by widget access (it lists people,
-not thread content) and stays open to any authenticated caller.
+services enforce. The mention directory is the one route gated
+DIFFERENTLY, not left ungated: it is polled per keystroke, so it takes
+`get_current_hub_user` + `granted_single_node` (the `airtable.py` fast-path
+shape) instead of the whole-tree `ViewerAccess` — see
+`_list_mentionable_users_sync` below and moderation plan §5.9.3.
 """
 
 from __future__ import annotations
@@ -34,11 +46,17 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import get_current_user, get_viewer_access
+from app.dependencies import (
+    CurrentHubUser,
+    get_current_hub_user,
+    get_current_user,
+    get_viewer_access,
+    is_hub_admin,
+)
 from app.helpers.rate_limit import rate_limited
 from app.models.auth import UserInfo
 from app.schemas.thread import (
@@ -51,13 +69,18 @@ from app.schemas.thread import (
     ThreadCreateRequest,
     ThreadDetail,
     ThreadListResponse,
+    ThreadModerationListResponse,
+    ThreadModerationRow,
+    ThreadModerationSummary,
     ThreadUpdateRequest,
+    ThreadWidgetCounts,
     UnreadCountResponse,
     VoteRequest,
     VoteResponse,
 )
 from app.services import thread_service
-from app.services.access_visibility_service import ViewerAccess
+from app.services.access_visibility_service import ViewerAccess, granted_single_node
+from app.services.rbac_graph_service import RbacClosures
 
 logger = logging.getLogger(__name__)
 
@@ -65,25 +88,80 @@ router = APIRouter(prefix="/data", tags=["Threads"])
 
 
 # ---------------------------------------------------------
-# Mentions (plan §5.1) — a static path segment ("mentionable-users"),
-# declared ahead of the dynamic `/threads/{thread_id}` GET below. FastAPI/
-# Starlette would still fall through to this route even if it came second
-# (an `int` path-converter failure on "mentionable-users" just skips that
-# route rather than erroring), but ordering it first avoids relying on that.
+# Mentions (plan §5.1, scoped per plan_thread_moderation_2026-09-18.md M9 /
+# §4.1 / §5.9). The directory is PER THREAD WIDGET now — the old un-scoped
+# `/threads/mentionable-users` is REMOVED, not kept beside: a directory with
+# no component is exactly the thing D7's amendment forbids. That static
+# path now falls through to `GET /threads/{thread_id}` and fails its `int`
+# validation (422), which the tests pin.
 # ---------------------------------------------------------
 
 
+def _list_mentionable_users_sync(
+    db: Session, link: str, q: str | None, current: CurrentHubUser
+) -> list[MentionableUser]:
+    """Resolve + gate + list, in ONE `asyncio.to_thread` call — the
+    `airtable.py` shape (`_resolve_airtable_bundle_and_access`), for the
+    same reason: this route is hit once per debounced keystroke in the
+    composer, and gating it with `Depends(get_viewer_access)` would put the
+    ~2.4 s whole-tree fold on every one of those requests for a non-admin
+    (moderation plan §5.9.3, landmine 16). `granted_single_node` is the
+    O(depth) single-node fast path built for exactly this shape of call.
+
+    ONE `RbacClosures`, shared by the caller's gate (`is_hub_admin` branch
+    2 + `granted_single_node`) and the audience loop inside the service
+    (§8.2's rule — build once per request). An admin caller short-circuits
+    `is_hub_admin` on branch 1 with zero queries, but the reverse fold
+    below needs the closures regardless, so a real snapshot (not
+    airtable.py's lazy one) is the right shape here.
+
+    404 for an unknown link or a non-thread component (the module's "wrong
+    type reads as not found" rule); 403 for a caller not granted on the
+    widget — the same wording `thread_service._check_view_access` uses, so
+    the composer's error handling sees nothing new.
+    """
+    component = thread_service.resolve_thread_widget_component(db, link)
+    closures = RbacClosures(db)
+    if not is_hub_admin(db, current, closures=closures) and not granted_single_node(
+        db, current.hub_user_id, ("component", component.id), is_admin=False, closures=closures
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You do not have access to this discussion")
+    return thread_service.list_mentionable_users(db, component, q, closures=closures)
+
+
 @router.get(
-    "/threads/mentionable-users",
+    "/threads/component/{link}/mentionable-users",
     response_model=list[MentionableUser],
-    summary="Search the mention directory (plan §5.1) — any authenticated caller",
+    summary="Search the mention directory for one thread widget (plan §5.1, scoped per M9)",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "No thread widget with this link"},
+    },
 )
 async def list_mentionable_users(
+    link: str = Path(..., description="The thread widget component's stable `link`."),
     q: str | None = Query(default=None, description="Search prefix/substring, matched accent-insensitively."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
 ):
-    return await asyncio.to_thread(thread_service.list_mentionable_users, db, q)
+    return await asyncio.to_thread(_list_mentionable_users_sync, db, link, q, current)
+
+
+@router.get(
+    "/threads/component/{link}/counts",
+    response_model=ThreadWidgetCounts,
+    summary="All-status thread/comment totals for one widget (followups plan §4.2)",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        404: {"description": "No thread widget with this link"},
+    },
+)
+async def get_thread_widget_counts(
+    link: str = Path(..., description="The thread widget component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.thread_widget_counts, db, link, access=access)
 
 
 # ---------------------------------------------------------
@@ -133,6 +211,109 @@ async def create_thread(
         payload.content,
         payload.mentions,
         access=access,
+    )
+
+
+# ---------------------------------------------------------
+# Moderation (plan_thread_moderation_2026-09-18.md §4.2) — approve/reject,
+# the pending queue, the history list, and the sidebar's polled summary.
+# The three static `/threads/moderation/*` paths are declared ABOVE
+# `/threads/{thread_id}` below, same convention as the mention directory.
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/threads/moderation/pending",
+    response_model=ThreadModerationListResponse,
+    summary="The caller's pending-thread moderation queue, oldest first",
+)
+async def list_pending_threads(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.list_pending_threads, db, cursor, access=access)
+
+
+@router.get(
+    "/threads/moderation/history",
+    response_model=ThreadModerationListResponse,
+    summary="Threads the caller moderates that have an explicit decision, most recent first",
+)
+async def list_thread_history(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.list_thread_history, db, cursor, access=access)
+
+
+@router.get(
+    "/threads/moderation/summary",
+    response_model=ThreadModerationSummary,
+    summary="Whether the caller moderates anything, and how many threads are pending",
+)
+async def get_moderation_summary(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    summary, etag = await asyncio.to_thread(thread_service.moderation_summary, db, access=access)
+    # Same 304-on-unchanged shape as `/notifications/unread-count` above.
+    # `Cache-Control: no-store` on both the 200 and the 304 (followups plan
+    # §1) so the browser's own HTTP cache never stores this body — that
+    # cache is keyed by URL, not by bearer token, so without `no-store` a
+    # user switch in one browser could revalidate against the *previous*
+    # user's cached response. With nothing stored, the only 304s left are
+    # the ones JS asks for with its own `If-None-Match`.
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
+    return summary
+
+
+@router.post(
+    "/threads/{thread_id}/approve",
+    response_model=ThreadModerationRow,
+    summary="Approve a pending thread — an editor of its widget or any ancestor",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        409: {"description": "Thread has already been reviewed"},
+    },
+)
+async def approve_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.decide_thread, db, thread_id, user, approve=True, access=access
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/reject",
+    response_model=ThreadModerationRow,
+    summary="Reject a pending thread — an editor of its widget or any ancestor",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        409: {"description": "Thread has already been reviewed"},
+    },
+)
+async def reject_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.decide_thread, db, thread_id, user, approve=False, access=access
     )
 
 
@@ -364,9 +545,15 @@ async def get_unread_notification_count(
     # overwhelmingly common unchanged case." A 304 carries no body by HTTP
     # definition, so the bell's poll saves the transfer even though it
     # still costs the same DB round trip.
+    # `Cache-Control: no-store` on both responses — same reasoning as
+    # `get_moderation_summary` above (followups plan §1).
     if request.headers.get("if-none-match") == etag:
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
     response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
     return UnreadCountResponse(count=count)
 
 

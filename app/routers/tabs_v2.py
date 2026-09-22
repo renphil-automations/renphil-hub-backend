@@ -15,11 +15,13 @@ from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
+    ComponentLockAPIResponse,
     CreateTabRequest,
     CreateTabVariantRequest,
     LockTabRequest,
     MoveTabRequest,
     MoveTabToNavTabRequest,
+    RenewLockRequest,
     ReorderTabsRequest,
     ReorderTabVariantsRequest,
     TabSummaryListAPIResponse,
@@ -47,11 +49,15 @@ from app.services.gridstack_service import (
     get_tab_content_v2,
     get_tab_variants_v2,
     get_tab_workspace_v2,
+    lock_component_by_link,
     lock_tab_by_document_id_v2,
     move_tab_by_document_id_v2,
+    renew_component_lock_by_link,
+    renew_tab_lock_by_document_id_v2,
     reorder_tab_variants_v2,
     reorder_tabs_by_document_id_v2,
     resolve_component_location_v2,
+    unlock_component_by_link,
     unlock_tab_by_document_id_v2,
     update_component_content,
     update_tab_by_document_id_v2,
@@ -221,14 +227,16 @@ to leave it unchanged. `type`, `access_control` and the layout fields are not
 accepted — see the request schema for why each one is absent.
 
 Authorization is `edit(n)` on the component itself
-(project_ac_enforcement_gap.md item 2) — still **no lock check**, matching
-the canvas save on that one axis; see the service function's docstring for
-why the two stay paired there.
+(project_ac_enforcement_gap.md item 2), then a live edit session covering
+it (`X-Edit-Tokens`) — the component's own lock from the sibling `/lock`
+door, or any ancestor's (its SBN root, its canvas, its tab, its nav tab).
+Refused with a 409 `EDIT_SESSION_*` code otherwise.
 """,
     responses={
         **COMMON_BAD_REQUEST_RESPONSE,
         **COMMON_NOT_FOUND_RESPONSE,
         **COMMON_FORBIDDEN_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
     },
 )
 def update_component_content_endpoint(
@@ -236,7 +244,7 @@ def update_component_content_endpoint(
     request: UpdateComponentContentRequest,
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
-    user: UserInfo = Depends(get_current_user),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
 ):
     # `model_fields_set` distinguishes "absent" from "explicitly null" — the
     # difference between preserving a title and clearing it. Same mechanism
@@ -251,11 +259,7 @@ def update_component_content_endpoint(
         updates["data"] = request.data
 
     try:
-        # plan_lock_propagation_2026-09-08.md §5.3 decision 6 — `holder`
-        # only, no session token: see update_component_content's own
-        # docstring.
-        holder = (user.email or "").strip().lower()
-        updated = update_component_content(db, link, access=access, holder=holder, **updates)
+        updated = update_component_content(db, link, access=access, session=session, **updates)
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
     except ValueError as e:
@@ -265,6 +269,121 @@ def update_component_content_endpoint(
         raise HTTPException(status_code=404, detail="Component not found")
 
     return {"data": updated}
+
+
+@router.put(
+    "/components/by-link/{link}/lock",
+    response_model=ComponentLockAPIResponse,
+    summary="Lock one component (v2)",
+    description="""
+The per-widget edit modal's own lock (plan_component_locking_and_sbn_2026-09-17.md
+§5.1). Acquires an edit session on THIS component's own row — not its canvas
+— so two editors on different widgets of one canvas no longer exclude each
+other. Refused (409 `NODE_LOCKED`, naming the holder) while the widget's
+canvas, tab or nav tab is held fresh by someone else, or — for a Super Block
+Note root — while any of its sub-tabs is. `force` takes the subtree over.
+
+Requires `edit(n)` on the component. A sub-grid's representation row and a
+`restricted` sentinel are refused (400) — neither is a lock node.
+`lock_token`/`lock_expires_at` are returned here and on `/lock/renew` only.
+""",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+    },
+)
+def lock_component(
+    link: str,
+    request: LockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    try:
+        # Identity-sourced holder, same as every other lock door (plan §6.6
+        # Fix 1). `request.link` is ignored here — the component IS the
+        # path parameter; the field exists on the shared schema only for the
+        # tab door's component-only fallback (retired in phase E).
+        locked_by = (user.email or "").strip().lower()
+        locked = lock_component_by_link(
+            db, link, locked_by=locked_by, force=request.force, access=access
+        )
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+    if locked is None:
+        raise HTTPException(status_code=404, detail="Component not found")
+    return {"data": locked}
+
+
+@router.put(
+    "/components/by-link/{link}/lock/renew",
+    response_model=ComponentLockAPIResponse,
+    summary="Renew an existing edit session on a component (v2)",
+    description="""
+The per-widget modal's save-preflight VALIDATE door — same contract as
+`PUT /{document_id}/lock/renew`: succeeds (bumping expiry) only if THIS
+component's own row is a fresh session held by the caller under one of the
+presented `X-Edit-Tokens`; never acquires, reclaims or forces.
+""",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+    },
+)
+def renew_component_lock(
+    link: str,
+    request: RenewLockRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
+):
+    try:
+        renewed = renew_component_lock_by_link(db, link, session=session, access=access)
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+    if renewed is None:
+        raise HTTPException(status_code=404, detail="Component not found")
+    return {"data": renewed}
+
+
+@router.put(
+    "/components/by-link/{link}/unlock",
+    response_model=ComponentLockAPIResponse,
+    summary="Unlock one component (v2)",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+    },
+)
+def unlock_component(
+    link: str,
+    request: UnlockTabRequest,
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    try:
+        unlocked_by = (user.email or "").strip().lower()
+        unlocked = unlock_component_by_link(
+            db, link, unlocked_by=unlocked_by, force=request.force, access=access
+        )
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+    if unlocked is None:
+        raise HTTPException(status_code=404, detail="Component not found")
+    return {"data": unlocked}
 
 
 @router.get(
@@ -572,13 +691,69 @@ def lock_tab(
         # Same normalization dependencies.get_current_hub_user applies.
         locked_by = (user.email or "").strip().lower()
         # plan_ac_enforcement_closeout_2026-09-09.md §3: gates lock (and,
-        # via `force`, force-unlock's takeover) on `edit(n)`.
+        # via `force`, force-unlock's takeover) on `edit(n)`. `request.link`
+        # (session_handoff_2026-09-16 follow-up) lets a component-only grant
+        # holder satisfy this via `edit(component)` instead — see
+        # `_require_edit_for_lock_action`'s own docstring.
         locked_workspace = lock_tab_by_document_id_v2(
-            db=db, document_id=document_id, locked_by=locked_by, force=request.force, access=access
+            db=db,
+            document_id=document_id,
+            locked_by=locked_by,
+            force=request.force,
+            access=access,
+            component_link=request.link,
         )
         if locked_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")
         return {"data": locked_workspace}
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+@router.put(
+    "/{document_id}/lock/renew",
+    response_model=TabWorkspaceAPIResponse,
+    summary="Renew an existing edit session on a tab (v2)",
+    description="""
+The save preflight's VALIDATE door (2026-09-16 TTL fix). Presents the
+caller's held tokens (`X-Edit-Tokens`) and succeeds — bumping the session's
+expiry — only if THIS tab/sub-grid's own lock row is a fresh session held by
+the caller under one of those tokens. Never acquires, reclaims, or forces:
+a stale, rotated, or absent session is refused with `EDIT_SESSION_EXPIRED`
+/ `EDIT_SESSION_TAKEN_OVER` / `EDIT_SESSION_MISSING` (409), leaving the row
+untouched. Unlike `PUT /{id}/lock`, which by design lets a holder silently
+reclaim their own stale lock, this cannot be used to keep an expired
+session alive — see `edit_lock_service.renew`.
+""",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
+)
+def renew_tab_lock(
+    document_id: str,
+    request: RenewLockRequest,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
+):
+    validate_document_id(document_id)
+
+    try:
+        renewed_workspace = renew_tab_lock_by_document_id_v2(
+            db=db,
+            document_id=document_id,
+            session=session,
+            access=access,
+            component_link=request.link,
+        )
+        if renewed_workspace is None:
+            raise HTTPException(status_code=404, detail="Tab not found")
+        return {"data": renewed_workspace}
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
     except ValueError as e:
@@ -608,13 +783,16 @@ def unlock_tab(
         unlocked_by = (user.email or "").strip().lower()
         # plan_ac_enforcement_closeout_2026-09-09.md §3: force-unlock
         # collapses to the same `edit(n)` check as lock — see
-        # lock_tab_by_document_id_v2's docstring for why.
+        # lock_tab_by_document_id_v2's docstring for why. `request.link`
+        # mirrors lock_tab's own new field — required for a component-only
+        # grant holder to release the lock their own acquire just took.
         unlocked_workspace = unlock_tab_by_document_id_v2(
             db=db,
             document_id=document_id,
             unlocked_by=unlocked_by,
             force=request.force,
             access=access,
+            component_link=request.link,
         )
         if unlocked_workspace is None:
             raise HTTPException(status_code=404, detail="Tab not found")

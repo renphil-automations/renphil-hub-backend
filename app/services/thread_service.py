@@ -4,7 +4,12 @@
 Threads + comments + votes: access-checked, `link`-addressed reads/writes,
 keyset pagination, and recompute-from-source counters. Mentions (plan §5)
 are validated and stored — see `derive_mention_token`,
-`list_mentionable_users` and `_validate_and_resolve_mentions` below.
+`list_mentionable_users` and `_validate_and_resolve_mentions` below — and,
+as of plan_thread_moderation_2026-09-18.md phase 2m (M9), SCOPED to the
+people who can open the thread: the directory is per thread widget and
+both it and the validator intersect the roster with
+`_granted_emails_on_component`, the read-time fold's `granted_view`
+inverted for that one node (`access_visibility_service.users_granted_on_node`).
 Notifications (plan §3.4, §4.5, §5.7, §7) are now live end to end: the
 "Notifications" section below fans rows out on thread/comment create and
 edit (`_notify_mentions`, plan §5.7's exact trigger rules), generates the
@@ -16,6 +21,17 @@ every time, never cached, plan §4.5 — `mark_notification_read`,
 control 2) lives one layer up, in `helpers/rate_limit.py`'s
 `@rate_limited(...)` decorator on the router handlers — it gates a request
 before it ever reaches this module, so there is nothing to enforce here.
+
+Moderation (plan_thread_moderation_2026-09-18.md phase 2a): a viewer's new
+thread lands `pending` until an editor of the widget or any of its
+ancestors (`_is_component_editor`, `edit(n)` — plan §0.1(2)) approves or
+rejects it (`decide_thread`); an editor's own post auto-approves. Comments
+and votes gate on `_require_approved` — nothing hangs off a non-approved
+thread, for anyone, author included. The "Moderation" section below also
+serves the "Threads Management" page's pending queue, history list and
+polled summary (`list_pending_threads`, `list_thread_history`,
+`moderation_summary`), each scoped to `_moderated_component_ids` — the set
+of thread widgets the caller can moderate, a Hub Admin's being every one.
 
 Every public function here is a thin, synchronous, DB-session-bound unit —
 each is called from the router via a single `asyncio.to_thread(...)` per
@@ -41,11 +57,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, tuple_
+from sqlalchemy import and_, case, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.notification import NotificationV2
+from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.thread import (
     THREAD_WIDGET_TYPE,
     ThreadCommentV2,
@@ -64,10 +81,21 @@ from app.schemas.thread import (
     NotificationListResponse,
     ThreadDetail,
     ThreadListResponse,
+    ThreadModerationListResponse,
+    ThreadModerationRow,
+    ThreadModerationSummary,
     ThreadSummary,
+    ThreadWidgetCounts,
     VoteResponse,
 )
-from app.services.access_visibility_service import ViewerAccess
+from app.services.access_visibility_service import (
+    NodeRef,
+    ViewerAccess,
+    users_granted_on_node,
+    walk_ancestors,
+)
+from app.services.rbac_graph_service import RbacClosures
+from app.services.resource_grant_service import _hub_user_email_map, resolve_node_labels
 
 logger = logging.getLogger(__name__)
 
@@ -75,14 +103,24 @@ THREADS_PAGE_SIZE = 20
 COMMENTS_PAGE_SIZE = 50
 NOTIFICATIONS_PAGE_SIZE = 20
 
-# D6 — the only two notification triggers.
+# Notification triggers. D6 (plan_thread_widget_2026-08-17.md) fixed the
+# first two as "the only two"; plan_thread_moderation_2026-09-18.md §3.2 +
+# M1 (owner-approved 2026-09-19, phase 2d) added the two decision types —
+# the AUTHOR of a moderated thread is told when an editor approves or
+# rejects it. Same `notifications` row shape for all four; `type` is a
+# `String(32)` with no CHECK, so the new values needed no migration.
 NOTIFICATION_TYPE_MENTION = "mention"
 NOTIFICATION_TYPE_THREAD_COMMENT = "thread_comment"
+NOTIFICATION_TYPE_THREAD_APPROVED = "thread_approved"
+NOTIFICATION_TYPE_THREAD_REJECTED = "thread_rejected"
 
-# Thread status values (D5). Only 'approved' is ever written in Phase 1 —
-# the moderation workflow that would write anything else is deferred,
-# pending the access-control rework.
+# Thread status values (D5, lifecycle in plan_thread_moderation_2026-09-18.md
+# §2). An editor's own post, or a decided pending one, is 'approved'; a
+# viewer's post lands 'pending' until an editor decides; 'rejected' is
+# terminal (no resubmit-on-edit — a PATCH on a rejected thread is a 409).
 THREAD_STATUS_APPROVED = "approved"
+THREAD_STATUS_PENDING = "pending"
+THREAD_STATUS_REJECTED = "rejected"
 
 
 # ---------------------------------------------------------
@@ -136,6 +174,18 @@ def _get_thread_widget_component(db: Session, link: str) -> ComponentV2 | None:
     component = db.query(ComponentV2).filter(ComponentV2.link == link).first()
     if component is None or component.type != THREAD_WIDGET_TYPE:
         return None
+    return component
+
+
+def resolve_thread_widget_component(db: Session, link: str) -> ComponentV2:
+    """`_get_thread_widget_component` with the 404 every `link` route in
+    this module raises on a miss — public so the mention-directory route,
+    which gates the caller in the router rather than in here (moderation
+    plan §5.9.3), resolves the widget through the same rule instead of
+    reaching into a private helper."""
+    component = _get_thread_widget_component(db, link)
+    if component is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
     return component
 
 
@@ -244,6 +294,62 @@ def _require_author(item_author_email: str, user: UserInfo) -> None:
 
 
 # ---------------------------------------------------------
+# Moderation gates (plan_thread_moderation_2026-09-18.md §5.1, §5.2) — a
+# viewer's new thread requires approval from an EDITOR of the widget or any
+# of its ancestors (0.1(2)); an editor's own post auto-approves (M8's mirror
+# case falls out of this definition for free — see `_moderated_component_ids`
+# below).
+# ---------------------------------------------------------
+
+
+def _is_component_editor(component: ComponentV2, access: ViewerAccess | None) -> bool:
+    """`access=None` deliberately does NOT keep this module's usual "no check
+    requested" convention (`_check_view_access`'s) — an internal caller with
+    no `ViewerAccess` is NOT an editor for auto-approval purposes, so its
+    post lands `pending` rather than silently auto-approving (plan §5.1's
+    own note, pinned by the `access=None` → `pending` test)."""
+    return access is not None and access.verdict(("component", component.id)).edit
+
+
+def _require_component_editor(component: ComponentV2, access: ViewerAccess | None) -> None:
+    if not _is_component_editor(component, access):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only an editor of this discussion can approve or reject threads",
+        )
+
+
+def _require_approved(thread: ThreadV2) -> None:
+    """Comments and votes can only ever hang off an APPROVED thread (plan
+    §2's visibility table) — same wording `get_thread_by_id` already uses
+    for a non-approved thread, so a pending/rejected thread's comments read
+    identically to a thread that doesn't exist, for everyone including its
+    own author (there is nothing to discuss until it's public)."""
+    if thread.status != THREAD_STATUS_APPROVED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+
+
+def _moderated_component_ids(db: Session, access: ViewerAccess | None) -> list[int]:
+    """Every thread-widget component the caller can moderate — plan §5.2's
+    "moderated set". A Hub Admin moderates every thread widget in the hub; a
+    non-admin moderates exactly the ones `edit(n)` is true for. `access=None`
+    → `[]`, matching every other internal-caller default in this module.
+
+    A mirror-typed component (`type == 'mirror'`) is never in the query this
+    filters (`WHERE type = 'thread'`), so M8 — "who approves a thread posted
+    through a mirror? The target's editors" — falls OUT of this definition
+    rather than needing a special case: a mirror is never itself a
+    moderated node, and a thread posted "through" one is, by construction,
+    stored against the TARGET component's own id (plan M8)."""
+    rows = db.query(ComponentV2.id).filter(ComponentV2.type == THREAD_WIDGET_TYPE).all()
+    if access is None:
+        return []
+    if access.full_access:
+        return [row[0] for row in rows]
+    return [row[0] for row in rows if access.verdict(("component", row[0])).edit]
+
+
+# ---------------------------------------------------------
 # Mentions (plan §5, D13) — directory + server-side validation. The token
 # derivation (§5.5) is the ONE function both this module's validation and
 # the directory endpoint call — a second, independent implementation
@@ -291,13 +397,17 @@ MENTIONABLE_USERS_LIMIT = 8
 
 
 def _eligible_mentionable_users_query(db: Session):
-    """The one eligibility rule (plan D7 as amended by D13, §5.1):
-    `EndDate IS NULL OR EndDate > current_date`, `status` deliberately
-    ignored, plus the structural exclusion of rows with no `work_email`
-    (mentions are email-keyed). Shared by the directory endpoint AND
-    mention validation below so the two definitions can never drift apart —
-    the plan's own test list (§10) explicitly checks the directory and
-    validation agree on who's eligible."""
+    """The ROSTER half of the eligibility rule (plan D7 as amended by D13,
+    §5.1): `EndDate IS NULL OR EndDate > current_date`, `status`
+    deliberately ignored, plus the structural exclusion of rows with no
+    `work_email` (mentions are email-keyed). Shared by the directory endpoint
+    AND mention validation below so the two definitions can never drift
+    apart — the plan's own test list (§10) explicitly checks the directory
+    and validation agree on who's eligible.
+
+    The ACCESS half — M9, plan_thread_moderation_2026-09-18.md §5.9 — is
+    `_granted_emails_on_component` below, applied by the same two callers
+    for the same reason."""
     today = func.current_date()
     return db.query(UserV2).filter(
         or_(UserV2.end_date.is_(None), UserV2.end_date > today),
@@ -306,12 +416,81 @@ def _eligible_mentionable_users_query(db: Session):
     )
 
 
-def list_mentionable_users(db: Session, q: str | None) -> list[MentionableUser]:
-    """`GET /threads/mentionable-users` (plan §5.1). Eligibility filter runs
-    in SQL; the accent-insensitive substring/prefix match runs in Python
-    over that (small, ≤175-row) result set, per §5.1's own reasoning for why
-    that split is the simplest correct thing at this table size."""
-    rows = _eligible_mentionable_users_query(db).all()
+def _granted_emails_on_component(
+    db: Session, component: ComponentV2, *, closures: RbacClosures | None = None
+) -> set[str]:
+    """M9 (plan_thread_moderation_2026-09-18.md §0.1(5), §5.9): the
+    normalised emails of every `hub_users` row that is GRANTED on this thread
+    widget — a direct user grant or a matching `(role, scope)` grant on the
+    component or any ancestor, view or edit level, or a Hub Admin by
+    assignment. This is the definition of "can open the thread", and it
+    amends the original plan's D7 ("you may mention anyone in that list
+    even without access to the tab") by owner decision — not a proposal.
+
+    ONE HELPER, TWO CALLERS (landmine 15): the directory
+    (`list_mentionable_users`) and the validator
+    (`_validate_and_resolve_mentions`) both intersect the roster with THIS
+    set. A validator looser than the menu would let a hand-typed `@Token`
+    mention someone the menu wouldn't offer; a stricter one would make the
+    menu offer people whose mention then silently vanishes on submit.
+
+    The set comes from `access_visibility_service.users_granted_on_node` —
+    the read-time fold's `granted_view` inverted for one node — so it agrees
+    exactly with the `is_granted` gate every thread read already applies to
+    the caller; its property test is what makes that claim safe. A mirror
+    never reaches here: a mirrored ThreadWidget posts to its TARGET's link
+    (M8), and every resolver in this module refuses a non-thread type, so
+    the same rule is asserted rather than "handled".
+
+    Ids become emails through `resource_grant_service._hub_user_email_map`
+    (one query). A roster row with no `hub_users` row — someone who has
+    never signed in — is simply absent from the map: not mentionable, which
+    is correct, since with no `hub_users` row they can hold no assignment
+    and no grant and therefore cannot open the thread either.
+
+    KNOWN GAP, NOT A BUG HERE (M10, plan §11.12): a Hub Admin recognised
+    only by the Airtable role in their own JWT is invisible to this set on
+    any widget they hold no grant on — nothing server-side can read another
+    user's JWT. `rbac_graph_service.hub_admin_user_ids` is the single seam
+    where the phase-3 `BOOTSTRAP_ADMIN_EMAILS` backstop gets unioned in.
+    """
+    if component.type != THREAD_WIDGET_TYPE:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
+    user_ids = users_granted_on_node(db, ("component", component.id), closures=closures)
+    if not user_ids:
+        return set()
+    return {_norm_email(email) for email in _hub_user_email_map(db, user_ids).values()}
+
+
+def list_mentionable_users(
+    db: Session,
+    component: ComponentV2,
+    q: str | None,
+    *,
+    closures: RbacClosures | None = None,
+) -> list[MentionableUser]:
+    """`GET /threads/component/{link}/mentionable-users` (plan §5.1, scoped
+    per M9 — moderation plan §4.1/§5.9.1). The roster eligibility filter
+    runs in SQL; the access filter (`_granted_emails_on_component`) and the
+    accent-insensitive substring/prefix match run in Python over that
+    (small, ≤175-row) result set, per §5.1's own reasoning for why that
+    split is the simplest correct thing at this table size. The cap of 8
+    applies AFTER both filters, so an ungranted roster row can never eat a
+    slot.
+
+    The caller's OWN access to `component` is the router's job
+    (`granted_single_node`, not `get_viewer_access` — moderation plan
+    §5.9.3 / landmine 16); this function lists people, it does not gate the
+    caller. `closures` is the request's shared `RbacClosures` (§8.2).
+    """
+    granted_emails = _granted_emails_on_component(db, component, closures=closures)
+    if not granted_emails:
+        return []
+    rows = [
+        row
+        for row in _eligible_mentionable_users_query(db).all()
+        if _norm_email(row.work_email) in granted_emails
+    ]
     q_folded = _fold_for_search(q) if q else ""
 
     results: list[MentionableUser] = []
@@ -341,18 +520,38 @@ def list_mentionable_users(db: Session, q: str | None) -> list[MentionableUser]:
 
 
 def _validate_and_resolve_mentions(
-    db: Session, claimed: list[MentionInput], content: str
+    db: Session,
+    claimed: list[MentionInput],
+    content: str,
+    *,
+    component: ComponentV2,
+    closures: RbacClosures | None = None,
 ) -> list[dict[str, str]]:
     """plan §5.3 — the server does not trust the client's `mentions` array.
     For each claimed email: (1) it must belong to an eligible `users` row
     (the SAME eligibility rule the directory applies — `_eligible_
-    mentionable_users_query`), and (2) the token the SERVER derives from
-    that row's name must actually occur in `content` as `@<token>` at a
-    word boundary. Anything failing either check is silently dropped
-    (never a 4xx for the whole request — plan §5.3: "this closes the
-    obvious hole"). `name`/`token` on the returned entries always come from
-    the matched `users` row, never from `claimed` — a client cannot make a
-    chip render someone else's name.
+    mentionable_users_query`), (1b) that person must be GRANTED on
+    `component` (M9 — the SAME access rule the directory applies,
+    `_granted_emails_on_component`; moderation plan §5.9.2), and (2) the
+    token the SERVER derives from that row's name must actually occur in
+    `content` as `@<token>` at a word boundary. Anything failing any check
+    is silently dropped (never a 4xx for the whole request — plan §5.3:
+    "this closes the obvious hole"); an ungranted roster user is dropped
+    exactly as a non-roster email always has been. `name`/`token` on the
+    returned entries always come from the matched `users` row, never from
+    `claimed` — a client cannot make a chip render someone else's name.
+
+    Consequence worth knowing (moderation plan §11.14): an author editing an
+    OLD post resends its stored mentions, and anyone who has since lost
+    access to the widget is dropped from the stored array on that edit —
+    the literal `@Token` stays in the text, unstyled, and they are not
+    re-notified. Correct under M9; surprising on first sight.
+
+    `component` is the thread widget the post lives on — every caller has
+    it in hand already. `closures` is optional: the four write paths hold a
+    `ViewerAccess`, not an `RbacClosures`, so the reverse fold builds its
+    own snapshot here (one extra closure load per WRITE, not per keystroke;
+    the directory route is the hot path and shares its own).
 
     De-duplicates by normalized email, preserving first-occurrence order
     (plan §5.2: rendering resolves a token collision by "array order,
@@ -382,13 +581,22 @@ def _validate_and_resolve_mentions(
         .filter(func.lower(UserV2.work_email).in_(ordered_emails))
         .all()
     )
-    eligible_by_email = {_norm_email(row.work_email): row for row in eligible_rows}
+    if not eligible_rows:
+        return []  # nothing survived check 1 — no reason to run the fold
+    # Check 1b (M9): the same access set the directory offers, computed
+    # once per request rather than once per claimed email.
+    granted_emails = _granted_emails_on_component(db, component, closures=closures)
+    eligible_by_email = {
+        _norm_email(row.work_email): row
+        for row in eligible_rows
+        if _norm_email(row.work_email) in granted_emails
+    }
 
     resolved: list[dict[str, str]] = []
     for email in ordered_emails:
         row = eligible_by_email.get(email)
         if row is None:
-            continue  # check 1 failed — not an eligible users row
+            continue  # check 1 or 1b failed — not an eligible, granted users row
         token = derive_mention_token(row.name)
         if not _token_occurs_in_content(content, token):
             continue  # check 2 failed — token isn't actually in the text
@@ -523,6 +731,53 @@ def _notify_new_thread_comment(
             thread_id=thread_id,
             comment_id=comment_id,
             excerpt=generate_notification_excerpt(content),
+            read_at=None,
+            created_at=_utc_now(),
+        )
+    )
+
+
+def _notify_thread_decision(
+    db: Session,
+    thread: ThreadV2,
+    *,
+    reviewer: UserInfo,
+    approved: bool,
+    component_id: int,
+) -> None:
+    """plan_thread_moderation_2026-09-18.md §3.2 / M1 (owner-approved
+    2026-09-19) — tell the AUTHOR that an editor decided their pending
+    thread. One recipient (the author), one row, `type` chosen by
+    `approved`; `actor_*` is the REVIEWER (they made the decision), the
+    `excerpt` is the thread's own, `comment_id` is NULL because the event
+    is about the thread body, not a comment.
+
+    Self-exclusion copies `_notify_new_thread_comment`'s shape — "skip when
+    the RECIPIENT is the actor" — NOT `_notify_mentions`' (which skips the
+    actor inside a loop over recipients). Here the recipient is the author
+    and the actor is the reviewer, so the comparison is written out
+    explicitly against those two. The only way this fires is an editor
+    deciding a thread they themselves posted back when they were a viewer
+    (the create route auto-approves an editor's post, so an editor's own
+    thread can only be `pending` if their grant arrived after they posted);
+    the "no self-pings" rule both existing writers follow applies.
+
+    Does not commit — the caller (`decide_thread`) owns the transaction,
+    same convention as every other write function in this module."""
+    recipient = _norm_email(thread.author_email)
+    reviewer_email = _norm_email(reviewer.email)
+    if recipient == reviewer_email:
+        return
+    db.add(
+        NotificationV2(
+            recipient_email=recipient,
+            type=NOTIFICATION_TYPE_THREAD_APPROVED if approved else NOTIFICATION_TYPE_THREAD_REJECTED,
+            actor_email=reviewer_email,
+            actor_name=reviewer.name,
+            component_id=component_id,
+            thread_id=thread.id,
+            comment_id=None,
+            excerpt=generate_notification_excerpt(thread.content),
             read_at=None,
             created_at=_utc_now(),
         )
@@ -817,6 +1072,9 @@ def _to_thread_summary(thread: ThreadV2, my_vote: int) -> ThreadSummary:
         author_email=thread.author_email,
         author_name=thread.author_name,
         status=thread.status,
+        reviewed_by_email=thread.reviewed_by_email,
+        reviewed_by_name=thread.reviewed_by_name,
+        reviewed_at=thread.reviewed_at,
         up_count=thread.up_count,
         down_count=thread.down_count,
         comment_count=thread.comment_count,
@@ -836,6 +1094,146 @@ def _to_thread_detail(thread: ThreadV2, my_vote: int) -> ThreadDetail:
         **_to_thread_summary(thread, my_vote).model_dump(),
         content=thread.content,
     )
+
+
+# ---------------------------------------------------------
+# Moderation page support — widget title / location label, batched per
+# DISTINCT component (plan §5.6), and the ThreadModerationRow builders.
+# ---------------------------------------------------------
+
+
+def _widget_title_and_location_for_components(
+    db: Session, components: dict[int, ComponentV2]
+) -> dict[int, tuple[str, str]]:
+    """`component_id -> (widget_title, location_label)`, one entry per
+    DISTINCT component in the page (plan §5.6) — a moderation list page can
+    show many rows from the SAME widget, and this is computed once for all
+    of them, not once per row.
+
+    `widget_title`: `PageContentV2.content["title"]` via
+    `component.page_content_id` (the same place
+    `gridstack_service._serialize_gridstack_content` reads widget data),
+    falling back to `component.title`, then `"Discussion"` (the widget's own
+    frontend default). Batched into ONE query across every distinct
+    `page_content_id`, the same "build once" shape
+    `_serialize_gridstack_content` already uses for the canvas save path.
+
+    `location_label`: `walk_ancestors` per component (3–5 PK reads each — NOT
+    `build_node_tree`, which a Hub Admin request has no tree for at all —
+    landmine 9), keeping only `tab`/`nav_tab` refs (a sub-grid representation
+    or SBN root is a `component` ref and reads as part of the chain, not as a
+    named location), labelled in ONE batched `resolve_node_labels` call
+    across every component's chain, joined root-first with " › ". An orphan
+    chain (§5.6, `walk_ancestors`'s own contract) or a widget with no
+    tab/nav-tab ancestor at all yields `""`.
+    """
+    if not components:
+        return {}
+
+    page_content_ids = {
+        c.page_content_id for c in components.values() if c.page_content_id is not None
+    }
+    preloaded_content: dict[int, Any] = {}
+    if page_content_ids:
+        preloaded_content = {
+            row.id: row.content
+            for row in db.query(PageContentV2)
+            .filter(PageContentV2.id.in_(page_content_ids))
+            .all()
+        }
+
+    chains: dict[int, list[NodeRef]] = {
+        component_id: walk_ancestors(db, ("component", component_id))
+        for component_id in components
+    }
+    all_location_refs: set[NodeRef] = set()
+    for chain in chains.values():
+        all_location_refs.update(ref for ref in chain if ref[0] in ("tab", "nav_tab"))
+    labels = resolve_node_labels(db, all_location_refs) if all_location_refs else {}
+
+    result: dict[int, tuple[str, str]] = {}
+    for component_id, component in components.items():
+        title: str | None = None
+        if component.page_content_id is not None:
+            content = preloaded_content.get(component.page_content_id)
+            if isinstance(content, dict):
+                raw_title = content.get("title")
+                title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+        if not title:
+            title = component.title or None
+        if not title:
+            title = "Discussion"
+
+        location_refs = [ref for ref in chains[component_id] if ref[0] in ("tab", "nav_tab")]
+        # `walk_ancestors` is nearest-first; a location label reads root-first.
+        location_label = " › ".join(
+            labels[ref] for ref in reversed(location_refs) if ref in labels
+        )
+        result[component_id] = (title, location_label)
+    return result
+
+
+def _to_moderation_rows(db: Session, threads: list[ThreadV2]) -> list[ThreadModerationRow]:
+    """`ThreadV2` rows (already the caller's page, already ordered) ->
+    `ThreadModerationRow`s, with `widget_title`/`location_label` computed
+    once per distinct component (see above), not once per thread."""
+    if not threads:
+        return []
+
+    component_ids = {t.component_id for t in threads}
+    components = {
+        c.id: c
+        for c in db.query(ComponentV2).filter(ComponentV2.id.in_(component_ids)).all()
+    }
+    info_by_component = _widget_title_and_location_for_components(db, components)
+
+    items: list[ThreadModerationRow] = []
+    for thread in threads:
+        component = components.get(thread.component_id)
+        if component is None:
+            # The FK is NOT NULL — this would mean the component was deleted
+            # without the cascade running (defensive only, same posture as
+            # `_require_thread_and_component`).
+            continue
+        widget_title, location_label = info_by_component.get(
+            thread.component_id, ("Discussion", "")
+        )
+        items.append(
+            ThreadModerationRow(
+                **_to_thread_summary(thread, my_vote=0).model_dump(),
+                component_link=component.link,
+                widget_title=widget_title,
+                location_label=location_label,
+            )
+        )
+    return items
+
+
+def _to_moderation_row(db: Session, thread: ThreadV2, component: ComponentV2) -> ThreadModerationRow:
+    """Single-row form — `decide_thread`'s return value and its 409 body
+    (plan §5.3)."""
+    widget_title, location_label = _widget_title_and_location_for_components(
+        db, {component.id: component}
+    )[component.id]
+    return ThreadModerationRow(
+        **_to_thread_summary(thread, my_vote=0).model_dump(),
+        component_link=component.link,
+        widget_title=widget_title,
+        location_label=location_label,
+    )
+
+
+def _author_as_user_info(thread: ThreadV2) -> UserInfo:
+    """plan §5.3's approval-time fan-out actor: the AUTHOR (they did the
+    mentioning), not the reviewing editor — built from the thread's own
+    stored author columns since there is no request-scoped `UserInfo` for
+    "the author" at decision time. `author_name` is nullable (plan §1.1);
+    falls back to the email's local part, the same display fallback used
+    when a thread is first created (`user.name` there; nothing stored here
+    if the author never had a name)."""
+    email = thread.author_email
+    name = thread.author_name or email.split("@")[0]
+    return UserInfo(email=email, name=name, roles=[])
 
 
 def _to_comment_summary(comment: ThreadCommentV2, my_vote: int) -> CommentSummary:
@@ -872,9 +1270,19 @@ def list_threads_for_link(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
     _check_view_access(component, access)
 
+    # plan §5.5 — every approved thread, plus the CALLER'S OWN pending/
+    # rejected ones (M3: an author sees their own non-approved threads with
+    # a status badge; nobody else's pending/rejected rows appear in the
+    # widget's list at all).
     query = db.query(ThreadV2).filter(
         ThreadV2.component_id == component.id,
-        ThreadV2.status == THREAD_STATUS_APPROVED,
+        or_(
+            ThreadV2.status == THREAD_STATUS_APPROVED,
+            and_(
+                ThreadV2.author_email == _norm_email(user.email),
+                ThreadV2.status.in_((THREAD_STATUS_PENDING, THREAD_STATUS_REJECTED)),
+            ),
+        ),
     )
     if cursor:
         after_created_at, after_id = _decode_cursor(cursor)
@@ -920,7 +1328,14 @@ def create_thread_for_link(
     # Resolve mentions BEFORE constructing the row — a 400 from the cap
     # (plan §4.7) must not leave a half-built thread behind (nothing is
     # `db.add`ed yet at this point).
-    resolved = _validate_and_resolve_mentions(db, mentions or [], content)
+    resolved = _validate_and_resolve_mentions(db, mentions or [], content, component=component)
+
+    # plan_thread_moderation_2026-09-18.md §0.1(1)/(2), §4.1 — an editor of
+    # the widget or any of its ancestors auto-approves; a granted VIEWER's
+    # post lands `pending` until an editor decides.
+    thread_status = (
+        THREAD_STATUS_APPROVED if _is_component_editor(component, access) else THREAD_STATUS_PENDING
+    )
 
     now = _utc_now()
     thread = ThreadV2(
@@ -930,7 +1345,7 @@ def create_thread_for_link(
         author_email=_norm_email(user.email),
         author_name=user.name,
         mentions=resolved,
-        status=THREAD_STATUS_APPROVED,
+        status=thread_status,
         up_count=0,
         down_count=0,
         comment_count=0,
@@ -939,18 +1354,21 @@ def create_thread_for_link(
     db.add(thread)
     db.flush()  # assigns thread.id — the notifications below FK to it
 
-    # plan §5.7 — "on create: notify every validated mention except the
-    # author". Same transaction as the thread insert: a notification must
-    # never survive a thread that doesn't (and vice versa).
-    _notify_mentions(
-        db,
-        resolved,
-        actor=user,
-        component_id=component.id,
-        thread_id=thread.id,
-        comment_id=None,
-        content=content,
-    )
+    # plan §5.4 (landmine 1) — fan out ONLY when the new row is approved. A
+    # pending thread notifies nobody: its mentions were validated and stored
+    # (so nothing has to be re-typed once approved), but every mentioned
+    # user would otherwise get a bell entry to a thread that 404s for them
+    # (`get_thread_by_id`'s non-approved branch) until an editor decides.
+    if thread_status == THREAD_STATUS_APPROVED:
+        _notify_mentions(
+            db,
+            resolved,
+            actor=user,
+            component_id=component.id,
+            thread_id=thread.id,
+            comment_id=None,
+            content=content,
+        )
 
     db.commit()
     db.refresh(thread)
@@ -964,15 +1382,24 @@ def get_thread_by_id(
     view access, NOT author-only (session handoff 2026-08-20 §0/addendum:
     the Phase 2 frontend worked around this endpoint not existing by
     empty-PATCH'ing as the author, which only ever closed the gap for a
-    thread's own author). Gated the same way `list_threads_for_link` gates
-    the list — including the same `status == approved` filter, so a future
-    moderation queue (D5) can't be read around by id once it exists; today
-    every thread is 'approved' by construction, so this is a no-op filter,
-    not a behavior change."""
+    thread's own author).
+
+    plan_thread_moderation_2026-09-18.md §4.1: an `approved` thread reads
+    for any granted viewer, unchanged. A `pending`/`rejected` thread reads
+    for its author OR a component editor (moderation needs the full body,
+    not just the queue row); anyone else gets the SAME 404 a nonexistent id
+    would — "this id exists but isn't yours" is never leaked. The `_check_
+    view_access` 403 still runs FIRST (landmine 2): a caller with no view
+    access to the widget at all keeps getting 403, never 404."""
     thread, component = _require_thread_and_component(db, thread_id)
+    # 403 BEFORE the status check (landmine 2) — a caller with no view
+    # access to the widget at all must keep getting the existing 403, never
+    # a 404 that would leak "this id exists but isn't approved/yours".
     _check_view_access(component, access)
     if thread.status != THREAD_STATUS_APPROVED:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+        is_author = _norm_email(thread.author_email) == _norm_email(user.email)
+        if not (is_author or _is_component_editor(component, access)):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
     my_vote = _my_vote_for_thread(db, thread.id, user.email)
     return _to_thread_detail(thread, my_vote)
 
@@ -994,6 +1421,14 @@ def update_thread_by_id(
     _check_view_access(component, access)
     _require_author(thread.author_email, user)
 
+    # plan §2 — rejected is terminal: no resubmit-on-edit. Checked after the
+    # author gate (a non-author still gets the existing 403, not this 409).
+    if thread.status == THREAD_STATUS_REJECTED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This thread was not approved and can no longer be edited",
+        )
+
     # Validate against the EFFECTIVE content — the new content if this PATCH
     # touches it, otherwise the thread's current content — since a mention's
     # token must occur in whatever the stored body ends up being, not
@@ -1002,20 +1437,28 @@ def update_thread_by_id(
     if mentions is not None:
         effective_content = content if content is not None else thread.content
         previous_mentions = thread.mentions
-        resolved = _validate_and_resolve_mentions(db, mentions, effective_content)
-        thread.mentions = resolved
-        # plan §5.7 — "on edit: notify only newly added mentions". Read
-        # BEFORE the reassignment above overwrites it.
-        _notify_newly_added_mentions(
-            db,
-            previous_mentions=previous_mentions,
-            resolved_mentions=resolved,
-            actor=user,
-            component_id=component.id,
-            thread_id=thread.id,
-            comment_id=None,
-            content=effective_content,
+        resolved = _validate_and_resolve_mentions(
+            db, mentions, effective_content, component=component
         )
+        thread.mentions = resolved
+        # plan §5.4 — a PENDING thread's mentions are validated and stored
+        # but NOT fanned out: nobody has read it yet, so there is no "newly
+        # added" to notify — the whole stored array is notified once, at
+        # approval time (`decide_thread`). An APPROVED thread keeps the
+        # unchanged "only newly added" behaviour.
+        if thread.status == THREAD_STATUS_APPROVED:
+            # plan §5.7 — "on edit: notify only newly added mentions". Read
+            # BEFORE the reassignment above overwrites it.
+            _notify_newly_added_mentions(
+                db,
+                previous_mentions=previous_mentions,
+                resolved_mentions=resolved,
+                actor=user,
+                component_id=component.id,
+                thread_id=thread.id,
+                comment_id=None,
+                content=effective_content,
+            )
 
     # Only stamp "edited" when title/content were actually supplied to
     # change — an empty PATCH ({} — both omitted) must not show an "edited"
@@ -1053,6 +1496,239 @@ def delete_thread_by_id(
 
 
 # ---------------------------------------------------------
+# Moderation (plan_thread_moderation_2026-09-18.md §4.2, §5.3, §5.7) —
+# approve/reject, the pending queue, the history list, and the sidebar's
+# polled summary. No edit-lock involvement anywhere here (plan §5.8): these
+# write `threads`, never `page_content`, so `edit_lock_service` is never
+# consulted and a locked tab does not block moderation.
+# ---------------------------------------------------------
+
+
+def decide_thread(
+    db: Session,
+    thread_id: int,
+    user: UserInfo,
+    *,
+    approve: bool,
+    access: ViewerAccess | None = None,
+) -> ThreadModerationRow:
+    """`POST /threads/{id}/approve` or `.../reject` — gated on `edit(n)`
+    (plan §5.1, landmine 8: NOT `full_access`/Hub-Admin-only, by analogy
+    with delete — a root-tab editor with no admin role must be able to
+    approve). `FOR UPDATE` serializes two editors deciding at once; the
+    loser re-reads a non-pending row and gets the winner's decision back in
+    the 409 body."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _require_component_editor(component, access)
+
+    # Re-fetch under lock — plan §5.3's recipe, same shape as the vote/
+    # comment-count recompute locks elsewhere in this module. The unlocked
+    # `thread` above already proved the caller is an editor of the right
+    # component; this second read is what makes the pending-check and the
+    # write atomic against a concurrent decision on the same row.
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    if thread.status != THREAD_STATUS_PENDING:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": "This thread has already been reviewed",
+                "thread": _to_moderation_row(db, thread, component).model_dump(mode="json"),
+            },
+        )
+
+    thread.status = THREAD_STATUS_APPROVED if approve else THREAD_STATUS_REJECTED
+    thread.reviewed_by_email = _norm_email(user.email)
+    thread.reviewed_by_name = user.name
+    thread.reviewed_at = _utc_now()
+
+    if approve:
+        # plan §5.4 (landmine 1, deferred fan-out): the mentions were
+        # validated and stored at post time but nobody was pinged, because
+        # the thread wasn't readable yet. Actor = the AUTHOR (they did the
+        # mentioning), not the reviewing editor.
+        _notify_mentions(
+            db,
+            thread.mentions or [],
+            actor=_author_as_user_info(thread),
+            component_id=component.id,
+            thread_id=thread.id,
+            comment_id=None,
+            content=thread.content,
+        )
+    # M1 (plan §3.2, owner-approved 2026-09-19): tell the author, for BOTH
+    # outcomes — the helper picks the type. Sits AFTER the pending check
+    # above so a 409 (already reviewed) writes no second row, after the
+    # mention fan-out so the two kinds of row land in the order the events
+    # happened, and before the commit so it shares the transaction.
+    _notify_thread_decision(
+        db, thread, reviewer=user, approved=approve, component_id=component.id
+    )
+
+    db.commit()
+    db.refresh(thread)
+    return _to_moderation_row(db, thread, component)
+
+
+def list_pending_threads(
+    db: Session, cursor: str | None, *, access: ViewerAccess | None = None
+) -> ThreadModerationListResponse:
+    """`GET /threads/moderation/pending` — scoped to the caller's moderated
+    set (plan §5.2); an empty set is a `200` with an empty page, never a
+    403 (a non-moderator deep-linking the management page sees an empty
+    state, not an error). Oldest-first (FIFO) — the queue drains in the
+    order people waited, not newest-first like the widget's own list."""
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadModerationListResponse(items=[], next_cursor=None)
+
+    query = db.query(ThreadV2).filter(
+        ThreadV2.component_id.in_(component_ids),
+        ThreadV2.status == THREAD_STATUS_PENDING,
+    )
+    if cursor:
+        after_created_at, after_id = _decode_cursor(cursor)
+        # Ascending order flips the keyset comparison to `>` (plan §4.3's
+        # row-comparison rule, same shape as the comment list's oldest-first
+        # pagination).
+        query = query.filter(
+            tuple_(ThreadV2.created_at, ThreadV2.id) > (after_created_at, after_id)
+        )
+
+    rows = (
+        query.order_by(ThreadV2.created_at.asc(), ThreadV2.id.asc())
+        .limit(THREADS_PAGE_SIZE + 1)
+        .all()
+    )
+    has_more = len(rows) > THREADS_PAGE_SIZE
+    page = rows[:THREADS_PAGE_SIZE]
+    next_cursor = _encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
+
+    return ThreadModerationListResponse(items=_to_moderation_rows(db, page), next_cursor=next_cursor)
+
+
+def list_thread_history(
+    db: Session, cursor: str | None, *, access: ViewerAccess | None = None
+) -> ThreadModerationListResponse:
+    """`GET /threads/moderation/history` — same scoping as the pending
+    queue. `reviewed_at IS NOT NULL` is the whole filter (M5): a legacy or
+    editor-auto-approved thread was never explicitly decided and does not
+    appear here. Newest decision first."""
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadModerationListResponse(items=[], next_cursor=None)
+
+    query = db.query(ThreadV2).filter(
+        ThreadV2.component_id.in_(component_ids),
+        ThreadV2.reviewed_at.isnot(None),
+    )
+    if cursor:
+        after_reviewed_at, after_id = _decode_cursor(cursor)
+        query = query.filter(
+            tuple_(ThreadV2.reviewed_at, ThreadV2.id) < (after_reviewed_at, after_id)
+        )
+
+    rows = (
+        query.order_by(ThreadV2.reviewed_at.desc(), ThreadV2.id.desc())
+        .limit(THREADS_PAGE_SIZE + 1)
+        .all()
+    )
+    has_more = len(rows) > THREADS_PAGE_SIZE
+    page = rows[:THREADS_PAGE_SIZE]
+    next_cursor = (
+        _encode_cursor(page[-1].reviewed_at, page[-1].id) if has_more and page else None
+    )
+
+    return ThreadModerationListResponse(items=_to_moderation_rows(db, page), next_cursor=next_cursor)
+
+
+def moderation_summary(
+    db: Session, *, access: ViewerAccess | None = None
+) -> tuple[ThreadModerationSummary, str]:
+    """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
+    top of the `ViewerAccess` the dependency already built; polled like the
+    notification bell. The ETag covers every field the body carries —
+    `"{1 if can_moderate else 0}-{len(component_ids)}-{count}-{max_id}"` —
+    so a viewer and an editor with zero pending threads never collide on
+    the same tag (followups plan §1: a shared `"0-0"` used to let the
+    browser's own HTTP cache revalidate one user's request against
+    another's cached body). A Hub Admin with zero thread widgets still gets
+    `can_moderate=True` — the section is part of their admin surface
+    regardless of whether any widget currently has a thread on it."""
+    component_ids = _moderated_component_ids(db, access)
+    can_moderate = (access is not None and access.full_access) or bool(component_ids)
+    can_moderate_flag = 1 if can_moderate else 0
+
+    if not component_ids:
+        return (
+            ThreadModerationSummary(
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0
+            ),
+            f'"{can_moderate_flag}-0-0-0"',
+        )
+
+    count, max_id = (
+        db.query(func.count(ThreadV2.id), func.max(ThreadV2.id))
+        .filter(ThreadV2.component_id.in_(component_ids), ThreadV2.status == THREAD_STATUS_PENDING)
+        .one()
+    )
+    count = int(count or 0)
+    etag = (
+        f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
+        f'{int(max_id) if max_id is not None else 0}"'
+    )
+    return (
+        ThreadModerationSummary(
+            can_moderate=can_moderate,
+            moderated_component_count=len(component_ids),
+            pending_count=count,
+        ),
+        etag,
+    )
+
+
+def thread_widget_counts(
+    db: Session, link: str, *, access: ViewerAccess | None = None
+) -> ThreadWidgetCounts:
+    """`GET /threads/component/{link}/counts` (followups plan §4.2) — the
+    widget-removal confirmation's true-totals check. Gated `resolve` (404)
+    → `_check_view_access` (403) → editor-only (403), same order as every
+    other gated read in this module. Deliberately NOT `_require_component_
+    editor`: that helper's message ("...can approve or reject threads") is
+    about a different action, and would be a wrong description of a 403 on
+    a read-only counts request — the check (`_is_component_editor`) is
+    reused, the wording is not.
+
+    ONE query, across ALL statuses — unlike every list endpoint here, which
+    scopes to `approved OR (own AND pending/rejected)` (2a's deliberate
+    widget/moderation authority split). The gate is what makes that safe:
+    only a component editor (or an ancestor tab/nav-tab editor, via
+    `_is_component_editor`'s `verdict(...).edit` fold) can see the true
+    total, including other authors' pending/rejected rows."""
+    component = resolve_thread_widget_component(db, link)
+    _check_view_access(component, access)
+    if not _is_component_editor(component, access):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only an editor of this discussion can view its thread counts",
+        )
+
+    thread_count, comment_total, pending_total = (
+        db.query(
+            func.count(ThreadV2.id),
+            func.coalesce(func.sum(ThreadV2.comment_count), 0),
+            func.coalesce(func.sum(case((ThreadV2.status == THREAD_STATUS_PENDING, 1), else_=0)), 0),
+        )
+        .filter(ThreadV2.component_id == component.id)
+        .one()
+    )
+    return ThreadWidgetCounts(
+        thread_count=int(thread_count or 0),
+        comment_count=int(comment_total or 0),
+        pending_count=int(pending_total or 0),
+    )
+
+
+# ---------------------------------------------------------
 # Comments
 # ---------------------------------------------------------
 
@@ -1065,8 +1741,9 @@ def list_comments_for_thread(
     *,
     access: ViewerAccess | None = None,
 ) -> CommentListResponse:
-    _thread, component = _require_thread_and_component(db, thread_id)
+    thread, component = _require_thread_and_component(db, thread_id)
     _check_view_access(component, access)
+    _require_approved(thread)
 
     query = db.query(ThreadCommentV2).filter(ThreadCommentV2.thread_id == thread_id)
     if cursor:
@@ -1113,10 +1790,11 @@ def create_comment_for_thread(
 ) -> CommentSummary:
     thread, component = _require_thread_and_component(db, thread_id)
     _check_view_access(component, access)
+    _require_approved(thread)
 
     # Resolve BEFORE the lock/recompute below — a 400 from the cap must not
     # leave a half-built comment or a bumped comment_count behind.
-    resolved = _validate_and_resolve_mentions(db, mentions or [], content)
+    resolved = _validate_and_resolve_mentions(db, mentions or [], content, component=component)
 
     # Lock the parent thread before the recompute below, same reasoning as
     # the vote recipe (plan §4.4): the recompute's snapshot must be taken
@@ -1179,15 +1857,18 @@ def update_comment_by_id(
     *,
     access: ViewerAccess | None = None,
 ) -> CommentSummary:
-    comment, _thread, component = _require_comment_thread_and_component(db, comment_id)
+    comment, thread, component = _require_comment_thread_and_component(db, comment_id)
     _check_view_access(component, access)
+    _require_approved(thread)
     _require_author(comment.author_email, user)
 
     # Same effective-content reasoning as update_thread_by_id.
     if mentions is not None:
         effective_content = content if content is not None else comment.content
         previous_mentions = comment.mentions
-        resolved = _validate_and_resolve_mentions(db, mentions, effective_content)
+        resolved = _validate_and_resolve_mentions(
+            db, mentions, effective_content, component=component
+        )
         comment.mentions = resolved
         # plan §5.7 — same "only newly added mentions" rule as thread edits.
         _notify_newly_added_mentions(
@@ -1223,6 +1904,12 @@ def delete_comment_by_id(
     thread_id = comment.thread_id
 
     thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    # plan §4.1's table lists this route explicitly, though it's unreachable
+    # in practice: a comment can only ever exist on a thread that was
+    # approved at the time it was created (`_require_approved` on create).
+    # Cheap, and the table says so.
+    if thread is not None:
+        _require_approved(thread)
 
     db.delete(comment)
     db.flush()
@@ -1333,6 +2020,7 @@ def vote_on_thread(
 ) -> VoteResponse:
     thread, component = _require_thread_and_component(db, thread_id)
     _check_view_access(component, access)
+    _require_approved(thread)
 
     # Serialize competing writers on this thread BEFORE the recompute runs
     # (plan §4.4) — under READ COMMITTED each statement takes a fresh
@@ -1358,8 +2046,9 @@ def vote_on_comment(
     *,
     access: ViewerAccess | None = None,
 ) -> VoteResponse:
-    comment, _thread, component = _require_comment_thread_and_component(db, comment_id)
+    comment, thread, component = _require_comment_thread_and_component(db, comment_id)
     _check_view_access(component, access)
+    _require_approved(thread)
 
     db.query(ThreadCommentV2).filter(ThreadCommentV2.id == comment_id).with_for_update().first()
 

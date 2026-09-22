@@ -32,22 +32,38 @@ ViewerAccess | None = None`, where `None` means "no check requested" (an
 internal caller), never "deny". An SBN node's `NodeRef` is always
 `("component", id)`, and its parent is `("component", super_blocknote_id)`
 for every node except the SBN root itself.
+
+LOCKING (plan_component_locking_and_sbn_2026-09-17.md §6), rebuilt
+2026-09-17. Until then an SBN node's lock was a private third flavour —
+`props.locked/locked_by/locked_at` JSONB keys, own-row conflict logic,
+invisible to `edit_lock_service`'s tree, and no write ever validated a
+session (an expired SBN session saved forever). Now every SBN node is a
+`("component", id)` lock node like any other real component: lock state
+lives on the four real lock columns, `lock_sbn_node`/`unlock_sbn_node` are
+thin wrappers over `edit_lock_service.acquire`/`release` (so a root session
+covers its whole subtree and a held sub-tab refuses its ancestors), and
+every write follows the same mechanical pair as `gridstack_service.py` —
+`require_edit(access, X)` then `_require_live_session(db, session, X)` —
+with ONE deliberate deviation on delete (decision B; see `delete_sbn_subtree`).
+`session: EditSession | None = None` follows `access`'s convention exactly:
+`None` is an internal caller, never a bypass.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
+from app.services import edit_lock_service
 from app.services.access_visibility_service import NodeRef, ViewerAccess, require_edit
 from app.services.gridstack_service import (
+    SBN_ROOT_WIDGET_TYPE,
     _generate_id,
+    _require_live_session,
     _resolve_component_data,
-    _utc_now,
     _validate_document_id_value,
     _validate_locked_by,
     _validate_order,
@@ -56,7 +72,10 @@ from app.services.gridstack_service import (
     is_lock_stale,
 )
 
-SBN_ROOT_TYPE = "super_block_note"
+# Defined in gridstack_service (which cannot import from here without a
+# cycle) and re-exported under this module's own long-standing name — every
+# importer of `SBN_ROOT_TYPE` keeps working unchanged.
+SBN_ROOT_TYPE = SBN_ROOT_WIDGET_TYPE
 SBN_LEAF_TYPE = "block_note"
 # Title of the auto-managed leaf that holds a Super Block Note root's own
 # blocknote content once it's moved off the (never-rendered) root — created
@@ -109,22 +128,31 @@ def _sbn_props(component: ComponentV2) -> dict[str, Any]:
     return component.props or {}
 
 
-def _sbn_locked_at(props: dict[str, Any]) -> datetime | None:
-    """`props["locked_at"]` is an ISO-8601 string (JSONB has no native
-    datetime type), written by `_utc_now().isoformat()` in `lock_sbn_node`
-    below. Missing OR unparseable both return None — which `is_lock_stale`
-    (gridstack_service.py) already treats as stale, the same "no usable
-    timestamp ⇒ assume stale, never assume fresh" convention
-    `airtable_service._envelope_age_seconds` uses for cache envelopes. Every
-    node locked before plan §6.6 Fix 2 landed has no `locked_at` key at all
-    and lands here."""
-    stamp = props.get("locked_at")
-    if not isinstance(stamp, str):
-        return None
-    try:
-        return datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
+def _sbn_lock_fields(component: ComponentV2, lock_view: Any = None) -> dict[str, Any]:
+    """The lock block every SBN summary/workspace carries — the row's own
+    four columns (same meaning as `_format_tab_summary`'s
+    `locked`/`locked_by`/`locked_at`/`lock_is_stale`), plus, when a caller
+    passes a `LockView`, the derived `lock_state`/`lock_holder`/
+    `lock_holder_node_label`/`lock_expires_at` block `_format_tab_summary`
+    adds under the same "only when a caller passes one" rule. Reads the
+    COLUMNS, never `props.locked*` — those keys are dead since 2026-09-17
+    (module docstring). `lock_view` is typed `Any` to match
+    `gridstack_service`'s convention, though this module may import
+    `edit_lock_service` at top level without a cycle."""
+    locked = bool(component.locked)
+    fields: dict[str, Any] = {
+        "locked": locked,
+        "locked_by": component.locked_by or "",
+        "locked_at": component.locked_at,
+        "lock_is_stale": locked and is_lock_stale(component.locked_at),
+    }
+    if lock_view is not None:
+        state = lock_view.state_for(("component", component.id))
+        fields["lock_state"] = state.state
+        fields["lock_holder"] = state.holder
+        fields["lock_holder_node_label"] = state.node_label
+        fields["lock_expires_at"] = state.expires_at
+    return fields
 
 
 def _has_sbn_children(db: Session, component_id: int) -> bool:
@@ -137,21 +165,20 @@ def _has_sbn_children(db: Session, component_id: int) -> bool:
 
 
 def _format_sbn_summary(
-    db: Session, component: ComponentV2, *, access: ViewerAccess | None = None
+    db: Session,
+    component: ComponentV2,
+    *,
+    access: ViewerAccess | None = None,
+    lock_view: Any = None,
 ) -> dict[str, Any]:
     props = _sbn_props(component)
-    locked = bool(props.get("locked", False))
-    locked_at = _sbn_locked_at(props)
     node = _sbn_node(component)
     summary = {
         "id": component.id,
         "documentId": component.link,
         "title": component.title,
         "order": props.get("order", 0),
-        "locked": locked,
-        "locked_by": props.get("locked_by", "") or "",
-        "locked_at": locked_at,
-        "lock_is_stale": locked and is_lock_stale(locked_at),
+        **_sbn_lock_fields(component, lock_view),
         "has_children": _has_sbn_children(db, component.id),
         "has_content": component.page_content_id is not None,
         "apiVersion": "v2",
@@ -178,7 +205,7 @@ def _format_sbn_summary(
 
 
 def get_sbn_children(
-    db: Session, link: str, *, access: ViewerAccess | None = None
+    db: Session, link: str, *, access: ViewerAccess | None = None, lock_view: Any = None
 ) -> list[dict[str, Any]] | None:
     component = get_component_by_link(db, link)
     if component is None or not _is_sbn_member(component):
@@ -192,7 +219,7 @@ def get_sbn_children(
         return None
 
     children = db.query(ComponentV2).filter(ComponentV2.super_blocknote_id == component.id).all()
-    summaries = [_format_sbn_summary(db, c, access=access) for c in children]
+    summaries = [_format_sbn_summary(db, c, access=access, lock_view=lock_view) for c in children]
     # §5.2: `visible` gates the CHROME — an invisible sub-tab must not appear
     # in the SBN's own tab rail at all, not merely render disabled.
     if access is not None:
@@ -202,7 +229,7 @@ def get_sbn_children(
 
 
 def get_sbn_workspace(
-    db: Session, link: str, *, access: ViewerAccess | None = None
+    db: Session, link: str, *, access: ViewerAccess | None = None, lock_view: Any = None
 ) -> dict[str, Any] | None:
     component = get_component_by_link(db, link)
     if component is None or not _is_sbn_member(component):
@@ -233,13 +260,12 @@ def get_sbn_workspace(
     # else: component IS the SBN root — no parent within its own tree.
 
     children = db.query(ComponentV2).filter(ComponentV2.super_blocknote_id == component.id).all()
-    child_summaries = [_format_sbn_summary(db, c, access=access) for c in children]
+    child_summaries = [
+        _format_sbn_summary(db, c, access=access, lock_view=lock_view) for c in children
+    ]
     if access is not None:
         child_summaries = [s for s in child_summaries if s["view"]]
     child_summaries.sort(key=lambda s: (s["order"], s["id"] or 0))
-
-    locked = bool(props.get("locked", False))
-    locked_at = _sbn_locked_at(props)
 
     workspace = {
         "id": component.id,
@@ -256,10 +282,7 @@ def get_sbn_workspace(
         # the SBN child filter's only consumer is canViewTab (frontend),
         # which must treat an absent access_control as viewable.
         "access_control": component.access_control,
-        "locked": locked,
-        "locked_by": props.get("locked_by", "") or "",
-        "locked_at": locked_at,
-        "lock_is_stale": locked and is_lock_stale(locked_at),
+        **_sbn_lock_fields(component, lock_view),
         "children": child_summaries,
         "apiVersion": "v2",
         "node_kind": node[0],
@@ -329,7 +352,9 @@ def _create_overview_leaf(
         link=_generate_id(),
         type=SBN_LEAF_TYPE,
         title=OVERVIEW_TITLE,
-        props={"locked": False, "locked_by": "", "order": order},
+        # `order` only — lock state lives on the real columns now (module
+        # docstring); the old `locked`/`locked_by` keys are no longer written.
+        props={"order": order},
         # NULL through: a leaf under a NULL root is itself NULL (§5.2),
         # not a manufactured default -- it inherits the same way the root
         # itself does.
@@ -373,6 +398,7 @@ def update_sbn_content(
     content: dict[str, Any] | list[Any] | None,
     *,
     access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     try:
         component = get_component_by_link(db, link)
@@ -381,7 +407,12 @@ def update_sbn_content(
 
         # §6.3 "change a canvas, widget config, or text → edit on `n`".
         # Before any of the transplant machinery below, which mutates rows.
+        # Then the session gate on the same node (plan_component_locking
+        # §6): the writer's own token on `n`, or an ancestor's — an SBN
+        # root session covers every sub-tab, a canvas session covers the
+        # whole SBN. A REVEALED node is already refused by `require_edit`.
         require_edit(access, _sbn_node(component))
+        _require_live_session(db, session, _sbn_node(component))
 
         # A Super Block Note's root is never rendered as a selectable row, so
         # content saved directly on it would be unreachable once sub-tabs
@@ -437,6 +468,7 @@ def create_sbn_node(
     access_control: dict[str, Any] | None = None,
     *,
     access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     """Creates a new leaf sub-tab (`type="block_note"`) under `parent_link`,
     which must itself be an SBN member (the root widget, or an existing
@@ -453,8 +485,10 @@ def create_sbn_node(
 
         # §6.3 "create a child of `n` → edit on `n`" — the parent, which is
         # the node whose contents this changes. The new row does not exist
-        # yet, so there is nothing else it could be gated against.
+        # yet, so there is nothing else it could be gated against. Session
+        # on the same node (the mechanical pair).
         require_edit(access, _sbn_node(parent))
+        _require_live_session(db, session, _sbn_node(parent))
 
         # Root's own content becomes permanently unreachable once real
         # sub-tabs exist — the root itself is never rendered as a selectable
@@ -487,7 +521,8 @@ def create_sbn_node(
             link=_generate_id(),
             type=SBN_LEAF_TYPE,
             title=title,
-            props={"locked": False, "locked_by": "", "order": order},
+            # `order` only — see `_create_overview_leaf`.
+            props={"order": order},
             # Store what was passed, NULL included (§5.2) -- NULL means
             # inherit, exactly like a canvas widget's own AC (§3.4). No
             # fallback to a manufactured default.
@@ -529,6 +564,7 @@ def update_sbn_node(
     access_control: dict[str, Any] | None = None,
     *,
     access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     try:
         title = _validate_title(title)
@@ -546,7 +582,9 @@ def update_sbn_node(
         # field is the single-node echo of it and stays with the node.
         # §11.2 records `edit(n)` vs `edit(parent(n))` for rename as still
         # open with the owner — this follows §6.3's proposal, same as tabs.
+        # Session on `n` too (the mechanical pair).
         require_edit(access, _sbn_node(component))
+        _require_live_session(db, session, _sbn_node(component))
 
         if title is not None:
             component.title = title
@@ -570,57 +608,56 @@ def update_sbn_node(
 
 
 def lock_sbn_node(
-    db: Session, link: str, locked_by: str, *, access: ViewerAccess | None = None
+    db: Session,
+    link: str,
+    locked_by: str,
+    force: bool = False,
+    *,
+    access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
-    """Every SBN node — the root widget itself, or any descendant — is
-    independently lockable, matching v1 (where the host tab and every
-    sub-tab could each be locked independently). Unlike
-    `gridstack_service.py`'s tab-level lock (root-tab-only), there's no
-    "must be root" restriction here.
+    """THIN WRAPPER over `edit_lock_service.acquire` on `("component", id)`
+    (plan_component_locking §6) — the SBN's lock is no longer its own
+    own-row-only flavour. Every SBN node is still independently
+    addressable for locking (root or any descendant), but the TREE now
+    decides who may hold what: a session on the root covers the whole
+    subtree (a sub-tab held by someone else refuses the root, and vice
+    versa), a canvas/tab/nav-tab session above refuses every SBN node
+    beneath it, and two sibling sub-tabs never conflict. Same-holder
+    re-entry keeps the token. `force` is §4.2 decision 8's subtree takeover.
 
     `locked_by` is the caller's OWN identity — the router derives it from
     the authenticated JWT (plan §6.6 Fix 1), same as
-    `lock_tab_by_document_id_v2`. This function reuses that one's staleness
-    rule (`is_lock_stale`, owner decision 2026-09-03: Fix 2 extends to SBN
-    nodes too) with `locked_at` stored as an ISO-8601 string under
-    `props["locked_at"]` rather than a column — `component.props` is
-    already JSONB and this needed no migration.
+    `lock_tab_by_document_id_v2`. Lock state is on the four real columns;
+    `is_lock_stale` is the same TTL rule as every other lock node.
 
     §6.3 gates this on `edit(n)`, NEW as of 2026-09-09 and the reason that
     table lists lock/unlock as new rows: "without it any signed-in user can
     lock a tab they cannot edit and deny service to those who can". Locking
     is a different axis from *may you edit* — it answers *is someone else
     editing right now* — but taking one is a write, and only an editor has
-    any business taking it."""
-    try:
-        locked_by = _validate_locked_by(locked_by)
-        if not locked_by:
-            raise ValueError("locked_by is required")
+    any business taking it.
 
-        component = get_component_by_link(db, link)
-        if component is None or not _is_sbn_member(component):
-            return None
+    Response: the workspace plus `lock_token`/`lock_expires_at` — the ONLY
+    SBN response that carries the token (same narrow rule as
+    `TabWorkspaceResponse.lock_token`); the SBN router already returns
+    `TabWorkspaceAPIResponse`, which declares both."""
+    locked_by = _validate_locked_by(locked_by) or ""
+    if not locked_by:
+        raise ValueError("locked_by is required")
 
-        require_edit(access, _sbn_node(component))
+    component = get_component_by_link(db, link)
+    if component is None or not _is_sbn_member(component):
+        return None
 
-        props = _sbn_props(component)
-        current_locked_by = props.get("locked_by") or ""
-        held_by_someone_else = bool(props.get("locked")) and current_locked_by and current_locked_by != locked_by
-        if held_by_someone_else and not is_lock_stale(_sbn_locked_at(props)):
-            raise ValueError(f"Node is already locked by {current_locked_by}")
+    require_edit(access, _sbn_node(component))
 
-        component.props = {
-            **props,
-            "locked": True,
-            "locked_by": locked_by,
-            "locked_at": _utc_now().isoformat(),
-        }
-        db.commit()
-        return get_sbn_workspace(db, link)
-
-    except Exception:
-        db.rollback()
-        raise
+    # `acquire` commits (or rolls back) on its own.
+    grant = edit_lock_service.acquire(db, _sbn_node(component), locked_by, force=force)
+    workspace = get_sbn_workspace(db, link)
+    if workspace is not None:
+        workspace["lock_token"] = grant.token
+        workspace["lock_expires_at"] = grant.expires_at
+    return workspace
 
 
 def unlock_sbn_node(
@@ -631,9 +668,11 @@ def unlock_sbn_node(
     *,
     access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
-    """`unlocked_by` is identity-sourced and `force` is unchanged — see
+    """THIN WRAPPER over `edit_lock_service.release` — `unlocked_by` is
+    identity-sourced and `force` is unchanged, see
     `unlock_tab_by_document_id_v2`'s docstring in gridstack_service.py,
-    which this mirrors exactly including the omission-bypass note.
+    which this mirrors exactly including the omission-bypass note (the
+    "no `and unlocked_by` short-circuit" guard now lives in `release`).
 
     §6.3 gates unlock on `edit(n)` and FORCE-unlock on "`n` or `parent(n)`",
     and one check covers both: `edit` folds DOWN the root path
@@ -644,36 +683,23 @@ def unlock_sbn_node(
     a pair below mine" are one lookup rather than two branches. Until this,
     `force: true` "skip[ped] every check with nothing gating who may use
     it"; now it skips only the holder check, never the grant check."""
-    try:
-        unlocked_by = _validate_locked_by(unlocked_by)
+    component = get_component_by_link(db, link)
+    if component is None or not _is_sbn_member(component):
+        return None
 
-        component = get_component_by_link(db, link)
-        if component is None or not _is_sbn_member(component):
-            return None
+    require_edit(access, _sbn_node(component))
 
-        require_edit(access, _sbn_node(component))
-
-        props = _sbn_props(component)
-        current_locked_by = props.get("locked_by") or ""
-        # No `and unlocked_by` short-circuit — see
-        # unlock_tab_by_document_id_v2's docstring in gridstack_service.py
-        # for why: a falsy unlocked_by must read as "not proven to be the
-        # holder", never as "no identity ⇒ let it through".
-        held_by_someone_else = bool(props.get("locked")) and current_locked_by and current_locked_by != unlocked_by
-        if not force and held_by_someone_else and not is_lock_stale(_sbn_locked_at(props)):
-            raise ValueError(f"Node is locked by {current_locked_by}")
-
-        component.props = {**props, "locked": False, "locked_by": "", "locked_at": None}
-        db.commit()
-        return get_sbn_workspace(db, link)
-
-    except Exception:
-        db.rollback()
-        raise
+    # `release` validates `unlocked_by` and commits/rolls back on its own.
+    edit_lock_service.release(db, _sbn_node(component), unlocked_by or "", force=force)
+    return get_sbn_workspace(db, link)
 
 
 def reorder_sbn_siblings(
-    db: Session, items: list[dict[str, Any]], *, access: ViewerAccess | None = None
+    db: Session,
+    items: list[dict[str, Any]],
+    *,
+    access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> list[dict[str, Any]]:
     try:
         if not items:
@@ -713,6 +739,16 @@ def reorder_sbn_siblings(
         for parent_node in {_sbn_parent_node(by_link[link]) for link in links}:
             require_edit(access, parent_node)
 
+        # plan_lock_propagation §5.4, decision 9: reorder is the ONE
+        # session-exempt write — no token required, but refused while any
+        # node in the reordered set is held fresh by someone else. Same
+        # rule, same helper as the other three reorder surfaces. `session`
+        # is only the holder identity here, never validated as a token.
+        if session is not None:
+            edit_lock_service.refuse_if_any_held(
+                db, [_sbn_node(by_link[link]) for link in links], session.holder
+            )
+
         for link, order in zip(links, orders):
             component = by_link[link]
             component.props = {**_sbn_props(component), "order": order}
@@ -750,7 +786,11 @@ def _get_descendant_sbn_ids(db: Session, component_id: int) -> list[int]:
 
 
 def delete_sbn_subtree(
-    db: Session, link: str, *, access: ViewerAccess | None = None
+    db: Session,
+    link: str,
+    *,
+    access: ViewerAccess | None = None,
+    session: edit_lock_service.EditSession | None = None,
 ) -> dict[str, Any] | None:
     try:
         component = get_component_by_link(db, link)
@@ -779,6 +819,21 @@ def delete_sbn_subtree(
         # the reverse, and a caller granted edit on one sub-tab must not be
         # able to delete it out of a tree they hold nothing else on.
         require_edit(access, _sbn_parent_node(component))
+
+        # DECISION B (plan_component_locking_and_sbn_2026-09-17.md, owner-
+        # locked): the SESSION check targets `n` ITSELF, not `parent(n)` —
+        # a deliberate deviation from the mechanical "session on the same
+        # node as require_edit" rule every other write here follows. The
+        # SBN's only Delete affordance lives on the row being edited
+        # (`showActions` is true only for the held node — owner feedback
+        # 2026-08-06), so the editor's session is on `n`; `parent(n)`'s
+        # ancestor chain does not contain `n`, and a session check there
+        # could never be satisfied by the one token the deleting user
+        # actually holds. Checking `n` is still safe: `n`'s chain contains
+        # every ancestor, so a root/canvas session passes too, and nothing
+        # under `n` can be held by anyone else — `n`'s own acquire already
+        # refused if it were.
+        _require_live_session(db, session, _sbn_node(component))
 
         descendant_ids = _get_descendant_sbn_ids(db, component.id)
         # Leaves-first, same self-referential-FK-without-relationship

@@ -30,6 +30,7 @@ from app.schemas.tab import (
     LockTabRequest,
     NavTabListAPIResponse,
     NavTabResponse,
+    RenewLockRequest,
     ReorderNavTabsRequest,
     TabSummaryListAPIResponse,
     UnlockTabRequest,
@@ -44,6 +45,7 @@ from app.services.nav_tab_service import (
     get_nav_tab_by_document_id,
     get_nav_tabs_v2,
     lock_nav_tab_by_document_id_v2,
+    renew_nav_tab_lock_by_document_id_v2,
     reorder_nav_tabs_v2,
     unlock_nav_tab_by_document_id_v2,
     update_nav_tab_v2,
@@ -293,6 +295,50 @@ def lock_nav_tab(
         if locked is None:
             raise HTTPException(status_code=404, detail="Nav tab not found")
         return locked
+    except AccessDeniedError as e:
+        raise access_denied_to_http_exception(e)
+    except ValueError as e:
+        raise value_error_to_http_exception(e)
+
+
+@router.put(
+    "/{document_id}/lock/renew",
+    response_model=NavTabResponse,
+    summary="Renew an existing edit session on a nav tab (v2)",
+    description="""
+Nav-tab mirror of `PUT /v2/tabs/{id}/lock/renew` — the save preflight's
+VALIDATE door (2026-09-16 TTL fix). Succeeds, bumping the session's expiry,
+only if this nav tab's own lock row is a fresh session held by the caller
+under one of the presented `X-Edit-Tokens`; otherwise 409 with the matching
+`EDIT_SESSION_*` code and no change to the row. Never acquires or reclaims —
+see `edit_lock_service.renew`.
+""",
+    responses={
+        **COMMON_BAD_REQUEST_RESPONSE,
+        **COMMON_NOT_FOUND_RESPONSE,
+        **COMMON_CONFLICT_RESPONSE,
+        **COMMON_FORBIDDEN_RESPONSE,
+    },
+)
+def renew_nav_tab_lock(
+    document_id: str,
+    # Parsed for schema symmetry with the tab route (same `{}` body from the
+    # same client helper) — `link` has no meaning for a nav tab and is not
+    # read here.
+    request: RenewLockRequest,  # noqa: ARG001
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+    session: edit_lock_service.EditSession = Depends(get_edit_session),
+):
+    validate_document_id(document_id)
+
+    try:
+        renewed = renew_nav_tab_lock_by_document_id_v2(
+            db=db, document_id=document_id, session=session, access=access
+        )
+        if renewed is None:
+            raise HTTPException(status_code=404, detail="Nav tab not found")
+        return renewed
     except AccessDeniedError as e:
         raise access_denied_to_http_exception(e)
     except ValueError as e:

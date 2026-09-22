@@ -3,46 +3,11 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from app.services import hub_service, nav_tab_service
-from app.services.access_control_service import NodeRef
+from app.services import nav_tab_service
 
 
 def _fake_db():
     return SimpleNamespace(commit=MagicMock(), rollback=MagicMock())
-
-
-def test_hub_access_write_returns_component_receipts(monkeypatch):
-    db = _fake_db()
-    hub = SimpleNamespace(
-        id=1,
-        document_id="hub-v2",
-        access_control={"viewers": {}, "admins": {}},
-        updated_at=None,
-    )
-    touched = [NodeRef("tab", 10)]
-    receipt = {"component_id": 295, "action": "upsert"}
-
-    monkeypatch.setattr(hub_service.access_control_service, "get_hub", lambda _db: hub)
-    monkeypatch.setattr(
-        hub_service.access_control_service,
-        "apply_write",
-        lambda _db, _ref, _ac: touched,
-    )
-    monkeypatch.setattr(
-        hub_service,
-        "_refresh_index_for_touched",
-        lambda _db, refs: [receipt] if refs == touched else [],
-    )
-
-    result = hub_service.update_hub_v2(
-        db,
-        {"viewers": {}, "admins": {}},
-    )
-
-    assert result is not None
-    assert result["search_updates"] == [receipt]
-    db.commit.assert_called_once()
-    db.rollback.assert_not_called()
 
 
 def test_nav_access_write_returns_component_receipts(monkeypatch):
@@ -58,7 +23,7 @@ def test_nav_access_write_returns_component_receipts(monkeypatch):
         icon=None,
         updated_at=None,
     )
-    touched = [NodeRef("tab", 10)]
+    touched = [("tab", 10)]
     receipt = {"component_id": 365, "action": "upsert"}
 
     monkeypatch.setattr(

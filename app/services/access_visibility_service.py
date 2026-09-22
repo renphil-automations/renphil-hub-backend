@@ -67,10 +67,15 @@ from app.db_v2.models.hub import HubV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.resource_grant import LEVEL_EDIT
 from app.db_v2.models.tab import TabV2
-from app.services.rbac_graph_service import RbacClosures
+from app.services.rbac_graph_service import (
+    RbacClosures,
+    audience_user_ids,
+    hub_admin_pairs,
+)
 from app.services.resource_grant_service import (
     GrantMatch,
     get_grant,
+    grants_on_nodes,
     list_grants_for_node,
     matching_grants,
     resolve_node_labels,
@@ -1239,6 +1244,36 @@ def _parent_node(db: Session, node: NodeRef) -> NodeRef | None:
     return None  # an unrecognised node kind — fail closed, matching verdict()'s INVISIBLE
 
 
+def walk_ancestors(db: Session, node: NodeRef) -> list[NodeRef]:
+    """``node``'s STRICT ancestors, nearest first, resolved one primary-key
+    read at a time via ``_parent_node`` — the single-node counterpart of
+    ``NodeTree.ancestors`` (plan_thread_moderation_2026-09-18.md §5.6, §5.9).
+
+    WHEN TO USE THIS AND NOT ``build_node_tree``. The tree is five full-table
+    scans (~2 s live, see ``granted_single_node``'s docstring) and a Hub Admin
+    request never builds one at all (``ViewerAccess.visibility is None``).
+    A caller that needs the chain of ONE node — the moderation page's
+    location label per distinct component, the mention directory's reverse
+    fold per keystroke — pays 3–5 PK reads here instead.
+
+    WHAT THE RESULT DOES AND DOES NOT PROMISE. It ends wherever
+    ``_parent_node`` runs out: at ``("hub", …)`` for a rooted node, or
+    EARLIER for an orphan (§3.3 — a tab with no ``nav_tab_id``, a widget on a
+    sub-grid with no representation row, a broken FK). Unlike
+    ``NodeTree.ancestors``, which returns ``[]`` for an orphan, this returns
+    the partial chain it found, because the location label wants to name
+    whatever ancestors exist. A caller that needs the ROOTED property must
+    check ``chain[-1]`` itself — ``users_granted_on_node`` below does, and
+    fails closed when the chain does not reach the hub.
+
+    Iterative with a visited set (§3.3): a cyclic parent chain terminates
+    with the nodes seen so far rather than hanging a request. The visited set
+    starts with ``node`` itself, so a node whose chain loops back to it is
+    cut there too.
+    """
+    return _walk_ancestors_from(db, node, _parent_node(db, node))
+
+
 def granted_single_node(
     db: Session,
     hub_user_id: int,
@@ -1280,6 +1315,26 @@ def granted_single_node(
     Iterative with a visited set (§3.3): an orphaned, or (should it ever
     happen) cyclic, parent chain terminates in ``False``, never a hang.
 
+    ROOTEDNESS IS CHECKED, NOT ASSUMED — fixed 2026-09-19 (thread-moderation
+    phase 2m). The walk used to return ``True`` the moment it met a seed,
+    so a grant written directly ON an orphan node (or on any node of an
+    orphan's partial chain) granted it here while ``compute_visibility``
+    — the reference this function's own tests say it must agree with — said
+    INVISIBLE, because ``_walk_from_root`` never descends to an orphan. That
+    was a fail-OPEN divergence in an authorization primitive, found by the
+    three-way property test in ``tests/test_thread_mentions_scoping.py``
+    (reverse fold vs. whole-tree fold vs. this fast path) the first time a
+    random grant bag landed on an orphan. The walk now continues to the end
+    of the chain regardless and answers ``True`` only if a seed was seen AND
+    the chain ends at THE hub row (``resolve_hub_node`` — ``None`` for
+    zero/two hub rows, exactly when ``build_node_tree``'s root is ``None``).
+    Cost: the walk no longer stops early at a seed, so a granted node pays
+    its full depth in PK reads (≤ ~6 live) instead of fewer — negligible,
+    and the price of matching the spec. Behaviour changes ONLY for grants on
+    orphan chains, which live data should not have (two orphan tabs exist,
+    ids 71/73; an admin could in principle have granted on them through the
+    UI, since the admin bypass shows them everything).
+
     MIRRORS (§3.4). If ``node`` is a ``mirror``-typed component, the real
     rule is a CONJUNCTION, not a redirect — see
     ``_apply_mirror_substitution``'s docstring for why:
@@ -1305,17 +1360,24 @@ def granted_single_node(
     if not seeds:
         return False  # nothing this user reaches — no walk needed either way
 
+    hub_node = resolve_hub_node(db)
+
     def _reaches_a_seed(start: NodeRef | None) -> bool:
+        """A seed lies on ``start``'s root path AND that path ends at the
+        hub — both halves, see ROOTEDNESS in the docstring."""
         current = start
         visited: set[NodeRef] = set()
+        seen_seed = False
         while current is not None:
-            if current in seeds:
-                return True
             if current in visited:
                 return False  # cycle guard — fail closed, §3.3
             visited.add(current)
+            if current in seeds:
+                seen_seed = True
+            if current[0] == "hub":
+                return seen_seed and current == hub_node
             current = _parent_node(db, current)
-        return False
+        return False  # the chain ran out before the hub — an orphan, §3.3
 
     if not _reaches_a_seed(node):
         return False
@@ -1341,6 +1403,146 @@ def granted_single_node(
     if target is None or target.type == MIRROR_WIDGET_TYPE:
         return False  # dangling — same rule build_node_tree applies (§3.4)
     return _reaches_a_seed(("component", target.id))
+
+
+# ---------------------------------------------------------
+# §8.1 step 3 READ BACKWARDS — which users are granted on ONE node?
+# (plan_thread_moderation_2026-09-18.md §5.9, M9 / M10)
+# ---------------------------------------------------------
+
+
+def users_granted_on_node(
+    db: Session,
+    node: NodeRef,
+    *,
+    closures: RbacClosures | None = None,
+) -> set[int]:
+    """Every ``hub_users`` id for whom ``granted_view(node)`` is true — the
+    same PAYLOAD question ``ViewerAccess.is_granted`` answers for one caller
+    (moderation plan §5.9), answered for every user at once.
+
+    THIS IS ``_fold_down`` INVERTED, NOT A SECOND ALGORITHM. §8.1 step 3
+    states the forward predicate as ``granted(n) ⟺ (ancestors(n) ∪ {n}) ∩ S_u
+    ≠ ∅`` — some grant the user reaches lies on the node's root path. Read
+    from the node's side: take the BAG of grants on the root path (§7, one
+    query — ``grants_on_nodes``), and a user is granted iff they reach any
+    grant in it. A user reaches a user-form grant iff it names them (D5),
+    and a pair-form grant iff their assignments reach its pair — which is
+    ``audience_user_ids``, ``audience_count``'s loop over a set of pairs.
+    Both levels count: edit implies view (§6.1), so an edit grant on the
+    chain grants view here exactly as it does in ``fold``.
+
+    THE TWO DIRECTIONS MUST AGREE EXACTLY, and ``tests/test_thread_mentions_
+    scoping.py``'s property test asserts ``u ∈ users_granted_on_node(c) ⟺
+    compute_visibility(u).is_granted(c)`` over random trees, org graphs and
+    grant bags. The places they could come apart, each handled below:
+
+    - **Orphans (§3.3).** The forward fold never reaches an orphan
+      (``_walk_from_root`` descends from the hub), so it is INVISIBLE to
+      everyone regardless of grants written on it. ``walk_ancestors`` returns
+      whatever partial chain exists, so this function checks that the chain
+      ends at the ONE hub row (``resolve_hub_node``) and contributes NOTHING
+      from the grant bag otherwise — never the orphan's own direct grants,
+      which would let a grant on an unreachable node name someone as able to
+      open it. What an orphan DOES still return is the admin set below,
+      because the forward side's bypass is not part of the fold and admits
+      an admin to every node, rooted or not (``ViewerAccess.is_granted``
+      returns True before it looks at the node). The property test pins
+      exactly that: orphan → admins-by-assignment and nobody else.
+    - **Hub Admins (M10).** The forward side's bypass is ``full_access``,
+      set from ``dependencies.is_hub_admin`` — JWT roles OR the
+      ``(hub_admin, universal)`` assignment closure. Only the second half is
+      knowable for another user, so the virtual admin pair
+      (``hub_admin_pairs``) is folded into the audience read and JWT-only
+      admins are absent. That is a documented data gap with one seam
+      (``hub_admin_user_ids`` / ``hub_admin_pairs`` in
+      ``rbac_graph_service``), not something to paper over here.
+    - **⊥ (§4.4, landmine 13).** ``(Any Role, Any Scope)`` reaches everyone
+      WITH AN ASSIGNMENT ROW in both directions — ``audience_user_ids``
+      walks ``role_assignments``, and a ``hub_users`` row with none matches
+      nothing, exactly as its empty ``effective_pairs`` matches nothing
+      forward. Do not "fix" this by treating ⊥ as every ``hub_users`` row.
+    - **Mirrors (§3.4).** A mirror-typed component is granted only if BOTH
+      its own position and its target are (``_apply_mirror_substitution``'s
+      conjunction; a dangling target or a mirror-of-mirror never is). The
+      thread widgets this was built for are never mirrors — a mirrored
+      ``ThreadWidget`` posts to the TARGET's link (M8) — so the branch below
+      is defence in depth on a general primitive, the same posture
+      ``granted_single_node`` takes, not a path the directory reaches.
+
+    COST, per call, measured against live Neon on 2026-09-19 for a
+    three-deep chain: the chain walk (one PK read per hop — a component
+    hop is two, component + gridstack), ``resolve_hub_node`` (1), the grants
+    query (1), the ``hub_admin`` role lookup (1; the universal scope comes
+    from the snapshot), and ONE ``role_assignments`` read covering the
+    chain's pairs AND the virtual admin pair together — about ten round
+    trips, no tree build. Pass ``closures`` to share the request's
+    ``RbacClosures`` (§8.2); never cache the result across requests — it is
+    an authorization input.
+
+    Returns ``hub_users`` ids. Consumers that need emails batch them through
+    ``resource_grant_service._hub_user_email_map``.
+    """
+    graph = closures if closures is not None else RbacClosures(db)
+    admin_pairs = hub_admin_pairs(db, closures=graph)
+
+    kind, node_id = node
+    # A component node is read ONCE, here, and reused for both the mirror
+    # check below and the first hop of the walk — the same row
+    # ``_parent_node`` would otherwise fetch again a few lines later.
+    component: ComponentV2 | None = None
+    if kind == "component":
+        component = db.query(ComponentV2).filter(ComponentV2.id == node_id).first()
+        first_parent = None if component is None else resolve_component_parent_node(db, component)
+        chain: list[NodeRef] = [node, *_walk_ancestors_from(db, node, first_parent)]
+    else:
+        chain = [node, *walk_ancestors(db, node)]
+
+    # Fail closed on anything that is not rooted at THE hub row — an orphan
+    # chain, a cycle cut by the visited set, an unknown node, a hub id that
+    # is not the one row, or a database with zero/two hub rows
+    # (``resolve_hub_node`` is ``None`` then, and ``build_node_tree``'s root
+    # is too). The grant bag contributes nothing; only the bypass does.
+    if chain[-1][0] != "hub" or chain[-1] != resolve_hub_node(db):
+        return audience_user_ids(db, admin_pairs, closures=graph)
+
+    grants = grants_on_nodes(db, chain)
+    granted: set[int] = {g.user_id for g in grants if g.user_id is not None}
+    pairs = {(g.role_id, g.scope_id) for g in grants if g.role_id is not None}
+    # One assignments read for the bag's pairs and the admin pair together:
+    # the union is the answer, and reading the table twice for two subsets
+    # of the same predicate was the single largest avoidable cost here.
+    granted |= audience_user_ids(db, pairs | admin_pairs, closures=graph)
+
+    if component is not None and component.type == MIRROR_WIDGET_TYPE:
+        target_link = (component.props or {}).get("target_link")
+        target = (
+            db.query(ComponentV2).filter(ComponentV2.link == target_link).first()
+            if target_link
+            else None
+        )
+        if target is None or target.type == MIRROR_WIDGET_TYPE:
+            # Dangling — nobody but the bypass (§3.4).
+            return audience_user_ids(db, admin_pairs, closures=graph)
+        # The target's own set already contains the admins, so the
+        # intersection keeps them — no separate union needed.
+        granted &= users_granted_on_node(db, ("component", target.id), closures=graph)
+
+    return granted
+
+
+def _walk_ancestors_from(db: Session, node: NodeRef, first_parent: NodeRef | None) -> list[NodeRef]:
+    """``walk_ancestors`` with the first hop already resolved by the caller
+    (which had the row in hand) — same visited-set contract, one fewer PK
+    read. Kept private; ``walk_ancestors`` is the public shape."""
+    chain: list[NodeRef] = []
+    visited: set[NodeRef] = {node}
+    current = first_parent
+    while current is not None and current not in visited:
+        visited.add(current)
+        chain.append(current)
+        current = _parent_node(db, current)
+    return chain
 
 
 class AccessDeniedError(Exception):

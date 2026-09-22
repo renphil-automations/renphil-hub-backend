@@ -16,6 +16,14 @@ this array — but `name`/`token` on the way IN are never trusted (plan §5.3):
 (bottom of this file) back `GET /notifications`, `GET
 /notifications/unread-count`, `POST /notifications/{id}/read` and `POST
 /notifications/read-all` (plan §4.1, §4.5, §7).
+
+`ThreadStatus` / `ThreadModerationRow` / `ThreadModerationListResponse` /
+`ThreadModerationSummary` are phase 2a
+(`plan_thread_moderation_2026-09-18.md` §4.3) — the moderation queue and
+history list the "Threads Management" page (built in phase 2c) consumes.
+`ThreadSummary.status` is now the typed `ThreadStatus` rather than a bare
+`str`, and gained `reviewed_by_email`/`reviewed_by_name`/`reviewed_at`,
+inherited by `ThreadDetail` and `ThreadModerationRow` alike.
 """
 
 from __future__ import annotations
@@ -66,7 +74,8 @@ class MentionEntry(BaseModel):
 
 
 class MentionableUser(BaseModel):
-    """One row of `GET /threads/mentionable-users` (plan §5.1)."""
+    """One row of `GET /threads/component/{link}/mentionable-users` (plan
+    §5.1; per-widget since plan_thread_moderation_2026-09-18.md M9)."""
 
     token: str
     name: str
@@ -167,6 +176,12 @@ class VoteRequest(BaseModel):
     value: Literal[1, -1, 0]
 
 
+# The status lifecycle (plan_thread_moderation_2026-09-18.md §2) — matches
+# the database CHECK (ck_threads_status) exactly; no other value is ever
+# written.
+ThreadStatus = Literal["pending", "approved", "rejected"]
+
+
 class ThreadSummary(BaseModel):
     """One row of the list endpoint (plan §4.1 — "counts + the caller's own
     vote per row")."""
@@ -176,7 +191,13 @@ class ThreadSummary(BaseModel):
     title: str
     author_email: str
     author_name: str | None
-    status: str
+    status: ThreadStatus
+    # Moderation decision (plan_thread_moderation_2026-09-18.md §3.1) — all
+    # three NULL unless an editor has explicitly decided this thread (M5:
+    # an editor's own auto-approved post is NOT "reviewed").
+    reviewed_by_email: str | None = None
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime | None = None
     # Two counts, rendered separately — never collapsed into a net score
     # (D10, amended 2026-08-19). There is deliberately no `score` field: the
     # UI shows up and down as independent like/dislike controls, and a
@@ -216,6 +237,47 @@ class ThreadDetail(ThreadSummary):
 class ThreadListResponse(BaseModel):
     items: list[ThreadSummary] = Field(default_factory=list)
     next_cursor: str | None = None
+
+
+class ThreadModerationRow(ThreadSummary):
+    """One row of the pending queue / history table
+    (plan_thread_moderation_2026-09-18.md §4.2, §4.3) — a thread summary
+    plus WHERE it lives, since the moderation page shows threads from MANY
+    widgets across the hub at once, unlike the widget's own list (which is
+    always scoped to one component the caller already knows)."""
+
+    component_link: str
+    widget_title: str
+    location_label: str
+
+
+class ThreadModerationListResponse(BaseModel):
+    items: list[ThreadModerationRow] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ThreadModerationSummary(BaseModel):
+    """`GET /threads/moderation/summary` (plan §4.2, §5.7) — polled like the
+    notification bell; the router pairs this with an ETag for the same
+    304-on-unchanged shape as `UnreadCountResponse`."""
+
+    can_moderate: bool
+    moderated_component_count: int
+    pending_count: int
+
+
+class ThreadWidgetCounts(BaseModel):
+    """`GET /threads/component/{link}/counts` (followups plan §4.2) — an
+    editor-only, all-status aggregate (unlike every list endpoint in this
+    module, which scopes to `approved OR (own AND pending/rejected)`), for
+    the widget-removal typed-confirmation dialog: it needs the TRUE totals,
+    including other authors' pending/rejected threads that `ON DELETE
+    CASCADE` would destroy along with the widget but that the widget's own
+    list never shows the caller."""
+
+    thread_count: int
+    comment_count: int
+    pending_count: int
 
 
 class CommentSummary(BaseModel):

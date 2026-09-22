@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Double, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Double, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db_v2.database import BaseV2
@@ -8,10 +8,16 @@ class ComponentV2(BaseV2):
     """A widget within a gridstack (canvas). A component's actual `data` (for
     every type, not just block_note) lives in `page_content` via
     `page_content_id` — `props` (JSONB) is structural-metadata-only: `min_w`/
-    `min_h` (any component), plus `locked`/`locked_by`/`order` for components
-    that are part of a Super Block Note's own tree (a component whose own
-    `type` is `super_block_note`, or any descendant reached via
-    `super_blocknote_id`) — never widget content.
+    `min_h` (any component), plus `order` for components that are part of a
+    Super Block Note's own tree (a component whose own `type` is
+    `super_block_note`, or any descendant reached via `super_blocknote_id`)
+    — never widget content. `props` ALSO still carries an SBN node's own
+    `locked`/`locked_by`/`locked_at` lock (read and written by
+    `super_blocknote_service.lock_sbn_node`/`unlock_sbn_node`) — until
+    plan_component_locking_and_sbn_2026-09-17.md phase B moves that onto
+    the four real lock columns below (phase A, which added the columns,
+    left the SBN service untouched). Once B ships, any `props.locked*` keys
+    still present on a live row are stale leftovers nothing reads.
 
     super_blocknote_id (self-referential FK) is set only for a Super Block
     Note's own nested sub-tab components, pointing at their parent SBN
@@ -66,3 +72,20 @@ class ComponentV2(BaseV2):
     # Set only for a Super Block Note's own nested sub-tab components — see
     # the class docstring.
     super_blocknote_id = Column(Integer, ForeignKey("components.id"), nullable=True, index=True)
+
+    # Added by scripts/migrate_component_lock_columns.py
+    # (plan_component_locking_and_sbn_2026-09-17.md §3, decision A): every
+    # REAL component — `current_grid_id IS NULL`, i.e. an ordinary canvas
+    # widget, a Super Block Note root, or any SBN sub-tab node — is a lock
+    # node of its own, the fourth kind in `edit_lock_service`'s tree beside
+    # tabs/gridstacks/nav_tabs. Same four columns, same shape, same
+    # `is_lock_stale` TTL helper as those three tables (mirrored, not
+    # independently designed), so the four lock flavours cannot drift onto
+    # different rules. A sub-grid's representation row (`current_grid_id`
+    # set) carries the columns like every other row but is NEVER a lock node
+    # and is never written — it stands for its gridstack, whose own row
+    # already holds the lock (`edit_lock_service.lock_node_of`).
+    locked = Column(Boolean, nullable=True, default=False)
+    locked_by = Column(String(255), nullable=True, default="")
+    locked_at = Column(DateTime, nullable=True)
+    lock_token = Column(String(64), nullable=True)
