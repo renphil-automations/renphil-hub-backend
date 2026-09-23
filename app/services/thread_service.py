@@ -1169,11 +1169,13 @@ def _to_thread_detail(
     my_vote: int,
     *,
     pending_revisions: list[ThreadRevisionSummary] | None = None,
+    viewer_is_editor: bool = False,
 ) -> ThreadDetail:
     """`pending_revisions` comes from the caller for the same reason as
     `_to_thread_summary`'s count (`_pending_revision_summaries`); the
     inherited `pending_revision_count` is its length, so the two can never
-    disagree on one response."""
+    disagree on one response. `viewer_is_editor` likewise needs `access`,
+    so every caller passes `_is_component_editor(component, access)`."""
     pending_revisions = pending_revisions or []
     return ThreadDetail(
         **_to_thread_summary(
@@ -1181,6 +1183,7 @@ def _to_thread_detail(
         ).model_dump(),
         content=thread.content,
         pending_revisions=pending_revisions,
+        viewer_is_editor=viewer_is_editor,
     )
 
 
@@ -1591,7 +1594,9 @@ def create_thread_for_link(
 
     db.commit()
     db.refresh(thread)
-    return _to_thread_detail(thread, my_vote=0)
+    return _to_thread_detail(
+        thread, my_vote=0, viewer_is_editor=_is_component_editor(component, access)
+    )
 
 
 def get_thread_by_id(
@@ -1624,6 +1629,7 @@ def get_thread_by_id(
         thread,
         my_vote,
         pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+        viewer_is_editor=_is_component_editor(component, access),
     )
 
 
@@ -1727,6 +1733,7 @@ def update_thread_by_id(
             thread,
             my_vote,
             pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+            viewer_is_editor=_is_component_editor(component, access),
         ),
         revision=None,
     )
@@ -1846,6 +1853,7 @@ def _apply_editor_edit(
                 thread,
                 _my_vote_for_thread(db, thread.id, user.email),
                 pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+                viewer_is_editor=_is_component_editor(component, access),
             ),
             revision=None,
         )
@@ -1925,6 +1933,7 @@ def _apply_editor_edit(
             thread,
             _my_vote_for_thread(db, thread.id, user.email),
             pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+            viewer_is_editor=_is_component_editor(component, access),
         ),
         revision=_to_revision_summary(revision),
     )
@@ -1993,7 +2002,10 @@ def _stage_thread_edit(
         db.commit()  # releases the row lock; nothing was written
         pending_revisions = _pending_revision_summaries(db, thread, component, user, access=access)
         detail = _to_thread_detail(
-            thread, _my_vote_for_thread(db, thread.id, user.email), pending_revisions=pending_revisions
+            thread,
+            _my_vote_for_thread(db, thread.id, user.email),
+            pending_revisions=pending_revisions,
+            viewer_is_editor=_is_component_editor(component, access),
         )
         if latest_pending is None:
             # Unchanged vs the LIVE thread — the same no-op a pre-versioning
@@ -2034,6 +2046,7 @@ def _stage_thread_edit(
             thread,
             _my_vote_for_thread(db, thread.id, user.email),
             pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+            viewer_is_editor=_is_component_editor(component, access),
         ),
         revision=_to_revision_summary(revision),
     )

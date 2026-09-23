@@ -316,10 +316,20 @@ class ThreadDetail(ThreadSummary):
     `pending_revisions` (plan_thread_edit_versioning §3) — the thread's
     staged edits awaiting review, oldest version first, same scoping as
     `pending_revision_count` (author or component editor, else `[]`). No
-    `content` on these; the body comes from `GET .../revisions/{id}`."""
+    `content` on these; the body comes from `GET .../revisions/{id}`.
+
+    `viewer_is_editor` (phase B, owner-approved 2026-09-23) — whether the
+    CALLER is an editor of this thread's widget or any ancestor
+    (`_is_component_editor`, the exact predicate `update_thread_by_id` uses
+    to choose between going live and staging). The author's edit composer
+    needs it: its base is the latest pending revision for a non-editor (the
+    staged path's base rule) but always the LIVE thread for an editor (the
+    editor path publishes over live). Nothing about the caller's own
+    authority is secret to them, so it is not scoped."""
 
     content: str
     pending_revisions: list[ThreadRevisionSummary] = Field(default_factory=list)
+    viewer_is_editor: bool = False
 
 
 class ThreadUpdateResult(BaseModel):
