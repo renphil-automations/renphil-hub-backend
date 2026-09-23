@@ -3,7 +3,10 @@
 Three of the plan's four new tables: ``threads``, ``thread_comments`` and
 ``thread_votes``. The fourth (``notifications``) lives in ``notification.py``
 so a caller that only needs the discussion-board shape doesn't have to import
-the notification model too.
+the notification model too. ``thread_revisions`` (a published thread's
+version log, including staged edits awaiting review —
+plan_thread_edit_versioning_2026-09-22.md §2, amended 2026-09-23) belongs to
+the thread and lives here beside it.
 
 None of these rows are reachable through an ORM ``relationship()`` — every
 other model in ``db_v2`` follows the same rule (see ``ComponentV2``'s class
@@ -133,6 +136,18 @@ class ThreadV2(BaseV2):
     # Non-null => render an "edited" marker (D4). Never set on creation.
     edited_at = Column(DateTime(timezone=True), nullable=True)
 
+    # The version of the content currently live in title/content/mentions
+    # (plan_thread_edit_versioning_2026-09-22.md §1.2, amended 2026-09-23).
+    # 1 for every new thread and every pre-versioning row; once the thread
+    # is published, the thread_revisions row at this version holds exactly
+    # the live content. Only ever moves forward — approving an author's
+    # revision or an editor's direct edit sets this to that revision's
+    # version, and every still-pending revision below it is `overwritten`
+    # first (explicitly, never silently), so a pending revision always has
+    # version > this. `server_default` so existing rows and the migration
+    # agree; `default` so the ORM sets it on insert without a refresh.
+    version = Column(Integer, nullable=False, default=1, server_default=text("1"))
+
     __table_args__ = (
         # (component_id, created_at DESC, id DESC) — the one query the list
         # endpoint runs (plan §3.1). The trailing `id` is not decorative: it
@@ -170,6 +185,112 @@ class ThreadV2(BaseV2):
         # bloats this index either.
         Index(
             "ix_threads_reviewed_at_id",
+            reviewed_at.desc(),
+            id.desc(),
+            postgresql_where=text("reviewed_at IS NOT NULL"),
+            sqlite_where=text("reviewed_at IS NOT NULL"),
+        ),
+    )
+
+
+class ThreadRevisionV2(BaseV2):
+    """One version of a PUBLISHED thread (plan_thread_edit_versioning_
+    2026-09-22.md §2.1, amended 2026-09-23). The table is the thread's full
+    version log; ``threads.title``/``content``/``mentions`` is a cache of the
+    row at ``version = threads.version``.
+
+    ``origin`` says where a row came from: ``'original'`` is v1, written
+    when the thread is PUBLISHED (at create for an editor's post, inside
+    ``decide_thread`` on approval for a viewer's — a pending or rejected
+    thread has no rows at all); ``'author'`` is a non-editor author's staged
+    edit, the only origin ever ``pending``; ``'editor'`` is an editor-
+    author's direct edit, auto-approved.
+
+    ``status`` is its own four-value lifecycle — ``'pending'`` /
+    ``'approved'`` / ``'rejected'`` / ``'overwritten'`` — deliberately NOT
+    ``ck_threads_status``: the thread's own state machine and an edit's are
+    two separate machines that share vocabulary and nothing else, and
+    ``threads.status`` never moves while a revision is decided (plan §1.1).
+    Many pending revisions per thread are legal (owner decision 1) — there
+    is NO "at most one pending" index.
+
+    Same cascade rule as every other table in this module (see the module
+    docstring): the FK's ``ON DELETE CASCADE`` removes a thread's revisions
+    with it — never application code.
+    """
+
+    __tablename__ = "thread_revisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # No `index=True` — uq_thread_revisions_thread_version below leads with
+    # thread_id and covers every per-thread lookup, same reasoning as
+    # ThreadV2.component_id.
+    thread_id = Column(
+        Integer,
+        ForeignKey("threads.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version = Column(Integer, nullable=False)
+
+    # A COMPLETE snapshot, never a diff — simpler to store, simpler to
+    # render, and the only representation `threads` itself has.
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    mentions = Column(JSONB, nullable=False, default=list)
+
+    status = Column(String(16), nullable=False)
+    origin = Column(String(16), nullable=False)
+
+    # Only the thread's own author can submit (`_require_author`), so this
+    # is technically derivable — stored anyway, because author_email on
+    # `threads` is a plain column for the same reason (email is identity,
+    # name is a display snapshot; plan_thread_widget §3.6).
+    submitted_by_email = Column(String(320), nullable=False)
+    submitted_by_name = Column(String(255), nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=False)
+
+    # Set together on EVERY non-pending row. The deciding editor for an
+    # author edit; on an `overwritten` row, the editor whose approval (or
+    # direct edit) displaced it, and that instant; on an auto-approved row,
+    # whoever published it — the approving editor for a viewer's v1, the
+    # editor themselves for their own post or direct edit.
+    reviewed_by_email = Column(String(320), nullable=True)
+    reviewed_by_name = Column(String(255), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'overwritten')",
+            name="ck_thread_revisions_status",
+        ),
+        CheckConstraint(
+            "origin IN ('original', 'author', 'editor')",
+            name="ck_thread_revisions_origin",
+        ),
+        # Only an author's staged edit is ever decided; v1 and an editor's
+        # edit are published the moment they are written. And v1 is exactly
+        # the original — no other row can claim version 1.
+        CheckConstraint(
+            "(origin = 'author' OR status = 'approved') "
+            "AND ((origin = 'original') = (version = 1))",
+            name="ck_thread_revisions_origin_shape",
+        ),
+        # Hard backstop for the version race (the allocation itself runs
+        # under a FOR UPDATE on the threads row). Also the per-thread lookup
+        # index and what MAX(version) reads.
+        Index("uq_thread_revisions_thread_version", "thread_id", "version", unique=True),
+        # The merged pending queue's own ordering half. PARTIAL — pending
+        # revisions are few by nature however large the table grows.
+        Index(
+            "ix_thread_revisions_pending_submitted_id",
+            "submitted_at",
+            "id",
+            postgresql_where=text("status = 'pending'"),
+            sqlite_where=text("status = 'pending'"),
+        ),
+        # History's half, mirroring ix_threads_reviewed_at_id exactly.
+        Index(
+            "ix_thread_revisions_reviewed_at_id",
             reviewed_at.desc(),
             id.desc(),
             postgresql_where=text("reviewed_at IS NOT NULL"),

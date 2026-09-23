@@ -33,6 +33,24 @@ polled summary (`list_pending_threads`, `list_thread_history`,
 `moderation_summary`), each scoped to `_moderated_component_ids` — the set
 of thread widgets the caller can moderate, a Hub Admin's being every one.
 
+Thread versioning (plan_thread_edit_versioning_2026-09-22.md, phase A, with
+the 2026-09-23 amendments): every PUBLISHED version of a thread is a
+`thread_revisions` row, and `threads` caches the row at `threads.version`.
+v1 (`origin='original'`) is written when a thread is published
+(`_write_original_revision` — at create for an editor's post, in
+`decide_thread` on approval for a viewer's). A NON-editor author's edit of
+an approved thread is staged as a pending `origin='author'` row
+(`_stage_thread_edit`) while the thread stays `approved` and readable; an
+editor decides each one (`decide_thread_revision`), in version order or
+with an explicit `overwrite`. An editor-author's edit goes live at once as
+an auto-approved `origin='editor'` row (`_apply_editor_edit`), refused while
+author edits are pending unless `overwrite` is set. Revisions have their
+OWN management section — `list_pending_revisions`, `list_revision_history`,
+`revision_history_facets`, `revision_moderation_summary` — and never appear
+in the Threads Management functions above them. Who may even learn that a
+thread has staged edits is ONE predicate, `_can_see_thread_revisions`
+(author or component editor).
+
 Every public function here is a thin, synchronous, DB-session-bound unit —
 each is called from the router via a single `asyncio.to_thread(...)` per
 request (plan §4.6: "every DB call through asyncio.to_thread" — today this
@@ -66,6 +84,7 @@ from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.thread import (
     THREAD_WIDGET_TYPE,
     ThreadCommentV2,
+    ThreadRevisionV2,
     ThreadV2,
     ThreadVoteV2,
 )
@@ -79,12 +98,20 @@ from app.schemas.thread import (
     MentionInput,
     NotificationEntry,
     NotificationListResponse,
+    RevisionPerson,
     ThreadDetail,
     ThreadListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
     ThreadModerationSummary,
+    ThreadRevisionDetail,
+    ThreadRevisionHistoryFacets,
+    ThreadRevisionModerationListResponse,
+    ThreadRevisionModerationRow,
+    ThreadRevisionModerationSummary,
+    ThreadRevisionSummary,
     ThreadSummary,
+    ThreadUpdateResult,
     ThreadWidgetCounts,
     VoteResponse,
 )
@@ -121,6 +148,28 @@ NOTIFICATION_TYPE_THREAD_REJECTED = "thread_rejected"
 THREAD_STATUS_APPROVED = "approved"
 THREAD_STATUS_PENDING = "pending"
 THREAD_STATUS_REJECTED = "rejected"
+
+# Revision status values (plan_thread_edit_versioning_2026-09-22.md §1.1) —
+# a staged edit's OWN lifecycle, separate from the thread's above: the
+# thread stays 'approved' throughout. 'overwritten' marks a pending revision
+# displaced by an explicit overwrite-approve of a NEWER one (owner decision
+# 4); it is terminal, like 'approved'/'rejected'.
+REVISION_STATUS_PENDING = "pending"
+REVISION_STATUS_APPROVED = "approved"
+REVISION_STATUS_REJECTED = "rejected"
+REVISION_STATUS_OVERWRITTEN = "overwritten"
+REVISION_DECIDED_STATUSES = (
+    REVISION_STATUS_APPROVED,
+    REVISION_STATUS_REJECTED,
+    REVISION_STATUS_OVERWRITTEN,
+)
+
+# Where a revision came from (amendment A3, 2026-09-23) — see
+# `ThreadRevisionV2`'s docstring. Only 'author' rows are ever pending.
+REVISION_ORIGIN_ORIGINAL = "original"
+REVISION_ORIGIN_AUTHOR = "author"
+REVISION_ORIGIN_EDITOR = "editor"
+REVISION_ORIGINS = (REVISION_ORIGIN_ORIGINAL, REVISION_ORIGIN_AUTHOR, REVISION_ORIGIN_EDITOR)
 
 
 # ---------------------------------------------------------
@@ -347,6 +396,25 @@ def _moderated_component_ids(db: Session, access: ViewerAccess | None) -> list[i
     if access.full_access:
         return [row[0] for row in rows]
     return [row[0] for row in rows if access.verdict(("component", row[0])).edit]
+
+
+def _can_see_thread_revisions(
+    thread: ThreadV2, component: ComponentV2, user: UserInfo, access: ViewerAccess | None
+) -> bool:
+    """plan_thread_edit_versioning_2026-09-22.md §4.4 / landmine 3 — "may
+    this caller know about this thread's staged edits": the thread's author
+    (the only person who can submit one) or an editor of its widget or any
+    ancestor (the people who decide them). Everyone else — a plain granted
+    viewer included — must not learn that someone is editing a thread,
+    which nothing in the product leaked before this feature.
+
+    The ONE predicate behind `pending_revision_count`,
+    `ThreadDetail.pending_revisions` and `GET .../revisions/{id}`, so the
+    three can't drift apart. `access=None` → author only (the editor arm is
+    `_is_component_editor`, which is False without a real `ViewerAccess`)."""
+    return _norm_email(thread.author_email) == _norm_email(user.email) or _is_component_editor(
+        component, access
+    )
 
 
 # ---------------------------------------------------------
@@ -1064,7 +1132,13 @@ def _my_vote_for_comment(db: Session, comment_id: int, caller_email: str) -> int
 # ---------------------------------------------------------
 
 
-def _to_thread_summary(thread: ThreadV2, my_vote: int) -> ThreadSummary:
+def _to_thread_summary(
+    thread: ThreadV2, my_vote: int, *, pending_revision_count: int = 0
+) -> ThreadSummary:
+    """`pending_revision_count` is computed by the CALLER (it needs `user`
+    and `access` for its scoping — `_can_see_thread_revisions` — which this
+    serializer deliberately doesn't take); defaults to 0, the value every
+    caller that can't or needn't scope it (moderation rows, create) sends."""
     return ThreadSummary(
         id=thread.id,
         component_id=thread.component_id,
@@ -1086,14 +1160,145 @@ def _to_thread_summary(thread: ThreadV2, my_vote: int) -> ThreadSummary:
         # is already loaded on this row regardless (ThreadV2 has no deferred
         # columns), so this costs no extra query, only a few CPU cycles.
         content_excerpt=generate_notification_excerpt(thread.content),
+        pending_revision_count=pending_revision_count,
     )
 
 
-def _to_thread_detail(thread: ThreadV2, my_vote: int) -> ThreadDetail:
+def _to_thread_detail(
+    thread: ThreadV2,
+    my_vote: int,
+    *,
+    pending_revisions: list[ThreadRevisionSummary] | None = None,
+) -> ThreadDetail:
+    """`pending_revisions` comes from the caller for the same reason as
+    `_to_thread_summary`'s count (`_pending_revision_summaries`); the
+    inherited `pending_revision_count` is its length, so the two can never
+    disagree on one response."""
+    pending_revisions = pending_revisions or []
     return ThreadDetail(
-        **_to_thread_summary(thread, my_vote).model_dump(),
+        **_to_thread_summary(
+            thread, my_vote, pending_revision_count=len(pending_revisions)
+        ).model_dump(),
         content=thread.content,
+        pending_revisions=pending_revisions,
     )
+
+
+def _to_revision_summary(revision: ThreadRevisionV2) -> ThreadRevisionSummary:
+    return ThreadRevisionSummary(
+        id=revision.id,
+        thread_id=revision.thread_id,
+        version=revision.version,
+        title=revision.title,
+        status=revision.status,
+        origin=revision.origin,
+        submitted_by_email=revision.submitted_by_email,
+        submitted_by_name=revision.submitted_by_name,
+        submitted_at=revision.submitted_at,
+        reviewed_by_email=revision.reviewed_by_email,
+        reviewed_by_name=revision.reviewed_by_name,
+        reviewed_at=revision.reviewed_at,
+        content_excerpt=generate_notification_excerpt(revision.content),
+    )
+
+
+def _write_original_revision(
+    db: Session, thread: ThreadV2, *, publisher: UserInfo, published_at: datetime
+) -> ThreadRevisionV2:
+    """Amendment A3 (2026-09-23): the published v1 (`origin='original'`),
+    written the moment a thread becomes PUBLIC — at create for an editor's
+    own post, in `decide_thread` on approval for a viewer's (so it holds the
+    final approved text, including any edits made while pending). A pending
+    or rejected thread has no rows at all. Snapshots the thread's CURRENT
+    title/content/mentions; `submitted_*` is the author, `reviewed_*` whoever
+    published it. No-op if the thread already has a v1 (defensive — the
+    migration backfills existing approved threads). Does not commit."""
+    existing = (
+        db.query(ThreadRevisionV2)
+        .filter(ThreadRevisionV2.thread_id == thread.id, ThreadRevisionV2.version == 1)
+        .first()
+    )
+    if existing is not None:
+        return existing
+    revision = ThreadRevisionV2(
+        thread_id=thread.id,
+        version=1,
+        title=thread.title,
+        content=thread.content,
+        mentions=list(thread.mentions or []),
+        status=REVISION_STATUS_APPROVED,
+        origin=REVISION_ORIGIN_ORIGINAL,
+        submitted_by_email=_norm_email(thread.author_email),
+        submitted_by_name=thread.author_name,
+        submitted_at=thread.created_at,
+        reviewed_by_email=_norm_email(publisher.email),
+        reviewed_by_name=publisher.name,
+        reviewed_at=published_at,
+    )
+    db.add(revision)
+    thread.version = 1
+    return revision
+
+
+def _to_revision_detail(revision: ThreadRevisionV2) -> ThreadRevisionDetail:
+    return ThreadRevisionDetail(
+        **_to_revision_summary(revision).model_dump(),
+        content=revision.content,
+        mentions=revision.mentions or [],
+    )
+
+
+def _pending_revision_counts(
+    db: Session,
+    threads: list[ThreadV2],
+    component: ComponentV2,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None,
+) -> dict[int, int]:
+    """`thread_id -> pending revision count` for one page of ONE widget's
+    threads (plan_thread_edit_versioning §4.4) — ONE grouped query, and only
+    over the threads `_can_see_thread_revisions` lets this caller know
+    about; any other thread is simply absent (reads as 0)."""
+    visible_ids = [
+        t.id for t in threads if _can_see_thread_revisions(t, component, user, access)
+    ]
+    if not visible_ids:
+        return {}
+    rows = (
+        db.query(ThreadRevisionV2.thread_id, func.count(ThreadRevisionV2.id))
+        .filter(
+            ThreadRevisionV2.thread_id.in_(visible_ids),
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+        )
+        .group_by(ThreadRevisionV2.thread_id)
+        .all()
+    )
+    return {thread_id: int(count) for thread_id, count in rows}
+
+
+def _pending_revision_summaries(
+    db: Session,
+    thread: ThreadV2,
+    component: ComponentV2,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None,
+) -> list[ThreadRevisionSummary]:
+    """`ThreadDetail.pending_revisions` — oldest version first, same scoping
+    as the count (`_can_see_thread_revisions`); `[]` for everyone else."""
+    if not _can_see_thread_revisions(thread, component, user, access):
+        return []
+    rows = (
+        db.query(ThreadRevisionV2)
+        .filter(
+            ThreadRevisionV2.thread_id == thread.id,
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+        )
+        .order_by(ThreadRevisionV2.version.asc())
+        .all()
+    )
+    return [_to_revision_summary(r) for r in rows]
 
 
 # ---------------------------------------------------------
@@ -1304,7 +1509,15 @@ def list_threads_for_link(
     page = rows[:THREADS_PAGE_SIZE]
 
     my_votes = _my_votes_for_threads(db, [t.id for t in page], user.email)
-    items = [_to_thread_summary(t, my_votes.get(t.id, 0)) for t in page]
+    # Scoped (plan_thread_edit_versioning §4.4, landmine 3) — 0 for any row
+    # this caller neither authored nor edits.
+    revision_counts = _pending_revision_counts(db, page, component, user, access=access)
+    items = [
+        _to_thread_summary(
+            t, my_votes.get(t.id, 0), pending_revision_count=revision_counts.get(t.id, 0)
+        )
+        for t in page
+    ]
     next_cursor = _encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
 
     return ThreadListResponse(items=items, next_cursor=next_cursor)
@@ -1354,6 +1567,12 @@ def create_thread_for_link(
     db.add(thread)
     db.flush()  # assigns thread.id — the notifications below FK to it
 
+    # Amendment A3: an editor's post is published at once, so its v1 is
+    # written now, with the editor as its own publisher. A viewer's pending
+    # post gets its v1 when `decide_thread` approves it.
+    if thread_status == THREAD_STATUS_APPROVED:
+        _write_original_revision(db, thread, publisher=user, published_at=now)
+
     # plan §5.4 (landmine 1) — fan out ONLY when the new row is approved. A
     # pending thread notifies nobody: its mentions were validated and stored
     # (so nothing has to be re-typed once approved), but every mentioned
@@ -1401,7 +1620,11 @@ def get_thread_by_id(
         if not (is_author or _is_component_editor(component, access)):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
     my_vote = _my_vote_for_thread(db, thread.id, user.email)
-    return _to_thread_detail(thread, my_vote)
+    return _to_thread_detail(
+        thread,
+        my_vote,
+        pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+    )
 
 
 def update_thread_by_id(
@@ -1412,8 +1635,24 @@ def update_thread_by_id(
     content: str | None,
     mentions: list[MentionInput] | None = None,
     *,
+    overwrite: bool = False,
     access: ViewerAccess | None = None,
-) -> ThreadDetail:
+) -> ThreadUpdateResult:
+    """PATCH /threads/{id}. Returns `ThreadUpdateResult`
+    (plan_thread_edit_versioning_2026-09-22.md §3, amended 2026-09-23). Four
+    paths, in this order:
+
+    - `rejected` thread → 409 (terminal; unchanged).
+    - `approved` thread, NON-editor author → STAGED as a pending
+      `origin='author'` revision (`_stage_thread_edit`), `applied=False`.
+    - `approved` thread, EDITOR author → live at once as an auto-approved
+      `origin='editor'` revision (`_apply_editor_edit`), `applied=True`;
+      409 `earlier_revisions_pending` while author edits are pending unless
+      `overwrite` (amendment A2).
+    - `pending` thread → written in place, no revision (the thread has no
+      version history until it is published — amendment A3), `applied=True`.
+
+    `overwrite` only means anything on the editor path."""
     thread, component = _require_thread_and_component(db, thread_id)
     # A caller who has lost view access to the widget since posting must
     # not still be able to edit through this endpoint (defense in depth —
@@ -1429,6 +1668,26 @@ def update_thread_by_id(
             "This thread was not approved and can no longer be edited",
         )
 
+    if thread.status == THREAD_STATUS_APPROVED:
+        # plan_thread_edit_versioning §4.2 (owner decision 2) — the SAME
+        # `_is_component_editor(component, access)` predicate
+        # `create_thread_for_link` uses to auto-approve (landmine 8), so
+        # posting authority and editing authority can't drift apart.
+        # `access=None` is not an editor there, so an internal caller
+        # without a `ViewerAccess` stages rather than silently going live.
+        if _is_component_editor(component, access):
+            return _apply_editor_edit(
+                db, thread_id, component, user, title, content, mentions,
+                overwrite=overwrite, access=access,
+            )
+        return _stage_thread_edit(
+            db, thread_id, component, user, title, content, mentions, access=access
+        )
+
+    # A PENDING thread (the only status left): edited in place, exactly as
+    # before versioning. No revision — its v1 is written when an editor
+    # approves it, and holds whatever the text is by then.
+    #
     # Validate against the EFFECTIVE content — the new content if this PATCH
     # touches it, otherwise the thread's current content — since a mention's
     # token must occur in whatever the stored body ends up being, not
@@ -1436,29 +1695,13 @@ def update_thread_by_id(
     # (e.g. a title-only edit that also resends the same mentions).
     if mentions is not None:
         effective_content = content if content is not None else thread.content
-        previous_mentions = thread.mentions
-        resolved = _validate_and_resolve_mentions(
-            db, mentions, effective_content, component=component
-        )
-        thread.mentions = resolved
         # plan §5.4 — a PENDING thread's mentions are validated and stored
         # but NOT fanned out: nobody has read it yet, so there is no "newly
         # added" to notify — the whole stored array is notified once, at
-        # approval time (`decide_thread`). An APPROVED thread keeps the
-        # unchanged "only newly added" behaviour.
-        if thread.status == THREAD_STATUS_APPROVED:
-            # plan §5.7 — "on edit: notify only newly added mentions". Read
-            # BEFORE the reassignment above overwrites it.
-            _notify_newly_added_mentions(
-                db,
-                previous_mentions=previous_mentions,
-                resolved_mentions=resolved,
-                actor=user,
-                component_id=component.id,
-                thread_id=thread.id,
-                comment_id=None,
-                content=effective_content,
-            )
+        # approval time (`decide_thread`).
+        thread.mentions = _validate_and_resolve_mentions(
+            db, mentions, effective_content, component=component
+        )
 
     # Only stamp "edited" when title/content were actually supplied to
     # change — an empty PATCH ({} — both omitted) must not show an "edited"
@@ -1478,7 +1721,323 @@ def update_thread_by_id(
     db.commit()
     db.refresh(thread)
     my_vote = _my_vote_for_thread(db, thread.id, user.email)
-    return _to_thread_detail(thread, my_vote)
+    return ThreadUpdateResult(
+        applied=True,
+        thread=_to_thread_detail(
+            thread,
+            my_vote,
+            pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+        ),
+        revision=None,
+    )
+
+
+def _ensure_original_revision(db: Session, thread: ThreadV2) -> None:
+    """Self-healing v1 for an APPROVED thread that has no version history
+    yet — the same row `scripts/migrate_thread_revisions.py` backfills for
+    every pre-versioning approved thread (publisher = the thread's own
+    reviewer, else its author; published at its decision, else its
+    creation). Called under the threads-row lock before any revision is
+    appended, so a history never starts without its v1. After the migration
+    has run this finds a revision every time and does nothing."""
+    has_revisions = (
+        db.query(ThreadRevisionV2.id).filter(ThreadRevisionV2.thread_id == thread.id).first()
+    )
+    if has_revisions is not None:
+        return
+    publisher_email = thread.reviewed_by_email or thread.author_email
+    publisher_name = thread.reviewed_by_name if thread.reviewed_by_email else thread.author_name
+    original = _write_original_revision(
+        db,
+        thread,
+        publisher=UserInfo(
+            email=publisher_email,
+            name=publisher_name or publisher_email.split("@")[0],
+            roles=[],
+        ),
+        published_at=thread.reviewed_at or thread.created_at,
+    )
+    # Store the name exactly as the migration's backfill does (possibly
+    # NULL), not the display fallback `UserInfo` needed.
+    original.reviewed_by_name = publisher_name
+
+
+def _next_revision_version(db: Session, thread: ThreadV2) -> int:
+    """COALESCE(MAX(version), threads.version) + 1 (plan §1.2) — call ONLY
+    under the threads-row lock; `uq_thread_revisions_thread_version` is the
+    hard backstop behind it."""
+    max_version = (
+        db.query(func.max(ThreadRevisionV2.version))
+        .filter(ThreadRevisionV2.thread_id == thread.id)
+        .scalar()
+    )
+    return (max_version if max_version is not None else thread.version) + 1
+
+
+def _earlier_revisions_conflict(
+    earlier: list[ThreadRevisionV2], revision: ThreadRevisionV2 | None
+) -> HTTPException:
+    """The 409 `earlier_revisions_pending` body, shared by an out-of-order
+    approve (`revision` = the one being approved) and an editor's PATCH over
+    pending author edits (`revision` = None — nothing was created)."""
+    noun = "edit" if len(earlier) == 1 else "edits"
+    verb = "is" if len(earlier) == 1 else "are"
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "code": "earlier_revisions_pending",
+            "message": f"There {verb} {len(earlier)} earlier {noun} still awaiting review",
+            "revision": _to_revision_summary(revision).model_dump(mode="json") if revision else None,
+            "earlier": [_to_revision_summary(r).model_dump(mode="json") for r in earlier],
+        },
+    )
+
+
+def _apply_editor_edit(
+    db: Session,
+    thread_id: int,
+    component: ComponentV2,
+    user: UserInfo,
+    title: str | None,
+    content: str | None,
+    mentions: list[MentionInput] | None,
+    *,
+    overwrite: bool,
+    access: ViewerAccess | None,
+) -> ThreadUpdateResult:
+    """Amendment A2 (2026-09-23) — an EDITOR-author's edit of an approved
+    thread goes live immediately AND is recorded as an auto-approved
+    `origin='editor'` revision at the next version, so `threads.version`
+    moves forward with every published change and the version log stays
+    complete.
+
+    While the thread has pending AUTHOR revisions (possible when the author
+    was a non-editor when they submitted them), publishing over them would
+    leave them below the live version — approving one later would move the
+    thread BACKWARDS. So this is refused with 409 `earlier_revisions_pending`
+    (listing them, `revision: null`) unless `overwrite=True`, which marks
+    them `overwritten`, stamped with this editor and instant — the same
+    opt-in-on-the-wire rule owner decision 4 set for an out-of-order
+    approve.
+
+    A no-op (title, content and mention emails all equal the live thread)
+    writes nothing and is never a conflict. Mentions keep the pre-
+    versioning rule: validated, and only newly added ones notified, inline,
+    with the editor as the actor."""
+    # Threads row first, then revisions — the order every writer here takes.
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+
+    new_title = title if title is not None else thread.title
+    new_content = content if content is not None else thread.content
+    if mentions is not None:
+        new_mentions = _validate_and_resolve_mentions(db, mentions, new_content, component=component)
+    else:
+        new_mentions = list(thread.mentions or [])
+
+    if (
+        new_title == thread.title
+        and new_content == thread.content
+        and _mention_emails(new_mentions) == _mention_emails(thread.mentions)
+    ):
+        db.commit()  # releases the row lock; nothing was written
+        return ThreadUpdateResult(
+            applied=True,
+            thread=_to_thread_detail(
+                thread,
+                _my_vote_for_thread(db, thread.id, user.email),
+                pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+            ),
+            revision=None,
+        )
+
+    # Every pending revision has version > threads.version (plan §1.2), so
+    # "pending at all" means "would end up below this edit".
+    pending = (
+        db.query(ThreadRevisionV2)
+        .filter(
+            ThreadRevisionV2.thread_id == thread.id,
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+        )
+        .order_by(ThreadRevisionV2.version.asc())
+        .all()
+    )
+    if pending and not overwrite:
+        conflict = _earlier_revisions_conflict(pending, None)
+        db.rollback()  # release the lock before raising
+        raise conflict
+
+    _ensure_original_revision(db, thread)
+    now = _utc_now()
+    editor_email = _norm_email(user.email)
+    for displaced in pending:
+        displaced.status = REVISION_STATUS_OVERWRITTEN
+        displaced.reviewed_by_email = editor_email
+        displaced.reviewed_by_name = user.name
+        displaced.reviewed_at = now
+
+    db.flush()  # the v1 above, if written, must count in MAX(version)
+    next_version = _next_revision_version(db, thread)
+    previous_mentions = list(thread.mentions or [])  # BEFORE the overwrite below
+    text_changed = new_title != thread.title or new_content != thread.content
+    thread.title = new_title
+    thread.content = new_content
+    thread.mentions = new_mentions
+    thread.version = next_version
+    if text_changed:
+        # A mentions-only change is a new version but not an "edit" of the
+        # visible text — same rule as the pre-versioning marker.
+        thread.edited_at = now
+
+    revision = ThreadRevisionV2(
+        thread_id=thread.id,
+        version=next_version,
+        title=new_title,
+        content=new_content,
+        mentions=list(new_mentions),
+        status=REVISION_STATUS_APPROVED,
+        origin=REVISION_ORIGIN_EDITOR,
+        submitted_by_email=editor_email,
+        submitted_by_name=user.name,
+        submitted_at=now,
+        reviewed_by_email=editor_email,
+        reviewed_by_name=user.name,
+        reviewed_at=now,
+    )
+    db.add(revision)
+
+    # plan §5.7 — "on edit: notify only newly added mentions", unchanged.
+    _notify_newly_added_mentions(
+        db,
+        previous_mentions=previous_mentions,
+        resolved_mentions=new_mentions,
+        actor=user,
+        component_id=component.id,
+        thread_id=thread.id,
+        comment_id=None,
+        content=new_content,
+    )
+
+    db.commit()
+    db.refresh(thread)
+    db.refresh(revision)
+    return ThreadUpdateResult(
+        applied=True,
+        thread=_to_thread_detail(
+            thread,
+            _my_vote_for_thread(db, thread.id, user.email),
+            pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+        ),
+        revision=_to_revision_summary(revision),
+    )
+
+
+def _stage_thread_edit(
+    db: Session,
+    thread_id: int,
+    component: ComponentV2,
+    user: UserInfo,
+    title: str | None,
+    content: str | None,
+    mentions: list[MentionInput] | None,
+    *,
+    access: ViewerAccess | None,
+) -> ThreadUpdateResult:
+    """plan_thread_edit_versioning_2026-09-22.md §4.2 — store a non-editor
+    author's edit of an approved thread as a pending `thread_revisions`
+    snapshot. `threads.title`/`content`/`mentions`/`edited_at`/`status` are
+    NEVER touched here — that is the whole point (landmine 7: if
+    `threads.status` moved, `_require_approved` would close comments and
+    votes on a live thread). No notification is written at submit; the
+    mention fan-out happens at approval (`decide_thread_revision`)."""
+    # Lock the THREADS row first — the same order `decide_thread_revision`
+    # takes (threads, then revisions), so a submit and a decision on the
+    # same thread can never deadlock on Postgres. This is also what
+    # serializes the version allocation below; `uq_thread_revisions_thread_
+    # version` is the hard backstop behind it.
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+
+    # Base for omitted fields = the author's latest PENDING revision if one
+    # exists, else the live thread (plan §4.2 step 2) — a PATCH carrying only
+    # `content` keeps the title the author last PROPOSED, not the published
+    # one. Every revision on a thread is its author's (`_require_author`
+    # gates submission), so "the thread's latest pending" is "the author's".
+    latest_pending = (
+        db.query(ThreadRevisionV2)
+        .filter(
+            ThreadRevisionV2.thread_id == thread.id,
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+        )
+        .order_by(ThreadRevisionV2.version.desc())
+        .first()
+    )
+    base = latest_pending if latest_pending is not None else thread
+
+    new_title = title if title is not None else base.title
+    new_content = content if content is not None else base.content
+    # Validation happens at SUBMIT, against the effective content (same rule
+    # as the write-through path); only the fan-out moves to approval.
+    # Omitted mentions carry over from the base, unvalidated — exactly what
+    # an omitted `mentions` means on the write-through path too.
+    if mentions is not None:
+        new_mentions = _validate_and_resolve_mentions(db, mentions, new_content, component=component)
+    else:
+        new_mentions = list(base.mentions or [])
+
+    # No-op (owner-approved 2026-09-23): an edit identical to its base
+    # writes nothing — no do-nothing revision lands in an editor's queue
+    # (an unchanged Save in the composer sends all three fields).
+    if (
+        new_title == base.title
+        and new_content == base.content
+        and _mention_emails(new_mentions) == _mention_emails(base.mentions)
+    ):
+        db.commit()  # releases the row lock; nothing was written
+        pending_revisions = _pending_revision_summaries(db, thread, component, user, access=access)
+        detail = _to_thread_detail(
+            thread, _my_vote_for_thread(db, thread.id, user.email), pending_revisions=pending_revisions
+        )
+        if latest_pending is None:
+            # Unchanged vs the LIVE thread — the same no-op a pre-versioning
+            # empty PATCH was.
+            return ThreadUpdateResult(applied=True, thread=detail, revision=None)
+        # Unchanged vs the author's own pending draft — that draft is still
+        # what is awaiting review.
+        return ThreadUpdateResult(
+            applied=False, thread=detail, revision=_to_revision_summary(latest_pending)
+        )
+
+    # A pre-versioning thread gets its v1 first, so the history never
+    # starts at v2 (a no-op after the migration's backfill).
+    _ensure_original_revision(db, thread)
+    db.flush()
+    next_version = _next_revision_version(db, thread)
+
+    revision = ThreadRevisionV2(
+        thread_id=thread.id,
+        version=next_version,
+        title=new_title,
+        content=new_content,
+        mentions=new_mentions,
+        status=REVISION_STATUS_PENDING,
+        origin=REVISION_ORIGIN_AUTHOR,
+        submitted_by_email=_norm_email(user.email),
+        submitted_by_name=user.name,
+        submitted_at=_utc_now(),
+    )
+    db.add(revision)
+    db.commit()
+    db.refresh(revision)
+    db.refresh(thread)
+
+    return ThreadUpdateResult(
+        applied=False,
+        thread=_to_thread_detail(
+            thread,
+            _my_vote_for_thread(db, thread.id, user.email),
+            pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+        ),
+        revision=_to_revision_summary(revision),
+    )
 
 
 def delete_thread_by_id(
@@ -1542,6 +2101,11 @@ def decide_thread(
     thread.reviewed_at = _utc_now()
 
     if approve:
+        # plan_thread_edit_versioning amendment A3: publication writes the
+        # thread's v1 — its text as approved (edits made while pending
+        # included), published by this editor at this instant. A rejected
+        # thread was never published and gets no version history.
+        _write_original_revision(db, thread, publisher=user, published_at=thread.reviewed_at)
         # plan §5.4 (landmine 1, deferred fan-out): the mentions were
         # validated and stored at post time but nobody was pinged, because
         # the thread wasn't readable yet. Actor = the AUTHOR (they did the
@@ -1567,6 +2131,157 @@ def decide_thread(
     db.commit()
     db.refresh(thread)
     return _to_moderation_row(db, thread, component)
+
+
+def decide_thread_revision(
+    db: Session,
+    thread_id: int,
+    revision_id: int,
+    user: UserInfo,
+    *,
+    approve: bool,
+    overwrite: bool = False,
+    access: ViewerAccess | None = None,
+) -> ThreadRevisionDetail:
+    """`POST /threads/{id}/revisions/{rid}/approve` or `.../reject`
+    (plan_thread_edit_versioning_2026-09-22.md §4.3) — `decide_thread`'s
+    shape, operating on one staged edit instead of the thread's own post.
+
+    Same gate (`_require_component_editor` — an editor of the widget or any
+    ancestor, never Hub-Admin-only). Same lock recipe, extended: the
+    `threads` row FIRST, then the revision — the order `_stage_thread_edit`
+    takes too, so a submit and a decision can never deadlock.
+
+    Approve applies the revision's full snapshot to the live thread and
+    sets `threads.version` to its version. Earlier still-pending revisions
+    block a plain approve (409 `earlier_revisions_pending`, owner decision
+    4); with `overwrite=True` they are marked `overwritten`, stamped with
+    THIS decision's reviewer and instant. Reject touches only this one
+    revision — never another revision, never the live content (owner
+    decision 6). `threads.status` never moves on either path."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _require_component_editor(component, access)
+
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    revision = (
+        db.query(ThreadRevisionV2)
+        .filter(ThreadRevisionV2.id == revision_id, ThreadRevisionV2.thread_id == thread_id)
+        .with_for_update()
+        .first()
+    )
+    if revision is None:
+        # Absent, or belonging to another thread — indistinguishable.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
+    if revision.status != REVISION_STATUS_PENDING:
+        # Includes a revision a newer approval has already `overwritten` —
+        # by §1.2's invariant there is no separate "too old" case.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "already_decided",
+                "message": "This edit has already been reviewed",
+                "revision": _to_revision_summary(revision).model_dump(mode="json"),
+            },
+        )
+
+    earlier: list[ThreadRevisionV2] = []
+    if approve:
+        earlier = (
+            db.query(ThreadRevisionV2)
+            .filter(
+                ThreadRevisionV2.thread_id == thread_id,
+                ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+                ThreadRevisionV2.version < revision.version,
+            )
+            .order_by(ThreadRevisionV2.version.asc())
+            .all()
+        )
+        if earlier and not overwrite:
+            # The warning modal's payload. The destructive path is opt-in
+            # ON THE WIRE (`overwrite: true`), so no client — or future
+            # script — overwrites by accident.
+            raise _earlier_revisions_conflict(earlier, revision)
+
+    now = _utc_now()
+    reviewer_email = _norm_email(user.email)
+
+    if approve:
+        for displaced in earlier:
+            displaced.status = REVISION_STATUS_OVERWRITTEN
+            displaced.reviewed_by_email = reviewer_email
+            displaced.reviewed_by_name = user.name
+            displaced.reviewed_at = now
+        # Read BEFORE the overwrite below (landmine 4) — and it is the LIVE
+        # thread's mentions, not the previous revision's: that is what makes
+        # an @mention present in both an overwritten v2 and the approved v3
+        # notify exactly once.
+        previous_mentions = list(thread.mentions or [])
+        text_changed = revision.title != thread.title or revision.content != thread.content
+        thread.title = revision.title
+        thread.content = revision.content
+        thread.mentions = list(revision.mentions or [])
+        thread.version = revision.version
+        # The approval instant, not `submitted_at` — the "edited" marker
+        # appears when the change becomes public, not when it was drafted.
+        # A mentions-only revision is a new version but not a visible edit
+        # (the same rule `_apply_editor_edit` and pre-versioning PATCH use).
+        if text_changed:
+            thread.edited_at = now
+
+    revision.status = REVISION_STATUS_APPROVED if approve else REVISION_STATUS_REJECTED
+    revision.reviewed_by_email = reviewer_email
+    revision.reviewed_by_name = user.name
+    revision.reviewed_at = now
+
+    if approve:
+        # plan §4.5 — the fan-out the pre-versioning PATCH ran inline moves
+        # here. Actor = the AUTHOR (they did the mentioning), not the
+        # reviewer — the same rule `decide_thread` applies. Mentions are
+        # not re-scoped at approval (2m's standing posture; plan §11).
+        _notify_newly_added_mentions(
+            db,
+            previous_mentions=previous_mentions,
+            resolved_mentions=revision.mentions or [],
+            actor=_author_as_user_info(thread),
+            component_id=component.id,
+            thread_id=thread.id,
+            comment_id=None,
+            content=revision.content,
+        )
+    # Phase D (plan_thread_edit_versioning §4.6/§8): `_notify_thread_edit_
+    # decision` — tell the submitter, for BOTH outcomes — goes here, after
+    # the mention fan-out and before the commit. Not written in phase A.
+
+    db.commit()
+    db.refresh(revision)
+    return _to_revision_detail(revision)
+
+
+def get_thread_revision(
+    db: Session,
+    thread_id: int,
+    revision_id: int,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None = None,
+) -> ThreadRevisionDetail:
+    """`GET /threads/{id}/revisions/{rid}` — one revision's full body, any
+    status. `_check_view_access` runs FIRST (landmine 2): a caller with no
+    view access to the widget keeps getting 403, never a 404 that would
+    leak existence. Then `_can_see_thread_revisions` (author or component
+    editor); anyone else gets the SAME 404 a nonexistent id gives."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    if not _can_see_thread_revisions(thread, component, user, access):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
+    revision = (
+        db.query(ThreadRevisionV2)
+        .filter(ThreadRevisionV2.id == revision_id, ThreadRevisionV2.thread_id == thread_id)
+        .first()
+    )
+    if revision is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
+    return _to_revision_detail(revision)
 
 
 def list_pending_threads(
@@ -1678,6 +2393,291 @@ def moderation_summary(
     )
     return (
         ThreadModerationSummary(
+            can_moderate=can_moderate,
+            moderated_component_count=len(component_ids),
+            pending_count=count,
+        ),
+        etag,
+    )
+
+
+# ---------------------------------------------------------
+# Revision Management (plan_thread_edit_versioning amendment A4,
+# 2026-09-23) — its OWN section, separate from Threads Management above
+# (which lists only NEW threads and is unchanged by versioning). Pending tab
+# newest-first; History tab = every non-pending revision (decided author
+# edits, overwritten ones, AND auto-approved originals/editor edits), newest
+# decision first, filterable by status, origin, decision date, submitter and
+# reviewer. Scoped to `_moderated_component_ids` exactly like the thread
+# queue; the revision rows reach it through a PK join to `threads`.
+# ---------------------------------------------------------
+
+
+def _moderated_revisions_query(db: Session, component_ids: list[int]):
+    return (
+        db.query(ThreadRevisionV2)
+        .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
+        .filter(ThreadV2.component_id.in_(component_ids))
+    )
+
+
+def _to_revision_moderation_rows(
+    db: Session, revisions: list[ThreadRevisionV2]
+) -> list[ThreadRevisionModerationRow]:
+    """One page of revisions (already ordered) -> rows, with the thread's
+    live title/version and `widget_title`/`location_label` computed once
+    per distinct component, and `earlier_pending_count` from ONE query over
+    the page's pending rows' threads — never once per row."""
+    if not revisions:
+        return []
+
+    threads = {
+        t.id: t
+        for t in db.query(ThreadV2)
+        .filter(ThreadV2.id.in_({r.thread_id for r in revisions}))
+        .all()
+    }
+    components = {
+        c.id: c
+        for c in db.query(ComponentV2)
+        .filter(ComponentV2.id.in_({t.component_id for t in threads.values()}))
+        .all()
+    }
+    info_by_component = _widget_title_and_location_for_components(db, components)
+
+    pending_thread_ids = {r.thread_id for r in revisions if r.status == REVISION_STATUS_PENDING}
+    pending_versions: dict[int, list[int]] = {}
+    if pending_thread_ids:
+        for thread_id, version in (
+            db.query(ThreadRevisionV2.thread_id, ThreadRevisionV2.version)
+            .filter(
+                ThreadRevisionV2.thread_id.in_(pending_thread_ids),
+                ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+            )
+            .all()
+        ):
+            pending_versions.setdefault(thread_id, []).append(version)
+
+    items: list[ThreadRevisionModerationRow] = []
+    for revision in revisions:
+        thread = threads.get(revision.thread_id)
+        component = components.get(thread.component_id) if thread is not None else None
+        if component is None:
+            continue  # FK cascade makes this unreachable; defensive only
+        widget_title, location_label = info_by_component.get(component.id, ("Discussion", ""))
+        items.append(
+            ThreadRevisionModerationRow(
+                **_to_revision_summary(revision).model_dump(),
+                component_id=component.id,
+                component_link=component.link,
+                widget_title=widget_title,
+                location_label=location_label,
+                thread_title=thread.title,
+                thread_version=thread.version,
+                earlier_pending_count=(
+                    sum(1 for v in pending_versions.get(revision.thread_id, []) if v < revision.version)
+                    if revision.status == REVISION_STATUS_PENDING
+                    else 0
+                ),
+            )
+        )
+    return items
+
+
+def list_pending_revisions(
+    db: Session, cursor: str | None, *, access: ViewerAccess | None = None
+) -> ThreadRevisionModerationListResponse:
+    """`GET /threads/revision-moderation/pending` — every pending revision in
+    the caller's moderated set, one row per revision (owner decision 5),
+    NEWEST submission first (amendment A4 — unlike the thread queue's
+    FIFO). An empty moderated set is a 200 with an empty page."""
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadRevisionModerationListResponse(items=[], next_cursor=None)
+
+    query = _moderated_revisions_query(db, component_ids).filter(
+        ThreadRevisionV2.status == REVISION_STATUS_PENDING
+    )
+    if cursor:
+        after_at, after_id = _decode_cursor(cursor)
+        query = query.filter(
+            tuple_(ThreadRevisionV2.submitted_at, ThreadRevisionV2.id) < (after_at, after_id)
+        )
+    rows = (
+        query.order_by(ThreadRevisionV2.submitted_at.desc(), ThreadRevisionV2.id.desc())
+        .limit(THREADS_PAGE_SIZE + 1)
+        .all()
+    )
+    has_more = len(rows) > THREADS_PAGE_SIZE
+    page = rows[:THREADS_PAGE_SIZE]
+    next_cursor = (
+        _encode_cursor(page[-1].submitted_at, page[-1].id) if has_more and page else None
+    )
+    return ThreadRevisionModerationListResponse(
+        items=_to_revision_moderation_rows(db, page), next_cursor=next_cursor
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    """A filter bound as a UTC instant — a naive value is taken as UTC.
+    Stored timestamps are UTC (`_utc_now`), and SQLite compares them as
+    naive strings, so an offset-carrying bound must be converted, not just
+    passed through."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def list_revision_history(
+    db: Session,
+    cursor: str | None,
+    *,
+    statuses: list[str] | None = None,
+    origins: list[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    authors: list[str] | None = None,
+    reviewers: list[str] | None = None,
+    access: ViewerAccess | None = None,
+) -> ThreadRevisionModerationListResponse:
+    """`GET /threads/revision-moderation/history` — every NON-pending
+    revision in the moderated set: author edits an editor approved/rejected,
+    `overwritten` ones, and the auto-approved `original` v1s and `editor`
+    edits (owner, 2026-09-23: "everything published too"). Newest decision
+    first (`reviewed_at DESC, id DESC` — overwritten rows share their
+    displacing approval's instant, so `id` breaks the tie).
+
+    Filters, all optional and combinable (owner, 2026-09-23):
+    - `statuses` ⊆ approved/rejected/overwritten (default all three);
+    - `origins` ⊆ original/author/editor (default all);
+    - `date_from` (inclusive) / `date_to` (exclusive) on the DECISION date,
+      `reviewed_at` — instants, so the client sends its own local-day bounds;
+    - `authors` = submitter emails, `reviewers` = decider emails (any-of,
+      case-insensitive).
+    The cursor only encodes the position; the caller must resend the same
+    filters with it."""
+    statuses = list(statuses or REVISION_DECIDED_STATUSES)
+    if any(value not in REVISION_DECIDED_STATUSES for value in statuses):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid status filter")
+    if origins and any(value not in REVISION_ORIGINS for value in origins):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid origin filter")
+
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadRevisionModerationListResponse(items=[], next_cursor=None)
+
+    query = _moderated_revisions_query(db, component_ids).filter(
+        ThreadRevisionV2.status.in_(statuses),
+        ThreadRevisionV2.reviewed_at.isnot(None),
+    )
+    if origins:
+        query = query.filter(ThreadRevisionV2.origin.in_(origins))
+    if date_from is not None:
+        query = query.filter(ThreadRevisionV2.reviewed_at >= _as_utc(date_from))
+    if date_to is not None:
+        query = query.filter(ThreadRevisionV2.reviewed_at < _as_utc(date_to))
+    if authors:
+        query = query.filter(
+            ThreadRevisionV2.submitted_by_email.in_({_norm_email(e) for e in authors})
+        )
+    if reviewers:
+        query = query.filter(
+            ThreadRevisionV2.reviewed_by_email.in_({_norm_email(e) for e in reviewers})
+        )
+    if cursor:
+        after_at, after_id = _decode_cursor(cursor)
+        query = query.filter(
+            tuple_(ThreadRevisionV2.reviewed_at, ThreadRevisionV2.id) < (after_at, after_id)
+        )
+
+    rows = (
+        query.order_by(ThreadRevisionV2.reviewed_at.desc(), ThreadRevisionV2.id.desc())
+        .limit(THREADS_PAGE_SIZE + 1)
+        .all()
+    )
+    has_more = len(rows) > THREADS_PAGE_SIZE
+    page = rows[:THREADS_PAGE_SIZE]
+    next_cursor = (
+        _encode_cursor(page[-1].reviewed_at, page[-1].id) if has_more and page else None
+    )
+    return ThreadRevisionModerationListResponse(
+        items=_to_revision_moderation_rows(db, page), next_cursor=next_cursor
+    )
+
+
+def revision_history_facets(
+    db: Session, *, access: ViewerAccess | None = None
+) -> ThreadRevisionHistoryFacets:
+    """`GET /threads/revision-moderation/history/facets` — the History
+    tab's two person-filter option lists (owner, 2026-09-23): the distinct
+    submitters and the distinct deciders of every non-pending revision in
+    the caller's moderated set, so a dropdown only offers people the caller
+    can actually find. Emails are stored normalized, so grouping by email
+    is grouping by person; the name shown is one of that person's stored
+    display snapshots."""
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadRevisionHistoryFacets()
+
+    decided = [ThreadRevisionV2.status.in_(REVISION_DECIDED_STATUSES)]
+
+    def _people(email_col, name_col) -> list[RevisionPerson]:
+        rows = (
+            db.query(email_col, func.max(name_col))
+            .select_from(ThreadRevisionV2)
+            .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
+            .filter(ThreadV2.component_id.in_(component_ids), email_col.isnot(None), *decided)
+            .group_by(email_col)
+            .all()
+        )
+        people = [RevisionPerson(email=email, name=name) for email, name in rows]
+        people.sort(key=lambda p: ((p.name or p.email).casefold(), p.email))
+        return people
+
+    return ThreadRevisionHistoryFacets(
+        authors=_people(ThreadRevisionV2.submitted_by_email, ThreadRevisionV2.submitted_by_name),
+        reviewers=_people(ThreadRevisionV2.reviewed_by_email, ThreadRevisionV2.reviewed_by_name),
+    )
+
+
+def revision_moderation_summary(
+    db: Session, *, access: ViewerAccess | None = None
+) -> tuple[ThreadRevisionModerationSummary, str]:
+    """`GET /threads/revision-moderation/summary` — Revision Management's
+    own sidebar badge (amendment A4), the same shape and ETag discipline as
+    `moderation_summary`: the tag covers every field the body carries —
+    `"{1 if can_moderate else 0}-{n_components}-{pending}-{max_pending_id}"`
+    — so two callers with different bodies never share a tag (followups
+    §1). Counts pending REVISIONS only; new threads are Threads
+    Management's."""
+    component_ids = _moderated_component_ids(db, access)
+    can_moderate = (access is not None and access.full_access) or bool(component_ids)
+    can_moderate_flag = 1 if can_moderate else 0
+
+    if not component_ids:
+        return (
+            ThreadRevisionModerationSummary(
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0
+            ),
+            f'"{can_moderate_flag}-0-0-0"',
+        )
+
+    count, max_id = (
+        db.query(func.count(ThreadRevisionV2.id), func.max(ThreadRevisionV2.id))
+        .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
+        .filter(
+            ThreadV2.component_id.in_(component_ids),
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+        )
+        .one()
+    )
+    count = int(count or 0)
+    etag = (
+        f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
+        f'{int(max_id) if max_id is not None else 0}"'
+    )
+    return (
+        ThreadRevisionModerationSummary(
             can_moderate=can_moderate,
             moderated_component_count=len(component_ids),
             pending_count=count,

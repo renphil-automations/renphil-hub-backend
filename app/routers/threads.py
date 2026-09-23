@@ -26,6 +26,21 @@ by analogy with delete (landmine 8). The three static `/threads/moderation/
 *` routes (`pending`, `history`, `summary`) are declared ABOVE
 `/threads/{thread_id}`, same convention as the mention directory above.
 
+THREAD VERSIONING (plan_thread_edit_versioning_2026-09-22.md, phase A, with
+the 2026-09-23 amendments). Every published version of a thread is a
+revision. A non-editor author's PATCH of an approved thread is staged as a
+pending revision; an editor-author's goes live as an auto-approved one (409
+`earlier_revisions_pending` while author edits are pending, unless the body
+carries `overwrite: true`). PATCH returns `ThreadUpdateResult` (`applied`
+says which happened). Editors decide staged revisions one at a time through
+`POST /threads/{id}/revisions/{rid}/approve` (body `{overwrite}` — an
+out-of-order approve is the same 409 unless `overwrite: true`) and
+`.../reject`, gated exactly like the thread approve/reject above; `GET
+/threads/{id}/revisions/{rid}` reads one body (author or editor). Revisions
+have their OWN management section, `/threads/revision-moderation/*`
+(pending, history + facets, summary); the Threads Management routes above
+list new threads only, exactly as before versioning.
+
 ACCESS CONTROL, added plan_ac_enforcement_closeout_2026-09-09.md §4. Until
 then every route below carried `Depends(get_current_user)` and nothing
 else — `thread_service` gated view/post against the component's own legacy
@@ -45,6 +60,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
@@ -66,13 +83,19 @@ from app.schemas.thread import (
     CommentUpdateRequest,
     MentionableUser,
     NotificationListResponse,
+    RevisionDecisionRequest,
     ThreadCreateRequest,
     ThreadDetail,
     ThreadListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
     ThreadModerationSummary,
+    ThreadRevisionDetail,
+    ThreadRevisionHistoryFacets,
+    ThreadRevisionModerationListResponse,
+    ThreadRevisionModerationSummary,
     ThreadUpdateRequest,
+    ThreadUpdateResult,
     ThreadWidgetCounts,
     UnreadCountResponse,
     VoteRequest,
@@ -277,6 +300,109 @@ async def get_moderation_summary(
     return summary
 
 
+# ---------------------------------------------------------
+# Revision Management (plan_thread_edit_versioning amendment A4) — its own
+# section, separate from Threads Management above. Static paths under
+# `/threads/revision-moderation/...`, NOT `/threads/moderation/revisions/...`:
+# the latter is depth 4 with `revisions` in position 3, which is exactly the
+# shape of `/threads/{thread_id}/revisions/{revision_id}` — `moderation`
+# would bind as a thread id and fail int validation (422) whenever that
+# route happened to match first. `revision-moderation` can't collide with
+# any `/threads/{thread_id}/...` pattern. Declared above
+# `/threads/{thread_id}` anyway, same convention as the rest of this file.
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/threads/revision-moderation/pending",
+    response_model=ThreadRevisionModerationListResponse,
+    summary="Pending thread revisions the caller can decide, newest first",
+)
+async def list_pending_revisions(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.list_pending_revisions, db, cursor, access=access)
+
+
+@router.get(
+    "/threads/revision-moderation/history",
+    response_model=ThreadRevisionModerationListResponse,
+    summary="Decided and auto-approved thread revisions, most recent decision first, filterable",
+    responses={400: {"description": "Malformed cursor"}},
+)
+async def list_revision_history(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; resend the same filters."),
+    status_filter: list[Literal["approved", "rejected", "overwritten"]] | None = Query(
+        default=None, alias="status", description="Repeatable. Default: all three."
+    ),
+    origin: list[Literal["original", "author", "editor"]] | None = Query(
+        default=None, description="Repeatable. Default: all three."
+    ),
+    date_from: datetime | None = Query(
+        default=None, description="Decision instant, inclusive (ISO-8601; naive = UTC)."
+    ),
+    date_to: datetime | None = Query(
+        default=None, description="Decision instant, exclusive (ISO-8601; naive = UTC)."
+    ),
+    author: list[str] | None = Query(default=None, description="Submitter email. Repeatable."),
+    reviewer: list[str] | None = Query(default=None, description="Decider email. Repeatable."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.list_revision_history,
+        db,
+        cursor,
+        statuses=status_filter,
+        origins=origin,
+        date_from=date_from,
+        date_to=date_to,
+        authors=author,
+        reviewers=reviewer,
+        access=access,
+    )
+
+
+@router.get(
+    "/threads/revision-moderation/history/facets",
+    response_model=ThreadRevisionHistoryFacets,
+    summary="The History tab's author and reviewer filter options",
+)
+async def get_revision_history_facets(
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.revision_history_facets, db, access=access)
+
+
+@router.get(
+    "/threads/revision-moderation/summary",
+    response_model=ThreadRevisionModerationSummary,
+    summary="Whether the caller moderates anything, and how many revisions are pending",
+)
+async def get_revision_moderation_summary(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    summary, etag = await asyncio.to_thread(
+        thread_service.revision_moderation_summary, db, access=access
+    )
+    # Identical discipline to `/threads/moderation/summary` above: no-store
+    # on both the 200 and the 304, 304 only for JS's own If-None-Match.
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
+    return summary
+
+
 @router.post(
     "/threads/{thread_id}/approve",
     response_model=ThreadModerationRow,
@@ -317,6 +443,98 @@ async def reject_thread(
     )
 
 
+# ---------------------------------------------------------
+# Staged edits (plan_thread_edit_versioning_2026-09-22.md §5). Depth-4 paths
+# under `/threads/{thread_id}/revisions/...` — they can't collide with the
+# depth-2 `/threads/{thread_id}` pattern, so their position above it is
+# convention, kept to match the file's grouping. The gate lives in the
+# service (the same split `decide_thread` uses).
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/threads/{thread_id}/revisions/{revision_id}",
+    response_model=ThreadRevisionDetail,
+    summary="One staged edit's full body — the thread's author or an editor",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "No such revision on this thread, or caller may not see it"},
+    },
+)
+async def get_thread_revision(
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.get_thread_revision, db, thread_id, revision_id, user, access=access
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/revisions/{revision_id}/approve",
+    response_model=ThreadRevisionDetail,
+    summary="Approve a staged edit — an editor of its widget or any ancestor",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        404: {"description": "No such revision on this thread"},
+        409: {
+            "description": "`detail.code` is `already_decided` (the revision is no longer pending) "
+            "or `earlier_revisions_pending` (older pending edits exist and `overwrite` was not set)"
+        },
+    },
+)
+async def approve_thread_revision(
+    payload: RevisionDecisionRequest | None = None,
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    overwrite = payload.overwrite if payload is not None else False
+    return await asyncio.to_thread(
+        thread_service.decide_thread_revision,
+        db,
+        thread_id,
+        revision_id,
+        user,
+        approve=True,
+        overwrite=overwrite,
+        access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/revisions/{revision_id}/reject",
+    response_model=ThreadRevisionDetail,
+    summary="Reject a staged edit — an editor of its widget or any ancestor",
+    responses={
+        403: {"description": "Caller is not an editor of this discussion"},
+        404: {"description": "No such revision on this thread"},
+        409: {"description": "`detail.code` is `already_decided`"},
+    },
+)
+async def reject_thread_revision(
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.decide_thread_revision,
+        db,
+        thread_id,
+        revision_id,
+        user,
+        approve=False,
+        access=access,
+    )
+
+
 @router.get(
     "/threads/{thread_id}",
     response_model=ThreadDetail,
@@ -336,9 +554,16 @@ async def get_thread(
 
 @router.patch(
     "/threads/{thread_id}",
-    response_model=ThreadDetail,
-    summary="Edit a thread — author only",
-    responses={403: {"description": "Caller is not this thread's author"}},
+    response_model=ThreadUpdateResult,
+    summary="Edit a thread — author only; a non-editor's edit of an approved thread is staged for review",
+    responses={
+        403: {"description": "Caller is not this thread's author"},
+        409: {
+            "description": "Thread was rejected and can no longer be edited; or (editor, "
+            "`detail.code` = `earlier_revisions_pending`) the thread has pending author "
+            "edits and `overwrite` was not set"
+        },
+    },
 )
 async def update_thread(
     payload: ThreadUpdateRequest,
@@ -355,6 +580,7 @@ async def update_thread(
         payload.title,
         payload.content,
         payload.mentions,
+        overwrite=payload.overwrite,
         access=access,
     )
 

@@ -24,6 +24,17 @@ history list the "Threads Management" page (built in phase 2c) consumes.
 `ThreadSummary.status` is now the typed `ThreadStatus` rather than a bare
 `str`, and gained `reviewed_by_email`/`reviewed_by_name`/`reviewed_at`,
 inherited by `ThreadDetail` and `ThreadModerationRow` alike.
+
+`ThreadRevisionStatus` / `ThreadRevisionSummary` / `ThreadRevisionDetail` /
+`RevisionDecisionRequest` / `ThreadUpdateResult` are thread versioning
+(`plan_thread_edit_versioning_2026-09-22.md` §3, phase A, with the
+2026-09-23 amendments): every published version of a thread is a
+revision row. PATCH now returns `ThreadUpdateResult`, not `ThreadDetail`;
+`ThreadSummary.pending_revision_count` and `ThreadDetail.pending_revisions`
+are the same feature. `ThreadRevisionModerationRow` /
+`ThreadRevisionModerationListResponse` / `ThreadRevisionHistoryFacets` /
+`ThreadRevisionModerationSummary` back the separate Revision Management
+section; Threads Management's own shapes are unchanged.
 """
 
 from __future__ import annotations
@@ -131,6 +142,14 @@ class ThreadUpdateRequest(BaseModel):
     title: str | None = None
     content: str | None = None
     mentions: list[MentionInput] | None = None
+    # plan_thread_edit_versioning amendment A2 (2026-09-23): an EDITOR's edit
+    # of an approved thread goes live as an auto-approved revision, and is
+    # refused with 409 `earlier_revisions_pending` while the thread has
+    # pending author revisions — unless this is true, which marks those
+    # revisions `overwritten`. The destructive path is opt-in on the wire,
+    # the same rule as `RevisionDecisionRequest.overwrite`. Ignored on every
+    # other path (a non-editor's edit is staged, never overwrites anything).
+    overwrite: bool = False
 
     @field_validator("title")
     @classmethod
@@ -223,15 +242,105 @@ class ThreadSummary(BaseModel):
     # full markdown bodies (plan §4.1), it just now also sends a short,
     # already-plain-text snippet of each one.
     content_excerpt: str = ""
+    # plan_thread_edit_versioning_2026-09-22.md §3/§4.4 — how many staged
+    # edits this thread has awaiting review, SCOPED server-side: non-zero
+    # only for the thread's author or an editor of its widget (or any
+    # ancestor); every other caller gets 0, so a plain viewer never learns
+    # that someone is editing a thread. Drives the widget row's indicator.
+    pending_revision_count: int = 0
+
+
+# The revision lifecycle (plan_thread_edit_versioning_2026-09-22.md §1.1) —
+# its OWN four values, matching ck_thread_revisions_status, deliberately not
+# a reuse of ThreadStatus.
+ThreadRevisionStatus = Literal["pending", "approved", "rejected", "overwritten"]
+
+# Where a revision came from (amendment A3, 2026-09-23) — matches
+# ck_thread_revisions_origin. 'original' is the published v1 (written when
+# the thread is PUBLISHED: at create for an editor's post, at approval for a
+# viewer's); 'author' is a non-editor author's staged edit (the only origin
+# that is ever `pending`); 'editor' is an editor-author's direct edit,
+# auto-approved.
+ThreadRevisionOrigin = Literal["original", "author", "editor"]
+
+
+class ThreadRevisionSummary(BaseModel):
+    """One version of a published thread (plan_thread_edit_versioning §3,
+    amended 2026-09-23) — a COMPLETE snapshot's metadata plus an excerpt;
+    the body is on `ThreadRevisionDetail`, the same Summary/Detail split
+    the thread endpoints use.
+
+    `reviewed_*` are set on EVERY non-pending row: the deciding editor for
+    an author edit; on an `overwritten` row, the editor who displaced it;
+    on an auto-approved row (`origin` 'original'/'editor'), whoever
+    published it — the approving editor for a viewer's v1, the editor
+    themselves for their own post or direct edit."""
+
+    id: int
+    thread_id: int
+    version: int
+    title: str
+    status: ThreadRevisionStatus
+    origin: ThreadRevisionOrigin
+    submitted_by_email: str
+    submitted_by_name: str | None
+    submitted_at: datetime
+    reviewed_by_email: str | None = None
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime | None = None
+    # generate_notification_excerpt, as ThreadSummary.content_excerpt does.
+    content_excerpt: str = ""
+
+
+class ThreadRevisionDetail(ThreadRevisionSummary):
+    content: str
+    mentions: list[MentionEntry] = Field(default_factory=list)
+
+
+class RevisionDecisionRequest(BaseModel):
+    """Body of `POST /threads/{id}/revisions/{rid}/approve`. `overwrite` is
+    the explicit, opt-in confirmation that approving this revision may mark
+    earlier pending ones `overwritten` and unreachable (owner decision 4).
+    Absent/false, an out-of-order approve is refused with 409
+    `earlier_revisions_pending`."""
+
+    overwrite: bool = False
 
 
 class ThreadDetail(ThreadSummary):
     """Adds the body — returned by create/update, which the list endpoint
     deliberately omits (plan §4.1 lists no `content` field on the list
     response; a 20-row page of full markdown bodies is not what the list
-    view needs)."""
+    view needs).
+
+    `pending_revisions` (plan_thread_edit_versioning §3) — the thread's
+    staged edits awaiting review, oldest version first, same scoping as
+    `pending_revision_count` (author or component editor, else `[]`). No
+    `content` on these; the body comes from `GET .../revisions/{id}`."""
 
     content: str
+    pending_revisions: list[ThreadRevisionSummary] = Field(default_factory=list)
+
+
+class ThreadUpdateResult(BaseModel):
+    """PATCH /threads/{id}'s response (plan_thread_edit_versioning §3,
+    amended 2026-09-23). `applied=True`: the edit is live — `thread` is the
+    new live content and `revision` the auto-approved `origin='editor'`
+    revision it became (null for an edit of a still-PENDING thread, which
+    has no version history yet, and for a no-op). `applied=False`: the edit
+    was STAGED — `thread` carries the UNCHANGED live content and `revision`
+    the pending `origin='author'` snapshot. An explicit flag, not a
+    status-code or diff-the-response convention, because the caller has to
+    render two very different outcomes.
+
+    A PATCH that changes nothing against its base writes nothing: vs the
+    live thread it reads `applied=True, revision=None`; vs the author's
+    latest pending revision it reads `applied=False, revision=<that existing
+    revision>` (owner-approved 2026-09-23)."""
+
+    applied: bool
+    thread: ThreadDetail
+    revision: ThreadRevisionSummary | None = None
 
 
 class ThreadListResponse(BaseModel):
@@ -244,11 +353,71 @@ class ThreadModerationRow(ThreadSummary):
     (plan_thread_moderation_2026-09-18.md §4.2, §4.3) — a thread summary
     plus WHERE it lives, since the moderation page shows threads from MANY
     widgets across the hub at once, unlike the widget's own list (which is
-    always scoped to one component the caller already knows)."""
+    always scoped to one component the caller already knows).
+
+    Threads Management only — NEW threads. Staged edits never appear here
+    (plan_thread_edit_versioning amendment A4, 2026-09-23); they have their
+    own Revision Management section and row type,
+    `ThreadRevisionModerationRow`."""
 
     component_link: str
     widget_title: str
     location_label: str
+
+
+class ThreadRevisionModerationRow(ThreadRevisionSummary):
+    """One row of Revision Management's Pending or History tab
+    (plan_thread_edit_versioning amendment A4, 2026-09-23) — a revision
+    plus WHERE its thread lives (same `component_link` / `widget_title` /
+    `location_label` as `ThreadModerationRow`) and the thread's CURRENT
+    live title/version, so a card can say "v3 proposed for 'X' (live: v1)".
+    `title`/`content_excerpt` (inherited) are the REVISION's.
+
+    `earlier_pending_count`: how many of the same thread's pending revisions
+    have a lower version — lets a Pending card warn before the editor clicks
+    Approve. Always 0 for a non-pending row."""
+
+    component_id: int
+    component_link: str
+    widget_title: str
+    location_label: str
+    thread_title: str
+    thread_version: int
+    earlier_pending_count: int = 0
+
+
+class ThreadRevisionModerationListResponse(BaseModel):
+    items: list[ThreadRevisionModerationRow] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class RevisionPerson(BaseModel):
+    """One option of a Revision History person filter."""
+
+    email: str
+    name: str | None = None
+
+
+class ThreadRevisionHistoryFacets(BaseModel):
+    """`GET /threads/revision-moderation/history/facets` — the distinct
+    submitters (`authors`) and deciders (`reviewers`) across the caller's
+    moderated set's non-pending revisions, for the History tab's two person
+    filters. Sorted by name, then email."""
+
+    authors: list[RevisionPerson] = Field(default_factory=list)
+    reviewers: list[RevisionPerson] = Field(default_factory=list)
+
+
+class ThreadRevisionModerationSummary(BaseModel):
+    """`GET /threads/revision-moderation/summary` — Revision Management's
+    own sidebar badge (amendment A4), polled with the same ETag/304/no-store
+    shape as `ThreadModerationSummary`. `pending_count` counts pending
+    revisions in the moderated set only; Threads Management's summary counts
+    new threads only."""
+
+    can_moderate: bool
+    moderated_component_count: int
+    pending_count: int
 
 
 class ThreadModerationListResponse(BaseModel):
