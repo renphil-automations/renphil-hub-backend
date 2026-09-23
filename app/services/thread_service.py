@@ -2548,6 +2548,7 @@ def list_revision_history(
     date_to: datetime | None = None,
     authors: list[str] | None = None,
     reviewers: list[str] | None = None,
+    thread_ids: list[int] | None = None,
     access: ViewerAccess | None = None,
 ) -> ThreadRevisionModerationListResponse:
     """`GET /threads/revision-moderation/history` — every NON-pending
@@ -2563,7 +2564,11 @@ def list_revision_history(
     - `date_from` (inclusive) / `date_to` (exclusive) on the DECISION date,
       `reviewed_at` — instants, so the client sends its own local-day bounds;
     - `authors` = submitter emails, `reviewers` = decider emails (any-of,
-      case-insensitive).
+      case-insensitive);
+    - `thread_ids` = one or more threads' own version logs (phase C: the
+      review modal asks whether an earlier edit of THIS thread was rejected,
+      plan §7.4). Narrows within the moderated set, never widens it — an
+      unmoderated thread's id simply matches nothing.
     The cursor only encodes the position; the caller must resend the same
     filters with it."""
     statuses = list(statuses or REVISION_DECIDED_STATUSES)
@@ -2594,6 +2599,8 @@ def list_revision_history(
         query = query.filter(
             ThreadRevisionV2.reviewed_by_email.in_({_norm_email(e) for e in reviewers})
         )
+    if thread_ids:
+        query = query.filter(ThreadRevisionV2.thread_id.in_(set(thread_ids)))
     if cursor:
         after_at, after_id = _decode_cursor(cursor)
         query = query.filter(

@@ -348,6 +348,9 @@ async def list_revision_history(
     ),
     author: list[str] | None = Query(default=None, description="Submitter email. Repeatable."),
     reviewer: list[str] | None = Query(default=None, description="Decider email. Repeatable."),
+    thread_id: list[int] | None = Query(
+        default=None, description="Thread id. Repeatable. Narrows within the moderated set."
+    ),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
@@ -361,6 +364,7 @@ async def list_revision_history(
         date_to=date_to,
         authors=author,
         reviewers=reviewer,
+        thread_ids=thread_id,
         access=access,
     )
 
