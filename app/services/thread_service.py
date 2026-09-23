@@ -1878,15 +1878,14 @@ def _apply_editor_edit(
     db.flush()  # the v1 above, if written, must count in MAX(version)
     next_version = _next_revision_version(db, thread)
     previous_mentions = list(thread.mentions or [])  # BEFORE the overwrite below
-    text_changed = new_title != thread.title or new_content != thread.content
     thread.title = new_title
     thread.content = new_content
     thread.mentions = new_mentions
     thread.version = next_version
-    if text_changed:
-        # A mentions-only change is a new version but not an "edit" of the
-        # visible text — same rule as the pre-versioning marker.
-        thread.edited_at = now
+    # "Edited" means a version after v1 is live (owner, 2026-09-23) — a
+    # mentions-only change included: it links or unlinks a chip and can
+    # notify someone, and the marker must agree with the version history.
+    thread.edited_at = now
 
     revision = ThreadRevisionV2(
         thread_id=thread.id,
@@ -2216,17 +2215,15 @@ def decide_thread_revision(
         # an @mention present in both an overwritten v2 and the approved v3
         # notify exactly once.
         previous_mentions = list(thread.mentions or [])
-        text_changed = revision.title != thread.title or revision.content != thread.content
         thread.title = revision.title
         thread.content = revision.content
         thread.mentions = list(revision.mentions or [])
         thread.version = revision.version
         # The approval instant, not `submitted_at` — the "edited" marker
         # appears when the change becomes public, not when it was drafted.
-        # A mentions-only revision is a new version but not a visible edit
-        # (the same rule `_apply_editor_edit` and pre-versioning PATCH use).
-        if text_changed:
-            thread.edited_at = now
+        # Stamped for EVERY version that goes live, a mentions-only one
+        # included (owner, 2026-09-23 — same rule as `_apply_editor_edit`).
+        thread.edited_at = now
 
     revision.status = REVISION_STATUS_APPROVED if approve else REVISION_STATUS_REJECTED
     revision.reviewed_by_email = reviewer_email
