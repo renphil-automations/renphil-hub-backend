@@ -418,6 +418,17 @@ class ThreadRevisionHistoryFacets(BaseModel):
     reviewers: list[RevisionPerson] = Field(default_factory=list)
 
 
+class ThreadHistoryFacets(BaseModel):
+    """`GET /threads/moderation/history/facets` — Threads Management's
+    History person filters, the same shape as `ThreadRevisionHistoryFacets`:
+    the distinct thread authors (`authors`) and deciders (`reviewers`)
+    across the caller's moderated set's decided threads. Sorted by name,
+    then email."""
+
+    authors: list[RevisionPerson] = Field(default_factory=list)
+    reviewers: list[RevisionPerson] = Field(default_factory=list)
+
+
 class ThreadRevisionModerationSummary(BaseModel):
     """`GET /threads/revision-moderation/summary` — Revision Management's
     own sidebar badge (amendment A4), polled with the same ETag/304/no-store

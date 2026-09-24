@@ -100,6 +100,7 @@ from app.schemas.thread import (
     NotificationListResponse,
     RevisionPerson,
     ThreadDetail,
+    ThreadHistoryFacets,
     ThreadListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
@@ -134,12 +135,17 @@ NOTIFICATIONS_PAGE_SIZE = 20
 # first two as "the only two"; plan_thread_moderation_2026-09-18.md §3.2 +
 # M1 (owner-approved 2026-09-19, phase 2d) added the two decision types —
 # the AUTHOR of a moderated thread is told when an editor approves or
-# rejects it. Same `notifications` row shape for all four; `type` is a
-# `String(32)` with no CHECK, so the new values needed no migration.
+# rejects it. plan_thread_edit_versioning_2026-09-22.md §4.6/§8 (phase D)
+# added the two EDIT decision types — the SUBMITTER of a staged edit to an
+# approved thread is told when an editor approves or declines that edit.
+# Same `notifications` row shape for all six; `type` is a `String(32)` with
+# no CHECK, so the new values needed no migration.
 NOTIFICATION_TYPE_MENTION = "mention"
 NOTIFICATION_TYPE_THREAD_COMMENT = "thread_comment"
 NOTIFICATION_TYPE_THREAD_APPROVED = "thread_approved"
 NOTIFICATION_TYPE_THREAD_REJECTED = "thread_rejected"
+NOTIFICATION_TYPE_THREAD_EDIT_APPROVED = "thread_edit_approved"
+NOTIFICATION_TYPE_THREAD_EDIT_REJECTED = "thread_edit_rejected"
 
 # Thread status values (D5, lifecycle in plan_thread_moderation_2026-09-18.md
 # §2). An editor's own post, or a decided pending one, is 'approved'; a
@@ -846,6 +852,54 @@ def _notify_thread_decision(
             thread_id=thread.id,
             comment_id=None,
             excerpt=generate_notification_excerpt(thread.content),
+            read_at=None,
+            created_at=_utc_now(),
+        )
+    )
+
+
+def _notify_thread_edit_decision(
+    db: Session,
+    thread: ThreadV2,
+    revision: ThreadRevisionV2,
+    *,
+    reviewer: UserInfo,
+    approved: bool,
+    component_id: int,
+) -> None:
+    """plan_thread_edit_versioning_2026-09-22.md §4.6 — `_notify_thread_
+    decision` transplanted onto a staged EDIT: tell the revision's SUBMITTER
+    that an editor approved / declined it. Same shape (one recipient, one
+    row, `actor_*` = the reviewer, `comment_id` NULL, explicit
+    recipient-vs-reviewer self-exclusion), three differences:
+
+    - the recipient is `revision.submitted_by_email`, not
+      `thread.author_email` — equal today (PATCH is author-only), but the
+      submitter is who is waiting on this decision;
+    - `type` is the edit pair, so an author is never told "your thread was
+      approved" about an edit to a thread that has been live for weeks;
+    - `excerpt` is the REVISION's content — a declined edit's text never
+      went live, so the thread's own content would describe the wrong thing.
+
+    Called once per decision, for the decided revision only. Revisions an
+    overwrite-approve displaces get NO row: one click, one bell row.
+
+    Does not commit — the caller (`decide_thread_revision`) owns the
+    transaction."""
+    recipient = _norm_email(revision.submitted_by_email)
+    reviewer_email = _norm_email(reviewer.email)
+    if recipient == reviewer_email:
+        return
+    db.add(
+        NotificationV2(
+            recipient_email=recipient,
+            type=NOTIFICATION_TYPE_THREAD_EDIT_APPROVED if approved else NOTIFICATION_TYPE_THREAD_EDIT_REJECTED,
+            actor_email=reviewer_email,
+            actor_name=reviewer.name,
+            component_id=component_id,
+            thread_id=thread.id,
+            comment_id=None,
+            excerpt=generate_notification_excerpt(revision.content),
             read_at=None,
             created_at=_utc_now(),
         )
@@ -2258,9 +2312,11 @@ def decide_thread_revision(
             comment_id=None,
             content=revision.content,
         )
-    # Phase D (plan_thread_edit_versioning §4.6/§8): `_notify_thread_edit_
-    # decision` — tell the submitter, for BOTH outcomes — goes here, after
-    # the mention fan-out and before the commit. Not written in phase A.
+    # plan §4.6 — tell the submitter, for BOTH outcomes. ONE call, for THIS
+    # revision only: the `earlier` rows an overwrite displaced get no row.
+    _notify_thread_edit_decision(
+        db, thread, revision, reviewer=user, approved=approve, component_id=component.id
+    )
 
     db.commit()
     db.refresh(revision)
@@ -2332,12 +2388,35 @@ def list_pending_threads(
 
 
 def list_thread_history(
-    db: Session, cursor: str | None, *, access: ViewerAccess | None = None
+    db: Session,
+    cursor: str | None,
+    *,
+    statuses: list[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    authors: list[str] | None = None,
+    reviewers: list[str] | None = None,
+    access: ViewerAccess | None = None,
 ) -> ThreadModerationListResponse:
     """`GET /threads/moderation/history` — same scoping as the pending
-    queue. `reviewed_at IS NOT NULL` is the whole filter (M5): a legacy or
+    queue. `reviewed_at IS NOT NULL` is the base filter (M5): a legacy or
     editor-auto-approved thread was never explicitly decided and does not
-    appear here. Newest decision first."""
+    appear here. Newest decision first.
+
+    Optional filters (owner, 2026-09-24), all combinable — Revision
+    History's semantics (`list_revision_history`):
+    - `statuses` ⊆ approved/rejected (default both);
+    - `date_from` (inclusive) / `date_to` (exclusive) on the DECISION date,
+      `reviewed_at` — instants, so the client sends its own local-day bounds;
+    - `authors` = thread author emails, `reviewers` = decider emails (any-of,
+      case-insensitive).
+    The cursor only encodes the position; the caller must resend the same
+    filters with it."""
+    if statuses and any(
+        value not in (THREAD_STATUS_APPROVED, THREAD_STATUS_REJECTED) for value in statuses
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid status filter")
+
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
         return ThreadModerationListResponse(items=[], next_cursor=None)
@@ -2346,6 +2425,16 @@ def list_thread_history(
         ThreadV2.component_id.in_(component_ids),
         ThreadV2.reviewed_at.isnot(None),
     )
+    if statuses:
+        query = query.filter(ThreadV2.status.in_(statuses))
+    if date_from is not None:
+        query = query.filter(ThreadV2.reviewed_at >= _as_utc(date_from))
+    if date_to is not None:
+        query = query.filter(ThreadV2.reviewed_at < _as_utc(date_to))
+    if authors:
+        query = query.filter(ThreadV2.author_email.in_({_norm_email(e) for e in authors}))
+    if reviewers:
+        query = query.filter(ThreadV2.reviewed_by_email.in_({_norm_email(e) for e in reviewers}))
     if cursor:
         after_reviewed_at, after_id = _decode_cursor(cursor)
         query = query.filter(
@@ -2364,6 +2453,41 @@ def list_thread_history(
     )
 
     return ThreadModerationListResponse(items=_to_moderation_rows(db, page), next_cursor=next_cursor)
+
+
+def thread_history_facets(
+    db: Session, *, access: ViewerAccess | None = None
+) -> ThreadHistoryFacets:
+    """`GET /threads/moderation/history/facets` — the History tab's two
+    person-filter option lists (owner, 2026-09-24), `revision_history_facets`'
+    shape: the distinct authors and the distinct deciders of every DECIDED
+    thread (`reviewed_at IS NOT NULL`, the list's own base filter) in the
+    caller's moderated set, so a dropdown only offers people the caller can
+    actually find. Emails are stored normalized, so grouping by email is
+    grouping by person."""
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadHistoryFacets()
+
+    def _people(email_col, name_col) -> list[RevisionPerson]:
+        rows = (
+            db.query(email_col, func.max(name_col))
+            .filter(
+                ThreadV2.component_id.in_(component_ids),
+                ThreadV2.reviewed_at.isnot(None),
+                email_col.isnot(None),
+            )
+            .group_by(email_col)
+            .all()
+        )
+        people = [RevisionPerson(email=email, name=name) for email, name in rows]
+        people.sort(key=lambda p: ((p.name or p.email).casefold(), p.email))
+        return people
+
+    return ThreadHistoryFacets(
+        authors=_people(ThreadV2.author_email, ThreadV2.author_name),
+        reviewers=_people(ThreadV2.reviewed_by_email, ThreadV2.reviewed_by_name),
+    )
 
 
 def moderation_summary(

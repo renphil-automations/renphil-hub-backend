@@ -22,8 +22,8 @@ MODERATION (plan_thread_moderation_2026-09-18.md phase 2a). `POST
 /threads/{id}/approve` and `.../reject` gate on `edit(n)` for the thread's
 own component — an editor of the widget OR of any ancestor (a root-tab
 editor approves every thread widget under that root), never Hub-Admin-only
-by analogy with delete (landmine 8). The three static `/threads/moderation/
-*` routes (`pending`, `history`, `summary`) are declared ABOVE
+by analogy with delete (landmine 8). The static `/threads/moderation/*`
+routes (`pending`, `history` + facets, `summary`) are declared ABOVE
 `/threads/{thread_id}`, same convention as the mention directory above.
 
 THREAD VERSIONING (plan_thread_edit_versioning_2026-09-22.md, phase A, with
@@ -86,6 +86,7 @@ from app.schemas.thread import (
     RevisionDecisionRequest,
     ThreadCreateRequest,
     ThreadDetail,
+    ThreadHistoryFacets,
     ThreadListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
@@ -261,14 +262,48 @@ async def list_pending_threads(
 @router.get(
     "/threads/moderation/history",
     response_model=ThreadModerationListResponse,
-    summary="Threads the caller moderates that have an explicit decision, most recent first",
+    summary="Threads the caller moderates that have an explicit decision, most recent first, filterable",
+    responses={400: {"description": "Malformed cursor"}},
 )
 async def list_thread_history(
-    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; resend the same filters."),
+    status_filter: list[Literal["approved", "rejected"]] | None = Query(
+        default=None, alias="status", description="Repeatable. Default: both."
+    ),
+    date_from: datetime | None = Query(
+        default=None, description="Decision instant, inclusive (ISO-8601; naive = UTC)."
+    ),
+    date_to: datetime | None = Query(
+        default=None, description="Decision instant, exclusive (ISO-8601; naive = UTC)."
+    ),
+    author: list[str] | None = Query(default=None, description="Thread author email. Repeatable."),
+    reviewer: list[str] | None = Query(default=None, description="Decider email. Repeatable."),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.list_thread_history, db, cursor, access=access)
+    return await asyncio.to_thread(
+        thread_service.list_thread_history,
+        db,
+        cursor,
+        statuses=status_filter,
+        date_from=date_from,
+        date_to=date_to,
+        authors=author,
+        reviewers=reviewer,
+        access=access,
+    )
+
+
+@router.get(
+    "/threads/moderation/history/facets",
+    response_model=ThreadHistoryFacets,
+    summary="The History tab's author and reviewer filter options",
+)
+async def get_thread_history_facets(
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.thread_history_facets, db, access=access)
 
 
 @router.get(
