@@ -146,6 +146,7 @@ _F_ACCOUNT_NAME = _S.AT_F_ACCOUNT_NAME
 _F_EXCLUDE_FROM_LISTS = _S.AT_F_EXCLUDE_FROM_LISTS
 _F_EXCLUDE_FROM_REPORTING = _S.AT_F_EXCLUDE_FROM_REPORTING
 _F_STATUS = _S.AT_F_STATUS
+_F_FUND_STATUS = _S.AT_F_FUND_STATUS
 _F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
 _F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
 _F_ONBOARDING_STATUS = _S.AT_F_ONBOARDING_STATUS
@@ -158,7 +159,7 @@ _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "Active Program"
 _STATUS_PUBLICLY_LAUNCHED = "Publicly Launched"
-_STATUS_FELLOWSHIP_SCOPING = "Fellowship (Scoping)"
+_STATUS_FELLOWSHIP_SCOPING = "Fellowship"
 _ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
@@ -185,7 +186,7 @@ _ML_LOOKUP_PROJECT_FIELDS = [
     "Initiative Type",
     "Focus Area(s)",
     "Program Lead/Fellow",
-    "Status",
+    "Fund Status",
     "Program Summary",
     "Internal Notes",
     "Can we talk about it publicly",
@@ -3182,15 +3183,15 @@ class AirtableService:
         # The two groups above are unioned (OR).
         status_membership_parts: list[str | None] = []
         if status_list:
-            status_membership_parts.append(af.in_str(_F_STATUS, status_list))
+            status_membership_parts.append(af.in_str(_F_FUND_STATUS, status_list))
         if not_status_list:
-            status_membership_parts.append(af.not_in_str(_F_STATUS, not_status_list))
+            status_membership_parts.append(af.not_in_str(_F_FUND_STATUS, not_status_list))
         membership_clause = af.AND(*status_membership_parts)
 
         status_clauses: list[str | None] = []
         if membership_clause:
             status_clauses.append(membership_clause)
-        status_clauses.append(af.empty_clause(_F_STATUS, status_empty))
+        status_clauses.append(af.empty_clause(_F_FUND_STATUS, status_empty))
         status_combined = af.OR(*status_clauses)
         if status_combined:
             clauses.append(status_combined)
@@ -3460,7 +3461,7 @@ class AirtableService:
         if checkin_user_id:
             program_fields_needed.append(_F_CHECKIN_HISTORY)
         if excluded_statuses:
-            program_fields_needed.append(_F_STATUS)
+            program_fields_needed.append(_F_FUND_STATUS)
 
         programs = await self._get_records_by_ids(
             self._master_list_table(),
@@ -3476,7 +3477,7 @@ class AirtableService:
                 if checkin_user_id not in user_ids:
                     return False
             if excluded_statuses:
-                status_val = pf.get(_F_STATUS)
+                status_val = pf.get(_F_FUND_STATUS)
                 if isinstance(status_val, list):
                     status_val = status_val[0] if status_val else None
                 if status_val in excluded_statuses:
@@ -4082,12 +4083,12 @@ class AirtableService:
         'Exclude from lists'.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
         records = await self._list_records(
-            self._master_list_table(), formula=formula, fields=[_F_STATUS]
+            self._master_list_table(), formula=formula, fields=[_F_FUND_STATUS]
         )
         return CountResponse(count=len(records))
 
@@ -4101,7 +4102,7 @@ class AirtableService:
         'Program Lead/Fellow' fields.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
@@ -4127,8 +4128,8 @@ class AirtableService:
     async def get_distinct_fellows_count(self) -> CountResponse:
         """Count distinct fellows sourced from the Master List.
 
-        Fellows are derived from the Master List: records whose Status
-        equals 'Fellowship (Scoping)' contribute their 'Program Lead/Fellow'
+        Fellows are derived from the Master List: records whose Fund Status
+        equals 'Fellowship' contribute their 'Program Lead/Fellow'
         name(s). Names are resolved to Users by matching the 'Name' field;
         each matched user contributes its (lower-cased) Work Email to the
         distinct set, and each unmatched name contributes its (lower-cased)
@@ -4304,7 +4305,7 @@ class AirtableService:
     ) -> list[tuple[str, dict[str, Any] | None]]:
         """Return one entry per Program Lead/Fellow, matched to a User when possible.
 
-        1. Query MASTER_LIST for records with Status = 'Fellowship (Scoping)',
+        1. Query MASTER_LIST for records with Fund Status = 'Fellowship',
            projecting the 'Program Lead/Fellow' field.
         2. Extract the list of unique lead/fellow names.
         3. Query USERS matching those names against the 'Name' field,
@@ -4314,8 +4315,8 @@ class AirtableService:
         """
         s = self._settings
 
-        # Step 1: pull Fellowship (Scoping) programs from the Master List.
-        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP_SCOPING)
+        # Step 1: pull Fellowship programs from the Master List.
+        program_formula = af.eq_str(_F_FUND_STATUS, _STATUS_FELLOWSHIP_SCOPING)
         program_records = await self._list_records(
             self._master_list_table(),
             formula=program_formula,

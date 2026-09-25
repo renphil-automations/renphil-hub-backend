@@ -190,6 +190,7 @@ class Settings(BaseSettings):
     AT_F_EXCLUDE_FROM_LISTS: str
     AT_F_EXCLUDE_FROM_REPORTING: str
     AT_F_STATUS: str
+    AT_F_FUND_STATUS: str
     AT_F_SUB_TRACK_OF: str
     AT_F_SHARE_PUBLICLY: str
     AT_F_ONBOARDING_STATUS: str
