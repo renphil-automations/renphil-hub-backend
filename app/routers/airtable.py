@@ -2632,7 +2632,7 @@ async def get_active_programs(
     response_model=CountResponse,
     summary=(
         "Number of fellows: distinct Work Emails resolved from the Master "
-        "List's 'Program Lead/Fellow' values (Status = 'Fellowship (Scoping)') "
+        "List's 'Program Lead/Fellow' values (Fund Status = 'Fellowship') "
         "matched against the Users table by Name."
     ),
 )
@@ -2650,8 +2650,8 @@ async def get_distinct_fellows_count(
     response_model=list[PersonContactItem],
     summary=(
         "Unique fellows (First Name, Last Name, Work Email) resolved from the "
-        "Master List's 'Program Lead/Fellow' values (Status = 'Fellowship "
-        "(Scoping)') matched against the Users table by Name."
+        "Master List's 'Program Lead/Fellow' values (Fund Status = 'Fellowship') "
+        "matched against the Users table by Name."
     ),
 )
 @airtable_cache(table=["MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "USERS_TABLE"])

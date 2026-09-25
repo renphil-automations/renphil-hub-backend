@@ -611,7 +611,7 @@ class ButtonFieldValue(BaseModel):
 class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     name: str | None = Field(default=None, alias="Name")
     fundraising_stage: list[str] | None = Field(default=None, alias="Fundraising Stage")
-    status: str | None = Field(default=None, alias="Status")
+    status: str | None = Field(default=None, alias="Fund Status")
     official_fund_or_program_name: str | None = Field(
         default=None, alias="Official Fund or Program Name"
     )
@@ -664,7 +664,7 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     )
     update_funding_documents: ButtonFieldValue | None = Field(
         default=None,
-        alias="Update Funding Documents",
+        alias="Update Fund Information & Funding Documents",
         description=(
             "Airtable 'Button' field that opens a URL. Returned as "
             "{label, url}; present only when the button opens a URL."
@@ -715,7 +715,7 @@ class MasterListLookupItem(BaseModel):
     initiative_type: str | None = Field(default=None, alias="Initiative Type")
     focus_areas: list[str] | None = Field(default=None, alias="Focus Area(s)")
     program_lead_fellow: Any = Field(default=None, alias="Program Lead/Fellow")
-    status: str | None = Field(default=None, alias="Status")
+    status: str | None = Field(default=None, alias="Fund Status")
     program_summary: str | None = Field(default=None, alias="Program Summary")
     internal_notes: str | None = Field(default=None, alias="Internal Notes")
     can_we_talk_about_it_publicly: bool | None = Field(
