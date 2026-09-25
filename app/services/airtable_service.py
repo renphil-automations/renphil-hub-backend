@@ -753,7 +753,7 @@ class AirtableService:
         serializing, and taking that lock here would let a schema call block
         a row walk.
         """
-        hints, _available = await self._fetch_table_field_hints_impl(
+        hints, _names, _available = await self._fetch_table_field_hints_impl(
             base_id=base_id, table_id=table_id, api_key=api_key
         )
         return hints
@@ -776,11 +776,12 @@ class AirtableService:
 
     async def fetch_table_field_hints_with_status(
         self, *, base_id: str, table_id: str, api_key: str
-    ) -> tuple[dict[str, str], bool]:
-        """`fetch_table_field_hints` plus an `available` flag, for the admin
-        preview only. A table with no URL/select columns legitimately returns
-        ({}, True); a PAT without `schema.bases:read` returns ({}, False). The
-        two are indistinguishable from the hints alone, and the Property
+    ) -> tuple[dict[str, str], list[str], bool]:
+        """`fetch_table_field_hints` plus the full ordered field-name list and
+        an `available` flag, for the admin preview only. A table with no
+        URL/select columns legitimately returns ({}, [...names], True); a PAT
+        without `schema.bases:read` returns ({}, [], False). The hints and the
+        flag are indistinguishable from the hints alone, and the Property
         Panel needs to say something different for each.
 
         Not used by the viewer-facing `/rows` and `/rows/full` paths — a
@@ -811,7 +812,7 @@ class AirtableService:
 
     async def _fetch_table_field_hints_impl(
         self, *, base_id: str, table_id: str, api_key: str, force_live: bool = False,
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, str], list[str], bool]:
         """Shared worker `fetch_table_field_hints` and
         `fetch_table_field_hints_with_status` both project from — one code
         path, so `available` is derived directly from the control flow that
@@ -843,13 +844,15 @@ class AirtableService:
             # per-viewer traffic, so paying for a live call while the cache
             # is down is cheap here.)
             if not cache.enabled:
-                return {}, True
+                return {}, [], True
 
             cached = await cache.get(cache_key)
             if isinstance(cached, dict):
-                return cached, True
+                # No field-name list on a cache hit; only the force_live
+                # (preview) path needs it, and that path skips this shortcut.
+                return cached, [], True
             if await cache.get(f"{cache_key}{self._SCHEMA_NEGATIVE_CACHE_SUFFIX}") is not None:
-                return {}, False
+                return {}, [], False
 
         try:
             api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
@@ -863,7 +866,7 @@ class AirtableService:
                 base_id, table_id, exc,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="fetch_failed")
-            return {}, False
+            return {}, [], False
         except Exception:
             # `BaseSchema.table(id)` raises a bare KeyError (NOT
             # RequestException) for a stale/renamed table_id — `_find` ends
@@ -874,19 +877,23 @@ class AirtableService:
                 base_id, table_id,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="unexpected_error")
-            return {}, False
+            return {}, [], False
 
         hints = {
             f.name: hint
             for f in table_schema.fields
             if (hint := _FIELD_TYPE_HINTS.get(f.type))
         }
+        # Full ordered field-name list from the SAME schema read, so a caller
+        # that needs every column (the editor preview's dropdowns) doesn't pay
+        # for a second Metadata call.
+        field_names = [f.name for f in table_schema.fields]
         await cache.set(
             cache_key,
             hints,
             ttl_seconds=self._settings.AIRTABLE_SCHEMA_CACHE_TTL_SECONDS,
         )
-        return hints, True
+        return hints, field_names, True
 
     async def _get_or_warm_widget_cache(
         self,
@@ -2240,8 +2247,9 @@ class AirtableService:
         personalize column is the wrong type and matches nothing" — which are
         otherwise indistinguishable and both look like a broken widget.
 
-        Costs up to two Airtable calls, which is acceptable at edit
-        frequency (and one when personalization is off).
+        Costs up to three Airtable calls (one records read, plus a second
+        when personalization is on, plus one Metadata/schema read that also
+        backs the full column list) — acceptable at edit frequency.
         """
         from app.models.airtable import AirtableEditorPreviewResponse
 
@@ -2303,39 +2311,28 @@ class AirtableService:
             {"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records
         ]
 
-        # Prefer the admin's explicit column order over discovery order — see
-        # the matching comment in fetch_widget_rows. Without this, the editor
-        # preview would silently ignore the admin's custom column ordering
-        # even though the saved widget honors it once persisted.
+        # One schema read backs BOTH the type hints and the full column list
+        # below — see fetch_table_field_hints_with_status.
+        field_types, schema_fields, field_types_available = (
+            await self.fetch_table_field_hints_with_status(
+                base_id=base_id, table_id=table_id, api_key=api_key
+            )
+        )
+
+        # Prefer the admin's explicit column order; otherwise populate the
+        # dropdowns from the table's FULL schema, not just columns present in
+        # the capped preview rows — a column empty across every previewed row
+        # can never be picked otherwise. Falls back to discovery order when the
+        # schema read failed (empty schema_fields; needs schema.bases:read).
         if selected_columns:
             fields = list(selected_columns)
+        elif schema_fields:
+            fields = list(schema_fields)
+            for name in seen_fields:
+                if name not in fields:
+                    fields.append(name)
         else:
-            # Populate the column dropdowns from the table's FULL schema, not
-            # just columns present in the capped preview rows — otherwise a
-            # column empty across every previewed row can never be picked.
-            # Best-effort: needs the PAT's schema.bases:read scope, and falls
-            # back to discovery order if the schema read fails.
             fields = seen_fields
-            try:
-                table_schema = await asyncio.to_thread(
-                    lambda: api.base(base_id).schema().table(table_id)
-                )
-            except Exception:
-                logger.warning(
-                    "Airtable editor preview schema fetch failed (base=%s table=%s) "
-                    "— column list limited to fields present in the preview rows",
-                    base_id,
-                    table_id,
-                )
-            else:
-                fields = [f.name for f in table_schema.fields]
-                for name in seen_fields:
-                    if name not in fields:
-                        fields.append(name)
-
-        field_types, field_types_available = await self.fetch_table_field_hints_with_status(
-            base_id=base_id, table_id=table_id, api_key=api_key
-        )
 
         return AirtableEditorPreviewResponse(
             base_id=base_id,
