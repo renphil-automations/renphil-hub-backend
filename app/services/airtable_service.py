@@ -2510,12 +2510,20 @@ class AirtableService:
         fetching all and discarding). ``formula`` is passed verbatim to
         Airtable's ``filterByFormula`` parameter and is applied server-side
         before the row cap, so the cap applies to already-filtered results.
+
+        When ``fields`` is not given, the full column list is taken from the
+        table's schema (Metadata API) rather than inferred from the capped
+        rows — otherwise a column that is empty across every previewed row
+        would silently disappear from ``fields``. Requires the PAT's
+        ``schema.bases:read`` scope; if the schema call fails it degrades to
+        the columns actually seen in the rows.
         """
         from app.models.airtable import AirtablePreviewResponse
 
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
 
-        table = Api(api_key.strip()).table(base_id, table_id)
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
         kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
         if view_id:
             kwargs["view"] = view_id
@@ -2537,18 +2545,45 @@ class AirtableService:
         seen_set: set[str] = set()
         rows: list[dict[str, Any]] = []
         for record in records:
-            fields = record.get("fields", {}) or {}
-            for key in fields:
+            record_fields = record.get("fields", {}) or {}
+            for key in record_fields:
                 if key not in seen_set:
                     seen_set.add(key)
                     seen_fields.append(key)
-            rows.append({"id": record.get("id"), **fields})
+            rows.append({"id": record.get("id"), **record_fields})
+
+        if fields:
+            # Caller projected explicit columns: return exactly those, so a
+            # requested column empty across every previewed row still appears.
+            response_fields = list(fields)
+        else:
+            response_fields = seen_fields
+            try:
+                table_schema = await asyncio.to_thread(
+                    lambda: api.base(base_id).schema().table(table_id)
+                )
+            except Exception:
+                # Best-effort: PAT lacks schema.bases:read, or the table id is
+                # stale/renamed — fall back to columns seen in the rows.
+                logger.warning(
+                    "Airtable preview schema fetch failed (base=%s table=%s) — "
+                    "returning only columns present in the previewed rows",
+                    base_id,
+                    table_id,
+                )
+            else:
+                # Full schema order first, then any column seen in the rows
+                # that the schema didn't list.
+                response_fields = [f.name for f in table_schema.fields]
+                for name in seen_fields:
+                    if name not in response_fields:
+                        response_fields.append(name)
 
         return AirtablePreviewResponse(
             base_id=base_id,
             table_id=table_id,
             view_id=view_id,
-            fields=seen_fields,
+            fields=response_fields,
             rows=rows,
         )
 
