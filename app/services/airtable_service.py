@@ -2307,7 +2307,31 @@ class AirtableService:
         # the matching comment in fetch_widget_rows. Without this, the editor
         # preview would silently ignore the admin's custom column ordering
         # even though the saved widget honors it once persisted.
-        fields = list(selected_columns) if selected_columns else seen_fields
+        if selected_columns:
+            fields = list(selected_columns)
+        else:
+            # Populate the column dropdowns from the table's FULL schema, not
+            # just columns present in the capped preview rows — otherwise a
+            # column empty across every previewed row can never be picked.
+            # Best-effort: needs the PAT's schema.bases:read scope, and falls
+            # back to discovery order if the schema read fails.
+            fields = seen_fields
+            try:
+                table_schema = await asyncio.to_thread(
+                    lambda: api.base(base_id).schema().table(table_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Airtable editor preview schema fetch failed (base=%s table=%s) "
+                    "— column list limited to fields present in the preview rows",
+                    base_id,
+                    table_id,
+                )
+            else:
+                fields = [f.name for f in table_schema.fields]
+                for name in seen_fields:
+                    if name not in fields:
+                        fields.append(name)
 
         field_types, field_types_available = await self.fetch_table_field_hints_with_status(
             base_id=base_id, table_id=table_id, api_key=api_key
