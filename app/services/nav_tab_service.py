@@ -24,6 +24,7 @@ from app.services import edit_lock_service
 from app.services.access_visibility_service import (
     ViewerAccess,
     require_edit,
+    require_force_allowed,
     resolve_hub_node,
 )
 from app.services.gridstack_service import (
@@ -263,6 +264,7 @@ def lock_nav_tab_by_document_id_v2(
         return None
 
     require_edit(access, ("nav_tab", nav_tab.id))
+    require_force_allowed(access, ("nav_tab", nav_tab.id), force)
 
     grant = edit_lock_service.acquire(db, ("nav_tab", nav_tab.id), locked_by, force=force)
     formatted = _format_nav_tab(nav_tab)
@@ -322,10 +324,9 @@ def unlock_nav_tab_by_document_id_v2(
 ) -> dict[str, Any] | None:
     """THIN WRAPPER — see `lock_nav_tab_by_document_id_v2`'s own comment on
     why the logic lives in `edit_lock_service.release`. `force` here is the
-    EXISTING unlock force (owner decision 2026-09-03: unrestricted, skips
-    ownership AND staleness) — the same flag
-    `gridstack_service.unlock_tab_by_document_id_v2` takes, unchanged by
-    this plan.
+    EXISTING unlock force (skips ownership AND staleness) — the same flag
+    `gridstack_service.unlock_tab_by_document_id_v2` takes, and like it Hub
+    Admin only (owner decision 2026-09-25, `require_force_allowed`).
 
     plan_ac_enforcement_closeout_2026-09-09.md §3: same single `edit(n)`
     gate as lock, covering force-unlock too."""
@@ -334,6 +335,7 @@ def unlock_nav_tab_by_document_id_v2(
         return None
 
     require_edit(access, ("nav_tab", nav_tab.id))
+    require_force_allowed(access, ("nav_tab", nav_tab.id), force)
 
     edit_lock_service.release(db, ("nav_tab", nav_tab.id), unlocked_by or "", force=force)
     return _format_nav_tab(nav_tab)

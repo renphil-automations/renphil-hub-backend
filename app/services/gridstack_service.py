@@ -37,6 +37,7 @@ from app.services.access_visibility_service import (
     NodeNotViewableError,
     ViewerAccess,
     require_edit,
+    require_force_allowed,
     resolve_gridstack_node,
     resolve_gridstack_parent_node,
 )
@@ -3160,6 +3161,7 @@ def lock_tab_by_document_id_v2(
         return None
 
     _require_edit_for_lock_action(db, gridstack, access, component_link)
+    require_force_allowed(access, resolve_gridstack_node(db, gridstack), force)
 
     grant = edit_lock_service.acquire(
         db, edit_lock_service.resolve_lock_node(gridstack), locked_by, force=force
@@ -3237,9 +3239,9 @@ def unlock_tab_by_document_id_v2(
 ) -> dict[str, Any] | None:
     """THIN WRAPPER — see `lock_tab_by_document_id_v2`'s own comment on why
     the logic moved to `edit_lock_service.release`. `force` here is the
-    EXISTING unlock force (owner decision 2026-09-03: unrestricted, skips
-    ownership AND staleness) — unchanged by this plan, and a different flag
-    from `lock_tab_by_document_id_v2`'s new one above.
+    EXISTING unlock force (skips ownership AND staleness), a different flag
+    from `lock_tab_by_document_id_v2`'s new one above. Both flags are Hub
+    Admin only (owner decision 2026-09-25) — `require_force_allowed`.
 
     plan_ac_enforcement_closeout_2026-09-09.md §3: same single `edit(n)`
     gate as lock, covering force-unlock too — see that function's docstring
@@ -3257,6 +3259,7 @@ def unlock_tab_by_document_id_v2(
         return None
 
     _require_edit_for_lock_action(db, gridstack, access, component_link)
+    require_force_allowed(access, resolve_gridstack_node(db, gridstack), force)
 
     edit_lock_service.release(
         db, edit_lock_service.resolve_lock_node(gridstack), unlocked_by or "", force=force
@@ -3346,6 +3349,7 @@ def lock_component_by_link(
     component = _lockable_component_by_link(db, link, access)
     if component is None:
         return None
+    require_force_allowed(access, ("component", component.id), force)
     grant = edit_lock_service.acquire(db, ("component", component.id), locked_by, force=force)
     db.refresh(component)
     return _component_lock_response(component, grant)
@@ -3377,12 +3381,13 @@ def unlock_component_by_link(
     access: ViewerAccess | None = None,
 ) -> dict[str, Any] | None:
     """THIN WRAPPER over `edit_lock_service.release` — same ownership rule
-    and same unrestricted `force` as `unlock_tab_by_document_id_v2`."""
+    and same admin-only `force` as `unlock_tab_by_document_id_v2`."""
     from app.services import edit_lock_service  # local: see that module's own import comment
 
     component = _lockable_component_by_link(db, link, access)
     if component is None:
         return None
+    require_force_allowed(access, ("component", component.id), force)
     edit_lock_service.release(db, ("component", component.id), unlocked_by or "", force=force)
     db.refresh(component)
     return _component_lock_response(component)

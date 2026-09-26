@@ -58,7 +58,12 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
 from app.services import edit_lock_service
-from app.services.access_visibility_service import NodeRef, ViewerAccess, require_edit
+from app.services.access_visibility_service import (
+    NodeRef,
+    ViewerAccess,
+    require_edit,
+    require_force_allowed,
+)
 from app.services.gridstack_service import (
     SBN_ROOT_WIDGET_TYPE,
     _generate_id,
@@ -650,6 +655,7 @@ def lock_sbn_node(
         return None
 
     require_edit(access, _sbn_node(component))
+    require_force_allowed(access, _sbn_node(component), force)
 
     # `acquire` commits (or rolls back) on its own.
     grant = edit_lock_service.acquire(db, _sbn_node(component), locked_by, force=force)
@@ -688,6 +694,7 @@ def unlock_sbn_node(
         return None
 
     require_edit(access, _sbn_node(component))
+    require_force_allowed(access, _sbn_node(component), force)
 
     # `release` validates `unlocked_by` and commits/rolls back on its own.
     edit_lock_service.release(db, _sbn_node(component), unlocked_by or "", force=force)

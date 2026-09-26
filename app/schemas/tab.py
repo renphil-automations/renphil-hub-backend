@@ -651,9 +651,9 @@ class UnlockTabRequest(StrictRequestModel):
     be omitted by the client either — the server derives it from the JWT on
     every call, with nothing left for an absent/null value to short-circuit.
 
-    `force` is UNCHANGED (owner decision, 2026-09-03): still present, still
-    unrestricted — see `unlock_tab_by_document_id_v2`'s docstring in
-    gridstack_service.py for why.
+    `force` is Hub Admin only (owner decision 2026-09-25, replacing the
+    2026-09-03 "unrestricted" one) — see
+    `access_visibility_service.require_force_allowed`.
 
     `link` — NEW, same reasoning and same optional/additive shape as
     `LockTabRequest.link` above. A component-only editor's own release must

@@ -35,6 +35,7 @@ from app.schemas.tab import (
 from app.services import edit_lock_service
 from app.services.access_visibility_service import (
     AccessDeniedError,
+    ForceLockNotAllowedError,
     NodeNotViewableError,
     ViewerAccess,
 )
@@ -106,6 +107,10 @@ def access_denied_to_http_exception(error: AccessDeniedError) -> HTTPException:
     """
     if isinstance(error, NodeNotViewableError):
         return HTTPException(status_code=404, detail="Tab not found")
+    if isinstance(error, ForceLockNotAllowedError):
+        return HTTPException(
+            status_code=403, detail="Only admins can take over another person's editing session"
+        )
     return HTTPException(
         status_code=403, detail="You do not have edit access to this item"
     )

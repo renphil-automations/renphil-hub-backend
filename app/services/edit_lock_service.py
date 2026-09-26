@@ -555,10 +555,11 @@ def release(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
     existing one — deliberately no `and unlocked_by` short-circuit (the
     omission bypass fixed 2026-09-03 in three places): a falsy `holder`
     must read as "not proven to be the holder", never as "no identity ⇒ let
-    it through". `force` here is the EXISTING unlock force (owner decision
-    2026-09-03: unrestricted, skips ownership AND staleness) — a different
-    flag from `acquire`'s new one above; unlock's force is unchanged by
-    this plan."""
+    it through". `force` here is the EXISTING unlock force (skips ownership
+    AND staleness) — a different flag from `acquire`'s above. WHO may pass
+    either flag is not decided here: both are Hub Admin only, gated by the
+    service wrappers via `access_visibility_service.require_force_allowed`
+    (owner decision 2026-09-25)."""
     try:
         holder = _validate_locked_by(holder) or ""
 
