@@ -489,6 +489,7 @@ def _format_tab_summary(
         summary["lock_holder"] = lock_node_state.holder
         summary["lock_holder_node_label"] = lock_node_state.node_label
         summary["lock_expires_at"] = lock_node_state.expires_at
+        summary["lock_takeover_blocked"] = lock_node_state.takeover_blocked
     return summary
 
 
@@ -2144,6 +2145,7 @@ def get_tab_workspace_v2(
         workspace["lock_holder"] = lock_node_state.holder
         workspace["lock_holder_node_label"] = lock_node_state.node_label
         workspace["lock_expires_at"] = lock_node_state.expires_at
+        workspace["lock_takeover_blocked"] = lock_node_state.takeover_blocked
     return workspace
 
 

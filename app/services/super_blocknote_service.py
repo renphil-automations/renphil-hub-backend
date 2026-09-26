@@ -157,6 +157,7 @@ def _sbn_lock_fields(component: ComponentV2, lock_view: Any = None) -> dict[str,
         fields["lock_holder"] = state.holder
         fields["lock_holder_node_label"] = state.node_label
         fields["lock_expires_at"] = state.expires_at
+        fields["lock_takeover_blocked"] = state.takeover_blocked
     return fields
 
 

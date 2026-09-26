@@ -153,6 +153,7 @@ def _format_nav_tab(
         summary["lock_holder"] = lock_node_state.holder
         summary["lock_holder_node_label"] = lock_node_state.node_label
         summary["lock_expires_at"] = lock_node_state.expires_at
+        summary["lock_takeover_blocked"] = lock_node_state.takeover_blocked
     return summary
 
 
