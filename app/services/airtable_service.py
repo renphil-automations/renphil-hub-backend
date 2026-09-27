@@ -223,6 +223,28 @@ _WIDGET_RETRY_STRATEGY = _pyairtable_retry_strategy(
     status_forcelist=(429, 500, 502, 503, 504)
 )
 
+
+def _list_records_page(api: Api, table: Any, options: dict[str, Any]) -> Any:
+    """One raw "list records" page — `records` AND `offset` together, which
+    `table.all()`/`.iterate()` can't hand back (they swallow `offset`).
+
+    Every raw list-records GET in this module goes through here so it carries
+    the same `fallback=` pyairtable's own `Table.iterate` passes
+    (pyairtable/api/table.py): once the prepared GET URL reaches
+    `Api.MAX_URL_LENGTH` (16,000), `Api.request` re-issues it as
+    `POST …/listRecords` with the options in a JSON body. Without it an
+    over-long URL (a filter formula with many multi-value `eq` tags — the
+    condition caps don't bound that) goes out as a GET and Airtable rejects
+    it. The POST response has the same `records`/`offset` shape, and
+    `offset` travels in the body, so paging works unchanged."""
+    return api.request(
+        "get",
+        table.urls.records,
+        fallback=("post", table.urls.records_post),
+        options=options,
+    )
+
+
 # ── Field-type hints for the viewer Filter/Sort/Group/Search toolbar ───────
 # (plan_airtable_widget_viewer_controls_2026-08-12.md §2.2). Deliberately
 # narrow: a field type not in this map renders as plain text, same as today.
@@ -360,7 +382,7 @@ class AirtableService:
         table = api.table(base_id, table_id)
         try:
             payload = await asyncio.to_thread(
-                api.request, "get", table.urls.records, options=options
+                _list_records_page, api, table, options
             )
         except RequestException as exc:
             logger.error("Airtable widget row fetch failed: %s", exc)
@@ -536,7 +558,7 @@ class AirtableService:
 
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable widget cache walk failed: %s", exc)
@@ -2263,7 +2285,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable editor preview failed: %s", exc)
@@ -2449,7 +2471,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable chart preview failed: %s", exc)
