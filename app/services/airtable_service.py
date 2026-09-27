@@ -297,7 +297,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
@@ -594,7 +594,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> tuple[dict[str, Any] | None, str]:
@@ -894,7 +894,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
         allow_warm: bool = True,
@@ -1014,7 +1014,7 @@ class AirtableService:
         link: str,
         url: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> dict[str, Any]:
@@ -1075,7 +1075,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
@@ -1231,7 +1231,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
     ):
         """Return one complete viewer-independent row set for shared indexing.
 
@@ -1325,7 +1325,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1602,7 +1602,7 @@ class AirtableService:
         caller_email: str,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1734,7 +1734,7 @@ class AirtableService:
 
     @staticmethod
     def _chart_cache_fingerprint(
-        *, link: str, url: str, filters: list[dict[str, Any]] | None
+        *, link: str, url: str, filters: af.WidgetFilters | None
     ) -> dict[str, Any]:
         """The `widget_rows` cache fingerprint a Chart widget's aggregation
         reads — a thin, Chart-specific alias over the shared
@@ -1879,7 +1879,7 @@ class AirtableService:
         group_field: str | None,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         max_groups: int | None = None,
@@ -1995,7 +1995,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> str:
@@ -2222,7 +2222,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -2334,7 +2334,7 @@ class AirtableService:
         group_field: str | None,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         max_groups: int | None = None,

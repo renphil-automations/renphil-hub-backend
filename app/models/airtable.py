@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
+from app.helpers.airtable_formulas import WidgetFilters
+
 
 class AirtableRecord(BaseModel):
     """A single Airtable record as returned by the REST API (raw fields)."""
@@ -139,7 +141,7 @@ class AirtableWidgetIndexSnapshotResponse(BaseModel):
     view_id: str | None = None
 
     selected_columns: list[str] = Field(default_factory=list)
-    filters: list[dict[str, Any]] = Field(default_factory=list)
+    filters: WidgetFilters = Field(default_factory=list)
 
     personalize_enabled: bool = False
     personalize_column: str | None = None
@@ -268,7 +270,7 @@ class AirtableChartPreviewRequest(BaseModel):
     link: str | None = None
     sourceUrl: str | None = None
     pat: str | None = None
-    filters: list[dict[str, Any]] | None = None
+    filters: WidgetFilters | None = None
     personalizeEnabled: bool = False
     personalizeColumn: str | None = None
     groupField: str | None = None
@@ -302,7 +304,7 @@ class AirtableEditorPreviewRequest(BaseModel):
     sourceUrl: str | None = None
     pat: str | None = None
     selectedColumns: list[str] | None = None
-    filters: list[dict[str, Any]] | None = None
+    filters: WidgetFilters | None = None
     personalizeEnabled: bool = False
     personalizeColumn: str | None = None
 

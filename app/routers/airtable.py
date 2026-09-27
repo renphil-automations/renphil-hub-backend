@@ -162,6 +162,7 @@ from app.models.airtable import (
     OrganizationInfoRecord,
     OrganizationInfoCreate,
     OrganizationInfoUpdate,
+    WidgetFilters,
 )
 from app.models.auth import UserInfo
 from app.routers.tabs_v2 import access_denied_to_http_exception
@@ -1124,15 +1125,22 @@ async def get_airtable_component_index_snapshot(
 
     raw_filters = stored.get("filters")
 
-    filters = (
-        [
+    # `filters` is a legacy flat list OR a root group object (advanced
+    # filters). Both must reach the walk below: collapsing a group to `[]`
+    # would index the widget's UNFILTERED rows. A list keeps its old
+    # dict-items-only cleanup so a stray non-dict can't fail the response
+    # model; a group passes through as-is (the compiler cleans it).
+    filters: WidgetFilters
+    if isinstance(raw_filters, list):
+        filters = [
             dict(item)
             for item in raw_filters
             if isinstance(item, dict)
         ]
-        if isinstance(raw_filters, list)
-        else []
-    )
+    elif isinstance(raw_filters, dict):
+        filters = dict(raw_filters)
+    else:
+        filters = []
 
     personalize_enabled = bool(
         config.get("personalizeEnabled")
