@@ -307,6 +307,22 @@ class AirtableEditorPreviewRequest(BaseModel):
     filters: WidgetFilters | None = None
     personalizeEnabled: bool = False
     personalizeColumn: str | None = None
+    # Table widget default view (advanced-filters plan §11): each is
+    # `{field, direction: "asc" | "desc"}` or null. Deliberately `Any`: the
+    # panel sends the stored value as-is, and a malformed or stale one is
+    # IGNORED (Part B decision 3, `airtable_ordering.parse_default_order`),
+    # the same as on the saved paths, not a 422 that would blank the preview.
+    defaultSort: Any = Field(
+        default=None,
+        description="In-progress default sort: {field, direction: 'asc'|'desc'}.",
+    )
+    defaultGroup: Any = Field(
+        default=None,
+        description=(
+            "In-progress default grouping: {field, direction: 'asc'|'desc'}. "
+            "The preview orders by it first, then by defaultSort."
+        ),
+    )
 
 
 class AirtableEditorPreviewResponse(BaseModel):
