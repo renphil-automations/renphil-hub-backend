@@ -1601,6 +1601,35 @@ def require_edit(access: ViewerAccess | None, node: NodeRef | None) -> None:
         raise NodeNotEditableError(node)
 
 
+class ForceLockNotAllowedError(AccessDeniedError):
+    """A non-admin sent `force: true` on a lock or unlock. A router should
+    map this to 403 — the caller has already passed `require_edit` on the
+    node, so it exists and they know it; only the takeover is refused."""
+
+
+def require_force_allowed(access: ViewerAccess | None, node: NodeRef | None, force: bool) -> None:
+    """Owner decision 2026-09-25: force takeover (acquire's `force`, §4.2
+    decision 8) and force-unlock are Hub Admin only. Both end another
+    person's live session, so both are gated — leaving force-unlock open
+    would let a non-admin reproduce a takeover as unlock(force) -> lock.
+    This replaces the 2026-09-03 "unrestricted" decision and closeout §3's
+    "force collapses into `edit(n)`": `edit(n)` still gates the lock
+    action itself; this is an additional check on the flag only.
+
+    Nothing legitimate is lost for a non-admin: a STALE lock is already
+    reclaimed by a plain acquire (§4.1) and released by a plain unlock, so
+    `force` only ever matters against a FRESH session.
+
+    Call AFTER `require_edit`, so a caller who cannot view the node still
+    gets the 404 and learns nothing. `access=None` is "no check requested",
+    same as `require_edit`. `full_access` is today exactly
+    `dependencies.is_hub_admin` — see `ViewerAccess`'s docstring on that
+    coupling."""
+    if not force or access is None or access.full_access:
+        return
+    raise ForceLockNotAllowedError(node)
+
+
 class ViewerAccess(NamedTuple):
     """One caller's access for a whole request — computed ONCE (§8.4) and
     threaded through every tab-serving function that needs to gate content.

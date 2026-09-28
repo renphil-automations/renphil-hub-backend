@@ -16,12 +16,16 @@ this module authorizes anybody, and it still enforces nothing about CONTENT:
 no existing endpoint reads ``granted`` or ``visible``, and no response shape
 any client reads today is affected by it.
 
-There is no update path. A grant is three immutable facts — a node, a
-principal, a level — and "changing" one is revoking it and writing another,
-which is what makes the provenance columns meaningful and what keeps §6.2's
-revoke-time confirmation the only place a grant ever disappears silently.
-The uniqueness rule on the table says the same thing structurally: the only
-mutable column would be one of the ones it keys on.
+The node and principal are immutable; the LEVEL is not, as of 2026-09-25
+(owner decision after team testing — the grant editor needed a View⇄Edit
+switch instead of revoke-and-regrant). ``update_grant_level`` is the one
+update path. It restamps the provenance columns (``granted_by_*`` and
+``created_at``) to the person who made the change, so "granted by X on D"
+still means "X is the one who put this level here". Changing the node or the
+principal is still a revoke plus a write. The uniqueness rule keys on level
+too, so a level change can collide with a sibling row naming the same
+principal at the target level — ``update_grant_level`` refuses that with the
+same ``duplicate_grant`` code ``create_grant`` uses.
 
 ⊥ IS THE NORMAL CASE HERE, AND THAT IS THE OPPOSITE OF THE ASSIGNMENTS PATH.
 ``routers/rbac_assignments.py::_assert_not_public`` refuses ``is_public`` as
@@ -527,6 +531,63 @@ def create_grant(
         row = db.query(HubUserV2.email).filter(HubUserV2.id == grant.user_id).first()
         user_email = row[0] if row is not None else None
     return serialize_grant(grant, user_email=user_email)
+
+
+def update_grant_level(
+    db: Session,
+    grant_id: int,
+    *,
+    level: str,
+    granted_by_user_id: int | None = None,
+    granted_by_email: str | None = None,
+) -> dict | None:
+    """Switch one grant between ``view`` and ``edit``. None if it was not there.
+
+    Node and principal are untouched. The provenance columns are restamped
+    to the caller (owner decision, 2026-09-25) — including when the level is
+    already the requested one, since the caller asked to put it there.
+
+    Refuses with ``duplicate_grant`` when a sibling row already names the
+    same principal at ``level`` on the same node — the same check, and the
+    same code, as ``create_grant``. The grant editor hides that option in
+    the first place; this is the backstop.
+
+    Does not commit — the caller owns the transaction.
+    """
+    _assert_level(level)
+    grant = db.query(ResourceGrantV2).filter(ResourceGrantV2.id == grant_id).first()
+    if grant is None:
+        return None
+
+    node_kind, node_id = node_of(grant)
+    if grant.level != level:
+        duplicate = (
+            db.query(ResourceGrantV2.id)
+            .filter(
+                _node_column(node_kind) == node_id,
+                ResourceGrantV2.role_id == grant.role_id,
+                ResourceGrantV2.scope_id == grant.scope_id,
+                ResourceGrantV2.user_id == grant.user_id,
+                ResourceGrantV2.level == level,
+                ResourceGrantV2.id != grant.id,
+            )
+            .first()
+        )
+        if duplicate is not None:
+            raise RbacGraphError(
+                "duplicate_grant",
+                f"That principal already has {level!r} on this {node_kind}.",
+                node_kind=node_kind,
+                node_id=node_id,
+                level=level,
+            )
+
+    grant.level = level
+    grant.granted_by_user_id = granted_by_user_id
+    grant.granted_by_email = granted_by_email
+    grant.created_at = _utc_now()
+    db.flush()
+    return get_grant(db, grant.id)
 
 
 def delete_grant(db: Session, grant_id: int) -> bool:

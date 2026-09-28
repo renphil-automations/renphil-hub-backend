@@ -20,11 +20,12 @@ from typing import Any, Iterable
 
 from pyairtable import Api
 from pyairtable import retry_strategy as _pyairtable_retry_strategy
-from requests.exceptions import RequestException
+from requests.exceptions import HTTPError, RequestException
 from fastapi import HTTPException, status as _http_status
 
 from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
+from app.helpers import airtable_ordering as ao
 from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
 from app.services.cache_service import CacheService, encoded_length, get_cache_service
@@ -224,6 +225,51 @@ _WIDGET_RETRY_STRATEGY = _pyairtable_retry_strategy(
     status_forcelist=(429, 500, 502, 503, 504)
 )
 
+
+def _list_records_page(api: Api, table: Any, options: dict[str, Any]) -> Any:
+    """One raw "list records" page — `records` AND `offset` together, which
+    `table.all()`/`.iterate()` can't hand back (they swallow `offset`).
+
+    Every raw list-records GET in this module goes through here so it carries
+    the same `fallback=` pyairtable's own `Table.iterate` passes
+    (pyairtable/api/table.py): once the prepared GET URL reaches
+    `Api.MAX_URL_LENGTH` (16,000), `Api.request` re-issues it as
+    `POST …/listRecords` with the options in a JSON body. Without it an
+    over-long URL (a filter formula with many multi-value `eq` tags — the
+    condition caps don't bound that) goes out as a GET and Airtable rejects
+    it. The POST response has the same `records`/`offset` shape, and
+    `offset` travels in the body, so paging works unchanged.
+
+    A `sort` option (the Table widget's stored default order, plan §11) is
+    carried the same way: pyairtable encodes it as `sort[i][…]` query params
+    on the GET and as `[{field, direction}]` in the POST body. When the
+    widget has no `selectedColumns`, nothing can check a sort field against
+    the table before this call, so a stale default (column since renamed or
+    deleted) gets Airtable's 422. That page is retried once WITHOUT `sort`:
+    a stale default is ignored, never an error (Part B decision 3)."""
+    try:
+        return api.request(
+            "get",
+            table.urls.records,
+            fallback=("post", table.urls.records_post),
+            options=options,
+        )
+    except HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if "sort" not in options or status_code != 422:
+            raise
+        logger.warning(
+            "Airtable rejected the widget's default sort (422): retrying without it: %s", exc
+        )
+        unsorted = {key: value for key, value in options.items() if key != "sort"}
+        return api.request(
+            "get",
+            table.urls.records,
+            fallback=("post", table.urls.records_post),
+            options=unsorted,
+        )
+
+
 # ── Field-type hints for the viewer Filter/Sort/Group/Search toolbar ───────
 # (plan_airtable_widget_viewer_controls_2026-08-12.md §2.2). Deliberately
 # narrow: a field type not in this map renders as plain text, same as today.
@@ -298,10 +344,11 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """One page of rows for a dashboard Airtable widget, filtered
         server-side under the app's own identity.
@@ -310,6 +357,13 @@ class AirtableService:
         URL or token. Everything else comes from the widget's stored config
         and the caller's authenticated email, so a viewer cannot widen what
         they are shown.
+
+        `order` is the widget's stored default order (group level, then sort
+        level; `airtable_ordering.widget_default_order`), sent as Airtable's
+        native `sort` so the order holds across Airtable's own pages. A level
+        on a column outside `selected_columns` is dropped (not displayed).
+        Airtable's type-aware ordering can differ slightly from the cached
+        path's JS-parity comparator on mixed-type columns (plan §11.3).
 
         FAILS CLOSED: if personalization is enabled but could not be applied
         (no email, no column, unusable column name), this returns an EMPTY
@@ -353,6 +407,11 @@ class AirtableService:
             options["formula"] = formula
         if cursor:
             options["offset"] = cursor
+        if selected_columns:
+            order = ao.restrict_order_to_fields(order, selected_columns)
+        sort = ao.airtable_sort_option(order)
+        if sort:
+            options["sort"] = sort
 
         # `table.all()` / `.iterate()` both swallow the response's `offset`,
         # so neither can hand back a next-page cursor. Drop to the raw
@@ -361,7 +420,7 @@ class AirtableService:
         table = api.table(base_id, table_id)
         try:
             payload = await asyncio.to_thread(
-                api.request, "get", table.urls.records, options=options
+                _list_records_page, api, table, options
             )
         except RequestException as exc:
             logger.error("Airtable widget row fetch failed: %s", exc)
@@ -537,7 +596,7 @@ class AirtableService:
 
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable widget cache walk failed: %s", exc)
@@ -595,7 +654,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> tuple[dict[str, Any] | None, str]:
@@ -902,7 +961,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
         allow_warm: bool = True,
@@ -1022,7 +1081,7 @@ class AirtableService:
         link: str,
         url: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> dict[str, Any]:
@@ -1083,15 +1142,23 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """Cache-aware sibling of `fetch_widget_rows` — same contract, same
         response shape, backing `GET /airtable/component/{link}/rows` once
         the cache is wired in below the endpoint's access-control check
         (plan §3.1, §4).
+
+        `order` (the stored default order, advanced-filters plan §11) is
+        applied at SERVE time: after personalization, before slicing, so an
+        `idx:<offset>` cursor is an offset into the ordered list and page 2
+        continues it. The cache envelope and fingerprint don't carry it, so a
+        default change costs no re-warm (Part B decision 7). The live
+        fallbacks pass it to Airtable as a native `sort` instead.
 
         Personalization is applied in Python against an unpersonalized,
         filters-only cached row set (§6) rather than baked into the
@@ -1149,6 +1216,7 @@ class AirtableService:
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
                 cursor=self._live_cursor(cursor),
+                order=order,
             )
 
         fingerprint = self._widget_cache_fingerprint(
@@ -1186,6 +1254,7 @@ class AirtableService:
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
                 cursor=self._live_cursor(cursor),
+                order=order,
             )
 
         rows = envelope["rows"]
@@ -1204,6 +1273,17 @@ class AirtableService:
         # "stable across pages" reasoning as `fetch_widget_rows`.
         response_fields = list(selected_columns) if selected_columns else envelope["fields"]
         field_set = set(response_fields)
+
+        # Default order (plan §11.3): AFTER personalization, so it orders only
+        # this caller's rows, and BEFORE the slice, so `idx:` cursors index
+        # the ordered list. Only displayed columns count (a stale default is
+        # ignored). `sort_rows` returns a new list; the envelope's own
+        # `rows` is never reordered in place. Off the event loop: it's pure
+        # CPU, ~0.5 s for two all-distinct string levels at the 50,000-row
+        # cache ceiling (tens of ms for a few thousand rows).
+        effective_order = ao.restrict_order_to_fields(order, response_fields)
+        if effective_order:
+            rows = await asyncio.to_thread(ao.sort_rows, rows, effective_order)
 
         start = self._parse_synthetic_cursor(cursor)
         page = rows[start : start + self._WIDGET_PAGE_SIZE]
@@ -1239,7 +1319,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
     ):
         """Return one complete viewer-independent row set for shared indexing.
 
@@ -1333,7 +1413,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1351,10 +1431,11 @@ class AirtableService:
         partial number" stance — a partial aggregate is silently WRONG, a
         partial row list is merely incomplete.)
 
-        The `viewerControlsEnabled` toggle gate is the ROUTER's job (product
-        control, not a security boundary — see the router docstring), not
-        this method's: everything below is exactly as safe to call as
-        `fetch_widget_rows_cached` is.
+        The gate (`viewerControlsEnabled` or a valid `defaultGroup`) is the
+        ROUTER's job (product control, not a security boundary — see the
+        router docstring), not this method's: everything below is exactly as
+        safe to call as `fetch_widget_rows_cached` is. Rows are returned
+        unsorted; the client applies the stored default order itself.
         """
         from app.models.airtable import AirtableWidgetFullRowsResponse
 
@@ -1610,7 +1691,7 @@ class AirtableService:
         caller_email: str,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1742,7 +1823,7 @@ class AirtableService:
 
     @staticmethod
     def _chart_cache_fingerprint(
-        *, link: str, url: str, filters: list[dict[str, Any]] | None
+        *, link: str, url: str, filters: af.WidgetFilters | None
     ) -> dict[str, Any]:
         """The `widget_rows` cache fingerprint a Chart widget's aggregation
         reads — a thin, Chart-specific alias over the shared
@@ -1887,7 +1968,7 @@ class AirtableService:
         group_field: str | None,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         max_groups: int | None = None,
@@ -2003,7 +2084,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> str:
@@ -2230,11 +2311,17 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """Editor preview for the Property Panel.
+
+        `order` (the in-progress default group + sort, plan §11.3 mode A) is
+        applied as Airtable's native `sort` on both calls, so the capped
+        sample is the right first 100 rows rather than an arbitrary 100
+        re-sorted afterwards. Same displayed-column rule as the saved paths.
 
         Returns `fields` computed WITHOUT personalization and `rows` computed
         WITH it. The split matters: an admin configuring a widget must be
@@ -2262,6 +2349,10 @@ class AirtableService:
             base_options["view"] = view_id
         if selected_columns:
             base_options["fields"] = list(selected_columns)
+            order = ao.restrict_order_to_fields(order, selected_columns)
+        sort = ao.airtable_sort_option(order)
+        if sort:
+            base_options["sort"] = sort
 
         api = Api(api_key.strip())
         table = api.table(base_id, table_id)
@@ -2272,7 +2363,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable editor preview failed: %s", exc)
@@ -2356,7 +2447,7 @@ class AirtableService:
         group_field: str | None,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         max_groups: int | None = None,
@@ -2471,7 +2562,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable chart preview failed: %s", exc)

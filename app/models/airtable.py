@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
+from app.helpers.airtable_formulas import WidgetFilters
+
 
 class AirtableRecord(BaseModel):
     """A single Airtable record as returned by the REST API (raw fields)."""
@@ -139,7 +141,7 @@ class AirtableWidgetIndexSnapshotResponse(BaseModel):
     view_id: str | None = None
 
     selected_columns: list[str] = Field(default_factory=list)
-    filters: list[dict[str, Any]] = Field(default_factory=list)
+    filters: WidgetFilters = Field(default_factory=list)
 
     personalize_enabled: bool = False
     personalize_column: str | None = None
@@ -268,7 +270,7 @@ class AirtableChartPreviewRequest(BaseModel):
     link: str | None = None
     sourceUrl: str | None = None
     pat: str | None = None
-    filters: list[dict[str, Any]] | None = None
+    filters: WidgetFilters | None = None
     personalizeEnabled: bool = False
     personalizeColumn: str | None = None
     groupField: str | None = None
@@ -302,9 +304,25 @@ class AirtableEditorPreviewRequest(BaseModel):
     sourceUrl: str | None = None
     pat: str | None = None
     selectedColumns: list[str] | None = None
-    filters: list[dict[str, Any]] | None = None
+    filters: WidgetFilters | None = None
     personalizeEnabled: bool = False
     personalizeColumn: str | None = None
+    # Table widget default view (advanced-filters plan §11): each is
+    # `{field, direction: "asc" | "desc"}` or null. Deliberately `Any`: the
+    # panel sends the stored value as-is, and a malformed or stale one is
+    # IGNORED (Part B decision 3, `airtable_ordering.parse_default_order`),
+    # the same as on the saved paths, not a 422 that would blank the preview.
+    defaultSort: Any = Field(
+        default=None,
+        description="In-progress default sort: {field, direction: 'asc'|'desc'}.",
+    )
+    defaultGroup: Any = Field(
+        default=None,
+        description=(
+            "In-progress default grouping: {field, direction: 'asc'|'desc'}. "
+            "The preview orders by it first, then by defaultSort."
+        ),
+    )
 
 
 class AirtableEditorPreviewResponse(BaseModel):

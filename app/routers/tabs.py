@@ -116,10 +116,16 @@ def value_error_to_http_exception(error: ValueError) -> HTTPException:
         return HTTPException(
             status_code=409,
             detail={
-                "code": "NODE_LOCKED",
+                # `NODE_LOCKED`, or `NODE_LOCKED_BY_ADMIN` for a refused force.
+                "code": error.code,
                 "message": str(error),
                 "blocking": [
-                    {"holder": b.holder, "node_label": b.node_label, "relation": b.relation}
+                    {
+                        "holder": b.holder,
+                        "node_label": b.node_label,
+                        "relation": b.relation,
+                        "is_admin": b.is_admin,
+                    }
                     for b in error.blocking
                 ],
             },
