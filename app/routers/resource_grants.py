@@ -76,12 +76,14 @@ from app.schemas.resource_grants import (
     InheritedGrantsAPIResponse,
     NodeKind,
     ResourceGrantAPIResponse,
+    ResourceGrantDeleteAPIResponse,
     ResourceGrantListAPIResponse,
     RetainedAccessAPIResponse,
     UserAccessAPIResponse,
 )
 from app.services import edit_lock_service, rbac_service
 from app.services import resource_grant_service as grants
+from app.services.resource_grant_search_updates import affected_component_search_updates
 from app.services.access_visibility_service import (
     build_node_tree,
     compute_visibility,
@@ -459,12 +461,17 @@ def create_grant(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
-    return {"data": grant}
+    return {
+        "data": grant,
+        "search_updates": affected_component_search_updates(
+            db, node_kind=request.node_kind, node_id=request.node_id
+        ),
+    }
 
 
 @router.delete(
     "/grants/{grant_id}",
-    status_code=204,
+    response_model=ResourceGrantDeleteAPIResponse,
     summary="Revoke a grant",
     responses={404: {"description": "Grant not found"}, **CONFLICT_RESPONSE},
 )
@@ -494,6 +501,8 @@ async def delete_grant(
     grant = grants.get_grant(db, grant_id)
     if grant is None:
         raise HTTPException(status_code=404, detail="Grant not found")
+    node_kind = grant["node_kind"]
+    node_id = grant["node_id"]
 
     try:
         closures = RbacClosures(db)
@@ -521,3 +530,8 @@ async def delete_grant(
         await edit_lock_service.release_locks_now_unauthorized(db)
     except Exception:
         pass
+    return {
+        "search_updates": affected_component_search_updates(
+            db, node_kind=node_kind, node_id=node_id
+        )
+    }
