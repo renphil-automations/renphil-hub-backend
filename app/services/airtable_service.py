@@ -147,6 +147,7 @@ _F_ACCOUNT_NAME = _S.AT_F_ACCOUNT_NAME
 _F_EXCLUDE_FROM_LISTS = _S.AT_F_EXCLUDE_FROM_LISTS
 _F_EXCLUDE_FROM_REPORTING = _S.AT_F_EXCLUDE_FROM_REPORTING
 _F_STATUS = _S.AT_F_STATUS
+_F_FUND_STATUS = _S.AT_F_FUND_STATUS
 _F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
 _F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
 _F_ONBOARDING_STATUS = _S.AT_F_ONBOARDING_STATUS
@@ -159,7 +160,7 @@ _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "Active Program"
 _STATUS_PUBLICLY_LAUNCHED = "Publicly Launched"
-_STATUS_FELLOWSHIP_SCOPING = "Fellowship (Scoping)"
+_STATUS_FELLOWSHIP_SCOPING = "Fellowship"
 _ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
@@ -186,7 +187,7 @@ _ML_LOOKUP_PROJECT_FIELDS = [
     "Initiative Type",
     "Focus Area(s)",
     "Program Lead/Fellow",
-    "Status",
+    "Fund Status",
     "Program Summary",
     "Internal Notes",
     "Can we talk about it publicly",
@@ -811,7 +812,7 @@ class AirtableService:
         serializing, and taking that lock here would let a schema call block
         a row walk.
         """
-        hints, _available = await self._fetch_table_field_hints_impl(
+        hints, _names, _available = await self._fetch_table_field_hints_impl(
             base_id=base_id, table_id=table_id, api_key=api_key
         )
         return hints
@@ -834,11 +835,12 @@ class AirtableService:
 
     async def fetch_table_field_hints_with_status(
         self, *, base_id: str, table_id: str, api_key: str
-    ) -> tuple[dict[str, str], bool]:
-        """`fetch_table_field_hints` plus an `available` flag, for the admin
-        preview only. A table with no URL/select columns legitimately returns
-        ({}, True); a PAT without `schema.bases:read` returns ({}, False). The
-        two are indistinguishable from the hints alone, and the Property
+    ) -> tuple[dict[str, str], list[str], bool]:
+        """`fetch_table_field_hints` plus the full ordered field-name list and
+        an `available` flag, for the admin preview only. A table with no
+        URL/select columns legitimately returns ({}, [...names], True); a PAT
+        without `schema.bases:read` returns ({}, [], False). The hints and the
+        flag are indistinguishable from the hints alone, and the Property
         Panel needs to say something different for each.
 
         Not used by the viewer-facing `/rows` and `/rows/full` paths — a
@@ -869,7 +871,7 @@ class AirtableService:
 
     async def _fetch_table_field_hints_impl(
         self, *, base_id: str, table_id: str, api_key: str, force_live: bool = False,
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, str], list[str], bool]:
         """Shared worker `fetch_table_field_hints` and
         `fetch_table_field_hints_with_status` both project from — one code
         path, so `available` is derived directly from the control flow that
@@ -901,13 +903,15 @@ class AirtableService:
             # per-viewer traffic, so paying for a live call while the cache
             # is down is cheap here.)
             if not cache.enabled:
-                return {}, True
+                return {}, [], True
 
             cached = await cache.get(cache_key)
             if isinstance(cached, dict):
-                return cached, True
+                # No field-name list on a cache hit; only the force_live
+                # (preview) path needs it, and that path skips this shortcut.
+                return cached, [], True
             if await cache.get(f"{cache_key}{self._SCHEMA_NEGATIVE_CACHE_SUFFIX}") is not None:
-                return {}, False
+                return {}, [], False
 
         try:
             api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
@@ -921,7 +925,7 @@ class AirtableService:
                 base_id, table_id, exc,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="fetch_failed")
-            return {}, False
+            return {}, [], False
         except Exception:
             # `BaseSchema.table(id)` raises a bare KeyError (NOT
             # RequestException) for a stale/renamed table_id — `_find` ends
@@ -932,19 +936,23 @@ class AirtableService:
                 base_id, table_id,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="unexpected_error")
-            return {}, False
+            return {}, [], False
 
         hints = {
             f.name: hint
             for f in table_schema.fields
             if (hint := _FIELD_TYPE_HINTS.get(f.type))
         }
+        # Full ordered field-name list from the SAME schema read, so a caller
+        # that needs every column (the editor preview's dropdowns) doesn't pay
+        # for a second Metadata call.
+        field_names = [f.name for f in table_schema.fields]
         await cache.set(
             cache_key,
             hints,
             ttl_seconds=self._settings.AIRTABLE_SCHEMA_CACHE_TTL_SECONDS,
         )
-        return hints, True
+        return hints, field_names, True
 
     async def _get_or_warm_widget_cache(
         self,
@@ -2326,8 +2334,9 @@ class AirtableService:
         personalize column is the wrong type and matches nothing" — which are
         otherwise indistinguishable and both look like a broken widget.
 
-        Costs up to two Airtable calls, which is acceptable at edit
-        frequency (and one when personalization is off).
+        Costs up to three Airtable calls (one records read, plus a second
+        when personalization is on, plus one Metadata/schema read that also
+        backs the full column list) — acceptable at edit frequency.
         """
         from app.models.airtable import AirtableEditorPreviewResponse
 
@@ -2393,15 +2402,28 @@ class AirtableService:
             {"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records
         ]
 
-        # Prefer the admin's explicit column order over discovery order — see
-        # the matching comment in fetch_widget_rows. Without this, the editor
-        # preview would silently ignore the admin's custom column ordering
-        # even though the saved widget honors it once persisted.
-        fields = list(selected_columns) if selected_columns else seen_fields
-
-        field_types, field_types_available = await self.fetch_table_field_hints_with_status(
-            base_id=base_id, table_id=table_id, api_key=api_key
+        # One schema read backs BOTH the type hints and the full column list
+        # below — see fetch_table_field_hints_with_status.
+        field_types, schema_fields, field_types_available = (
+            await self.fetch_table_field_hints_with_status(
+                base_id=base_id, table_id=table_id, api_key=api_key
+            )
         )
+
+        # Prefer the admin's explicit column order; otherwise populate the
+        # dropdowns from the table's FULL schema, not just columns present in
+        # the capped preview rows — a column empty across every previewed row
+        # can never be picked otherwise. Falls back to discovery order when the
+        # schema read failed (empty schema_fields; needs schema.bases:read).
+        if selected_columns:
+            fields = list(selected_columns)
+        elif schema_fields:
+            fields = list(schema_fields)
+            for name in seen_fields:
+                if name not in fields:
+                    fields.append(name)
+        else:
+            fields = seen_fields
 
         return AirtableEditorPreviewResponse(
             base_id=base_id,
@@ -2600,12 +2622,20 @@ class AirtableService:
         fetching all and discarding). ``formula`` is passed verbatim to
         Airtable's ``filterByFormula`` parameter and is applied server-side
         before the row cap, so the cap applies to already-filtered results.
+
+        When ``fields`` is not given, the full column list is taken from the
+        table's schema (Metadata API) rather than inferred from the capped
+        rows — otherwise a column that is empty across every previewed row
+        would silently disappear from ``fields``. Requires the PAT's
+        ``schema.bases:read`` scope; if the schema call fails it degrades to
+        the columns actually seen in the rows.
         """
         from app.models.airtable import AirtablePreviewResponse
 
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
 
-        table = Api(api_key.strip()).table(base_id, table_id)
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
         kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
         if view_id:
             kwargs["view"] = view_id
@@ -2627,18 +2657,45 @@ class AirtableService:
         seen_set: set[str] = set()
         rows: list[dict[str, Any]] = []
         for record in records:
-            fields = record.get("fields", {}) or {}
-            for key in fields:
+            record_fields = record.get("fields", {}) or {}
+            for key in record_fields:
                 if key not in seen_set:
                     seen_set.add(key)
                     seen_fields.append(key)
-            rows.append({"id": record.get("id"), **fields})
+            rows.append({"id": record.get("id"), **record_fields})
+
+        if fields:
+            # Caller projected explicit columns: return exactly those, so a
+            # requested column empty across every previewed row still appears.
+            response_fields = list(fields)
+        else:
+            response_fields = seen_fields
+            try:
+                table_schema = await asyncio.to_thread(
+                    lambda: api.base(base_id).schema().table(table_id)
+                )
+            except Exception:
+                # Best-effort: PAT lacks schema.bases:read, or the table id is
+                # stale/renamed — fall back to columns seen in the rows.
+                logger.warning(
+                    "Airtable preview schema fetch failed (base=%s table=%s) — "
+                    "returning only columns present in the previewed rows",
+                    base_id,
+                    table_id,
+                )
+            else:
+                # Full schema order first, then any column seen in the rows
+                # that the schema didn't list.
+                response_fields = [f.name for f in table_schema.fields]
+                for name in seen_fields:
+                    if name not in response_fields:
+                        response_fields.append(name)
 
         return AirtablePreviewResponse(
             base_id=base_id,
             table_id=table_id,
             view_id=view_id,
-            fields=seen_fields,
+            fields=response_fields,
             rows=rows,
         )
 
@@ -3273,15 +3330,15 @@ class AirtableService:
         # The two groups above are unioned (OR).
         status_membership_parts: list[str | None] = []
         if status_list:
-            status_membership_parts.append(af.in_str(_F_STATUS, status_list))
+            status_membership_parts.append(af.in_str(_F_FUND_STATUS, status_list))
         if not_status_list:
-            status_membership_parts.append(af.not_in_str(_F_STATUS, not_status_list))
+            status_membership_parts.append(af.not_in_str(_F_FUND_STATUS, not_status_list))
         membership_clause = af.AND(*status_membership_parts)
 
         status_clauses: list[str | None] = []
         if membership_clause:
             status_clauses.append(membership_clause)
-        status_clauses.append(af.empty_clause(_F_STATUS, status_empty))
+        status_clauses.append(af.empty_clause(_F_FUND_STATUS, status_empty))
         status_combined = af.OR(*status_clauses)
         if status_combined:
             clauses.append(status_combined)
@@ -3551,7 +3608,7 @@ class AirtableService:
         if checkin_user_id:
             program_fields_needed.append(_F_CHECKIN_HISTORY)
         if excluded_statuses:
-            program_fields_needed.append(_F_STATUS)
+            program_fields_needed.append(_F_FUND_STATUS)
 
         programs = await self._get_records_by_ids(
             self._master_list_table(),
@@ -3567,7 +3624,7 @@ class AirtableService:
                 if checkin_user_id not in user_ids:
                     return False
             if excluded_statuses:
-                status_val = pf.get(_F_STATUS)
+                status_val = pf.get(_F_FUND_STATUS)
                 if isinstance(status_val, list):
                     status_val = status_val[0] if status_val else None
                 if status_val in excluded_statuses:
@@ -4173,12 +4230,12 @@ class AirtableService:
         'Exclude from lists'.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
         records = await self._list_records(
-            self._master_list_table(), formula=formula, fields=[_F_STATUS]
+            self._master_list_table(), formula=formula, fields=[_F_FUND_STATUS]
         )
         return CountResponse(count=len(records))
 
@@ -4192,7 +4249,7 @@ class AirtableService:
         'Program Lead/Fellow' fields.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
@@ -4218,8 +4275,8 @@ class AirtableService:
     async def get_distinct_fellows_count(self) -> CountResponse:
         """Count distinct fellows sourced from the Master List.
 
-        Fellows are derived from the Master List: records whose Status
-        equals 'Fellowship (Scoping)' contribute their 'Program Lead/Fellow'
+        Fellows are derived from the Master List: records whose Fund Status
+        equals 'Fellowship' contribute their 'Program Lead/Fellow'
         name(s). Names are resolved to Users by matching the 'Name' field;
         each matched user contributes its (lower-cased) Work Email to the
         distinct set, and each unmatched name contributes its (lower-cased)
@@ -4395,7 +4452,7 @@ class AirtableService:
     ) -> list[tuple[str, dict[str, Any] | None]]:
         """Return one entry per Program Lead/Fellow, matched to a User when possible.
 
-        1. Query MASTER_LIST for records with Status = 'Fellowship (Scoping)',
+        1. Query MASTER_LIST for records with Fund Status = 'Fellowship',
            projecting the 'Program Lead/Fellow' field.
         2. Extract the list of unique lead/fellow names.
         3. Query USERS matching those names against the 'Name' field,
@@ -4405,8 +4462,8 @@ class AirtableService:
         """
         s = self._settings
 
-        # Step 1: pull Fellowship (Scoping) programs from the Master List.
-        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP_SCOPING)
+        # Step 1: pull Fellowship programs from the Master List.
+        program_formula = af.eq_str(_F_FUND_STATUS, _STATUS_FELLOWSHIP_SCOPING)
         program_records = await self._list_records(
             self._master_list_table(),
             formula=program_formula,
