@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from collections import Counter, defaultdict
@@ -954,6 +955,36 @@ class AirtableService:
         )
         return hints, field_names, True
 
+    def _base_lock_retry_delay(self) -> float:
+        """One `patient` per-base-lock retry interval: the shared base
+        interval plus per-base jitter. Its jitter MAX is the floor of the
+        fingerprint-lock jitter (see `_fingerprint_lock_retry_delay`), so a
+        base-lock waiter is never out-waited by a fingerprint-lock follower.
+        """
+        s = self._settings
+        return s.AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS + random.uniform(
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MIN_SECONDS,
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS,
+        )
+
+    def _fingerprint_lock_retry_delay(self) -> float:
+        """One `patient` per-fingerprint-lock poll interval: the shared base
+        interval plus jitter starting one `..._FINGERPRINT_LOCK_JITTER_GAP_
+        SECONDS` ABOVE the per-base jitter MAX and spanning `..._RANGE_
+        SECONDS`, so it is strictly longer than any `_base_lock_retry_delay`
+        — the lead request must not finish its base-lock wait after the
+        followers polling behind it have already given up (`available=false`).
+        """
+        s = self._settings
+        fp_min = (
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS
+            + s.AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_GAP_SECONDS
+        )
+        fp_max = fp_min + s.AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_RANGE_SECONDS
+        return s.AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS + random.uniform(
+            fp_min, fp_max
+        )
+
     async def _get_or_warm_widget_cache(
         self,
         *,
@@ -965,6 +996,7 @@ class AirtableService:
         personalize_enabled: bool,
         personalize_column: str | None,
         allow_warm: bool = True,
+        patient: bool = False,
     ) -> dict[str, Any] | None:
         """Returns the cached envelope, warming it on a miss. Returns None
         when the table turned out to be oversized (never cached), the walk
@@ -983,6 +1015,15 @@ class AirtableService:
         so every existing caller — `fetch_widget_rows_cached`,
         `fetch_widget_full_rows_cached`, `fetch_widget_metric_cached` — is
         unaffected.
+
+        `patient=True` is for the no-live-fallback callers (Metric/Chart):
+        instead of returning None on the FIRST base-lock loss (a sibling
+        widget on the same base mid-walk) — which those callers surface as
+        `available=false` — it retries both the per-fingerprint and the
+        per-base lock on the bounded, jittered schedule in `config.py`
+        (`AIRTABLE_CACHE_LOCK_RETRY_*`), re-checking the cache before each
+        wait. Left `False` for Table/Full, which already degrade gracefully
+        to a live read on the first loss.
         """
         cache = get_cache_service()
 
@@ -1008,69 +1049,107 @@ class AirtableService:
             lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
         )
         if not lock_token:
-            # Someone else is warming this exact key. Wait briefly rather
-            # than starting a second concurrent full-table walk — the whole
-            # point of the lock (plan §4.4): without it, a cold key plus a
-            # burst of viewers would each start their own walk and breach
-            # Airtable's per-base rate limit.
-            for _ in range(4):
-                await asyncio.sleep(1.5)
+            # Someone else is warming this exact key. Wait rather than
+            # starting a second concurrent full-table walk — the whole point
+            # of the lock (plan §4.4). `patient` callers poll on the longer,
+            # base-lock-aligned schedule so a follower never gives up while
+            # the lead request (which holds this same fingerprint lock) is
+            # still inside its own base-lock wait; everyone else keeps the
+            # original short poll.
+            fp_attempts = (
+                self._settings.AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS
+                if patient
+                else 4
+            )
+            for _ in range(fp_attempts):
+                await asyncio.sleep(
+                    self._fingerprint_lock_retry_delay() if patient else 1.5
+                )
                 cached = await cache.get(cache_key)
                 if isinstance(cached, dict) and "rows" in cached:
                     return cached
             return None
 
         try:
-            try:
-                envelope, status = await self._build_widget_cache_envelope(
-                    cache=cache,
-                    url=url,
-                    api_key=api_key,
-                    selected_columns=selected_columns,
-                    filters=filters,
-                    personalize_enabled=personalize_enabled,
-                    personalize_column=personalize_column,
-                )
-            except AirtableError:
-                # Every OTHER miss-path exit degrades to the live fallback;
-                # a walk failure (e.g. an Airtable 429 mid-walk) must too,
-                # rather than propagating as a 502 to the caller (finding
-                # #2) — the failure rate scales with table size now that a
-                # miss makes N Airtable requests instead of 1.
-                logger.warning(
-                    "Airtable widget cache: walk failed (url=%s) — "
-                    "serving live instead",
-                    url,
-                    exc_info=True,
-                )
-                await self._mark_walk_unwarmable(cache, cache_key, reason="walk_failed")
-                return None
-            if status == "locked":
-                # A DIFFERENT widget on the same base is walking right now
-                # (finding #6) — not a confirmed bad table, just contention,
-                # so no negative marker. And unlike the fingerprint-lock
-                # wait above, there is nothing to poll for: another widget's
-                # walk will never populate THIS cache key. Degrade to live
-                # immediately.
-                return None
-            if status == "oversized":
-                logger.warning(
-                    "Airtable widget cache: table too large to cache "
-                    "(url=%s) — serving live instead, never truncated",
-                    url,
-                )
-                await self._mark_walk_unwarmable(cache, cache_key, reason="oversized")
-                return None
-            await cache.set(
-                cache_key,
-                envelope,
-                ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
-                # ~4.8x smaller stored AND transferred, on a payload that is
-                # by far the largest thing in this cache (§4.3). Opt-in, so
-                # the decorator-cached endpoints are untouched.
-                compress=True,
+            # `patient` callers retry a base-lock loss (a DIFFERENT widget on
+            # the same base mid-walk) instead of giving up on the first miss;
+            # the cache is re-checked before each wait in case the cron (or
+            # any other warmer) populated this key meanwhile. Non-patient
+            # callers keep the original single attempt.
+            base_attempts = (
+                self._settings.AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS
+                if patient
+                else 1
             )
-            return envelope
+            for base_attempt in range(base_attempts):
+                try:
+                    envelope, status = await self._build_widget_cache_envelope(
+                        cache=cache,
+                        url=url,
+                        api_key=api_key,
+                        selected_columns=selected_columns,
+                        filters=filters,
+                        personalize_enabled=personalize_enabled,
+                        personalize_column=personalize_column,
+                    )
+                except AirtableError:
+                    # Every OTHER miss-path exit degrades to the live
+                    # fallback; a walk failure (e.g. an Airtable 429 mid-walk)
+                    # must too, rather than propagating as a 502 to the caller
+                    # (finding #2) — the failure rate scales with table size
+                    # now that a miss makes N Airtable requests instead of 1.
+                    logger.warning(
+                        "Airtable widget cache: walk failed (url=%s) — "
+                        "serving live instead",
+                        url,
+                        exc_info=True,
+                    )
+                    await self._mark_walk_unwarmable(
+                        cache, cache_key, reason="walk_failed"
+                    )
+                    return None
+                if status == "locked":
+                    # A DIFFERENT widget on the same base is walking right now
+                    # (finding #6) — not a confirmed bad table, just
+                    # contention, so no negative marker. A `patient` caller
+                    # waits and retries (re-checking the cache first, since a
+                    # concurrent warmer may have filled THIS key); everyone
+                    # else degrades to live immediately as before.
+                    if patient and base_attempt < base_attempts - 1:
+                        await asyncio.sleep(self._base_lock_retry_delay())
+                        cached = await cache.get(cache_key)
+                        if isinstance(cached, dict) and "rows" in cached:
+                            return cached
+                        continue
+                    if patient:
+                        logger.warning(
+                            "Airtable widget cache: base lock still held after "
+                            "%d patient attempts (url=%s) — reporting unavailable",
+                            base_attempts,
+                            url,
+                        )
+                    return None
+                if status == "oversized":
+                    logger.warning(
+                        "Airtable widget cache: table too large to cache "
+                        "(url=%s) — serving live instead, never truncated",
+                        url,
+                    )
+                    await self._mark_walk_unwarmable(
+                        cache, cache_key, reason="oversized"
+                    )
+                    return None
+                await cache.set(
+                    cache_key,
+                    envelope,
+                    ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
+                    # ~4.8x smaller stored AND transferred, on a payload that
+                    # is by far the largest thing in this cache (§4.3).
+                    # Opt-in, so the decorator-cached endpoints are untouched.
+                    compress=True,
+                )
+                return envelope
+            return None
         finally:
             await cache.release_lock(lock_key, lock_token)
 
@@ -1780,6 +1859,7 @@ class AirtableService:
             filters=filters,
             personalize_enabled=False,
             personalize_column=None,
+            patient=True,
         )
 
         if envelope is None:
@@ -2039,6 +2119,7 @@ class AirtableService:
             filters=filters,
             personalize_enabled=False,
             personalize_column=None,
+            patient=True,
         )
 
         if envelope is None:
