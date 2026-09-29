@@ -70,7 +70,6 @@ RESERVED_NAV_SLUGS = frozenset(
         "fundraising",
         "tracking",
         "tracking-airtable",
-        "funders",
         "tickets",
         "workflows",
         "knowledge",
