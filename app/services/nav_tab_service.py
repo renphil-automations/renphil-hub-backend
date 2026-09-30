@@ -606,6 +606,13 @@ def delete_nav_tab_v2(
         # target and the permission gate are NOT the same node.
         if session is not None:
             edit_lock_service.require_live_session(session, ("nav_tab", nav_tab.id), db)
+            # plan_node_session_gaps_2026-09-28.md §4 item 3: nav-tab locks
+            # are structure-only, so the session above no longer excludes
+            # anyone editing inside this nav tab. Refuse (NODE_LOCKED, naming
+            # them) while anyone else holds anything inside it — checked
+            # over `_nav_tab_contents` by `refuse_if_subtree_held`. The
+            # cascade below passes no session, so this is the only check.
+            edit_lock_service.refuse_if_subtree_held(db, ("nav_tab", nav_tab.id), session.holder)
         if nav_tab.protected:
             raise ValueError("The Dashboard nav tab cannot be deleted")
 
@@ -700,13 +707,19 @@ def move_tab_to_nav_tab_v2(
         # without crossing any AC boundary of their own.
         require_edit(access, ("nav_tab", tab.nav_tab_id) if tab.nav_tab_id is not None else None)
         require_edit(access, ("nav_tab", destination.id))
-        # A move is not a reorder — full session check on BOTH nav tabs,
-        # mirroring gridstack_service.move_tab_by_document_id_v2's own
-        # two-parent treatment.
+        # A move is not a reorder — a full session check on the SOURCE nav
+        # tab. The destination needs edit permission (above) but NO session
+        # (owner decision O3, plan_node_session_gaps_2026-09-28.md §3): the
+        # pen model only ever holds one nav-tab session at a time, and the
+        # root is not edited in the destination, just placed there.
         if session is not None and tab.nav_tab_id is not None:
             edit_lock_service.require_live_session(session, ("nav_tab", tab.nav_tab_id), db)
+        # plan §4 item 3: nav-tab locks are structure-only, so the source
+        # session no longer excludes anyone editing inside this root.
+        # Refuse (NODE_LOCKED, naming them) while anyone else holds the root
+        # or anything inside it, variants included.
         if session is not None:
-            edit_lock_service.require_live_session(session, ("nav_tab", destination.id), db)
+            edit_lock_service.refuse_if_subtree_held(db, ("tab", tab.id), session.holder)
 
         # Slug-based, not exact title: "Home" and "home" address the same
         # URL in the destination, so moving one next to the other would make
