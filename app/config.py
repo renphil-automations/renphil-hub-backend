@@ -482,6 +482,33 @@ class Settings(BaseSettings):
     # sharing one marker between both paths.
     AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS: int = 900
 
+    # ── Airtable widget lock-contention retry (no-live-fallback callers) ──
+    # Metric/Chart widgets have no live fallback: a base-lock loss to a
+    # sibling widget on the same base used to return `available=false` on the
+    # spot, so the same component could flip false→value between two adjacent
+    # calls purely on contention. These `patient` callers instead retry both
+    # the per-fingerprint AND the per-base lock on this shared schedule
+    # (Table/Full and the cron keep the original single-attempt behavior).
+    #
+    # Retry count and base interval are shared by BOTH locks; only the jitter
+    # ranges differ. Total worst-case wait is bounded by
+    # MAX_ATTEMPTS × (BASE_INTERVAL + jitter_max), by design — there is no
+    # separate total-wait cap because the interval is fixed, not exponential.
+    AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS: int = 4
+    AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS: float = 2.0
+    # Per-base jitter, added to the base interval each attempt.
+    AIRTABLE_CACHE_BASE_LOCK_JITTER_MIN_SECONDS: float = 0.5
+    AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS: float = 2.0
+    # Fingerprint-lock jitter starts `..._FINGERPRINT_LOCK_JITTER_GAP_SECONDS`
+    # ABOVE the per-base jitter MAX and spans this width, so a fingerprint-lock
+    # waiter's per-attempt interval is STRICTLY longer than any base-lock
+    # waiter's — the lead request (holding the fingerprint lock while waiting
+    # on the base lock) is never out-waited by the followers polling behind
+    # it, which would otherwise return `available=false` while the lead is
+    # still mid-contention.
+    AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_RANGE_SECONDS: float = 2.0
+    AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_GAP_SECONDS: float = 1.0
+
     # ── Airtable widget viewer controls (plan_airtable_widget_viewer_controls_2026-08-12.md) ──
     # Schema churns far less than rows, so it gets its own, much longer TTL
     # rather than riding the row cache's 30-minute one.

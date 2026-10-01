@@ -30,6 +30,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.schemas.tab import StrictRequestModel
+from app.schemas.page_content import SearchUpdateReceipt
 
 # Spelled out rather than derived from `resource_grant.NODE_KINDS` /
 # `GRANT_LEVELS`, because a Literal needs literal members. The model remains
@@ -108,6 +109,11 @@ class ResourceGrantListAPIResponse(BaseModel):
 
 class ResourceGrantAPIResponse(BaseModel):
     data: ResourceGrantResponse
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
+
+
+class ResourceGrantDeleteAPIResponse(BaseModel):
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
 
 class CreateGrantRequest(StrictRequestModel):
