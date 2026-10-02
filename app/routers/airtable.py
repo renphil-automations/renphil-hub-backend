@@ -688,7 +688,22 @@ async def get_airtable_component_metric(
         filters=stored.get("filters") or None,
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
+        **_metric_count_options(stored),
     )
+
+
+def _metric_count_options(stored: dict) -> dict:
+    """The Metric widget's Count-dedupe settings, read from the widget's OWN
+    stored data (never the request). The single reader shared by BOTH
+    `fetch_widget_metric_cached` callers — the `/metric` route and
+    `get_airtable_personal_context` (the Agent path) — so the Agent can never
+    report a different number from the one the dashboard shows.
+    """
+    return {
+        "count_field": str(stored.get("countField") or "").strip() or None,
+        "count_distinct": bool(stored.get("countDistinct")),
+        "count_ignore_empty": bool(stored.get("countIgnoreEmpty")),
+    }
 
 
 # Registered BEFORE its /{link}-shaped GET sibling below, so a request here
@@ -1220,6 +1235,16 @@ async def get_airtable_component_index_snapshot(
                 ).strip()
                 or None
             ),
+            metric_title=(
+                str(
+                    stored.get("title")
+                    or ""
+                ).strip()
+                or None
+            ),
+            # Same reader as both live metric callers, so the Agent's
+            # description of the number matches how it was computed.
+            **_metric_count_options(stored),
         )
 
     # Personalized row data is viewer-specific. The index gets only the
@@ -1438,6 +1463,7 @@ async def get_airtable_personal_context(
                     filters=stored.get("filters") or None,
                     personalize_enabled=True,
                     personalize_column=personalize_column,
+                    **_metric_count_options(stored),
                 )
 
                 blocked = bool(getattr(metric, "personalize_blocked", False))

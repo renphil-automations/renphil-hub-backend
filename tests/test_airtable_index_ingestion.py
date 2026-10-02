@@ -210,6 +210,10 @@ def test_metric_is_config_only_and_never_returns_live_value():
                 "description": "Active Member",
                 "note": "Dashboard count",
                 "url": "https://example.com",
+                "title": " Organisations Reached ",
+                "countField": "Organisation",
+                "countDistinct": True,
+                "countIgnoreEmpty": True,
             },
         ),
         service,
@@ -220,6 +224,10 @@ def test_metric_is_config_only_and_never_returns_live_value():
     assert result.metric_description == "Active Member"
     assert result.metric_note == "Dashboard count"
     assert result.metric_url == "https://example.com"
+    assert result.metric_title == "Organisations Reached"
+    assert result.count_field == "Organisation"
+    assert result.count_distinct is True
+    assert result.count_ignore_empty is True
 
     assert result.rows == []
     assert result.row_data_included is False
@@ -231,6 +239,29 @@ def test_metric_is_config_only_and_never_returns_live_value():
     assert "SAFE_TEST_PAT" not in repr(dumped)
 
     service.fetch_widget_index_rows.assert_not_awaited()
+
+
+def test_metric_snapshot_count_options_default_when_unset():
+    service = SimpleNamespace(
+        fetch_widget_index_rows=AsyncMock(
+            side_effect=AssertionError(
+                "Metric ingestion must not fetch rows"
+            )
+        )
+    )
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="airtable_metric",
+            data={"filters": [], "aggregation": "count", "countField": "  "},
+        ),
+        service,
+    )
+
+    assert result.metric_title is None
+    assert result.count_field is None
+    assert result.count_distinct is False
+    assert result.count_ignore_empty is False
 
 
 def test_unpersonalized_missing_pat_is_unavailable_not_empty_authority():

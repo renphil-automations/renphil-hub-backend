@@ -158,6 +158,15 @@ class AirtableWidgetIndexSnapshotResponse(BaseModel):
     metric_description: str | None = None
     metric_note: str | None = None
     metric_url: str | None = None
+    # The Metric widget's visible display title (its widget data `title`,
+    # NOT components.title) and its Count-dedupe settings, so the Agent can
+    # describe the number correctly ("distinct organisations", not
+    # "records"). The count settings are reported as stored even for Sum,
+    # where the computation ignores them.
+    metric_title: str | None = None
+    count_field: str | None = None
+    count_distinct: bool = False
+    count_ignore_empty: bool = False
 
 
 class AirtableWidgetMetricResponse(BaseModel):

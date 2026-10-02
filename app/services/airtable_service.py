@@ -15,9 +15,10 @@ import logging
 import random
 import re
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from pyairtable import Api
 from pyairtable import retry_strategy as _pyairtable_retry_strategy
@@ -1761,6 +1762,104 @@ class AirtableService:
             return "(Empty)"
         return text if text else "(Empty)"
 
+    @staticmethod
+    def _normalize_dedupe_text(text: str) -> str:
+        """One text value -> its Metric-dedupe comparison form (D-M4a,
+        plan_metric_chart_feedback_2026-09-30.md §1): NFKC, lowercase, drop
+        every character that is not a Unicode letter/digit/whitespace
+        (underscores included), collapse whitespace runs, trim. So `Acme`,
+        ` ACME `, `Acme.` and `acme!` all compare equal.
+
+        Deliberately NOT shared with `_chart_group_key`: the Chart groups by
+        exact, order-sensitive value; the Metric dedupe normalises. Mirrored
+        client-side by `normalizeDedupeText` in AirtableMetricWidget.tsx.
+        """
+        text = unicodedata.normalize("NFKC", text).lower()
+        text = "".join(ch for ch in text if ch.isalnum() or ch.isspace())
+        return " ".join(text.split())
+
+    @staticmethod
+    def _dedupe_elements(value: Any) -> Iterator[str]:
+        """Yield the normalised, non-empty comparison texts of one cell value
+        (D-M4b). Lists (multi-select, linked records, lookups — nested
+        included) flatten into their elements. Real numbers keep their
+        canonical numeric text and are NOT run through
+        `_normalize_dedupe_text`, so numeric 1.5 never merges with 15
+        (D-M4a sub-decision; text "1.5" still does). Never raises.
+        """
+        if value is None:
+            return
+        if isinstance(value, bool):
+            yield "yes" if value else "no"
+            return
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value.is_integer():
+                yield str(int(value))
+            else:
+                yield str(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                yield from AirtableService._dedupe_elements(item)
+            return
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, dict):
+            if not value:
+                return
+            text = None
+            for key in ("name", "email"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    text = candidate
+                    break
+            if text is None:
+                try:
+                    text = str(value)
+                except Exception:
+                    return
+        else:
+            try:
+                text = str(value)
+            except Exception:
+                return
+        normalized = AirtableService._normalize_dedupe_text(text)
+        if normalized:
+            yield normalized
+
+    @staticmethod
+    def _dedupe_key(value: Any) -> frozenset[str] | None:
+        """One cell value -> its Metric-dedupe key, or None when empty
+        (D-M4c). A frozenset of the normalised elements implements Rule B in
+        one stroke: order-insensitive, in-record duplicates collapse, and a
+        scalar equals its one-element list.
+        """
+        elems = frozenset(AirtableService._dedupe_elements(value))
+        return elems or None
+
+    @staticmethod
+    def _count_rows(
+        rows: list[dict[str, Any]],
+        *,
+        count_field: str | None,
+        count_distinct: bool,
+        count_ignore_empty: bool,
+    ) -> int:
+        """The Metric widget's Count, honouring the two dedupe switches
+        (plan §1 "M4 semantics"). No field, or both switches off, is a plain
+        record count — today's behaviour. Distinct without ignore-empty
+        counts every empty record together as ONE extra value.
+        """
+        if not count_field or not (count_distinct or count_ignore_empty):
+            return len(rows)
+        keys = [AirtableService._dedupe_key(row.get(count_field)) for row in rows]
+        if not count_distinct:
+            return sum(k is not None for k in keys)
+        distinct = len({k for k in keys if k is not None})
+        if count_ignore_empty:
+            return distinct
+        return distinct + (1 if None in keys else 0)
+
     async def fetch_widget_metric_cached(
         self,
         *,
@@ -1773,6 +1872,9 @@ class AirtableService:
         filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
     ):
         """Count/Sum aggregation for a dashboard Airtable Metric widget.
 
@@ -1797,6 +1899,12 @@ class AirtableService:
         envelope, exactly like `fetch_widget_rows_cached` — same fail-closed
         gate, checked before the cache is even touched, so Count/Sum can be
         computed per-viewer without a second cache entry per viewer.
+
+        `count_field` / `count_distinct` / `count_ignore_empty` (Count only,
+        ignored for Sum) dedupe AFTER personalisation via `_count_rows`. They
+        deliberately do NOT enter the cache fingerprint: the walk above
+        already fetches every field, so any `count_field` is present in the
+        cached rows and warm-on-save / the cron sweep need no change.
         """
         from app.models.airtable import AirtableWidgetMetricResponse
 
@@ -1889,7 +1997,12 @@ class AirtableService:
                     total += coerced
             value: float | int = total
         else:
-            value = len(rows)
+            value = self._count_rows(
+                rows,
+                count_field=count_field,
+                count_distinct=count_distinct,
+                count_ignore_empty=count_ignore_empty,
+            )
 
         return AirtableWidgetMetricResponse(
             base_id=base_id,
