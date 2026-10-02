@@ -56,6 +56,7 @@ from app.dependencies import (
     get_viewer_access,
     is_hub_admin,
 )
+from app.helpers import airtable_ordering as ao
 from app.helpers.cache import airtable_cache, invalidates_cache
 from app.helpers.slack import (
     post_to_response_url,
@@ -163,6 +164,7 @@ from app.models.airtable import (
     OrganizationInfoRecord,
     OrganizationInfoCreate,
     OrganizationInfoUpdate,
+    WidgetFilters,
 )
 from app.models.auth import UserInfo
 from app.routers.tabs_v2 import access_denied_to_http_exception
@@ -596,6 +598,10 @@ async def get_airtable_component_rows(
     # Cache sits strictly BELOW the access-control check above — never
     # decorate this handler with @airtable_cache, which would serve a
     # cached hit before that check ever ran (plan §3.1).
+    #
+    # The default order (group, then sort; advanced-filters plan §11) comes
+    # from STORAGE only. There is deliberately no ordering query parameter:
+    # the caller supplies a cursor and nothing else.
     return await airtable_service.fetch_widget_rows_cached(
         link=link,
         url=source_url,
@@ -606,6 +612,10 @@ async def get_airtable_component_rows(
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
         cursor=cursor,
+        order=ao.widget_default_order(
+            default_group=stored.get("defaultGroup"),
+            default_sort=stored.get("defaultSort"),
+        ),
     )
 
 
@@ -1213,15 +1223,22 @@ async def get_airtable_component_index_snapshot(
 
     raw_filters = stored.get("filters")
 
-    filters = (
-        [
+    # `filters` is a legacy flat list OR a root group object (advanced
+    # filters). Both must reach the walk below: collapsing a group to `[]`
+    # would index the widget's UNFILTERED rows. A list keeps its old
+    # dict-items-only cleanup so a stray non-dict can't fail the response
+    # model; a group passes through as-is (the compiler cleans it).
+    filters: WidgetFilters
+    if isinstance(raw_filters, list):
+        filters = [
             dict(item)
             for item in raw_filters
             if isinstance(item, dict)
         ]
-        if isinstance(raw_filters, list)
-        else []
-    )
+    elif isinstance(raw_filters, dict):
+        filters = dict(raw_filters)
+    else:
+        filters = []
 
     personalize_enabled = bool(
         config.get("personalizeEnabled")
@@ -1669,14 +1686,22 @@ Returns the widget's ENTIRE cached row set in one response, for the viewer
 Filter/Sort/Group/Search toolbar to run client-side over. Reads the same
 Upstash-cached table `/rows` warms — no second Airtable walk.
 
-Gated on the widget's own `viewerControlsEnabled` toggle (admin opt-in,
-off by default): when the toggle is off, `available: false` is returned
-rather than 403/404, so a stale client degrades to the paginated `/rows`
-view instead of erroring.
+Gated on the widget's own display settings: open when `viewerControlsEnabled`
+is on (admin opt-in, off by default) OR the widget has a valid default
+grouping (`defaultGroup`, on a displayed column), since grouping needs the
+whole table for group counts, collapse and the group-aware pager (see
+advanced-filters plan §11.3). A default SORT alone doesn't open it: sorting
+is served paginated by `/rows`. When the gate is closed, `available: false`
+is returned rather than 403/404, so a stale client degrades to the paginated
+`/rows` view instead of erroring.
+
+Rows come back UNSORTED: the client orders and groups the whole table
+itself, starting from the stored defaults.
 
 **This gate is a product control, not a security boundary.**
-`viewerControlsEnabled` rides the ordinary canvas save, which requires login
-but no per-widget authorization, so a determined caller could flip it. That
+`viewerControlsEnabled` and `defaultGroup` ride the ordinary canvas save,
+which requires login but no per-widget authorization, so a determined caller
+could flip either. That
 is acceptable only because the gate does not widen what anyone may see:
 access control, the fail-closed personalize gate, and the `selectedColumns`
 projection all run below it, unchanged, and every row this endpoint can
@@ -1730,7 +1755,9 @@ async def get_airtable_component_rows_full(
     # Product-control gate (see docstring above), enforced HERE rather than
     # in the service — everything below this point is exactly as safe to
     # call as fetch_widget_rows_cached is, toggle or no toggle.
-    if not bool(stored.get("viewerControlsEnabled")):
+    if not (
+        bool(stored.get("viewerControlsEnabled")) or ao.default_group_is_valid(stored)
+    ):
         settings = get_settings()
         base_id, table_id, view_id = AirtableService._parse_airtable_share_url(source_url)
         return AirtableWidgetFullRowsResponse(
@@ -2067,6 +2094,9 @@ async def preview_airtable_component(
         filters=body.filters or None,
         personalize_enabled=bool(body.personalizeEnabled),
         personalize_column=body.personalizeColumn,
+        order=ao.widget_default_order(
+            default_group=body.defaultGroup, default_sort=body.defaultSort
+        ),
     )
 
 
@@ -2721,7 +2751,7 @@ async def get_active_programs(
     response_model=CountResponse,
     summary=(
         "Number of fellows: distinct Work Emails resolved from the Master "
-        "List's 'Program Lead/Fellow' values (Status = 'Fellowship (Scoping)') "
+        "List's 'Program Lead/Fellow' values (Fund Status = 'Fellowship') "
         "matched against the Users table by Name."
     ),
 )
@@ -2739,8 +2769,8 @@ async def get_distinct_fellows_count(
     response_model=list[PersonContactItem],
     summary=(
         "Unique fellows (First Name, Last Name, Work Email) resolved from the "
-        "Master List's 'Program Lead/Fellow' values (Status = 'Fellowship "
-        "(Scoping)') matched against the Users table by Name."
+        "Master List's 'Program Lead/Fellow' values (Fund Status = 'Fellowship') "
+        "matched against the Users table by Name."
     ),
 )
 @airtable_cache(table=["MASTER_LIST_FUNDS_AND_SUBPROGRAMS_TABLE", "USERS_TABLE"])

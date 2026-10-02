@@ -404,6 +404,10 @@ class BlockingHolder(NamedTuple):
     holder: str
     node_label: str
     relation: str  # "self" | "ancestor" | "descendant"
+    # Owner decision 2026-09-26: an admin's session can never be taken
+    # over. Lets the client skip the "Take over anyway?" confirm when a
+    # force would be refused anyway. See `_admin_holder_emails`.
+    is_admin: bool = False
 
 
 class LockConflictError(ValueError):
@@ -414,11 +418,51 @@ class LockConflictError(ValueError):
     already pin. Phase 3's dedicated `NODE_LOCKED` 409 (§5.5) reads
     `.blocking` off this same exception rather than replacing it, so this
     phase changes NOTHING about the wire contract; only the conflict
-    detection underneath (self-only -> whole subtree) does."""
+    detection underneath (self-only -> whole subtree) does.
 
-    def __init__(self, message: str, blocking: list[BlockingHolder]) -> None:
+    `code` is `NODE_LOCKED` for an ordinary conflict and
+    `NODE_LOCKED_BY_ADMIN` when a `force` was refused because an admin holds
+    one of the conflicting sessions (owner decision 2026-09-26)."""
+
+    def __init__(self, message: str, blocking: list[BlockingHolder], code: str = "NODE_LOCKED") -> None:
         super().__init__(message)
         self.blocking = blocking
+        self.code = code
+
+
+def _admin_holder_emails(db: Session, emails: set[str]) -> set[str]:
+    """Which of `emails` belong to a Hub Admin — BY ASSIGNMENT ONLY
+    (`rbac_graph_service.hub_admin_user_ids`, owner decision 2026-09-26).
+    A JWT-only admin cannot be recognized from a stored `locked_by` (see
+    that function's docstring), so their sessions are NOT protected from
+    takeover until their assignment exists or phase 3's backstop lands in
+    that one function."""
+    emails = {e for e in emails if e}
+    if not emails:
+        return set()
+    # Local imports: same layering reason as `release_locks_now_unauthorized`.
+    from sqlalchemy import func
+
+    from app.db_v2.models.hub_user import HubUserV2
+    from app.services.rbac_graph_service import hub_admin_user_ids
+
+    admin_ids = hub_admin_user_ids(db)
+    if not admin_ids:
+        return set()
+    rows = (
+        db.query(HubUserV2.email)
+        .filter(HubUserV2.id.in_(admin_ids), func.lower(HubUserV2.email).in_(emails))
+        .all()
+    )
+    return {(email or "").strip().lower() for (email,) in rows}
+
+
+def _admin_refusal_message(admins: list[BlockingHolder]) -> str:
+    first = admins[0]
+    return (
+        f'"{first.node_label}" is being edited by {first.holder}, an admin. '
+        "An admin's editing session can't be taken over."
+    )
 
 
 class LockGrant(NamedTuple):
@@ -499,8 +543,22 @@ def acquire(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
             if d_locked and d_holder and d_holder != holder and not is_lock_stale(d_locked_at):
                 conflicts.append(BlockingHolder(d_holder, _label_for(desc, desc_row), "descendant"))
 
+        if conflicts:
+            admins = _admin_holder_emails(db, {c.holder for c in conflicts})
+            conflicts = [c._replace(is_admin=c.holder in admins) for c in conflicts]
+
         if conflicts and not force:
             raise LockConflictError(_conflict_message(conflicts), blocking=conflicts)
+
+        # Owner decision 2026-09-26: an admin's session is never taken over —
+        # on `node` itself or anywhere beneath it. All-or-nothing: a partial
+        # takeover can't exist, since the admin's surviving lock below would
+        # still block `node`.
+        admin_conflicts = [c for c in conflicts if c.is_admin]
+        if admin_conflicts:
+            raise LockConflictError(
+                _admin_refusal_message(admin_conflicts), blocking=conflicts, code="NODE_LOCKED_BY_ADMIN"
+            )
 
         now = _utc_now()
 
@@ -555,10 +613,12 @@ def release(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
     existing one — deliberately no `and unlocked_by` short-circuit (the
     omission bypass fixed 2026-09-03 in three places): a falsy `holder`
     must read as "not proven to be the holder", never as "no identity ⇒ let
-    it through". `force` here is the EXISTING unlock force (owner decision
-    2026-09-03: unrestricted, skips ownership AND staleness) — a different
-    flag from `acquire`'s new one above; unlock's force is unchanged by
-    this plan."""
+    it through". `force` here is the EXISTING unlock force (skips ownership
+    AND staleness) — a different flag from `acquire`'s above. WHO may pass
+    either flag is not decided here: both are Hub Admin only, gated by the
+    service wrappers via `access_visibility_service.require_force_allowed`
+    (owner decision 2026-09-25). Force-unlock of an admin's FRESH session is
+    refused like a forced acquire is (owner decision 2026-09-26)."""
     try:
         holder = _validate_locked_by(holder) or ""
 
@@ -568,8 +628,14 @@ def release(db: Session, node: LockNode, holder: str, *, force: bool = False) ->
 
         locked, locked_by, locked_at, _token = _locked_quad(row)
         held_by_someone_else = locked and locked_by and locked_by != holder
-        if not force and held_by_someone_else and not is_lock_stale(locked_at):
+        fresh_foreign = held_by_someone_else and not is_lock_stale(locked_at)
+        if not force and fresh_foreign:
             raise ValueError(f"Tab is locked by {locked_by}")
+        if force and fresh_foreign and _admin_holder_emails(db, {locked_by}):
+            blocking = [BlockingHolder(locked_by, _label_for(node, row), "self", is_admin=True)]
+            raise LockConflictError(
+                _admin_refusal_message(blocking), blocking=blocking, code="NODE_LOCKED_BY_ADMIN"
+            )
 
         _clear_lock(row)
         db.commit()
@@ -768,6 +834,12 @@ class LockNodeState(NamedTuple):
     node_label: str  # WHICH node is actually held — this node's own for
     # self/locked_here, the ancestor's/descendant's own for the other two.
     expires_at: datetime | None
+    # Owner decision 2026-09-26: True when a forced acquire ON this node
+    # would be refused because an admin holds a fresh session on it or
+    # beneath it. The badge still shows; only the takeover icon is hidden.
+    # Only ever True for `locked_here`/`blocked_by_descendant` — the two
+    # states a takeover from this node can act on.
+    takeover_blocked: bool = False
 
 
 _FREE = LockNodeState(state="free", holder="", node_label="", expires_at=None)
@@ -794,6 +866,18 @@ class LockView(NamedTuple):
     active: list[_ActiveLock]
     ancestors_of: dict[LockNode, list[LockNode]]
     descendants_of: dict[LockNode, list[LockNode]]
+    # Holders of `active` locks who are admins (`_admin_holder_emails`).
+    admin_holders: frozenset[str] = frozenset()
+
+    def _takeover_blocked(self, node: LockNode) -> bool:
+        """Mirrors `acquire(node, force=True)`'s admin refusal: any foreign
+        fresh session on `node` itself or beneath it held by an admin."""
+        return any(
+            a.holder != self.viewer
+            and a.holder in self.admin_holders
+            and (a.node == node or node in self.ancestors_of[a.node])
+            for a in self.active
+        )
 
     def state_for(self, node: LockNode) -> LockNodeState:
         # Same holder never conflicts with themself at any level (§4.1) —
@@ -812,7 +896,11 @@ class LockView(NamedTuple):
         for a in self.active:
             if a.node == node:
                 return LockNodeState(
-                    state="locked_here", holder=a.holder, node_label=a.label, expires_at=a.expires_at
+                    state="locked_here",
+                    holder=a.holder,
+                    node_label=a.label,
+                    expires_at=a.expires_at,
+                    takeover_blocked=self._takeover_blocked(node),
                 )
 
         for a in self.active:
@@ -828,6 +916,7 @@ class LockView(NamedTuple):
                     holder=a.holder,
                     node_label=a.label,
                     expires_at=a.expires_at,
+                    takeover_blocked=self._takeover_blocked(node),
                 )
 
         return _FREE
@@ -857,7 +946,15 @@ def resolve_lock_view(db: Session, viewer: str) -> LockView:
     ancestors_of = {a.node: ancestors(db, a.node) for a in active}
     descendants_of = {a.node: descendants(db, a.node) for a in active}
 
-    return LockView(viewer=viewer, active=active, ancestors_of=ancestors_of, descendants_of=descendants_of)
+    admin_holders = frozenset(_admin_holder_emails(db, {a.holder for a in active if a.holder != viewer}))
+
+    return LockView(
+        viewer=viewer,
+        active=active,
+        ancestors_of=ancestors_of,
+        descendants_of=descendants_of,
+        admin_holders=admin_holders,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.schemas.tab import StrictRequestModel
+from app.schemas.page_content import SearchUpdateReceipt
 
 # Spelled out rather than derived from `resource_grant.NODE_KINDS` /
 # `GRANT_LEVELS`, because a Literal needs literal members. The model remains
@@ -108,13 +109,19 @@ class ResourceGrantListAPIResponse(BaseModel):
 
 class ResourceGrantAPIResponse(BaseModel):
     data: ResourceGrantResponse
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
+
+
+class ResourceGrantDeleteAPIResponse(BaseModel):
+    search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
 
 class CreateGrantRequest(StrictRequestModel):
     """One grant on one node.
 
-    No update counterpart, deliberately: a grant is three immutable facts, and
-    "changing" one is a revoke plus a write. See the service module docstring.
+    Only the level can be changed afterwards (`UpdateGrantRequest`); node and
+    principal changes are a revoke plus a write. See the service module
+    docstring.
 
     `user_id` IS AN ID, where `CreateAssignmentRequest` takes an email. Both
     of the questions this docstring used to leave open were decided by the
@@ -140,6 +147,13 @@ class CreateGrantRequest(StrictRequestModel):
     role_id: int | None = None
     scope_id: int | None = None
     user_id: int | None = None
+
+
+class UpdateGrantRequest(StrictRequestModel):
+    """`PATCH /grants/{id}` — switch a grant between view and edit (owner
+    decision, 2026-09-25). The level is the only mutable fact on a grant."""
+
+    level: GrantLevel
 
 
 class NodeRefResponse(BaseModel):
@@ -228,6 +242,12 @@ class InheritedGrantsEntry(BaseModel):
     # here (unlike that field, which is sometimes deliberately `None`):
     # naming the ancestor is the entire point of this entry existing.
     node_label: str
+    # Whether the CALLER holds edit on this ancestor (or is a Hub Admin) —
+    # i.e. whether revoking or re-levelling one of these rows would pass the
+    # gate's node half. The grant editor hides both actions when it's False
+    # (owner decision, 2026-09-25). Required, no default: the router is the
+    # only builder and must compute it, never fall back to "yes".
+    can_manage: bool
     grants: list[ResourceGrantResponse] = Field(default_factory=list)
 
 

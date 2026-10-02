@@ -73,6 +73,17 @@ CONFLICT_RESPONSE = {
 }
 FORBIDDEN_RESPONSE = {403: {"description": "Hub Admin access required"}}
 
+# TEMPORARY (owner decision, 2026-09-24, testing phase only): lets "Any
+# Scope" (the ⊥ scope) be ASSIGNED to any user, under the normal delegation
+# rules. "Any Role" stays refused regardless. This deliberately reopens the
+# scope half of the hole `_assert_not_public` documents — anyone holding a
+# non-leaf role can grant `(<a role beneath theirs>, Any Scope)` to anyone,
+# and that reaches every object grant written on `(<that role>, Any Scope)`.
+# Flip back to False (and the frontend twin, `ALLOW_ANY_SCOPE_ASSIGNMENT`
+# in UserManagementPage.tsx) when testing ends. Existing ⊥ assignments are
+# NOT cleaned up by flipping it — revoke them first.
+TEMP_ALLOW_PUBLIC_SCOPE_ASSIGNMENT = True
+
 
 def _conflict(error: RbacGraphError) -> HTTPException:
     """Same shape as rbac.py's own `_conflict` — duplicated rather than
@@ -123,9 +134,14 @@ def _assert_not_public(role: dict | None, scope: dict | None) -> None:
     below can call this having looked up only whichever of role_id/scope_id
     the request actually changed — a `None` here means "not part of this
     write", not "checked and fine", and is simply skipped.
+
+    TEMPORARILY WEAKENED for the scope half — see
+    `TEMP_ALLOW_PUBLIC_SCOPE_ASSIGNMENT`.
     """
     for kind, row, key in (("role", role, "role_id"), ("scope", scope, "scope_id")):
         if row is None:
+            continue
+        if kind == "scope" and TEMP_ALLOW_PUBLIC_SCOPE_ASSIGNMENT:
             continue
         if row.get("is_public"):
             raise RbacGraphError(

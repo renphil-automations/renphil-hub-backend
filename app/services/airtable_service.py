@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from collections import Counter, defaultdict
@@ -20,11 +21,12 @@ from typing import Any, Iterable
 
 from pyairtable import Api
 from pyairtable import retry_strategy as _pyairtable_retry_strategy
-from requests.exceptions import RequestException
+from requests.exceptions import HTTPError, RequestException
 from fastapi import HTTPException, status as _http_status
 
 from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
+from app.helpers import airtable_ordering as ao
 from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
 from app.services.cache_service import CacheService, encoded_length, get_cache_service
@@ -146,6 +148,7 @@ _F_ACCOUNT_NAME = _S.AT_F_ACCOUNT_NAME
 _F_EXCLUDE_FROM_LISTS = _S.AT_F_EXCLUDE_FROM_LISTS
 _F_EXCLUDE_FROM_REPORTING = _S.AT_F_EXCLUDE_FROM_REPORTING
 _F_STATUS = _S.AT_F_STATUS
+_F_FUND_STATUS = _S.AT_F_FUND_STATUS
 _F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
 _F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
 _F_ONBOARDING_STATUS = _S.AT_F_ONBOARDING_STATUS
@@ -158,7 +161,7 @@ _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "Active Program"
 _STATUS_PUBLICLY_LAUNCHED = "Publicly Launched"
-_STATUS_FELLOWSHIP_SCOPING = "Fellowship (Scoping)"
+_STATUS_FELLOWSHIP_SCOPING = "Fellowship"
 _ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
@@ -185,7 +188,7 @@ _ML_LOOKUP_PROJECT_FIELDS = [
     "Initiative Type",
     "Focus Area(s)",
     "Program Lead/Fellow",
-    "Status",
+    "Fund Status",
     "Program Summary",
     "Internal Notes",
     "Can we talk about it publicly",
@@ -222,6 +225,51 @@ _UPCOMING_DELIVERABLES_FIELD = "Upcoming Deliverables"
 _WIDGET_RETRY_STRATEGY = _pyairtable_retry_strategy(
     status_forcelist=(429, 500, 502, 503, 504)
 )
+
+
+def _list_records_page(api: Api, table: Any, options: dict[str, Any]) -> Any:
+    """One raw "list records" page — `records` AND `offset` together, which
+    `table.all()`/`.iterate()` can't hand back (they swallow `offset`).
+
+    Every raw list-records GET in this module goes through here so it carries
+    the same `fallback=` pyairtable's own `Table.iterate` passes
+    (pyairtable/api/table.py): once the prepared GET URL reaches
+    `Api.MAX_URL_LENGTH` (16,000), `Api.request` re-issues it as
+    `POST …/listRecords` with the options in a JSON body. Without it an
+    over-long URL (a filter formula with many multi-value `eq` tags — the
+    condition caps don't bound that) goes out as a GET and Airtable rejects
+    it. The POST response has the same `records`/`offset` shape, and
+    `offset` travels in the body, so paging works unchanged.
+
+    A `sort` option (the Table widget's stored default order, plan §11) is
+    carried the same way: pyairtable encodes it as `sort[i][…]` query params
+    on the GET and as `[{field, direction}]` in the POST body. When the
+    widget has no `selectedColumns`, nothing can check a sort field against
+    the table before this call, so a stale default (column since renamed or
+    deleted) gets Airtable's 422. That page is retried once WITHOUT `sort`:
+    a stale default is ignored, never an error (Part B decision 3)."""
+    try:
+        return api.request(
+            "get",
+            table.urls.records,
+            fallback=("post", table.urls.records_post),
+            options=options,
+        )
+    except HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if "sort" not in options or status_code != 422:
+            raise
+        logger.warning(
+            "Airtable rejected the widget's default sort (422): retrying without it: %s", exc
+        )
+        unsorted = {key: value for key, value in options.items() if key != "sort"}
+        return api.request(
+            "get",
+            table.urls.records,
+            fallback=("post", table.urls.records_post),
+            options=unsorted,
+        )
+
 
 # ── Field-type hints for the viewer Filter/Sort/Group/Search toolbar ───────
 # (plan_airtable_widget_viewer_controls_2026-08-12.md §2.2). Deliberately
@@ -297,10 +345,11 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """One page of rows for a dashboard Airtable widget, filtered
         server-side under the app's own identity.
@@ -309,6 +358,13 @@ class AirtableService:
         URL or token. Everything else comes from the widget's stored config
         and the caller's authenticated email, so a viewer cannot widen what
         they are shown.
+
+        `order` is the widget's stored default order (group level, then sort
+        level; `airtable_ordering.widget_default_order`), sent as Airtable's
+        native `sort` so the order holds across Airtable's own pages. A level
+        on a column outside `selected_columns` is dropped (not displayed).
+        Airtable's type-aware ordering can differ slightly from the cached
+        path's JS-parity comparator on mixed-type columns (plan §11.3).
 
         FAILS CLOSED: if personalization is enabled but could not be applied
         (no email, no column, unusable column name), this returns an EMPTY
@@ -352,6 +408,11 @@ class AirtableService:
             options["formula"] = formula
         if cursor:
             options["offset"] = cursor
+        if selected_columns:
+            order = ao.restrict_order_to_fields(order, selected_columns)
+        sort = ao.airtable_sort_option(order)
+        if sort:
+            options["sort"] = sort
 
         # `table.all()` / `.iterate()` both swallow the response's `offset`,
         # so neither can hand back a next-page cursor. Drop to the raw
@@ -360,7 +421,7 @@ class AirtableService:
         table = api.table(base_id, table_id)
         try:
             payload = await asyncio.to_thread(
-                api.request, "get", table.urls.records, options=options
+                _list_records_page, api, table, options
             )
         except RequestException as exc:
             logger.error("Airtable widget row fetch failed: %s", exc)
@@ -536,7 +597,7 @@ class AirtableService:
 
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable widget cache walk failed: %s", exc)
@@ -594,7 +655,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> tuple[dict[str, Any] | None, str]:
@@ -752,7 +813,7 @@ class AirtableService:
         serializing, and taking that lock here would let a schema call block
         a row walk.
         """
-        hints, _available = await self._fetch_table_field_hints_impl(
+        hints, _names, _available = await self._fetch_table_field_hints_impl(
             base_id=base_id, table_id=table_id, api_key=api_key
         )
         return hints
@@ -775,11 +836,12 @@ class AirtableService:
 
     async def fetch_table_field_hints_with_status(
         self, *, base_id: str, table_id: str, api_key: str
-    ) -> tuple[dict[str, str], bool]:
-        """`fetch_table_field_hints` plus an `available` flag, for the admin
-        preview only. A table with no URL/select columns legitimately returns
-        ({}, True); a PAT without `schema.bases:read` returns ({}, False). The
-        two are indistinguishable from the hints alone, and the Property
+    ) -> tuple[dict[str, str], list[str], bool]:
+        """`fetch_table_field_hints` plus the full ordered field-name list and
+        an `available` flag, for the admin preview only. A table with no
+        URL/select columns legitimately returns ({}, [...names], True); a PAT
+        without `schema.bases:read` returns ({}, [], False). The hints and the
+        flag are indistinguishable from the hints alone, and the Property
         Panel needs to say something different for each.
 
         Not used by the viewer-facing `/rows` and `/rows/full` paths — a
@@ -810,7 +872,7 @@ class AirtableService:
 
     async def _fetch_table_field_hints_impl(
         self, *, base_id: str, table_id: str, api_key: str, force_live: bool = False,
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, str], list[str], bool]:
         """Shared worker `fetch_table_field_hints` and
         `fetch_table_field_hints_with_status` both project from — one code
         path, so `available` is derived directly from the control flow that
@@ -842,13 +904,15 @@ class AirtableService:
             # per-viewer traffic, so paying for a live call while the cache
             # is down is cheap here.)
             if not cache.enabled:
-                return {}, True
+                return {}, [], True
 
             cached = await cache.get(cache_key)
             if isinstance(cached, dict):
-                return cached, True
+                # No field-name list on a cache hit; only the force_live
+                # (preview) path needs it, and that path skips this shortcut.
+                return cached, [], True
             if await cache.get(f"{cache_key}{self._SCHEMA_NEGATIVE_CACHE_SUFFIX}") is not None:
-                return {}, False
+                return {}, [], False
 
         try:
             api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
@@ -862,7 +926,7 @@ class AirtableService:
                 base_id, table_id, exc,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="fetch_failed")
-            return {}, False
+            return {}, [], False
         except Exception:
             # `BaseSchema.table(id)` raises a bare KeyError (NOT
             # RequestException) for a stale/renamed table_id — `_find` ends
@@ -873,19 +937,53 @@ class AirtableService:
                 base_id, table_id,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="unexpected_error")
-            return {}, False
+            return {}, [], False
 
         hints = {
             f.name: hint
             for f in table_schema.fields
             if (hint := _FIELD_TYPE_HINTS.get(f.type))
         }
+        # Full ordered field-name list from the SAME schema read, so a caller
+        # that needs every column (the editor preview's dropdowns) doesn't pay
+        # for a second Metadata call.
+        field_names = [f.name for f in table_schema.fields]
         await cache.set(
             cache_key,
             hints,
             ttl_seconds=self._settings.AIRTABLE_SCHEMA_CACHE_TTL_SECONDS,
         )
-        return hints, True
+        return hints, field_names, True
+
+    def _base_lock_retry_delay(self) -> float:
+        """One `patient` per-base-lock retry interval: the shared base
+        interval plus per-base jitter. Its jitter MAX is the floor of the
+        fingerprint-lock jitter (see `_fingerprint_lock_retry_delay`), so a
+        base-lock waiter is never out-waited by a fingerprint-lock follower.
+        """
+        s = self._settings
+        return s.AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS + random.uniform(
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MIN_SECONDS,
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS,
+        )
+
+    def _fingerprint_lock_retry_delay(self) -> float:
+        """One `patient` per-fingerprint-lock poll interval: the shared base
+        interval plus jitter starting one `..._FINGERPRINT_LOCK_JITTER_GAP_
+        SECONDS` ABOVE the per-base jitter MAX and spanning `..._RANGE_
+        SECONDS`, so it is strictly longer than any `_base_lock_retry_delay`
+        — the lead request must not finish its base-lock wait after the
+        followers polling behind it have already given up (`available=false`).
+        """
+        s = self._settings
+        fp_min = (
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS
+            + s.AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_GAP_SECONDS
+        )
+        fp_max = fp_min + s.AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_RANGE_SECONDS
+        return s.AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS + random.uniform(
+            fp_min, fp_max
+        )
 
     async def _get_or_warm_widget_cache(
         self,
@@ -894,10 +992,11 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
         allow_warm: bool = True,
+        patient: bool = False,
     ) -> dict[str, Any] | None:
         """Returns the cached envelope, warming it on a miss. Returns None
         when the table turned out to be oversized (never cached), the walk
@@ -916,6 +1015,15 @@ class AirtableService:
         so every existing caller — `fetch_widget_rows_cached`,
         `fetch_widget_full_rows_cached`, `fetch_widget_metric_cached` — is
         unaffected.
+
+        `patient=True` is for the no-live-fallback callers (Metric/Chart):
+        instead of returning None on the FIRST base-lock loss (a sibling
+        widget on the same base mid-walk) — which those callers surface as
+        `available=false` — it retries both the per-fingerprint and the
+        per-base lock on the bounded, jittered schedule in `config.py`
+        (`AIRTABLE_CACHE_LOCK_RETRY_*`), re-checking the cache before each
+        wait. Left `False` for Table/Full, which already degrade gracefully
+        to a live read on the first loss.
         """
         cache = get_cache_service()
 
@@ -941,69 +1049,107 @@ class AirtableService:
             lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
         )
         if not lock_token:
-            # Someone else is warming this exact key. Wait briefly rather
-            # than starting a second concurrent full-table walk — the whole
-            # point of the lock (plan §4.4): without it, a cold key plus a
-            # burst of viewers would each start their own walk and breach
-            # Airtable's per-base rate limit.
-            for _ in range(4):
-                await asyncio.sleep(1.5)
+            # Someone else is warming this exact key. Wait rather than
+            # starting a second concurrent full-table walk — the whole point
+            # of the lock (plan §4.4). `patient` callers poll on the longer,
+            # base-lock-aligned schedule so a follower never gives up while
+            # the lead request (which holds this same fingerprint lock) is
+            # still inside its own base-lock wait; everyone else keeps the
+            # original short poll.
+            fp_attempts = (
+                self._settings.AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS
+                if patient
+                else 4
+            )
+            for _ in range(fp_attempts):
+                await asyncio.sleep(
+                    self._fingerprint_lock_retry_delay() if patient else 1.5
+                )
                 cached = await cache.get(cache_key)
                 if isinstance(cached, dict) and "rows" in cached:
                     return cached
             return None
 
         try:
-            try:
-                envelope, status = await self._build_widget_cache_envelope(
-                    cache=cache,
-                    url=url,
-                    api_key=api_key,
-                    selected_columns=selected_columns,
-                    filters=filters,
-                    personalize_enabled=personalize_enabled,
-                    personalize_column=personalize_column,
-                )
-            except AirtableError:
-                # Every OTHER miss-path exit degrades to the live fallback;
-                # a walk failure (e.g. an Airtable 429 mid-walk) must too,
-                # rather than propagating as a 502 to the caller (finding
-                # #2) — the failure rate scales with table size now that a
-                # miss makes N Airtable requests instead of 1.
-                logger.warning(
-                    "Airtable widget cache: walk failed (url=%s) — "
-                    "serving live instead",
-                    url,
-                    exc_info=True,
-                )
-                await self._mark_walk_unwarmable(cache, cache_key, reason="walk_failed")
-                return None
-            if status == "locked":
-                # A DIFFERENT widget on the same base is walking right now
-                # (finding #6) — not a confirmed bad table, just contention,
-                # so no negative marker. And unlike the fingerprint-lock
-                # wait above, there is nothing to poll for: another widget's
-                # walk will never populate THIS cache key. Degrade to live
-                # immediately.
-                return None
-            if status == "oversized":
-                logger.warning(
-                    "Airtable widget cache: table too large to cache "
-                    "(url=%s) — serving live instead, never truncated",
-                    url,
-                )
-                await self._mark_walk_unwarmable(cache, cache_key, reason="oversized")
-                return None
-            await cache.set(
-                cache_key,
-                envelope,
-                ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
-                # ~4.8x smaller stored AND transferred, on a payload that is
-                # by far the largest thing in this cache (§4.3). Opt-in, so
-                # the decorator-cached endpoints are untouched.
-                compress=True,
+            # `patient` callers retry a base-lock loss (a DIFFERENT widget on
+            # the same base mid-walk) instead of giving up on the first miss;
+            # the cache is re-checked before each wait in case the cron (or
+            # any other warmer) populated this key meanwhile. Non-patient
+            # callers keep the original single attempt.
+            base_attempts = (
+                self._settings.AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS
+                if patient
+                else 1
             )
-            return envelope
+            for base_attempt in range(base_attempts):
+                try:
+                    envelope, status = await self._build_widget_cache_envelope(
+                        cache=cache,
+                        url=url,
+                        api_key=api_key,
+                        selected_columns=selected_columns,
+                        filters=filters,
+                        personalize_enabled=personalize_enabled,
+                        personalize_column=personalize_column,
+                    )
+                except AirtableError:
+                    # Every OTHER miss-path exit degrades to the live
+                    # fallback; a walk failure (e.g. an Airtable 429 mid-walk)
+                    # must too, rather than propagating as a 502 to the caller
+                    # (finding #2) — the failure rate scales with table size
+                    # now that a miss makes N Airtable requests instead of 1.
+                    logger.warning(
+                        "Airtable widget cache: walk failed (url=%s) — "
+                        "serving live instead",
+                        url,
+                        exc_info=True,
+                    )
+                    await self._mark_walk_unwarmable(
+                        cache, cache_key, reason="walk_failed"
+                    )
+                    return None
+                if status == "locked":
+                    # A DIFFERENT widget on the same base is walking right now
+                    # (finding #6) — not a confirmed bad table, just
+                    # contention, so no negative marker. A `patient` caller
+                    # waits and retries (re-checking the cache first, since a
+                    # concurrent warmer may have filled THIS key); everyone
+                    # else degrades to live immediately as before.
+                    if patient and base_attempt < base_attempts - 1:
+                        await asyncio.sleep(self._base_lock_retry_delay())
+                        cached = await cache.get(cache_key)
+                        if isinstance(cached, dict) and "rows" in cached:
+                            return cached
+                        continue
+                    if patient:
+                        logger.warning(
+                            "Airtable widget cache: base lock still held after "
+                            "%d patient attempts (url=%s) — reporting unavailable",
+                            base_attempts,
+                            url,
+                        )
+                    return None
+                if status == "oversized":
+                    logger.warning(
+                        "Airtable widget cache: table too large to cache "
+                        "(url=%s) — serving live instead, never truncated",
+                        url,
+                    )
+                    await self._mark_walk_unwarmable(
+                        cache, cache_key, reason="oversized"
+                    )
+                    return None
+                await cache.set(
+                    cache_key,
+                    envelope,
+                    ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
+                    # ~4.8x smaller stored AND transferred, on a payload that
+                    # is by far the largest thing in this cache (§4.3).
+                    # Opt-in, so the decorator-cached endpoints are untouched.
+                    compress=True,
+                )
+                return envelope
+            return None
         finally:
             await cache.release_lock(lock_key, lock_token)
 
@@ -1014,7 +1160,7 @@ class AirtableService:
         link: str,
         url: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> dict[str, Any]:
@@ -1075,15 +1221,23 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """Cache-aware sibling of `fetch_widget_rows` — same contract, same
         response shape, backing `GET /airtable/component/{link}/rows` once
         the cache is wired in below the endpoint's access-control check
         (plan §3.1, §4).
+
+        `order` (the stored default order, advanced-filters plan §11) is
+        applied at SERVE time: after personalization, before slicing, so an
+        `idx:<offset>` cursor is an offset into the ordered list and page 2
+        continues it. The cache envelope and fingerprint don't carry it, so a
+        default change costs no re-warm (Part B decision 7). The live
+        fallbacks pass it to Airtable as a native `sort` instead.
 
         Personalization is applied in Python against an unpersonalized,
         filters-only cached row set (§6) rather than baked into the
@@ -1141,6 +1295,7 @@ class AirtableService:
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
                 cursor=self._live_cursor(cursor),
+                order=order,
             )
 
         fingerprint = self._widget_cache_fingerprint(
@@ -1178,6 +1333,7 @@ class AirtableService:
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
                 cursor=self._live_cursor(cursor),
+                order=order,
             )
 
         rows = envelope["rows"]
@@ -1196,6 +1352,17 @@ class AirtableService:
         # "stable across pages" reasoning as `fetch_widget_rows`.
         response_fields = list(selected_columns) if selected_columns else envelope["fields"]
         field_set = set(response_fields)
+
+        # Default order (plan §11.3): AFTER personalization, so it orders only
+        # this caller's rows, and BEFORE the slice, so `idx:` cursors index
+        # the ordered list. Only displayed columns count (a stale default is
+        # ignored). `sort_rows` returns a new list; the envelope's own
+        # `rows` is never reordered in place. Off the event loop: it's pure
+        # CPU, ~0.5 s for two all-distinct string levels at the 50,000-row
+        # cache ceiling (tens of ms for a few thousand rows).
+        effective_order = ao.restrict_order_to_fields(order, response_fields)
+        if effective_order:
+            rows = await asyncio.to_thread(ao.sort_rows, rows, effective_order)
 
         start = self._parse_synthetic_cursor(cursor)
         page = rows[start : start + self._WIDGET_PAGE_SIZE]
@@ -1231,7 +1398,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
     ):
         """Return one complete viewer-independent row set for shared indexing.
 
@@ -1325,7 +1492,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1343,10 +1510,11 @@ class AirtableService:
         partial number" stance — a partial aggregate is silently WRONG, a
         partial row list is merely incomplete.)
 
-        The `viewerControlsEnabled` toggle gate is the ROUTER's job (product
-        control, not a security boundary — see the router docstring), not
-        this method's: everything below is exactly as safe to call as
-        `fetch_widget_rows_cached` is.
+        The gate (`viewerControlsEnabled` or a valid `defaultGroup`) is the
+        ROUTER's job (product control, not a security boundary — see the
+        router docstring), not this method's: everything below is exactly as
+        safe to call as `fetch_widget_rows_cached` is. Rows are returned
+        unsorted; the client applies the stored default order itself.
         """
         from app.models.airtable import AirtableWidgetFullRowsResponse
 
@@ -1602,7 +1770,7 @@ class AirtableService:
         caller_email: str,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1691,6 +1859,7 @@ class AirtableService:
             filters=filters,
             personalize_enabled=False,
             personalize_column=None,
+            patient=True,
         )
 
         if envelope is None:
@@ -1734,7 +1903,7 @@ class AirtableService:
 
     @staticmethod
     def _chart_cache_fingerprint(
-        *, link: str, url: str, filters: list[dict[str, Any]] | None
+        *, link: str, url: str, filters: af.WidgetFilters | None
     ) -> dict[str, Any]:
         """The `widget_rows` cache fingerprint a Chart widget's aggregation
         reads — a thin, Chart-specific alias over the shared
@@ -1879,7 +2048,7 @@ class AirtableService:
         group_field: str | None,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         max_groups: int | None = None,
@@ -1950,6 +2119,7 @@ class AirtableService:
             filters=filters,
             personalize_enabled=False,
             personalize_column=None,
+            patient=True,
         )
 
         if envelope is None:
@@ -1995,7 +2165,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> str:
@@ -2222,11 +2392,17 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """Editor preview for the Property Panel.
+
+        `order` (the in-progress default group + sort, plan §11.3 mode A) is
+        applied as Airtable's native `sort` on both calls, so the capped
+        sample is the right first 100 rows rather than an arbitrary 100
+        re-sorted afterwards. Same displayed-column rule as the saved paths.
 
         Returns `fields` computed WITHOUT personalization and `rows` computed
         WITH it. The split matters: an admin configuring a widget must be
@@ -2239,8 +2415,9 @@ class AirtableService:
         personalize column is the wrong type and matches nothing" — which are
         otherwise indistinguishable and both look like a broken widget.
 
-        Costs up to two Airtable calls, which is acceptable at edit
-        frequency (and one when personalization is off).
+        Costs up to three Airtable calls (one records read, plus a second
+        when personalization is on, plus one Metadata/schema read that also
+        backs the full column list) — acceptable at edit frequency.
         """
         from app.models.airtable import AirtableEditorPreviewResponse
 
@@ -2253,6 +2430,10 @@ class AirtableService:
             base_options["view"] = view_id
         if selected_columns:
             base_options["fields"] = list(selected_columns)
+            order = ao.restrict_order_to_fields(order, selected_columns)
+        sort = ao.airtable_sort_option(order)
+        if sort:
+            base_options["sort"] = sort
 
         api = Api(api_key.strip())
         table = api.table(base_id, table_id)
@@ -2263,7 +2444,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable editor preview failed: %s", exc)
@@ -2302,15 +2483,28 @@ class AirtableService:
             {"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records
         ]
 
-        # Prefer the admin's explicit column order over discovery order — see
-        # the matching comment in fetch_widget_rows. Without this, the editor
-        # preview would silently ignore the admin's custom column ordering
-        # even though the saved widget honors it once persisted.
-        fields = list(selected_columns) if selected_columns else seen_fields
-
-        field_types, field_types_available = await self.fetch_table_field_hints_with_status(
-            base_id=base_id, table_id=table_id, api_key=api_key
+        # One schema read backs BOTH the type hints and the full column list
+        # below — see fetch_table_field_hints_with_status.
+        field_types, schema_fields, field_types_available = (
+            await self.fetch_table_field_hints_with_status(
+                base_id=base_id, table_id=table_id, api_key=api_key
+            )
         )
+
+        # Prefer the admin's explicit column order; otherwise populate the
+        # dropdowns from the table's FULL schema, not just columns present in
+        # the capped preview rows — a column empty across every previewed row
+        # can never be picked otherwise. Falls back to discovery order when the
+        # schema read failed (empty schema_fields; needs schema.bases:read).
+        if selected_columns:
+            fields = list(selected_columns)
+        elif schema_fields:
+            fields = list(schema_fields)
+            for name in seen_fields:
+                if name not in fields:
+                    fields.append(name)
+        else:
+            fields = seen_fields
 
         return AirtableEditorPreviewResponse(
             base_id=base_id,
@@ -2334,7 +2528,7 @@ class AirtableService:
         group_field: str | None,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         max_groups: int | None = None,
@@ -2449,7 +2643,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable chart preview failed: %s", exc)
@@ -2509,12 +2703,20 @@ class AirtableService:
         fetching all and discarding). ``formula`` is passed verbatim to
         Airtable's ``filterByFormula`` parameter and is applied server-side
         before the row cap, so the cap applies to already-filtered results.
+
+        When ``fields`` is not given, the full column list is taken from the
+        table's schema (Metadata API) rather than inferred from the capped
+        rows — otherwise a column that is empty across every previewed row
+        would silently disappear from ``fields``. Requires the PAT's
+        ``schema.bases:read`` scope; if the schema call fails it degrades to
+        the columns actually seen in the rows.
         """
         from app.models.airtable import AirtablePreviewResponse
 
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
 
-        table = Api(api_key.strip()).table(base_id, table_id)
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
         kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
         if view_id:
             kwargs["view"] = view_id
@@ -2536,18 +2738,45 @@ class AirtableService:
         seen_set: set[str] = set()
         rows: list[dict[str, Any]] = []
         for record in records:
-            fields = record.get("fields", {}) or {}
-            for key in fields:
+            record_fields = record.get("fields", {}) or {}
+            for key in record_fields:
                 if key not in seen_set:
                     seen_set.add(key)
                     seen_fields.append(key)
-            rows.append({"id": record.get("id"), **fields})
+            rows.append({"id": record.get("id"), **record_fields})
+
+        if fields:
+            # Caller projected explicit columns: return exactly those, so a
+            # requested column empty across every previewed row still appears.
+            response_fields = list(fields)
+        else:
+            response_fields = seen_fields
+            try:
+                table_schema = await asyncio.to_thread(
+                    lambda: api.base(base_id).schema().table(table_id)
+                )
+            except Exception:
+                # Best-effort: PAT lacks schema.bases:read, or the table id is
+                # stale/renamed — fall back to columns seen in the rows.
+                logger.warning(
+                    "Airtable preview schema fetch failed (base=%s table=%s) — "
+                    "returning only columns present in the previewed rows",
+                    base_id,
+                    table_id,
+                )
+            else:
+                # Full schema order first, then any column seen in the rows
+                # that the schema didn't list.
+                response_fields = [f.name for f in table_schema.fields]
+                for name in seen_fields:
+                    if name not in response_fields:
+                        response_fields.append(name)
 
         return AirtablePreviewResponse(
             base_id=base_id,
             table_id=table_id,
             view_id=view_id,
-            fields=seen_fields,
+            fields=response_fields,
             rows=rows,
         )
 
@@ -3182,15 +3411,15 @@ class AirtableService:
         # The two groups above are unioned (OR).
         status_membership_parts: list[str | None] = []
         if status_list:
-            status_membership_parts.append(af.in_str(_F_STATUS, status_list))
+            status_membership_parts.append(af.in_str(_F_FUND_STATUS, status_list))
         if not_status_list:
-            status_membership_parts.append(af.not_in_str(_F_STATUS, not_status_list))
+            status_membership_parts.append(af.not_in_str(_F_FUND_STATUS, not_status_list))
         membership_clause = af.AND(*status_membership_parts)
 
         status_clauses: list[str | None] = []
         if membership_clause:
             status_clauses.append(membership_clause)
-        status_clauses.append(af.empty_clause(_F_STATUS, status_empty))
+        status_clauses.append(af.empty_clause(_F_FUND_STATUS, status_empty))
         status_combined = af.OR(*status_clauses)
         if status_combined:
             clauses.append(status_combined)
@@ -3460,7 +3689,7 @@ class AirtableService:
         if checkin_user_id:
             program_fields_needed.append(_F_CHECKIN_HISTORY)
         if excluded_statuses:
-            program_fields_needed.append(_F_STATUS)
+            program_fields_needed.append(_F_FUND_STATUS)
 
         programs = await self._get_records_by_ids(
             self._master_list_table(),
@@ -3476,7 +3705,7 @@ class AirtableService:
                 if checkin_user_id not in user_ids:
                     return False
             if excluded_statuses:
-                status_val = pf.get(_F_STATUS)
+                status_val = pf.get(_F_FUND_STATUS)
                 if isinstance(status_val, list):
                     status_val = status_val[0] if status_val else None
                 if status_val in excluded_statuses:
@@ -4082,12 +4311,12 @@ class AirtableService:
         'Exclude from lists'.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
         records = await self._list_records(
-            self._master_list_table(), formula=formula, fields=[_F_STATUS]
+            self._master_list_table(), formula=formula, fields=[_F_FUND_STATUS]
         )
         return CountResponse(count=len(records))
 
@@ -4101,7 +4330,7 @@ class AirtableService:
         'Program Lead/Fellow' fields.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
@@ -4127,8 +4356,8 @@ class AirtableService:
     async def get_distinct_fellows_count(self) -> CountResponse:
         """Count distinct fellows sourced from the Master List.
 
-        Fellows are derived from the Master List: records whose Status
-        equals 'Fellowship (Scoping)' contribute their 'Program Lead/Fellow'
+        Fellows are derived from the Master List: records whose Fund Status
+        equals 'Fellowship' contribute their 'Program Lead/Fellow'
         name(s). Names are resolved to Users by matching the 'Name' field;
         each matched user contributes its (lower-cased) Work Email to the
         distinct set, and each unmatched name contributes its (lower-cased)
@@ -4304,7 +4533,7 @@ class AirtableService:
     ) -> list[tuple[str, dict[str, Any] | None]]:
         """Return one entry per Program Lead/Fellow, matched to a User when possible.
 
-        1. Query MASTER_LIST for records with Status = 'Fellowship (Scoping)',
+        1. Query MASTER_LIST for records with Fund Status = 'Fellowship',
            projecting the 'Program Lead/Fellow' field.
         2. Extract the list of unique lead/fellow names.
         3. Query USERS matching those names against the 'Name' field,
@@ -4314,8 +4543,8 @@ class AirtableService:
         """
         s = self._settings
 
-        # Step 1: pull Fellowship (Scoping) programs from the Master List.
-        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP_SCOPING)
+        # Step 1: pull Fellowship programs from the Master List.
+        program_formula = af.eq_str(_F_FUND_STATUS, _STATUS_FELLOWSHIP_SCOPING)
         program_records = await self._list_records(
             self._master_list_table(),
             formula=program_formula,

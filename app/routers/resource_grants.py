@@ -76,12 +76,15 @@ from app.schemas.resource_grants import (
     InheritedGrantsAPIResponse,
     NodeKind,
     ResourceGrantAPIResponse,
+    ResourceGrantDeleteAPIResponse,
     ResourceGrantListAPIResponse,
     RetainedAccessAPIResponse,
+    UpdateGrantRequest,
     UserAccessAPIResponse,
 )
 from app.services import edit_lock_service, rbac_service
 from app.services import resource_grant_service as grants
+from app.services.resource_grant_search_updates import affected_component_search_updates
 from app.services.access_visibility_service import (
     build_node_tree,
     compute_visibility,
@@ -201,16 +204,30 @@ def list_node_inherited_grants(
     edit on the node gets the same answer whether it is absent, orphaned,
     invisible, or uneditable (§9: a hidden node should not confirm itself
     exists).
+
+    Each entry carries `can_manage` — whether the caller holds `edit` on
+    THAT ancestor (the node half of the revoke/re-level gate), so the grant
+    editor can hide actions it knows the server would refuse (owner
+    decision, 2026-09-25). One visibility fold serves both the gate and
+    every entry's flag. It is the node half only: a (role, scope) row can
+    still be refused by the pair rule, exactly as a direct row can.
     """
+    closures = RbacClosures(db)
+    tree = build_node_tree(db)
+    admin = is_hub_admin(db, current, closures=closures)
+    visibility = (
+        None if admin else compute_visibility(db, current.hub_user_id, closures=closures, tree=tree)
+    )
     try:
-        closures = RbacClosures(db)
         assert_can_administer_node(
             db,
             hub_user_id=current.hub_user_id,
-            is_hub_admin=is_hub_admin(db, current, closures=closures),
+            is_hub_admin=admin,
             node_kind=node_kind,
             node_id=node_id,
             closures=closures,
+            tree=tree,
+            visibility=visibility,
         )
     except RbacGraphError as e:
         raise _conflict(e)
@@ -218,7 +235,10 @@ def list_node_inherited_grants(
     if not grants.node_exists(db, node_kind, node_id):
         raise HTTPException(status_code=404, detail=f"No {node_kind} with id {node_id} exists")
 
-    return {"data": list_inherited_grants(db, node_kind, node_id)}
+    entries = list_inherited_grants(db, node_kind, node_id, tree=tree)
+    for entry in entries:
+        entry["can_manage"] = admin or visibility.verdict(entry["node_kind"], entry["node_id"]).edit
+    return {"data": entries}
 
 
 @router.get(
@@ -459,12 +479,78 @@ def create_grant(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
-    return {"data": grant}
+    return {
+        "data": grant,
+        "search_updates": affected_component_search_updates(
+            db, node_kind=request.node_kind, node_id=request.node_id
+        ),
+    }
+
+
+@router.patch(
+    "/grants/{grant_id}",
+    response_model=ResourceGrantAPIResponse,
+    summary="Switch a grant between view and edit",
+    responses={404: {"description": "Grant not found"}, **CONFLICT_RESPONSE},
+)
+async def update_grant(
+    grant_id: int,
+    request: UpdateGrantRequest,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Owner decision, 2026-09-25: the grant editor switches a row's level in
+    place instead of revoke-and-regrant.
+
+    SAME GATE AS CREATE AND DELETE, against the grant's OWN node and
+    principal — a level change is a write of that principal onto that node,
+    so it must pass exactly what writing it fresh would. Provenance is
+    restamped to the caller (see `update_grant_level`).
+
+    An edit→view downgrade releases now-unauthorized edit locks, the same
+    best-effort sweep `delete_grant` runs and for the same reason: without
+    it the principal keeps a live lock for the rest of the TTL.
+    """
+    grant = grants.get_grant(db, grant_id)
+    if grant is None:
+        raise HTTPException(status_code=404, detail="Grant not found")
+
+    try:
+        closures = RbacClosures(db)
+        assert_can_grant(
+            db,
+            granter_hub_user_id=current.hub_user_id,
+            is_hub_admin=is_hub_admin(db, current, closures=closures),
+            node_kind=grant["node_kind"],
+            node_id=grant["node_id"],
+            role_id=grant["role_id"],
+            scope_id=grant["scope_id"],
+            user_id=grant["user_id"],
+            closures=closures,
+        )
+        updated = grants.update_grant_level(
+            db,
+            grant_id,
+            level=request.level,
+            granted_by_user_id=current.hub_user_id,
+            granted_by_email=current.email,
+        )
+    except RbacGraphError as e:
+        raise _conflict(e)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Grant not found")
+    db.commit()
+    if grant["level"] == "edit" and request.level == "view":
+        try:
+            await edit_lock_service.release_locks_now_unauthorized(db)
+        except Exception:
+            pass
+    return {"data": updated}
 
 
 @router.delete(
     "/grants/{grant_id}",
-    status_code=204,
+    response_model=ResourceGrantDeleteAPIResponse,
     summary="Revoke a grant",
     responses={404: {"description": "Grant not found"}, **CONFLICT_RESPONSE},
 )
@@ -494,6 +580,8 @@ async def delete_grant(
     grant = grants.get_grant(db, grant_id)
     if grant is None:
         raise HTTPException(status_code=404, detail="Grant not found")
+    node_kind = grant["node_kind"]
+    node_id = grant["node_id"]
 
     try:
         closures = RbacClosures(db)
@@ -521,3 +609,8 @@ async def delete_grant(
         await edit_lock_service.release_locks_now_unauthorized(db)
     except Exception:
         pass
+    return {
+        "search_updates": affected_component_search_updates(
+            db, node_kind=node_kind, node_id=node_id
+        )
+    }

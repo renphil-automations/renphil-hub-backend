@@ -147,6 +147,9 @@ class TabSummaryResponse(BaseModel):
     lock_holder: StrictStr = ""
     lock_holder_node_label: StrictStr = ""
     lock_expires_at: datetime | None = None
+    # Owner decision 2026-09-26 — an admin holds a fresh session on this
+    # node or beneath it, so a forced takeover from here would be refused.
+    lock_takeover_blocked: StrictBool = False
 
     has_children: StrictBool = False
     has_content: StrictBool = False
@@ -228,6 +231,9 @@ class TabWorkspaceResponse(BaseModel):
     lock_holder: StrictStr = ""
     lock_holder_node_label: StrictStr = ""
     lock_expires_at: datetime | None = None
+    # Owner decision 2026-09-26 — an admin holds a fresh session on this
+    # node or beneath it, so a forced takeover from here would be refused.
+    lock_takeover_blocked: StrictBool = False
 
     # plan_lock_propagation_2026-09-08.md §4.1 — "return the token +
     # expires_at". SENSITIVE, and deliberately narrow: populated ONLY by
@@ -298,6 +304,9 @@ class NavTabResponse(BaseModel):
     lock_holder: StrictStr = ""
     lock_holder_node_label: StrictStr = ""
     lock_expires_at: datetime | None = None
+    # Owner decision 2026-09-26 — an admin holds a fresh session on this
+    # node or beneath it, so a forced takeover from here would be refused.
+    lock_takeover_blocked: StrictBool = False
 
     # plan_lock_propagation_2026-09-08.md §8 phase 5 — SAME sensitive,
     # narrow-population field as TabWorkspaceResponse.lock_token above (see
@@ -368,6 +377,50 @@ class ComponentLockAPIResponse(BaseModel):
 
 class BreadcrumbAPIResponse(BaseModel):
     data: list[BreadcrumbItemResponse] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------
+# Lock-state poll (POST /v2/locks/state)
+# ---------------------------------------------------------
+
+# Per-kind cap on how many ids one poll may name. The frontend only ever
+# sends what is currently on screen (tens, not hundreds); this just bounds
+# the `IN (...)` lists a hand-crafted request could make the server build.
+MAX_LOCK_STATE_IDS_PER_KIND = 500
+
+
+class LockStateResponse(BaseModel):
+    """Exactly the lock block `TabSummaryResponse`/`NavTabResponse` already
+    carry — the node's own raw row (first four) plus the derived
+    `LockView.state_for` state (last five) — and nothing else, so the
+    frontend can patch these fields over a list row it already holds
+    without touching anything the user may be editing."""
+
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
+
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+    lock_takeover_blocked: StrictBool = False
+
+
+class LockStatesResponse(BaseModel):
+    """Keyed by the same id each list endpoint returns as `documentId` —
+    a nav tab's / gridstack's `document_id`, an SBN node's `link`. An id
+    that does not exist, or that the caller cannot view, is simply absent
+    (§9: the two must not be distinguishable)."""
+
+    nav_tabs: dict[str, LockStateResponse] = Field(default_factory=dict)
+    tabs: dict[str, LockStateResponse] = Field(default_factory=dict)
+    sbn: dict[str, LockStateResponse] = Field(default_factory=dict)
+
+
+class LockStatesAPIResponse(BaseModel):
+    data: LockStatesResponse
 
 
 # ---------------------------------------------------------
@@ -651,9 +704,9 @@ class UnlockTabRequest(StrictRequestModel):
     be omitted by the client either — the server derives it from the JWT on
     every call, with nothing left for an absent/null value to short-circuit.
 
-    `force` is UNCHANGED (owner decision, 2026-09-03): still present, still
-    unrestricted — see `unlock_tab_by_document_id_v2`'s docstring in
-    gridstack_service.py for why.
+    `force` is Hub Admin only (owner decision 2026-09-25, replacing the
+    2026-09-03 "unrestricted" one) — see
+    `access_visibility_service.require_force_allowed`.
 
     `link` — NEW, same reasoning and same optional/additive shape as
     `LockTabRequest.link` above. A component-only editor's own release must
@@ -741,6 +794,17 @@ class UpdateNavTabRequest(StrictRequestModel):
 
 class ReorderNavTabsRequest(StrictRequestModel):
     orderedDocumentIds: list[StrictStr] = Field(default_factory=list)
+
+
+class LockStatesRequest(StrictRequestModel):
+    """`documentId`s to report lock state for, grouped by the three id
+    namespaces the frontend holds: nav tabs, v2 tabs (root tabs, variants
+    and SGS sub-tabs — all addressed by their gridstack's `document_id`),
+    and Super Block Note nodes (addressed by `link`)."""
+
+    nav_tabs: list[StrictStr] = Field(default_factory=list, max_length=MAX_LOCK_STATE_IDS_PER_KIND)
+    tabs: list[StrictStr] = Field(default_factory=list, max_length=MAX_LOCK_STATE_IDS_PER_KIND)
+    sbn: list[StrictStr] = Field(default_factory=list, max_length=MAX_LOCK_STATE_IDS_PER_KIND)
 
 
 class MoveTabToNavTabRequest(StrictRequestModel):
