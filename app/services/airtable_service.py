@@ -7876,6 +7876,28 @@ class AirtableService:
             {"id": created["id"], **created.get("fields", {})}
         )
 
+    async def list_feedbacks(self, *, limit: int = 500) -> list[FeedbackRecord]:
+        """Read the configured Feedbacks table for the protected analytics view."""
+        bounded_limit = min(max(int(limit), 1), 500)
+        try:
+            records = await asyncio.to_thread(
+                self._feedbacks_table().all,
+                max_records=bounded_limit,
+            )
+        except RequestException as exc:
+            logger.error("Airtable list feedbacks failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error while listing feedback")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return [
+            FeedbackRecord.model_validate(
+                {"id": record["id"], **record.get("fields", {})}
+            )
+            for record in records
+        ]
+
     def _tickets_table(self):
         return self._api.table(
             self._settings.RENPHIL_HUB_BASE_ID,

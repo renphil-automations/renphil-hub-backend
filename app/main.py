@@ -20,6 +20,7 @@ from app.helpers.http_client import close_http_client, init_http_client
 from app.routers import (
     agent_access,
     airtable,
+    bot_management,
     auth,
     calendar,
     dify,
@@ -96,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix=api_prefix)
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
+    app.include_router(bot_management.router, prefix=api_prefix)
     app.include_router(airtable.router, prefix=api_prefix)
     app.include_router(agent_access.router, prefix=api_prefix)
     app.include_router(calendar.router, prefix=api_prefix)
