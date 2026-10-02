@@ -1,5 +1,5 @@
 """
-RenPhil Hub — FastAPI Application Entry Point.
+RenPhil Hub â€” FastAPI Application Entry Point.
 
 Registers routers, configures CORS, and manages lifespan events
 (HTTP client init/teardown).
@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.helpers.http_client import close_http_client, init_http_client
 from app.routers import (
     airtable,
+    bot_management,
     auth,
     calendar,
     dify,
@@ -43,7 +44,7 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         handlers=[logging.StreamHandler()],
     )
-    logger.info("Starting %s …", settings.APP_NAME)
+    logger.info("Starting %s â€¦", settings.APP_NAME)
     await init_http_client()
     yield
     await close_http_client()
@@ -62,7 +63,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ── CORS ───────────────────────────────────────────────────────────
+    # â”€â”€ CORS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.ALLOWED_ORIGINS,
@@ -72,12 +73,13 @@ def create_app() -> FastAPI:
         expose_headers=["ETag"],
     )
 
-    # ── Routers ────────────────────────────────────────────────────────
+    # â”€â”€ Routers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     api_prefix = ""
 
     app.include_router(auth.router, prefix=api_prefix)
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
+    app.include_router(bot_management.router, prefix=api_prefix)
     app.include_router(airtable.router, prefix=api_prefix)
     app.include_router(calendar.router, prefix=api_prefix)
     app.include_router(knowledge.router, prefix=api_prefix)
@@ -89,7 +91,7 @@ def create_app() -> FastAPI:
     app.include_router(rbac_assignments.router, prefix=api_prefix)
     app.include_router(resource_grants.router, prefix=api_prefix)
 
-    # ── Health check ───────────────────────────────────────────────────
+    # â”€â”€ Health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     @app.get("/health", tags=["Health"])
     async def health():
         return {"status": "ok"}
