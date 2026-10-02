@@ -20,13 +20,26 @@ So a `LockNode` has exactly four kinds — "nav_tab", "tab", "gridstack",
 than in `NodeRef` (a representation row is a `("component", …)` AC node but
 never a `("component", …)` lock node).
 
-The tree, top to bottom: nav_tab -> tab [-> tab, a variant] -> gridstack
-(a sub-grid; a root/variant canvas has no lock node of its own, its TabV2
-row is the node) -> component -> component (an SBN sub-tab) -> ... Every
-real component under a canvas — root canvases included — is that canvas's
+The tree, top to bottom: tab [-> tab, a variant] -> gridstack (a sub-grid;
+a root/variant canvas has no lock node of its own, its TabV2 row is the
+node) -> component -> component (an SBN sub-tab) -> ... Every real
+component under a canvas — root canvases included — is that canvas's
 descendant, so an admin entering canvas edit mode is refused while any
 widget or SBN node beneath is held, and `force` breaks the whole subtree
 (plan_component_locking §2.1 row 4).
+
+NAV-TAB LOCKS ARE STRUCTURE-ONLY (plan_node_session_gaps_2026-09-28.md
+§2.3/§4, option 2, approved 2026-09-29). A nav tab is still a lock node, but
+it is NOT the top of the tree above: it has no descendants and appears in
+no tab's ancestor chain. The rule is "a session covers what it makes
+editable" — a root-tab session makes content editable, so it keeps covering
+its subtree; a nav-tab session only makes the root-tab list and the nav
+tab's own name/access editable, so it covers only the nav tab. Hence: a
+nav-tab lock neither blocks nor is blocked by any lock inside it, and a
+nav-tab token authorizes no write inside a root tab. Structural writes that
+would destroy or relocate someone else's live work (root delete/move,
+nav-tab delete) are guarded instead by `refuse_if_subtree_held`, which
+reads the nav tab's contents through the private `_nav_tab_contents`.
 """
 
 from __future__ import annotations
@@ -82,8 +95,13 @@ def ancestors(db: Session, node: LockNode) -> list[LockNode]:
     """Every node whose subtree contains `node`, nearest first. Each hop is
     a single denormalized column read — no recursive walk above the
     component level, because that part of the tree is fixed-depth:
-    gridstack -> tab -> [tab ->] nav_tab, at most three hops even through a
-    variant. The ONE exception is the component level (2026-09-17): an SBN
+    gridstack -> tab [-> tab], at most two hops even through a variant.
+
+    A chain STOPS AT THE TAB LEVEL — a root tab's chain is empty, never its
+    nav tab (plan_node_session_gaps §4 item 1, option 2): nav-tab locks are
+    structure-only (see this module's docstring), so a nav tab never counts
+    as an ancestor for `acquire`'s veto, `require_live_session`'s coverage
+    or the lock view. A nav tab's own chain is empty too. The ONE exception is the component level (2026-09-17): an SBN
     sub-tab's chain first climbs `super_blocknote_id` link by link to its
     SBN root — unbounded in principle, "chains four deep" live — before
     reaching its canvas and the fixed part above.
@@ -133,15 +151,12 @@ def ancestors(db: Session, node: LockNode) -> list[LockNode]:
         tab = db.query(TabV2).filter(TabV2.id == node_id).first()
         if tab is None:
             return []
-        chain: list[LockNode] = []
-        # A variant's parent is the root tab it varies, not the nav tab
-        # directly (mirrors resolve_gridstack_parent_node's own comment on
-        # why parent_tab_id must be read before nav_tab_id).
+        # A variant's parent is the root tab it varies. A root tab has no
+        # lock ancestor at all: its nav tab is deliberately NOT appended
+        # (structure-only nav-tab locks, plan_node_session_gaps §4 item 1).
         if tab.parent_tab_id is not None:
-            chain.append(("tab", tab.parent_tab_id))
-        if tab.nav_tab_id is not None:
-            chain.append(("nav_tab", tab.nav_tab_id))
-        return chain
+            return [("tab", tab.parent_tab_id)]
+        return []
 
     if kind == "gridstack":
         gridstack = db.query(GridstackV2).filter(GridstackV2.id == node_id).first()
@@ -202,9 +217,14 @@ def descendants(db: Session, node: LockNode) -> list[LockNode]:
     nest (a permanent tree-shape rule, confirmed by the owner 2026-09-07),
     so a tab's own gridstacks are always exactly one or two levels down.
 
+    A NAV TAB HAS NO DESCENDANTS (plan_node_session_gaps §4 item 2, option
+    2): nav-tab locks are structure-only, see this module's docstring. What
+    sits inside a nav tab is `_nav_tab_contents`, which is deliberately not
+    a lock relation.
+
     A GRIDSTACK IS NO LONGER A LEAF (2026-09-17, decision A): its
     descendants are the real components on it, SBN members included. And a
-    tab's/nav tab's component query must run over EVERY gridstack under it
+    tab's component query must run over EVERY gridstack under it
     — root/variant canvases included — not just the sub-grids that are lock
     nodes in their own right: a root canvas has no lock node of its own
     (its TabV2 row is the node), but the widgets ON it are its descendants
@@ -262,28 +282,43 @@ def descendants(db: Session, node: LockNode) -> list[LockNode]:
         return result
 
     if kind == "nav_tab":
-        # Every TabV2 under this nav tab — roots AND variants
-        # (create_tab_variant_v2 copies the parent's nav_tab_id, so a
-        # variant is just as much "under" the nav tab as its root is) —
-        # plus every sub-grid under any of them, plus every real component
-        # on any canvas under any of them.
-        tabs = db.query(TabV2.id).filter(TabV2.nav_tab_id == node_id).all()
-        tab_ids = [t.id for t in tabs]
-
-        all_gridstacks = (
-            db.query(GridstackV2.id, GridstackV2.parent_id)
-            .filter(GridstackV2.parent_tab_id.in_(tab_ids))
-            .all()
-            if tab_ids
-            else []
-        )
-
-        result = [("tab", t.id) for t in tabs]
-        result.extend(("gridstack", g.id) for g in all_gridstacks if g.parent_id is not None)
-        result.extend(_components_under_gridstacks(db, [g.id for g in all_gridstacks]))
-        return result
+        # Structure-only (plan_node_session_gaps §4 item 2, option 2): a
+        # nav tab's lock covers the nav tab alone, so it has no lock
+        # descendants — `acquire` on it never sees a content hold, and a
+        # force on it ends only its own session. What is physically inside
+        # it is `_nav_tab_contents`, read only by `refuse_if_subtree_held`.
+        return []
 
     raise ValueError(f"Unknown lock node kind: {kind!r}")
+
+
+def _nav_tab_contents(db: Session, nav_tab_id: int) -> list[LockNode]:
+    """Every lock node physically inside a nav tab — what `descendants`
+    returned for a nav tab before nav-tab locks became structure-only
+    (plan_node_session_gaps §4 item 2). NOT a lock-coverage relation any
+    more: its only caller is `refuse_if_subtree_held`, so a nav-tab delete
+    is still refused while anyone edits anything inside it.
+
+    Every TabV2 under this nav tab — roots AND variants
+    (create_tab_variant_v2 copies the parent's nav_tab_id, so a variant is
+    just as much "under" the nav tab as its root is) — plus every sub-grid
+    under any of them, plus every real component on any canvas under any of
+    them."""
+    tabs = db.query(TabV2.id).filter(TabV2.nav_tab_id == nav_tab_id).all()
+    tab_ids = [t.id for t in tabs]
+
+    all_gridstacks = (
+        db.query(GridstackV2.id, GridstackV2.parent_id)
+        .filter(GridstackV2.parent_tab_id.in_(tab_ids))
+        .all()
+        if tab_ids
+        else []
+    )
+
+    result: list[LockNode] = [("tab", t.id) for t in tabs]
+    result.extend(("gridstack", g.id) for g in all_gridstacks if g.parent_id is not None)
+    result.extend(_components_under_gridstacks(db, [g.id for g in all_gridstacks]))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1049,8 @@ def lock_node_of(db: Session, ac_node: tuple[str, int] | None) -> LockNode | Non
     `update_component_content`, `update_airtable_component_config`, and
     (phase B) every SBN write — onto the component's own row with no
     per-call edits: the session chain becomes `[component, (SBN parents…),
-    canvas, tab, nav_tab]`, so a narrow editor's own token on the widget
+    canvas, tab [, root tab]]` (no nav tab since 2026-09-30: nav-tab locks
+    are structure-only, plan_node_session_gaps §4), so a narrow editor's own token on the widget
     passes, and so does an admin's canvas-edit-mode token one hop up (an
     ancestor session covers a descendant write, as it always has for
     sub-grids). Until the modal locks the widget itself (phase C) it still
@@ -1242,4 +1278,40 @@ def refuse_if_any_held(db: Session, nodes: list[LockNode], holder: str) -> None:
             conflicts.append(BlockingHolder(locked_by, _label_for(node, row), "self"))
 
     if conflicts:
+        raise LockConflictError(_conflict_message(conflicts), blocking=conflicts)
+
+
+def refuse_if_subtree_held(db: Session, node: LockNode, holder: str) -> None:
+    """plan_node_session_gaps_2026-09-28.md §4 item 3 — the structural-write
+    guard that option 2 (structure-only nav-tab locks) needs. Root delete,
+    root move and nav-tab delete are authorized by a session on the PARENT
+    (the nav tab), and a nav-tab session no longer excludes anyone editing
+    inside it. So before one of those writes destroys or relocates live
+    work, this refuses (`LockConflictError`, `NODE_LOCKED`, the same family
+    `acquire` and `refuse_if_any_held` raise) if `node` itself or anything
+    inside it is held FRESH by someone other than `holder`, naming every
+    such holder in `blocking`.
+
+    "Inside" is `descendants(node)`, except for a nav tab, whose
+    `descendants` is empty by design: there it is `_nav_tab_contents`.
+
+    The caller's own holds never count — you may delete the root you
+    pressed the pen on. A stale hold never counts either (`is_lock_stale`,
+    claimable as everywhere else). No session is required or checked here:
+    call it AFTER `require_edit` and the call site's own
+    `require_live_session`, before any write."""
+    holder = (holder or "").strip()
+    kind, node_id = node
+    inside = _nav_tab_contents(db, node_id) if kind == "nav_tab" else descendants(db, node)
+
+    conflicts: list[BlockingHolder] = []
+    for candidate, row in _node_rows(db, [node] + inside):
+        locked, locked_by, locked_at, _token = _locked_quad(row)
+        if locked and locked_by and locked_by != holder and not is_lock_stale(locked_at):
+            relation = "self" if candidate == node else "descendant"
+            conflicts.append(BlockingHolder(locked_by, _label_for(candidate, row), relation))
+
+    if conflicts:
+        admins = _admin_holder_emails(db, {c.holder for c in conflicts})
+        conflicts = [c._replace(is_admin=c.holder in admins) for c in conflicts]
         raise LockConflictError(_conflict_message(conflicts), blocking=conflicts)

@@ -3623,11 +3623,23 @@ def delete_tab_subtree_by_document_id_v2(
         # boundary the first check does not cover, and the recursive call
         # re-checks accordingly.
         require_edit(access, resolve_gridstack_parent_node(db, gridstack))
-        # A session on parent(n) covers n's whole subtree by construction
-        # (edit_lock_service.ancestors), so this — like the require_edit
-        # right above it — is defense in depth for the recursive variant
-        # call below, not a new bar to clear.
+        # The session is checked on parent(n): for a variant or sub-grid
+        # that is a tab, for a root it is the nav tab.
         _require_live_session(db, session, resolve_gridstack_parent_node(db, gridstack))
+        # plan_node_session_gaps_2026-09-28.md §4 item 3: nav-tab locks are
+        # structure-only, so a nav-tab session no longer excludes someone
+        # editing inside the root being deleted. Refuse (NODE_LOCKED, naming
+        # them) while anyone else holds `n` or anything inside it. For a
+        # variant or sub-grid the parent's session already excludes others,
+        # so this can only fire for roots; it runs everywhere to keep the
+        # function uniform. Covers the variants too (they are in a root's
+        # lock descendants), which is why the recursive call below skips it.
+        if session is not None:
+            from app.services import edit_lock_service
+
+            edit_lock_service.refuse_if_subtree_held(
+                db, edit_lock_service.resolve_lock_node(gridstack), session.holder
+            )
 
         deleted_tabs: list[dict[str, Any]] = []
         deleted_component_ids: list[int] = []
@@ -3657,8 +3669,19 @@ def delete_tab_subtree_by_document_id_v2(
                     # check did — `edit(nav_tab)` implies `edit(root_tab)`
                     # implies this variant's own gate — so this is defense
                     # in depth, not a new bar to clear.
+                    #
+                    # `session=None` ("no check requested"), NOT `session`:
+                    # the variant's session target is the root tab, and
+                    # since nav-tab locks became structure-only
+                    # (plan_node_session_gaps §4) the caller's nav-tab token
+                    # no longer covers it — re-checking would turn this
+                    # defense-in-depth hop into a NEW bar (a root session)
+                    # for roots with variants only. The outer session check
+                    # on the nav tab plus the outer `refuse_if_subtree_held`
+                    # (whose root descendants include every variant) already
+                    # decided this whole delete.
                     variant_result = delete_tab_subtree_by_document_id_v2(
-                        db, variant_tab.document_id, access=access, session=session
+                        db, variant_tab.document_id, access=access, session=None
                     )
                     if variant_result:
                         deleted_tabs.extend(variant_result.get("deleted_tabs", []))
