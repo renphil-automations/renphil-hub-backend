@@ -203,6 +203,50 @@ class AirtableWidgetMetricResponse(BaseModel):
     )
 
 
+class AirtableDrilldownRow(BaseModel):
+    """One record in a Metric/Chart drill-down modal."""
+
+    id: str
+    fields: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Only the widget's title field, detail fields and (for Sum) the summed field.",
+    )
+    group: str | None = Field(
+        default=None,
+        description="The record's chart group — set only when drilling into a chart's 'Other' bucket.",
+    )
+
+
+class AirtableWidgetDrilldownResponse(BaseModel):
+    """The records behind a Metric widget's number, or behind one Chart
+    group (bar/slice/point), for the click-to-open drill-down modal. Read
+    from the SAME cached row set the widget's own aggregate uses."""
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    title_field: str = Field(description="Field shown as each row's heading.")
+    fields: list[str] = Field(
+        default_factory=list,
+        description="Detail fields shown under the heading, in display order.",
+    )
+    field_types: dict[str, str] = Field(default_factory=dict)
+    rows: list[AirtableDrilldownRow] = Field(default_factory=list)
+    total_rows: int = Field(default=0, description="Matching records before the row cap.")
+    truncated: bool = Field(
+        default=False,
+        description="True when `total_rows` exceeded AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS and `rows` was cut.",
+    )
+    available: bool = Field(
+        default=True,
+        description="False when the underlying table is too large to cache or the walk failed.",
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description="Same fail-closed meaning as AirtableWidgetMetricResponse.",
+    )
+
+
 class AirtableChartGroup(BaseModel):
     """One group/slice/bar of a Chart widget's aggregation."""
 

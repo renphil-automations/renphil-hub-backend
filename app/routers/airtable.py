@@ -69,6 +69,7 @@ from app.models.airtable import (
     AirtableEditorPreviewResponse,
     AirtablePreviewResponse,
     AirtableWidgetChartResponse,
+    AirtableWidgetDrilldownResponse,
     AirtableWidgetFullRowsResponse,
     AirtableWidgetIndexSnapshotResponse,
     AirtableWidgetMetricResponse,
@@ -888,6 +889,118 @@ async def get_airtable_component_chart(
         personalize_column=config.get("personalizeColumn"),
         max_groups=stored.get("maxGroups"),
         group_sort=stored.get("groupSort") or "value_desc",
+    )
+
+
+@router.get(
+    "/airtable/component/{link}/drilldown",
+    response_model=AirtableWidgetDrilldownResponse,
+    summary="Records behind a Metric widget's number or one Chart group (drill-down modal)",
+    description="""
+Returns the records behind a Metric widget's value, or behind one Chart
+group (bar, slice or line point), for the widget's click-to-open modal.
+
+Only available when the widget's stored `clickAction` is `modal` and a
+`drilldownTitleField` is set. Which rows qualify, and which fields are
+returned (the title field, `drilldownFields`, and the summed field for Sum),
+come from the widget's OWN stored configuration — the caller picks only
+which chart group, via `group` (a label exactly as `/chart` returned it) or
+`other=true` for the folded 'Other' bucket. Personalization and access
+control apply exactly as on `/metric` and `/chart`.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_drilldown(
+    link: str = Path(..., description="The component's stable `link`."),
+    group: str | None = Query(
+        default=None,
+        description="Chart only: the clicked group's label, as returned by /chart.",
+    ),
+    other: bool = Query(
+        default=False,
+        description="Chart only: drill into the folded 'Other' bucket instead of `group`.",
+    ),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_metric
+    # — see the comments there.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    widget_type = (bundle.widget_type or "").strip().lower()
+    if widget_type not in ("airtable_metric", "chart"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Drill-down is only available for Metric and Chart widgets",
+        )
+
+    stored = bundle.data or {}
+    title_field = str(stored.get("drilldownTitleField") or "").strip()
+    # The gate is the widget's own stored setting: a viewer cannot pull rows
+    # out of a widget whose editor never turned the modal on.
+    if stored.get("clickAction") != "modal" or not title_field:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This widget does not have a drill-down modal enabled",
+        )
+    if widget_type == "chart" and not other and group is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide the chart group to drill into",
+        )
+
+    config = bundle.config
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = bundle.pat
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    raw_details = stored.get("drilldownFields")
+    detail_fields = [
+        str(f).strip()
+        for f in (raw_details if isinstance(raw_details, list) else [])
+        if str(f or "").strip()
+    ]
+    count_options = _metric_count_options(stored) if widget_type == "airtable_metric" else {}
+
+    return await airtable_service.fetch_widget_drilldown_cached(
+        widget_type=widget_type,
+        link=link,
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        title_field=title_field,
+        detail_fields=detail_fields,
+        aggregation=stored.get("aggregation") or "count",
+        sum_field=stored.get("sumField") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
+        count_field=count_options.get("count_field"),
+        count_ignore_empty=bool(count_options.get("count_ignore_empty")),
+        group_field=stored.get("groupField") or None,
+        max_groups=stored.get("maxGroups"),
+        group=group if widget_type == "chart" else None,
+        other=other if widget_type == "chart" else False,
     )
 
 

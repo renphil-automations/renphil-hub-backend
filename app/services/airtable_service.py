@@ -2043,34 +2043,23 @@ class AirtableService:
             personalize_column=None,
         )
 
-    def _aggregate_chart_groups(
+    def _rank_chart_groups(
         self,
         *,
         rows: list[dict[str, Any]],
-        base_id: str,
-        table_id: str,
-        view_id: str | None,
         group_field: str,
         aggregation: str,
         sum_field: str | None,
         max_groups: int | None,
-        group_sort: str,
-        partial: bool,
-    ):
-        """Steps 7-9 of the Chart widget's aggregation (plan §3.3): group,
-        truncate-then-sort (L6), and total (L7), over an already-resolved
-        `rows` list — personalization (step 6) is the CALLER's job, and
-        deliberately not done here, because the two callers apply it
-        differently: `fetch_widget_chart_cached` and the preview's cache-hit
-        branch post-filter an unpersonalized envelope in Python
-        (`ap.personalize_match`), while the preview's live-capped branch
-        bakes personalization into the Airtable formula itself
-        (`af.widget_formula`) before the rows ever reach here. Sharing THIS
-        half keeps a widget and its own preview computing groups identically
-        (L1) without coupling the two different personalize mechanisms.
-        """
-        from app.models.airtable import AirtableChartGroup, AirtableWidgetChartResponse
+    ) -> tuple[list[str], list[str], dict[str, float], dict[str, int]]:
+        """Group `rows` and split the group keys into kept and folded-into-
+        'Other', returning `(kept_keys, other_keys, totals, counts)`.
 
+        The ONE place that decides which groups 'Other' holds — shared by
+        `_aggregate_chart_groups` (what the chart draws) and
+        `fetch_widget_drilldown_cached` (the rows behind a clicked 'Other'),
+        so a click can never list a different set of groups from the bar.
+        """
         totals: dict[str, float] = defaultdict(float)
         counts: dict[str, int] = defaultdict(int)
         order: list[str] = []
@@ -2103,8 +2092,46 @@ class AirtableService:
         # fold the alphabetically-LAST groups into 'Other' instead of the
         # smallest ones.
         ranked = sorted(order, key=_value_for, reverse=True)
-        kept_keys = ranked[: effective_max - 1]
-        other_keys = ranked[effective_max - 1 :]
+        return ranked[: effective_max - 1], ranked[effective_max - 1 :], totals, counts
+
+    def _aggregate_chart_groups(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        base_id: str,
+        table_id: str,
+        view_id: str | None,
+        group_field: str,
+        aggregation: str,
+        sum_field: str | None,
+        max_groups: int | None,
+        group_sort: str,
+        partial: bool,
+    ):
+        """Steps 7-9 of the Chart widget's aggregation (plan §3.3): group,
+        truncate-then-sort (L6), and total (L7), over an already-resolved
+        `rows` list — personalization (step 6) is the CALLER's job, and
+        deliberately not done here, because the two callers apply it
+        differently: `fetch_widget_chart_cached` and the preview's cache-hit
+        branch post-filter an unpersonalized envelope in Python
+        (`ap.personalize_match`), while the preview's live-capped branch
+        bakes personalization into the Airtable formula itself
+        (`af.widget_formula`) before the rows ever reach here. Sharing THIS
+        half keeps a widget and its own preview computing groups identically
+        (L1) without coupling the two different personalize mechanisms.
+        """
+        from app.models.airtable import AirtableChartGroup, AirtableWidgetChartResponse
+
+        kept_keys, other_keys, totals, counts = self._rank_chart_groups(
+            rows=rows,
+            group_field=group_field,
+            aggregation=aggregation,
+            sum_field=sum_field,
+            max_groups=max_groups,
+        )
+
+        def _value_for(key: str) -> float | int:
+            return totals.get(key, 0.0) if aggregation == "sum" else counts.get(key, 0)
 
         kept = [
             AirtableChartGroup(label=key, value=_value_for(key), is_other=False)
@@ -2268,6 +2295,187 @@ class AirtableService:
             max_groups=max_groups,
             group_sort=group_sort,
             partial=False,
+        )
+
+    async def fetch_widget_drilldown_cached(
+        self,
+        *,
+        widget_type: str,
+        link: str,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        title_field: str,
+        detail_fields: list[str],
+        aggregation: str,
+        sum_field: str | None = None,
+        filters: af.WidgetFilters | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+        count_field: str | None = None,
+        count_ignore_empty: bool = False,
+        group_field: str | None = None,
+        max_groups: int | None = None,
+        group: str | None = None,
+        other: bool = False,
+    ):
+        """The records behind a Metric widget's number, or behind one Chart
+        group, for the click-to-open drill-down modal.
+
+        Reads the SAME cached, unprojected `widget_rows` envelope
+        `fetch_widget_metric_cached` / `fetch_widget_chart_cached` aggregate
+        over, with the same fail-closed personalize gate, so the modal lists
+        exactly the rows the widget counted:
+
+        - Metric: every row, except that a Count with `count_ignore_empty`
+          drops rows whose `count_field` is empty (those were not counted).
+          `count_distinct` does NOT dedupe here — the owner chose "every
+          record" (2026-10-02), so the list may be longer than the number.
+        - Chart: rows whose `_chart_group_key` equals `group`; or, with
+          `other`, rows in every group `_rank_chart_groups` folded into
+          'Other' (each tagged with its own group). `other` is a separate
+          flag rather than `group="Other"` because a real group can carry
+          that label.
+
+        Rows are projected to the title field, the detail fields and (for
+        Sum) the summed field — nothing else reaches the viewer — then sorted
+        A–Z by title (empty last) and capped at
+        AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS (`truncated=True` past it).
+        Unlike the aggregates, a capped list is merely incomplete, not
+        wrong, so it is returned rather than refused.
+        """
+        from app.models.airtable import AirtableDrilldownRow, AirtableWidgetDrilldownResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        fields = [f for f in dict.fromkeys(detail_fields) if f and f != title_field]
+        if aggregation == "sum" and sum_field and sum_field != title_field and sum_field not in fields:
+            fields.append(sum_field)
+
+        def _empty(*, available: bool, personalize_blocked: bool):
+            return AirtableWidgetDrilldownResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                title_field=title_field,
+                fields=fields,
+                available=available,
+                personalize_blocked=personalize_blocked,
+            )
+
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            logger.warning(
+                "Airtable widget drill-down refused: personalization enabled but "
+                "not applicable (base=%s table=%s) — no rows returned",
+                base_id,
+                table_id,
+            )
+            return _empty(available=True, personalize_blocked=True)
+
+        is_chart = widget_type == AIRTABLE_CHART_WIDGET_TYPE
+        if is_chart and not group_field:
+            return _empty(available=False, personalize_blocked=False)
+
+        cache = get_cache_service()
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=widget_type,
+            link=link,
+            url=url,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope = await self._get_or_warm_widget_cache(
+            cache_key=cache_key,
+            url=url,
+            api_key=api_key,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+            patient=True,
+        )
+        if envelope is None:
+            return _empty(available=False, personalize_blocked=False)
+
+        rows = envelope["rows"]
+        if personalize_enabled:
+            rows = [
+                row
+                for row in rows
+                if ap.personalize_match(row.get(personalize_column), caller_email)
+            ]
+
+        group_of: dict[int, str] = {}
+        if is_chart:
+            if other:
+                _kept, other_keys, _totals, _counts = self._rank_chart_groups(
+                    rows=rows,
+                    group_field=group_field,
+                    aggregation=aggregation,
+                    sum_field=sum_field,
+                    max_groups=max_groups,
+                )
+                wanted = set(other_keys)
+                selected = []
+                for row in rows:
+                    key = self._chart_group_key(row.get(group_field))
+                    if key in wanted:
+                        group_of[id(row)] = key
+                        selected.append(row)
+                rows = selected
+            else:
+                rows = [
+                    row for row in rows
+                    if self._chart_group_key(row.get(group_field)) == (group or "")
+                ]
+        elif aggregation != "sum" and count_field and count_ignore_empty:
+            rows = [row for row in rows if self._dedupe_key(row.get(count_field)) is not None]
+
+        def _sort_key(row: dict[str, Any]) -> tuple[bool, str]:
+            label = self._chart_group_key(row.get(title_field))
+            return (label == "(Empty)", label.casefold())
+
+        rows = sorted(rows, key=_sort_key)
+        total_rows = len(rows)
+        cap = self._settings.AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS
+        truncated = total_rows > cap
+        if truncated:
+            rows = rows[:cap]
+
+        shown = [title_field, *fields]
+        result_rows = [
+            AirtableDrilldownRow(
+                id=str(row.get("id") or ""),
+                fields={f: row.get(f) for f in shown if row.get(f) is not None},
+                group=group_of.get(id(row)),
+            )
+            for row in rows
+        ]
+
+        field_types = await self.fetch_table_field_hints(
+            base_id=envelope["base_id"], table_id=envelope["table_id"], api_key=api_key
+        )
+
+        return AirtableWidgetDrilldownResponse(
+            base_id=envelope["base_id"],
+            table_id=envelope["table_id"],
+            view_id=envelope.get("view_id"),
+            title_field=title_field,
+            fields=fields,
+            field_types={f: t for f, t in field_types.items() if f in shown},
+            rows=result_rows,
+            total_rows=total_rows,
+            truncated=truncated,
+            available=True,
+            personalize_blocked=False,
         )
 
     async def warm_widget_cache(
