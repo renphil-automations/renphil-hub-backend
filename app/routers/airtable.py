@@ -47,6 +47,7 @@ from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.hub_user import HubUserV2
 from app.dependencies import (
     CurrentHubUser,
+    _ensure_hub_user,
     get_airtable_service,
     get_current_hub_user,
     get_current_user,
@@ -172,6 +173,7 @@ from app.services.access_visibility_service import (
     AccessDeniedError,
     ViewerAccess,
     granted_single_node,
+    resolve_viewer_access,
 )
 from app.services.airtable_service import AirtableService
 from app.services.edit_lock_service import EditSession
@@ -1164,6 +1166,93 @@ def _require_airtable_personal_identity(
         x_agent_context,
         x_agent_signature,
     )
+
+
+def _agent_acl_authorization_fingerprint(
+    *,
+    email: str,
+    is_admin: bool,
+    granted_node_keys: list[str],
+) -> str:
+    """Stable, non-secret cache partition for one live ACL decision."""
+
+    canonical = json.dumps(
+        {
+            "email": email,
+            "is_admin": is_admin,
+            "granted_node_keys": granted_node_keys,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_agent_granted_nodes(
+    db: Session,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the Agent's signed end-user identity through the Hub ACL fold.
+
+    The Agent authenticates with the shared sync token and a short-lived,
+    HMAC-bound user envelope. The database-backed Hub access graph remains the
+    authority for the resulting admin bypass or granted resource nodes.
+    """
+
+    email = str(identity["email"]).strip().lower()
+    roles = list(identity.get("roles") or [])
+    hub_user = _ensure_hub_user(db, email=email, name=email)
+    if hub_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to resolve the Agent user identity.",
+        )
+
+    current = CurrentHubUser(
+        info=UserInfo(email=email, name=hub_user.name or email, roles=roles),
+        hub_user_id=hub_user.id,
+        email=email,
+    )
+    closures = RbacClosures(db)
+    is_admin = is_hub_admin(db, current, closures=closures)
+
+    if is_admin:
+        granted_node_keys: list[str] = []
+    else:
+        access = resolve_viewer_access(
+            db,
+            current.hub_user_id,
+            is_admin=False,
+            closures=closures,
+        )
+        granted_node_keys = sorted(
+            f"{node_kind}:{node_id}"
+            for node_kind, node_id in (access.visibility.granted_view if access.visibility else set())
+        )
+
+    return {
+        "email": email,
+        "is_admin": is_admin,
+        "granted_node_keys": granted_node_keys,
+        "authorization_fingerprint": _agent_acl_authorization_fingerprint(
+            email=email,
+            is_admin=is_admin,
+            granted_node_keys=granted_node_keys,
+        ),
+    }
+
+
+@router.get(
+    "/agent/access/granted-nodes",
+    include_in_schema=False,
+)
+def get_agent_granted_nodes(
+    identity: dict[str, Any] = Depends(_require_airtable_personal_identity),
+    db: Session = Depends(get_db_v2),
+) -> dict[str, Any]:
+    """Return only the live Hub ACL inputs required by Agent retrieval."""
+
+    return _resolve_agent_granted_nodes(db, identity)
 
 
 

@@ -90,6 +90,53 @@ def test_airtable_index_sync_auth_uses_constant_time_compare():
     assert exc.value.status_code == 401
 
 
+def test_agent_granted_nodes_uses_live_admin_bypass_without_disclosing_nodes():
+    hub_user = SimpleNamespace(id=17, name="Test Admin")
+
+    with (
+        patch.object(airtable_router, "_ensure_hub_user", return_value=hub_user),
+        patch.object(airtable_router, "RbacClosures", return_value=object()),
+        patch.object(airtable_router, "is_hub_admin", return_value=True),
+    ):
+        payload = airtable_router._resolve_agent_granted_nodes(
+            object(),
+            {"email": "ADMIN@EXAMPLE.ORG", "roles": ["Hub Admin"]},
+        )
+
+    assert payload["email"] == "admin@example.org"
+    assert payload["is_admin"] is True
+    assert payload["granted_node_keys"] == []
+    assert len(payload["authorization_fingerprint"]) == 64
+
+
+def test_agent_granted_nodes_returns_sorted_live_grants_for_non_admin():
+    hub_user = SimpleNamespace(id=21, name="Member")
+    access = SimpleNamespace(
+        visibility=SimpleNamespace(
+            granted_view={("component", 11), ("tab", 3), ("component", 2)}
+        )
+    )
+
+    with (
+        patch.object(airtable_router, "_ensure_hub_user", return_value=hub_user),
+        patch.object(airtable_router, "RbacClosures", return_value=object()),
+        patch.object(airtable_router, "is_hub_admin", return_value=False),
+        patch.object(airtable_router, "resolve_viewer_access", return_value=access),
+    ):
+        payload = airtable_router._resolve_agent_granted_nodes(
+            object(),
+            {"email": "member@example.org", "roles": []},
+        )
+
+    assert payload["is_admin"] is False
+    assert payload["granted_node_keys"] == ["component:11", "component:2", "tab:3"]
+    assert payload["authorization_fingerprint"] == airtable_router._agent_acl_authorization_fingerprint(
+        email="member@example.org",
+        is_admin=False,
+        granted_node_keys=["component:11", "component:2", "tab:3"],
+    )
+
+
 def test_unpersonalized_table_returns_only_shared_filtered_rows():
     filters = [
         {
