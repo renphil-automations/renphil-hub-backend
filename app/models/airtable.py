@@ -162,7 +162,8 @@ class AirtableWidgetIndexSnapshotResponse(BaseModel):
     # NOT components.title) and its Count-dedupe settings, so the Agent can
     # describe the number correctly ("distinct organisations", not
     # "records"). The count settings are reported as stored even for Sum,
-    # where the computation ignores them.
+    # where the computation ignores them. Chart snapshots report the same
+    # three count fields (per-group dedupe), on every chart branch.
     metric_title: str | None = None
     count_field: str | None = None
     count_distinct: bool = False
@@ -331,6 +332,11 @@ class AirtableChartPreviewRequest(BaseModel):
     sumField: str | None = None
     maxGroups: int | None = None
     groupSort: str = "value_desc"
+    # Count-only dedupe, same names as the widget data (and the Metric's).
+    # Ignored for Sum and when countField equals groupField.
+    countField: str | None = None
+    countDistinct: bool = False
+    countIgnoreEmpty: bool = False
 
 
 class AirtableEditorPreviewRequest(BaseModel):

@@ -816,6 +816,11 @@ async def preview_airtable_component_chart(
         personalize_column=body.personalizeColumn,
         max_groups=body.maxGroups,
         group_sort=body.groupSort,
+        # The preview legitimately takes the UNSAVED dedupe settings from
+        # the body — same as every other field here.
+        count_field=(body.countField or "").strip() or None,
+        count_distinct=bool(body.countDistinct),
+        count_ignore_empty=bool(body.countIgnoreEmpty),
     )
 
 
@@ -889,6 +894,8 @@ async def get_airtable_component_chart(
         personalize_column=config.get("personalizeColumn"),
         max_groups=stored.get("maxGroups"),
         group_sort=stored.get("groupSort") or "value_desc",
+        # Stored data only, never the request — the Metric's own reader.
+        **_metric_count_options(stored),
     )
 
 
@@ -980,7 +987,9 @@ async def get_airtable_component_drilldown(
         for f in (raw_details if isinstance(raw_details, list) else [])
         if str(f or "").strip()
     ]
-    count_options = _metric_count_options(stored) if widget_type == "airtable_metric" else {}
+    # Both widget types: a Metric drops uncounted rows, a Chart also ranks
+    # 'Other' with the same dedupe its /chart response used.
+    count_options = _metric_count_options(stored)
 
     return await airtable_service.fetch_widget_drilldown_cached(
         widget_type=widget_type,
@@ -1001,6 +1010,7 @@ async def get_airtable_component_drilldown(
         max_groups=stored.get("maxGroups"),
         group=group if widget_type == "chart" else None,
         other=other if widget_type == "chart" else False,
+        count_distinct=bool(count_options.get("count_distinct")),
     )
 
 
@@ -1248,14 +1258,24 @@ async def get_airtable_component_index_snapshot(
             if name.strip() and name not in selected_columns:
                 selected_columns.append(name)
 
+    # Chart-only extras, reported on EVERY chart snapshot branch below: the
+    # stored Count-dedupe settings (as stored, even for Sum — same as the
+    # Metric's), so the Agent knows each bar is deduped.
+    chart_extras: dict[str, Any] = {}
+
     if widget_type == "chart":
-        chart_fields = [
-            str(stored.get("groupField") or "").strip(),
-        ]
-        if str(stored.get("aggregation") or "").strip().lower() == "sum":
+        chart_extras = _metric_count_options(stored)
+        group_name = str(stored.get("groupField") or "").strip()
+        chart_fields = [group_name]
+        chart_aggregation = str(stored.get("aggregation") or "").strip().lower()
+        if chart_aggregation == "sum":
             chart_fields.append(
                 str(stored.get("sumField") or "").strip()
             )
+        elif chart_extras["count_field"] and chart_extras["count_field"] != group_name:
+            # Count with a dedupe field: the Agent counts the indexed rows
+            # itself, so it needs the dedupe field's values too.
+            chart_fields.append(chart_extras["count_field"])
         for name in chart_fields:
             if name and name not in selected_columns:
                 selected_columns.append(name)
@@ -1301,6 +1321,8 @@ async def get_airtable_component_index_snapshot(
         "filters": filters,
         "personalize_enabled": personalize_enabled,
         "personalize_column": personalize_column,
+        # Empty for every non-chart widget (the Metric passes its own).
+        **chart_extras,
     }
 
     # Metric values are mutable structured facts. They remain a live-query

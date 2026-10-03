@@ -2043,6 +2043,22 @@ class AirtableService:
             personalize_column=None,
         )
 
+    @staticmethod
+    def _chart_count_field(
+        *, group_field: str | None, aggregation: str, count_field: str | None
+    ) -> str | None:
+        """The Chart's effective Count-dedupe field: None for Sum, and None
+        when it names the group-by field itself (owner decision 2026-10-03 —
+        the panel never offers that pairing, so stored data carrying it is
+        ignored rather than trusted). Shared by the chart aggregation and
+        the drill-down so both always agree on whether dedupe applies.
+        """
+        if aggregation == "sum" or not count_field:
+            return None
+        if count_field.strip() == (group_field or "").strip():
+            return None
+        return count_field
+
     def _rank_chart_groups(
         self,
         *,
@@ -2051,6 +2067,9 @@ class AirtableService:
         aggregation: str,
         sum_field: str | None,
         max_groups: int | None,
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
     ) -> tuple[list[str], list[str], dict[str, float], dict[str, int]]:
         """Group `rows` and split the group keys into kept and folded-into-
         'Other', returning `(kept_keys, other_keys, totals, counts)`.
@@ -2059,21 +2078,43 @@ class AirtableService:
         `_aggregate_chart_groups` (what the chart draws) and
         `fetch_widget_drilldown_cached` (the rows behind a clicked 'Other'),
         so a click can never list a different set of groups from the bar.
+
+        For Count, `counts[key]` is the group's Count VALUE: the record
+        count, or with a dedupe field the Metric's `_count_rows` over that
+        group's records — so ranking (and with it which groups fold into
+        'Other') uses the deduped values. A group whose deduped value is 0
+        stays and simply ranks last (owner decision 2026-10-03). Grouping
+        itself is unchanged: exact-match `_chart_group_key`.
         """
         totals: dict[str, float] = defaultdict(float)
         counts: dict[str, int] = defaultdict(int)
         order: list[str] = []
         seen: set[str] = set()
+        dedupe_field = self._chart_count_field(
+            group_field=group_field, aggregation=aggregation, count_field=count_field
+        )
+        dedupe = bool(dedupe_field and (count_distinct or count_ignore_empty))
+        members: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
             key = self._chart_group_key(row.get(group_field))
             if key not in seen:
                 seen.add(key)
                 order.append(key)
             counts[key] += 1
+            if dedupe:
+                members[key].append(row)
             if aggregation == "sum":
                 coerced = self._coerce_numeric(row.get(sum_field))
                 if coerced is not None:
                     totals[key] += coerced
+        if dedupe:
+            for key in order:
+                counts[key] = self._count_rows(
+                    members[key],
+                    count_field=dedupe_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
+                )
 
         def _value_for(key: str) -> float | int:
             return totals.get(key, 0.0) if aggregation == "sum" else counts.get(key, 0)
@@ -2107,6 +2148,9 @@ class AirtableService:
         max_groups: int | None,
         group_sort: str,
         partial: bool,
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
     ):
         """Steps 7-9 of the Chart widget's aggregation (plan §3.3): group,
         truncate-then-sort (L6), and total (L7), over an already-resolved
@@ -2119,6 +2163,14 @@ class AirtableService:
         (`af.widget_formula`) before the rows ever reach here. Sharing THIS
         half keeps a widget and its own preview computing groups identically
         (L1) without coupling the two different personalize mechanisms.
+
+        `count_field` / `count_distinct` / `count_ignore_empty` (Count only)
+        dedupe each group with the Metric's `_count_rows` — see
+        `_rank_chart_groups`. 'Other' is ONE group: its value is
+        `_count_rows` over every folded group's records together, so a value
+        present in several folded groups counts once there and 'Other' no
+        longer equals the sum of the folded values (owner decision
+        2026-10-03). With dedupe off this is exactly the old record sum.
         """
         from app.models.airtable import AirtableChartGroup, AirtableWidgetChartResponse
 
@@ -2128,7 +2180,14 @@ class AirtableService:
             aggregation=aggregation,
             sum_field=sum_field,
             max_groups=max_groups,
+            count_field=count_field,
+            count_distinct=count_distinct,
+            count_ignore_empty=count_ignore_empty,
         )
+        dedupe_field = self._chart_count_field(
+            group_field=group_field, aggregation=aggregation, count_field=count_field
+        )
+        dedupe = bool(dedupe_field and (count_distinct or count_ignore_empty))
 
         def _value_for(key: str) -> float | int:
             return totals.get(key, 0.0) if aggregation == "sum" else counts.get(key, 0)
@@ -2140,11 +2199,22 @@ class AirtableService:
 
         other_group_count = len(other_keys)
         if other_keys:
-            other_value: float | int = (
-                sum(totals.get(k, 0.0) for k in other_keys)
-                if aggregation == "sum"
-                else sum(counts.get(k, 0) for k in other_keys)
-            )
+            other_value: float | int
+            if aggregation == "sum":
+                other_value = sum(totals.get(k, 0.0) for k in other_keys)
+            elif dedupe:
+                folded = set(other_keys)
+                other_value = self._count_rows(
+                    [
+                        row for row in rows
+                        if self._chart_group_key(row.get(group_field)) in folded
+                    ],
+                    count_field=dedupe_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
+                )
+            else:
+                other_value = sum(counts.get(k, 0) for k in other_keys)
             kept.append(AirtableChartGroup(label="Other", value=other_value, is_other=True))
 
         # Now apply the admin's display sort to the KEPT groups only —
@@ -2158,9 +2228,10 @@ class AirtableService:
         groups = real_groups + other_group
 
         # L7 — the % denominator includes 'Other', so the caller's displayed
-        # labels sum to 100%. Equal by construction to the pre-truncation
-        # total minus nothing: every row landed in exactly one kept-or-Other
-        # bucket.
+        # labels sum to 100%: percentages are shares of the summed drawn
+        # values. Without dedupe that equals the record total (every row
+        # landed in exactly one kept-or-Other bucket); with dedupe a value
+        # may legitimately count in several bars, so it need not.
         total = sum(g.value for g in groups)
 
         return AirtableWidgetChartResponse(
@@ -2193,11 +2264,19 @@ class AirtableService:
         personalize_column: str | None = None,
         max_groups: int | None = None,
         group_sort: str = "value_desc",
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
     ):
         """Grouped Count/Sum aggregation for a dashboard Airtable Chart
         widget — one aggregate PER GROUP, over the SAME cached `widget_rows`
         envelope `fetch_widget_metric_cached` uses (see
         `_chart_cache_fingerprint`). No new caching mechanism.
+
+        The Count-dedupe kwargs apply per group AFTER personalisation (see
+        `_aggregate_chart_groups`). Like the Metric's, they stay out of the
+        cache fingerprint: the walk fetches every field, so any dedupe field
+        is already in the cached rows.
 
         Same "no partial aggregate" stance as the Metric widget:
         `available=False` on an oversized/uncacheable table rather than a
@@ -2295,6 +2374,9 @@ class AirtableService:
             max_groups=max_groups,
             group_sort=group_sort,
             partial=False,
+            count_field=count_field,
+            count_distinct=count_distinct,
+            count_ignore_empty=count_ignore_empty,
         )
 
     async def fetch_widget_drilldown_cached(
@@ -2318,6 +2400,7 @@ class AirtableService:
         max_groups: int | None = None,
         group: str | None = None,
         other: bool = False,
+        count_distinct: bool = False,
     ):
         """The records behind a Metric widget's number, or behind one Chart
         group, for the click-to-open drill-down modal.
@@ -2335,7 +2418,13 @@ class AirtableService:
           `other`, rows in every group `_rank_chart_groups` folded into
           'Other' (each tagged with its own group). `other` is a separate
           flag rather than `group="Other"` because a real group can carry
-          that label.
+          that label. 'Other' is ranked with the chart's own Count-dedupe
+          settings, so it folds the same groups the chart did. A Count with
+          an effective dedupe field (`_chart_count_field`) and
+          `count_ignore_empty` also drops rows whose dedupe field is empty —
+          "only counted records" (owner, 2026-10-03), as for the Metric; a
+          0-value group therefore opens an empty list. `count_distinct`
+          still lists every record.
 
         Rows are projected to the title field, the detail fields and (for
         Sum) the summed field — nothing else reaches the viewer — then sorted
@@ -2422,6 +2511,9 @@ class AirtableService:
                     aggregation=aggregation,
                     sum_field=sum_field,
                     max_groups=max_groups,
+                    count_field=count_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
                 )
                 wanted = set(other_keys)
                 selected = []
@@ -2435,6 +2527,14 @@ class AirtableService:
                 rows = [
                     row for row in rows
                     if self._chart_group_key(row.get(group_field)) == (group or "")
+                ]
+            chart_dedupe_field = self._chart_count_field(
+                group_field=group_field, aggregation=aggregation, count_field=count_field
+            )
+            if chart_dedupe_field and count_ignore_empty:
+                rows = [
+                    row for row in rows
+                    if self._dedupe_key(row.get(chart_dedupe_field)) is not None
                 ]
         elif aggregation != "sum" and count_field and count_ignore_empty:
             rows = [row for row in rows if self._dedupe_key(row.get(count_field)) is not None]
@@ -2854,9 +2954,14 @@ class AirtableService:
         personalize_column: str | None = None,
         max_groups: int | None = None,
         group_sort: str = "value_desc",
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
     ):
         """Editor preview for a Chart widget's in-progress settings (decision
-        3, plan §3.4). Two paths, chosen by what the caller could supply:
+        3, plan §3.4). Two paths, chosen by what the caller could supply
+        (both apply the unsaved Count-dedupe settings — the live path reads
+        every field, so the dedupe field is present there too):
 
         * **Cached path** — `link` was resolved (so the widget's own stored
           token/URL are in play) AND the cache is enabled. A READ-ONLY
@@ -2946,6 +3051,9 @@ class AirtableService:
                     max_groups=max_groups,
                     group_sort=group_sort,
                     partial=False,
+                    count_field=count_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
                 )
 
         # Live capped path — no warmed entry to read. One Airtable call,
@@ -3007,6 +3115,9 @@ class AirtableService:
             max_groups=max_groups,
             group_sort=group_sort,
             partial=True,
+            count_field=count_field,
+            count_distinct=count_distinct,
+            count_ignore_empty=count_ignore_empty,
         )
 
     async def preview_from_url(
