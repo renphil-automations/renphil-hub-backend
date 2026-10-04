@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.hub_user import HubUserV2
@@ -257,6 +258,42 @@ def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
         }
         for u in users
     ]
+
+
+def create_hub_user(db: Session, *, email: str, name: str) -> dict:
+    """Admin pre-registration of a `hub_users` row (owner decision,
+    2026-10-04) — the row that lets an external (non-org-domain) email pass
+    `AuthService._enforce_login_allowed`. Same email normalization as
+    `_ensure_hub_user`. Flushes but does not commit; the router commits.
+
+    Raises `RbacGraphError("hub_user_exists")` for an email that already has
+    a row, whether found by the pre-check or by the UNIQUE constraint in a
+    concurrent-insert race (the caller must roll back in that case).
+    """
+    normalized = email.strip().lower()
+    if db.query(HubUserV2.id).filter(HubUserV2.email == normalized).first() is not None:
+        raise RbacGraphError(
+            "hub_user_exists",
+            f"A user with email {normalized} already exists.",
+            email=normalized,
+        )
+    user = HubUserV2(email=normalized, name=name, is_active=True, created_at=_utc_now())
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise RbacGraphError(
+            "hub_user_exists",
+            f"A user with email {normalized} already exists.",
+            email=normalized,
+        ) from exc
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "is_active": user.is_active,
+        "assignments": [],
+    }
 
 
 def _assert_update_does_not_remove_last_hub_admin(

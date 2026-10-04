@@ -62,7 +62,7 @@ async def callback(
     redirects to the frontend with the JWT and roles.
     """
     token_response, frontend_redirect_uri = await auth_service.handle_callback(
-        code, state, airtable_service
+        code, state, airtable_service, db
     )
 
     # findings_dev_login_live_testing_2026-09-12.md #1: the frontend never
