@@ -67,7 +67,7 @@ RESERVED_NAV_SLUGS = frozenset(
         "auth",
         "aixscience",
         "profile",
-        "fundraising",
+        "fundraising-stats",
         "tracking",
         "tracking-airtable",
         "tickets",
