@@ -85,6 +85,7 @@ from app.schemas.resource_grants import (
 from app.services import edit_lock_service, rbac_service
 from app.services import resource_grant_service as grants
 from app.services.resource_grant_search_updates import affected_component_search_updates
+from app.services.content_link_registry import mark_components_acl_refresh
 from app.services.access_visibility_service import (
     build_node_tree,
     compute_visibility,
@@ -478,12 +479,14 @@ def create_grant(
         )
     except RbacGraphError as e:
         raise _conflict(e)
+    search_updates = affected_component_search_updates(
+        db, node_kind=request.node_kind, node_id=request.node_id
+    )
+    mark_components_acl_refresh(db, (item["component_id"] for item in search_updates))
     db.commit()
     return {
         "data": grant,
-        "search_updates": affected_component_search_updates(
-            db, node_kind=request.node_kind, node_id=request.node_id
-        ),
+        "search_updates": search_updates,
     }
 
 
@@ -539,6 +542,10 @@ async def update_grant(
         raise _conflict(e)
     if updated is None:
         raise HTTPException(status_code=404, detail="Grant not found")
+    search_updates = affected_component_search_updates(
+        db, node_kind=grant["node_kind"], node_id=grant["node_id"]
+    )
+    mark_components_acl_refresh(db, (item["component_id"] for item in search_updates))
     db.commit()
     if grant["level"] == "edit" and request.level == "view":
         try:
@@ -599,6 +606,10 @@ async def delete_grant(
         grants.delete_grant(db, grant_id)
     except RbacGraphError as e:
         raise _conflict(e)
+    search_updates = affected_component_search_updates(
+        db, node_kind=node_kind, node_id=node_id
+    )
+    mark_components_acl_refresh(db, (item["component_id"] for item in search_updates))
     db.commit()
     # Same gap rbac_assignments.py's delete_assignment/update_assignment_admin
     # close — a user edited mid-session, then revoked here via a grant
@@ -610,7 +621,5 @@ async def delete_grant(
     except Exception:
         pass
     return {
-        "search_updates": affected_component_search_updates(
-            db, node_kind=node_kind, node_id=node_id
-        )
+        "search_updates": search_updates
     }
