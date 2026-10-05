@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, StrictStr, field_validator
 
 from app.schemas.tab import StrictRequestModel
 
@@ -96,6 +96,30 @@ class HubUserAdminResponse(BaseModel):
 
 class HubUserAdminListAPIResponse(BaseModel):
     data: list[HubUserAdminResponse] = Field(default_factory=list)
+
+
+class HubUserAdminAPIResponse(BaseModel):
+    data: HubUserAdminResponse
+
+
+class CreateHubUserRequest(StrictRequestModel):
+    """Admin pre-registration of a person (owner decision, 2026-10-04). The
+    main reason this exists is to let someone OUTSIDE the org email domains
+    sign in: `AuthService._enforce_login_allowed` admits any email that
+    already has a `hub_users` row. `name` is required (owner decision) —
+    sign-in never overwrites an existing row's name, so a row created
+    without one would stay nameless forever."""
+
+    email: EmailStr
+    name: StrictStr = Field(min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("name must not be blank")
+        return stripped
 
 
 class UpdateAssignmentRequest(StrictRequestModel):
