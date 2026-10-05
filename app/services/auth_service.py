@@ -68,7 +68,10 @@ class AuthService:
 
         auth_url, state = flow.authorization_url(
             access_type="offline",
-            prompt="consent",
+            # select_account renders the account chooser; without it Google can
+            # route users to "add a Google account" and reject an account that
+            # already exists on the device. consent keeps the refresh token.
+            prompt="select_account consent",
             code_challenge=code_challenge,
             code_challenge_method="S256",
         )
