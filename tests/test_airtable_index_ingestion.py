@@ -257,6 +257,10 @@ def test_metric_is_config_only_and_never_returns_live_value():
                 "description": "Active Member",
                 "note": "Dashboard count",
                 "url": "https://example.com",
+                "title": " Organisations Reached ",
+                "countField": "Organisation",
+                "countDistinct": True,
+                "countIgnoreEmpty": True,
             },
         ),
         service,
@@ -267,6 +271,10 @@ def test_metric_is_config_only_and_never_returns_live_value():
     assert result.metric_description == "Active Member"
     assert result.metric_note == "Dashboard count"
     assert result.metric_url == "https://example.com"
+    assert result.metric_title == "Organisations Reached"
+    assert result.count_field == "Organisation"
+    assert result.count_distinct is True
+    assert result.count_ignore_empty is True
 
     assert result.rows == []
     assert result.row_data_included is False
@@ -278,6 +286,29 @@ def test_metric_is_config_only_and_never_returns_live_value():
     assert "SAFE_TEST_PAT" not in repr(dumped)
 
     service.fetch_widget_index_rows.assert_not_awaited()
+
+
+def test_metric_snapshot_count_options_default_when_unset():
+    service = SimpleNamespace(
+        fetch_widget_index_rows=AsyncMock(
+            side_effect=AssertionError(
+                "Metric ingestion must not fetch rows"
+            )
+        )
+    )
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="airtable_metric",
+            data={"filters": [], "aggregation": "count", "countField": "  "},
+        ),
+        service,
+    )
+
+    assert result.metric_title is None
+    assert result.count_field is None
+    assert result.count_distinct is False
+    assert result.count_ignore_empty is False
 
 
 def test_unpersonalized_missing_pat_is_unavailable_not_empty_authority():
@@ -334,6 +365,10 @@ def test_chart_uses_complete_shared_index_rows_and_only_required_fields():
                 "aggregation": "sum",
                 "sumField": "Earnings",
                 "filters": [],
+                # Stale Count settings under Sum: reported as stored, but
+                # the dedupe field is NOT indexed (Sum ignores it).
+                "countField": "Program",
+                "countDistinct": True,
             },
         ),
         service,
@@ -344,8 +379,146 @@ def test_chart_uses_complete_shared_index_rows_and_only_required_fields():
     assert result.row_data_included is True
     assert result.available is True
     assert result.fields == ["Location", "Earnings"]
+    assert result.count_field == "Program"
+    assert result.count_distinct is True
+    assert result.count_ignore_empty is False
 
     kwargs = service.fetch_widget_index_rows.await_args.kwargs
     assert kwargs["selected_columns"] == ["Location", "Earnings"]
     assert kwargs["filters"] is None
     assert "SAFE_TEST_PAT" not in repr(result.model_dump())
+
+
+def _chart_index_service():
+    return SimpleNamespace(
+        fetch_widget_index_rows=AsyncMock(
+            return_value=SimpleNamespace(
+                fields=["Status", "Program"],
+                rows=[{"id": "rec-safe", "Status": "Todo", "Program": "P"}],
+                available=True,
+            )
+        )
+    )
+
+
+def test_chart_count_dedupe_indexes_the_dedupe_field_and_reports_settings():
+    service = _chart_index_service()
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="chart",
+            data={
+                "groupField": "Status",
+                "aggregation": "count",
+                "countField": " Program ",
+                "countDistinct": True,
+                "countIgnoreEmpty": True,
+                "filters": [],
+            },
+        ),
+        service,
+    )
+
+    kwargs = service.fetch_widget_index_rows.await_args.kwargs
+    assert kwargs["selected_columns"] == ["Status", "Program"]
+    assert result.count_field == "Program"
+    assert result.count_distinct is True
+    assert result.count_ignore_empty is True
+
+
+def test_chart_count_without_dedupe_field_indexes_only_the_group():
+    service = _chart_index_service()
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="chart",
+            data={"groupField": "Status", "aggregation": "count", "filters": []},
+        ),
+        service,
+    )
+
+    kwargs = service.fetch_widget_index_rows.await_args.kwargs
+    assert kwargs["selected_columns"] == ["Status"]
+    assert result.count_field is None
+    assert result.count_distinct is False
+    assert result.count_ignore_empty is False
+
+
+def test_chart_dedupe_field_equal_to_group_is_not_indexed_twice():
+    service = _chart_index_service()
+
+    _run_snapshot(
+        _bundle(
+            widget_type="chart",
+            data={
+                "groupField": "Status",
+                "aggregation": "count",
+                "countField": "Status",
+                "countDistinct": True,
+                "filters": [],
+            },
+        ),
+        service,
+    )
+
+    kwargs = service.fetch_widget_index_rows.await_args.kwargs
+    assert kwargs["selected_columns"] == ["Status"]
+
+
+def test_personalized_chart_snapshot_still_reports_dedupe_settings():
+    service = SimpleNamespace(
+        fetch_widget_index_rows=AsyncMock(
+            side_effect=AssertionError(
+                "Personalized ingestion must not fetch rows"
+            )
+        )
+    )
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="chart",
+            personalize_enabled=True,
+            data={
+                "groupField": "Status",
+                "aggregation": "count",
+                "countField": "Program",
+                "countIgnoreEmpty": True,
+                "filters": [],
+            },
+        ),
+        service,
+    )
+
+    assert result.reason == "personalized_live_only"
+    assert result.fields == ["Status", "Program"]
+    assert result.count_field == "Program"
+    assert result.count_distinct is False
+    assert result.count_ignore_empty is True
+    service.fetch_widget_index_rows.assert_not_awaited()
+
+
+def test_chart_without_pat_still_reports_dedupe_settings():
+    service = SimpleNamespace(
+        fetch_widget_index_rows=AsyncMock(
+            side_effect=AssertionError("Missing PAT must not fetch rows")
+        )
+    )
+
+    result = _run_snapshot(
+        _bundle(
+            widget_type="chart",
+            pat=None,
+            data={
+                "groupField": "Status",
+                "aggregation": "count",
+                "countField": "Program",
+                "countDistinct": True,
+                "filters": [],
+            },
+        ),
+        service,
+    )
+
+    assert result.reason == "source_credentials_unavailable"
+    assert result.count_field == "Program"
+    assert result.count_distinct is True

@@ -78,11 +78,20 @@ DATABASE_URL_V2 = _resolve_database_url_v2()
 # the next query fails with ``server closed the connection unexpectedly``.
 # ``pool_recycle`` proactively refreshes connections older than the value.
 # Mirrors the primary engine's config in ``app.database`` — this v2 engine is a
-# fully separate connection pool and needs the same safeguards independently.
+# fully separate connection pool and needs the same safeguards independently,
+# including the larger pool size (shared DB_POOL_* env vars) that keeps
+# concurrent authenticated requests from exhausting the default 5+10 pool.
+_pool_size = int(os.getenv("DB_POOL_SIZE", "20"))
+_max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "40"))
+_pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+
 engine_v2 = create_engine(
     DATABASE_URL_V2,
     pool_pre_ping=True,
     pool_recycle=300,
+    pool_size=_pool_size,
+    max_overflow=_max_overflow,
+    pool_timeout=_pool_timeout,
     connect_args={"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30,
                   "keepalives_interval": 10, "keepalives_count": 3},
 )

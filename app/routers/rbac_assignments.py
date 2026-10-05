@@ -37,6 +37,8 @@ from app.schemas.rbac_assignments import (
     AssignmentAPIResponse,
     AssignmentListAPIResponse,
     CreateAssignmentRequest,
+    CreateHubUserRequest,
+    HubUserAdminAPIResponse,
     HubUserAdminListAPIResponse,
     HubUserListAPIResponse,
     UpdateAssignmentRequest,
@@ -365,6 +367,38 @@ def list_hub_users_admin(db: Session = Depends(get_db_v2)):
     admin can find and assign those people, not just search for ones who
     already hold something."""
     return {"data": rbac_assignment_service.list_all_hub_users_with_assignments(db)}
+
+
+@router.post(
+    "/admin/hub-users",
+    response_model=HubUserAdminAPIResponse,
+    status_code=201,
+    summary="Pre-register a hub user by email + name (Hub Admin only)",
+    responses={
+        409: {"description": "A hub user with this email already exists"},
+        **FORBIDDEN_RESPONSE,
+    },
+    dependencies=ADMIN_ONLY,
+)
+def create_hub_user_admin(
+    request: CreateHubUserRequest,
+    db: Session = Depends(get_db_v2),
+):
+    """Owner decision, 2026-10-04: lets an admin add someone OUTSIDE the org
+    email domains so they can sign in — `AuthService._enforce_login_allowed`
+    admits any email with a `hub_users` row (Airtable Access Control remains
+    a fallback until cutover). Org-domain emails are accepted too: they
+    could sign in anyway, and pre-registering them lets an admin assign
+    roles before their first login."""
+    try:
+        created = rbac_assignment_service.create_hub_user(
+            db, email=str(request.email), name=request.name
+        )
+    except RbacGraphError as e:
+        db.rollback()
+        raise _conflict(e)
+    db.commit()
+    return {"data": created}
 
 
 @router.patch(
