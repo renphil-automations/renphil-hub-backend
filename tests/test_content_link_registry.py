@@ -56,6 +56,7 @@ class ContentLinkRegistryTests(unittest.TestCase):
         rows = self.db.query(ContentLinkV2).order_by(ContentLinkV2.normalized_url).all()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0].normalized_url, "https://docs.google.com/document/d/abc/edit")
+        self.assertTrue(all(row.resource_type == "Pending detection" for row in rows))
         self.assertEqual(self.db.query(ComponentLinkMapV2).count(), 2)
         self.assertEqual(mark_component_links_deleted(self.db, self.component.id), 2)
         self.db.flush()
@@ -114,6 +115,27 @@ class ContentLinkRegistryTests(unittest.TestCase):
         }
         self.assertNotIn("https://hub.example/dashboard/finance", urls)
         self.assertIn("https://external.example/reference.pdf", urls)
+
+    def test_component_sync_preserves_worker_detection(self) -> None:
+        sync_component_links(self.db, self.component)
+        self.db.flush()
+        link = (
+            self.db.query(ContentLinkV2)
+            .filter_by(normalized_url="https://example.org/guide.pdf")
+            .one()
+        )
+        link.provider = "Google Drive"
+        link.resource_type = "PDF"
+        self.db.flush()
+
+        self.component.description = "https://example.org/guide.pdf#updated"
+        sync_component_links(self.db, self.component)
+        self.db.flush()
+        self.db.expire_all()
+
+        persisted = self.db.query(ContentLinkV2).filter_by(id=link.id).one()
+        self.assertEqual(persisted.provider, "Google Drive")
+        self.assertEqual(persisted.resource_type, "PDF")
 
     def test_acl_refresh_marks_only_active_links_for_affected_components(self) -> None:
         sync_component_links(self.db, self.component)
