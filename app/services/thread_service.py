@@ -700,14 +700,21 @@ _EXCERPT_INPUT_BOUND = 400
 _EXCERPT_OUTPUT_LENGTH = 200
 
 # plan §4.8 rule 2 — linear, non-backtracking patterns only: character-class
-# deletion and anchored line-leading forms. No nested quantifiers, no
-# backreferences, no alternation over `.*`. This deliberately does NOT parse
-# markdown — a `[text](url)` link strips to `texturl`, and that is accepted
-# cosmetic loss ("losing the nuance of link-title syntax costs nothing" —
-# plan §4.8), not a bug to fix here.
+# deletion, negated-class spans and anchored line-leading forms. No nested
+# quantifiers, no backreferences, no alternation over `.*`. This still does
+# NOT parse markdown in general; the one construct it does recognize is an
+# inline link `[text](url)` (and the `:color[text]{…}` directive, same
+# shape), because stripping its brackets glued label and URL together
+# (`websitehttps://…`, 2026-10-06 owner report). Every span below is a
+# negated class bounded by its own closing delimiter, so it stays linear.
 _EXCERPT_LINE_LEADING_RE = re.compile(r"^[ \t]*(?:[-+*]|\d+\.)[ \t]+", re.MULTILINE)
 _EXCERPT_MARKDOWN_CHARS_RE = re.compile(r"[*_`~#>\[\]()]+")
 _EXCERPT_WHITESPACE_RE = re.compile(r"\s+")
+# Group 1 is the visible label of either form; the URL / directive
+# attributes are never shown in a preview.
+_EXCERPT_INLINE_LINK_RE = re.compile(
+    r"(?::color)?\[([^\[\]\n]*)\](?:\([^()\s]*\)|\{[^{}\n]*\})"
+)
 
 
 def generate_notification_excerpt(content: str) -> str:
@@ -717,14 +724,86 @@ def generate_notification_excerpt(content: str) -> str:
     slicing already operates on code points, not bytes or UTF-16 units
     (same unit as §4.2 throughout), so bounding and the final trim are both
     "on a code-point boundary" for free — no separate handling needed to
-    avoid corrupting a multi-code-point sequence."""
+    avoid corrupting a multi-code-point sequence.
+
+    Links keep only their label (`[website](https://…)` -> `website`)."""
     bounded = (content or "")[:_EXCERPT_INPUT_BOUND]
     stripped = _EXCERPT_LINE_LEADING_RE.sub("", bounded)
+    stripped = _EXCERPT_INLINE_LINK_RE.sub(r"\1", stripped)
     stripped = _EXCERPT_MARKDOWN_CHARS_RE.sub("", stripped)
     collapsed = _EXCERPT_WHITESPACE_RE.sub(" ", stripped).strip()
     if len(collapsed) <= _EXCERPT_OUTPUT_LENGTH:
         return collapsed
     return collapsed[:_EXCERPT_OUTPUT_LENGTH].rstrip() + "…"
+
+
+# The thread-card preview (2026-10-06): unlike the panel excerpt above this
+# one IS rendered as markdown (ThreadWidget / PendingThreadCard), so inline
+# syntax — links, emphasis, code, `:color` — is KEPT and only block syntax
+# is flattened into one line. Same safety rules (bound first, linear
+# patterns only). The input bound is larger than the panel's because the
+# URLs it now keeps don't count toward the visible length.
+_PREVIEW_INPUT_BOUND = 1500
+_PREVIEW_BLOCK_LINE_RE = re.compile(
+    r"^[ \t]*(?:```|~~~)[^\n]*$|^[ \t]*(?:---+|\*\*\*+|___+)[ \t]*$", re.MULTILINE
+)
+_PREVIEW_LINE_LEADING_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}|>+|[-+*]|\d+\.)[ \t]+", re.MULTILINE
+)
+# Paired inline markers a cut can leave unclosed — an odd count would render
+# the marker literally, so the last one is dropped.
+_PREVIEW_PAIRED_MARKERS = ("**", "~~", "`")
+
+
+def generate_preview_excerpt(content: str) -> str:
+    """Markdown-preserving card preview: block syntax flattened, inline
+    syntax kept, at most `_EXCERPT_OUTPUT_LENGTH` VISIBLE characters (a
+    link counts only its label). A link is never cut in half: it is either
+    kept whole or left out, and a trailing partial link left by the input
+    bound is dropped rather than shown as raw `[label](ht…`."""
+    raw = content or ""
+    bounded = raw[:_PREVIEW_INPUT_BOUND]
+    input_cut = len(raw) > _PREVIEW_INPUT_BOUND
+    flat = _PREVIEW_BLOCK_LINE_RE.sub("", bounded)
+    flat = _PREVIEW_LINE_LEADING_RE.sub("", flat)
+    flat = _EXCERPT_WHITESPACE_RE.sub(" ", flat).strip()
+
+    budget = _EXCERPT_OUTPUT_LENGTH
+    parts: list[str] = []
+    visible = 0
+    pos = 0
+    cut = False
+    for match in _EXCERPT_INLINE_LINK_RE.finditer(flat):
+        text = flat[pos:match.start()]
+        if visible + len(text) >= budget:
+            parts.append(text[: budget - visible])
+            cut = True
+            break
+        parts.append(text)
+        visible += len(text) + len(match.group(1))
+        parts.append(match.group(0))
+        pos = match.end()
+    else:
+        tail = flat[pos:]
+        if input_cut and "[" in tail:
+            # No complete link remains in `tail`, so a `[` here is most
+            # likely a link the input bound sliced through.
+            tail = tail[: tail.rfind("[")]
+        if visible + len(tail) > budget:
+            tail = tail[: budget - visible]
+            cut = True
+        parts.append(tail)
+        cut = cut or input_cut
+
+    excerpt = "".join(parts).rstrip()
+    outside_links = _EXCERPT_INLINE_LINK_RE.sub("", excerpt)
+    for marker in _PREVIEW_PAIRED_MARKERS:
+        if outside_links.count(marker) % 2:
+            idx = excerpt.rfind(marker)
+            excerpt = excerpt[:idx] + excerpt[idx + len(marker):]
+            outside_links = _EXCERPT_INLINE_LINK_RE.sub("", excerpt)
+    excerpt = excerpt.rstrip()
+    return excerpt + "…" if cut else excerpt
 
 
 def _notify_mentions(
@@ -1210,10 +1289,11 @@ def _to_thread_summary(
         edited_at=thread.edited_at,
         my_vote=my_vote,
         mentions=thread.mentions or [],
-        # Same generator notifications already use (plan §4.8) — `thread.content`
-        # is already loaded on this row regardless (ThreadV2 has no deferred
-        # columns), so this costs no extra query, only a few CPU cycles.
-        content_excerpt=generate_notification_excerpt(thread.content),
+        # The markdown-preserving card preview (links keep their syntax so the
+        # card renders them like the modal does) — NOT the plain-text panel
+        # excerpt. `thread.content` is already loaded on this row regardless
+        # (ThreadV2 has no deferred columns), so this costs no extra query.
+        content_excerpt=generate_preview_excerpt(thread.content),
         pending_revision_count=pending_revision_count,
     )
 

@@ -234,13 +234,14 @@ class ThreadSummary(BaseModel):
     # response shape that DOES render markdown (ThreadDetail, via
     # inheritance) gets them without a second field declaration.
     mentions: list[MentionEntry] = Field(default_factory=list)
-    # Bounded, markdown-stripped preview for the list row's "read without
-    # opening the thread" card (2026-08-20 UI pass). Built the SAME way as a
-    # notification's own `excerpt` — `thread_service.generate_notification_excerpt`,
-    # reused rather than duplicated — deliberately NOT the full `content`
+    # Bounded preview for the list row's "read without opening the thread"
+    # card (2026-08-20 UI pass) — deliberately NOT the full `content`
     # ThreadDetail carries: the list endpoint still never sends a page of
-    # full markdown bodies (plan §4.1), it just now also sends a short,
-    # already-plain-text snippet of each one.
+    # full markdown bodies (plan §4.1). Since 2026-10-06 it is
+    # `thread_service.generate_preview_excerpt`: block syntax flattened but
+    # INLINE markdown (links, emphasis, code) kept, so the card can render
+    # links like the modal does. Revisions and notifications still use the
+    # plain-text `generate_notification_excerpt`.
     content_excerpt: str = ""
     # plan_thread_edit_versioning_2026-09-22.md §3/§4.4 — how many staged
     # edits this thread has awaiting review, SCOPED server-side: non-zero
