@@ -58,6 +58,7 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.page_content import PageContentV2
 from app.services import edit_lock_service
+from app.services.content_link_registry import mark_component_links_deleted, sync_component_links
 from app.services.access_visibility_service import (
     NodeRef,
     ViewerAccess,
@@ -435,6 +436,9 @@ def update_sbn_content(
         if is_childless_root and block_content:
             overview = _create_overview_leaf(db, component, block_content, order=0)
             _drop_root_content(db, component)
+            db.flush()
+            sync_component_links(db, component)
+            sync_component_links(db, overview)
             db.commit()
             # The root is now an empty container; its content lives in the
             # freshly-created "Overview" child (surfaced via /workspace).
@@ -451,6 +455,8 @@ def update_sbn_content(
         # Every SBN node's content is a plain BlockNote doc (Block[]) — the
         # user's confirmed scope narrowing (no rich per-sub-tab canvas yet).
         _write_component_data(db, component, {"content": content})
+        db.flush()
+        sync_component_links(db, component)
         db.commit()
 
         response = get_sbn_content(db, link)
@@ -545,6 +551,8 @@ def create_sbn_node(
         db.add(new_component)
         db.flush()
         _write_component_data(db, new_component, {"content": content or []})
+        db.flush()
+        sync_component_links(db, new_component)
 
         db.commit()
         response = _format_sbn_summary(db, new_component)
@@ -599,6 +607,9 @@ def update_sbn_node(
         if order is not None:
             component.props = {**_sbn_props(component), "order": order}
 
+        if title is not None or access_control is not None:
+            db.flush()
+            sync_component_links(db, component)
         db.commit()
         response = get_sbn_workspace(db, link)
         # SBN order is UI-only. Title and component access are indexed.
@@ -856,6 +867,7 @@ def delete_sbn_subtree(
             if node is None:
                 continue
             deleted.append({"id": node.id, "documentId": node.link, "title": node.title})
+            mark_component_links_deleted(db, node.id)
             if node.page_content_id is not None:
                 page_content = db.query(PageContentV2).filter(PageContentV2.id == node.page_content_id).first()
                 if page_content is not None:

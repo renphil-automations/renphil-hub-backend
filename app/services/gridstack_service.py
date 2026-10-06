@@ -42,6 +42,7 @@ from app.services.access_visibility_service import (
     resolve_gridstack_parent_node,
 )
 from app.services.tab_service import DEFAULT_ACCESS_CONTROL
+from app.services.content_link_registry import mark_component_links_deleted, sync_component_links
 
 
 # ---------------------------------------------------------
@@ -1330,6 +1331,8 @@ def update_airtable_component_config(
             component.access_control = access_control
 
         _write_component_data(db, component, data)
+        db.flush()
+        sync_component_links(db, component)
         db.commit()
 
         config = get_airtable_component_config(db, link)
@@ -1537,6 +1540,8 @@ def update_component_content(
 
         db.flush()
         changed = before_signature != _component_persistence_signature(db, component)
+        if changed:
+            sync_component_links(db, component)
         db.commit()
 
         response: dict[str, Any] = {
@@ -2352,8 +2357,10 @@ def update_tab_content_v2(
                     )
                     if descendant is None:
                         continue
+                    mark_component_links_deleted(db, descendant.id)
                     _delete_component_and_page_content(db, descendant)
                     db.flush()
+                mark_component_links_deleted(db, component.id)
                 _delete_component_and_page_content(db, component)
                 db.flush()
                 del existing_components[existing_id]
@@ -2648,6 +2655,18 @@ def update_tab_content_v2(
             tab = _get_root_tab(db, gridstack)
             if tab is not None:
                 tab.updated_at = _utc_now()
+
+        # Every upsert receipt corresponds to newly created or persisted
+        # component content. Capture its authored external links in the same
+        # transaction; this performs no URL visit or Qdrant operation.
+        for component_id, action in search_updates.items():
+            if action != "upsert":
+                continue
+            changed_component = (
+                db.query(ComponentV2).filter(ComponentV2.id == component_id).first()
+            )
+            if changed_component is not None:
+                sync_component_links(db, changed_component)
 
         db.commit()
 
@@ -3721,6 +3740,7 @@ def delete_tab_subtree_by_document_id_v2(
             )
             for component in components:
                 deleted_component_ids.append(component.id)
+                mark_component_links_deleted(db, component.id)
                 if component.page_content_id is not None:
                     page_content = (
                         db.query(PageContentV2)
