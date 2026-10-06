@@ -70,34 +70,6 @@ def _normalized_url(url: str) -> str | None:
     return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
 
 
-def _classification(url: str) -> tuple[str, str]:
-    try:
-        parsed = urlsplit(url)
-        host = (parsed.hostname or "").lower()
-        path = parsed.path.lower()
-    except ValueError:
-        return "Unknown", "Unknown"
-    if host in {"drive.google.com", "docs.google.com"}:
-        provider = "Google Drive"
-    elif host == "sharepoint.com" or host.endswith(".sharepoint.com"):
-        provider = "SharePoint"
-    else:
-        provider = host or "Unknown"
-    if path.endswith(".pdf"):
-        resource_type = "PDF"
-    elif host == "docs.google.com":
-        resource_type = "Google Docs"
-    elif host == "drive.google.com":
-        resource_type = "Google Drive file"
-    elif host in {"docsend.com", "www.docsend.com"}:
-        resource_type = "DocSend document"
-    elif path.endswith((".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx")):
-        resource_type = "Document file"
-    else:
-        resource_type = "Unknown"
-    return provider, resource_type
-
-
 def _component_content(db: Session, component: ComponentV2) -> object:
     if component.page_content_id is None:
         return None
@@ -128,8 +100,7 @@ def sync_component_links(db: Session, component: ComponentV2) -> int:
             continue
         if host in internal_hosts:
             continue
-        provider, resource_type = _classification(normalized)
-        current = found.setdefault(normalized, {"url": url, "paths": [], "provider": provider, "resource_type": resource_type})
+        current = found.setdefault(normalized, {"url": url, "paths": []})
         current["paths"].append(path)
 
     existing_maps = db.query(ComponentLinkMapV2).filter(ComponentLinkMapV2.component_id == component.id).all()
@@ -140,11 +111,19 @@ def sync_component_links(db: Session, component: ComponentV2) -> int:
         if row is None:
             row = db.query(ContentLinkV2).filter(ContentLinkV2.normalized_url == normalized).first()
         if row is None:
-            row = ContentLinkV2(normalized_url=normalized, created_at=now)
+            row = ContentLinkV2(
+                normalized_url=normalized,
+                url=str(item["url"]),
+                provider="Pending detection",
+                resource_type="Pending detection",
+                created_at=now,
+            )
             db.add(row)
-        row.url = str(item["url"])
-        row.provider = str(item["provider"])
-        row.resource_type = str(item["resource_type"])
+        else:
+            # The worker owns the detected provider and MIME-derived type. A
+            # component edit may update the authored spelling of a URL but
+            # must never erase worker results.
+            row.url = str(item["url"])
         row.deleted = False
         row.deleted_at = None
         row.acl_refresh_required = True

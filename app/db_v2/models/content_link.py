@@ -23,8 +23,8 @@ class ContentLinkV2(BaseV2):
     provider = Column(String(255), nullable=False)
     resource_type = Column(String(128), nullable=False)
 
-    # Stage 1 state. Later scheduled workers own visited/ingested/revisit and
-    # may fill content_fingerprint/reason; component writes never fetch URLs.
+    # Component saves register URLs only. The scheduled worker owns provider
+    # and file-type detection, visitation, ingestion, and content metadata.
     visited = Column(Boolean, nullable=False, default=False, index=True)
     ingested = Column(Boolean, nullable=False, default=False, index=True)
     revisit = Column(Boolean, nullable=False, default=False, index=True)
