@@ -564,6 +564,22 @@ class Settings(BaseSettings):
     # SBN node's component.props["locked_at"] (a JSONB key, no column) —
     # so the two stay on one TTL rather than silently drifting apart.
     TAB_LOCK_TTL_SECONDS: int = 14_400  # 4h
+
+    # ══════════════════════════════════════════════════════════════════
+    # Bookmarks (Postgres `bookmarks` table)
+    # ══════════════════════════════════════════════════════════════════
+    # Table and column names are env-driven so a rename on the database side
+    # never requires a code change — matching this codebase's convention of
+    # keeping physical names out of the source.
+    BOOKMARKS_TABLE: str = "bookmarks"
+    BOOKMARKS_ID_FIELD: str = "id"
+    BOOKMARKS_USER_ID_FIELD: str = "user_id"
+    BOOKMARKS_LINK_FIELD: str = "bookmark_link"
+    BOOKMARKS_SAVED_AT_FIELD: str = "saved_at"
+    BOOKMARKS_TYPE_FIELD: str = "type"
+    BOOKMARKS_TITLE_FIELD: str = "bookmark_title"
+
+
 def get_settings() -> Settings:
     """Return a cached singleton of the application settings."""
     return Settings()  # type: ignore[call-arg]
