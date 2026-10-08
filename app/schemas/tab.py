@@ -282,6 +282,12 @@ class NavTabResponse(BaseModel):
     view: bool | None = None
     edit: bool | None = None
     revealed: bool | None = None
+    # 2026-10-07 — edit holds on this nav tab OR on any node beneath it
+    # (root, variant, sub-tab, sub-grid, component). Not part of the §5.2
+    # triple: it gates whether the frontend offers its Edit Mode toggle,
+    # which a caller with only a deep, narrow grant still needs. Same
+    # "only when a ViewerAccess was supplied" convention as the triple.
+    edit_within: bool | None = None
 
     access_control: AccessControlResponse | dict[str, Any] | None = None
 

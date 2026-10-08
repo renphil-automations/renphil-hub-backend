@@ -143,6 +143,10 @@ def _format_nav_tab(
         summary["view"] = verdict.view
         summary["edit"] = verdict.edit
         summary["revealed"] = verdict.revealed
+        # 2026-10-07 — edit on this nav tab or anything beneath it; gates the
+        # header Edit Mode toggle for non-admins (see
+        # VisibilityResult.edit_within).
+        summary["edit_within"] = access.edit_within(("nav_tab", nav_tab.id))
 
     # §4.3 — additive, same "only when a caller passes one" convention as
     # the triple above.

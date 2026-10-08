@@ -614,6 +614,34 @@ class VisibilityResult:
         # ``_apply_mirror_substitution`` (which only ever narrows
         # ``granted_view``/``granted_edit``, never this).
         self.edit_seeds = edit_seeds
+        self._edit_within: set[NodeRef] | None = None
+
+    def edit_within(self, node_kind: str, node_id: int) -> bool:
+        """True when ``edit`` holds on this node OR on any node beneath it.
+
+        Drives whether the frontend offers its Edit Mode toggle at all — a
+        caller whose only grant sits on, say, one component three levels
+        down still needs the toggle to reach that component's pencil, and
+        the frontend cannot see a grant on a node it has not loaded.
+
+        Read off ``granted_edit`` (post-fold, post-mirror-substitution), not
+        the raw seeds, so a mirror whose conjunction failed does not count.
+        Computed once per result by marking every ancestor of every edit
+        node; the walk stops at the first already-marked node, so the whole
+        pass is linear in the tree.
+        """
+        if self._edit_within is None:
+            marked: set[NodeRef] = set()
+            for ref in self.granted_edit:
+                if ref in marked:
+                    continue
+                marked.add(ref)
+                for ancestor in self.tree.ancestors(ref):
+                    if ancestor in marked:
+                        break
+                    marked.add(ancestor)
+            self._edit_within = marked
+        return (node_kind, node_id) in self._edit_within
 
     def verdict(self, node_kind: str, node_id: int) -> NodeVerdict:
         """§5.2's triple for one node (plus ``edit_seed``, outside the
@@ -1677,6 +1705,15 @@ class ViewerAccess(NamedTuple):
         if node is None or self.visibility is None:
             return INVISIBLE
         return self.visibility.verdict(*node)
+
+    def edit_within(self, node: NodeRef | None) -> bool:
+        """See ``VisibilityResult.edit_within``. Hub Admins can edit
+        everything, so it is always true for them."""
+        if self.full_access:
+            return True
+        if node is None or self.visibility is None:
+            return False
+        return self.visibility.edit_within(*node)
 
     def is_granted(self, node: NodeRef | None) -> bool:
         """Gates the PAYLOAD for one node — see ``NodeVerdict``'s own
