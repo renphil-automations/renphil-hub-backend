@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+from app.helpers.airtable_formulas import WidgetFilters
 
 
 class AirtableRecord(BaseModel):
@@ -125,6 +127,49 @@ class AirtableWidgetFullRowsResponse(BaseModel):
     )
 
 
+class AirtableWidgetIndexSnapshotResponse(BaseModel):
+    """PAT-free, viewer-independent snapshot used by Agent ingestion.
+
+    Shared Airtable Table widgets may include their shared filtered rows.
+    Personalized Tables and all Metric widgets intentionally return config
+    only so viewer-specific values never enter a shared semantic index.
+    """
+
+    widget_type: str
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+
+    selected_columns: list[str] = Field(default_factory=list)
+    filters: WidgetFilters = Field(default_factory=list)
+
+    personalize_enabled: bool = False
+    personalize_column: str | None = None
+
+    fields: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+
+    row_data_included: bool = False
+    available: bool = True
+    reason: str
+
+    aggregation: str | None = None
+    sum_field: str | None = None
+    metric_description: str | None = None
+    metric_note: str | None = None
+    metric_url: str | None = None
+    # The Metric widget's visible display title (its widget data `title`,
+    # NOT components.title) and its Count-dedupe settings, so the Agent can
+    # describe the number correctly ("distinct organisations", not
+    # "records"). The count settings are reported as stored even for Sum,
+    # where the computation ignores them. Chart snapshots report the same
+    # three count fields (per-group dedupe), on every chart branch.
+    metric_title: str | None = None
+    count_field: str | None = None
+    count_distinct: bool = False
+    count_ignore_empty: bool = False
+
+
 class AirtableWidgetMetricResponse(BaseModel):
     """Single-number Count/Sum aggregation for a dashboard Airtable Metric
     widget, computed server-side over the SAME cached row set the Table
@@ -159,6 +204,141 @@ class AirtableWidgetMetricResponse(BaseModel):
     )
 
 
+class AirtableDrilldownRow(BaseModel):
+    """One record in a Metric/Chart drill-down modal."""
+
+    id: str
+    fields: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Only the widget's title field, detail fields and (for Sum) the summed field.",
+    )
+    group: str | None = Field(
+        default=None,
+        description="The record's chart group — set only when drilling into a chart's 'Other' bucket.",
+    )
+
+
+class AirtableWidgetDrilldownResponse(BaseModel):
+    """The records behind a Metric widget's number, or behind one Chart
+    group (bar/slice/point), for the click-to-open drill-down modal. Read
+    from the SAME cached row set the widget's own aggregate uses."""
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    title_field: str = Field(description="Field shown as each row's heading.")
+    fields: list[str] = Field(
+        default_factory=list,
+        description="Detail fields shown under the heading, in display order.",
+    )
+    field_types: dict[str, str] = Field(default_factory=dict)
+    rows: list[AirtableDrilldownRow] = Field(default_factory=list)
+    total_rows: int = Field(default=0, description="Matching records before the row cap.")
+    truncated: bool = Field(
+        default=False,
+        description="True when `total_rows` exceeded AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS and `rows` was cut.",
+    )
+    available: bool = Field(
+        default=True,
+        description="False when the underlying table is too large to cache or the walk failed.",
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description="Same fail-closed meaning as AirtableWidgetMetricResponse.",
+    )
+
+
+class AirtableChartGroup(BaseModel):
+    """One group/slice/bar of a Chart widget's aggregation."""
+
+    label: str
+    value: float | int
+    is_other: bool = Field(
+        default=False,
+        description="True only for the single folded 'Other' remainder bucket, never a real group.",
+    )
+
+
+class AirtableWidgetChartResponse(BaseModel):
+    """Grouped Count/Sum aggregation for a dashboard Airtable Chart widget,
+    computed server-side over the SAME cached row set the Metric widget's
+    `fetch_widget_metric_cached` uses (see
+    `AirtableService.fetch_widget_chart_cached`) — one aggregate PER GROUP
+    instead of one aggregate overall.
+    """
+
+    base_id: str
+    table_id: str
+    view_id: str | None = None
+    aggregation: str = Field(description="'count' or 'sum', echoed back for the caller's own bookkeeping.")
+    group_field: str = Field(default="", description="The field grouped by, echoed back.")
+    groups: list[AirtableChartGroup] = Field(default_factory=list)
+    total: float | int = Field(
+        default=0,
+        description=(
+            "Sum of every returned group's value, INCLUDING 'Other' — the "
+            "percentage denominator, so displayed labels sum to 100%."
+        ),
+    )
+    other_group_count: int = Field(
+        default=0,
+        description="How many real groups were folded into the 'Other' bucket, if any.",
+    )
+    row_count: int = Field(default=0, description="Rows that fed the aggregation (post-personalize-filter).")
+    available: bool = Field(
+        default=True,
+        description=(
+            "False when the underlying table is too large to cache (or the "
+            "cache walk itself failed), or the widget is not yet configured "
+            "(no groupField, or no sumField while aggregation is 'sum'). "
+            "Deliberately never falls back to a live partial fetch for an "
+            "aggregate — same stance as AirtableWidgetMetricResponse."
+        ),
+    )
+    personalize_blocked: bool = Field(
+        default=False,
+        description="Same fail-closed meaning as AirtableWidgetMetricResponse.",
+    )
+    partial: bool = Field(
+        default=False,
+        description=(
+            "True only on the editor preview path, when no warmed cache "
+            "entry could answer the request and a live, 100-record-capped "
+            "read was used instead. The saved-viewer endpoint never sets "
+            "this."
+        ),
+    )
+
+
+class AirtableChartPreviewRequest(BaseModel):
+    """Property Panel preview of an in-progress Chart widget's settings.
+
+    A separate model rather than extending `AirtableEditorPreviewRequest`
+    (which is `extra="forbid"` and shared with the column-discovery
+    preview) — same two-shape resolution (own token, or `link` + stored
+    token), plus the chart-specific aggregation fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    link: str | None = None
+    sourceUrl: str | None = None
+    pat: str | None = None
+    filters: WidgetFilters | None = None
+    personalizeEnabled: bool = False
+    personalizeColumn: str | None = None
+    groupField: str | None = None
+    aggregation: str = "count"
+    sumField: str | None = None
+    maxGroups: int | None = None
+    groupSort: str = "value_desc"
+    # Count-only dedupe, same names as the widget data (and the Metric's).
+    # Ignored for Sum and when countField equals groupField.
+    countField: str | None = None
+    countDistinct: bool = False
+    countIgnoreEmpty: bool = False
+
+
 class AirtableEditorPreviewRequest(BaseModel):
     """Property Panel preview of an Airtable widget's in-progress settings.
 
@@ -183,9 +363,25 @@ class AirtableEditorPreviewRequest(BaseModel):
     sourceUrl: str | None = None
     pat: str | None = None
     selectedColumns: list[str] | None = None
-    filters: list[dict[str, Any]] | None = None
+    filters: WidgetFilters | None = None
     personalizeEnabled: bool = False
     personalizeColumn: str | None = None
+    # Table widget default view (advanced-filters plan §11): each is
+    # `{field, direction: "asc" | "desc"}` or null. Deliberately `Any`: the
+    # panel sends the stored value as-is, and a malformed or stale one is
+    # IGNORED (Part B decision 3, `airtable_ordering.parse_default_order`),
+    # the same as on the saved paths, not a 422 that would blank the preview.
+    defaultSort: Any = Field(
+        default=None,
+        description="In-progress default sort: {field, direction: 'asc'|'desc'}.",
+    )
+    defaultGroup: Any = Field(
+        default=None,
+        description=(
+            "In-progress default grouping: {field, direction: 'asc'|'desc'}. "
+            "The preview orders by it first, then by defaultSort."
+        ),
+    )
 
 
 class AirtableEditorPreviewResponse(BaseModel):
@@ -254,6 +450,7 @@ class AirtableComponentConfigResponse(BaseModel):
         description="ISO-8601 timestamp of the last PAT change, if any.",
     )
     access_control: dict[str, Any] | None = None
+    search_updates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AirtableComponentConfigUpdate(BaseModel):
@@ -418,6 +615,15 @@ class PersonContactItem(BaseModel):
     first_name: str | None = Field(default=None, alias="First Name")
     last_name: str | None = Field(default=None, alias="Last Name")
     work_email: str | None = Field(default=None, alias="Work Email")
+    office_location: str | None = Field(default=None, alias="Office Location")
+    programs: list[str] = Field(
+        default_factory=list,
+        alias="Program Names",
+        description=(
+            "Program names resolved from the Users table's 'Program Names' "
+            "lookup field, split into individual values."
+        ),
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -482,7 +688,7 @@ class ButtonFieldValue(BaseModel):
 class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     name: str | None = Field(default=None, alias="Name")
     fundraising_stage: list[str] | None = Field(default=None, alias="Fundraising Stage")
-    status: str | None = Field(default=None, alias="Status")
+    status: str | None = Field(default=None, alias="Fund Status")
     official_fund_or_program_name: str | None = Field(
         default=None, alias="Official Fund or Program Name"
     )
@@ -535,7 +741,7 @@ class MasterListFundsAndSubprogramsRecord(_TypedAirtableRecord):
     )
     update_funding_documents: ButtonFieldValue | None = Field(
         default=None,
-        alias="Update Funding Documents",
+        alias="Update Fund Information & Funding Documents",
         description=(
             "Airtable 'Button' field that opens a URL. Returned as "
             "{label, url}; present only when the button opens a URL."
@@ -586,7 +792,7 @@ class MasterListLookupItem(BaseModel):
     initiative_type: str | None = Field(default=None, alias="Initiative Type")
     focus_areas: list[str] | None = Field(default=None, alias="Focus Area(s)")
     program_lead_fellow: Any = Field(default=None, alias="Program Lead/Fellow")
-    status: str | None = Field(default=None, alias="Status")
+    status: str | None = Field(default=None, alias="Fund Status")
     program_summary: str | None = Field(default=None, alias="Program Summary")
     internal_notes: str | None = Field(default=None, alias="Internal Notes")
     can_we_talk_about_it_publicly: bool | None = Field(
@@ -1720,12 +1926,25 @@ class AnnouncementRecord(_TypedAirtableRecord):
 class FeedbackCreate(BaseModel):
     """Payload to submit a new piece of user feedback.
 
-    Stored in the Feedbacks table. ``Date & Time`` is a computed Airtable
-    field and is populated automatically on create.
+    ``from_email`` is accepted only for backward compatibility with the
+    existing floating feedback widget. The authenticated backend user is the
+    authority for the Airtable ``From`` field.
     """
 
-    from_email: EmailStr = Field(description="Email of the person giving feedback.")
-    message: str = Field(min_length=1, description="The feedback message body.")
+    from_email: EmailStr | None = Field(
+        default=None,
+        description="Deprecated client hint; the server derives From from authentication.",
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="Feedback shortcut plus optional custom comment.",
+    )
+    source: str | None = Field(default=None, max_length=100)
+    impression: Literal["Like", "Dislike"] | None = None
+    message_id: str | None = Field(default=None, max_length=128)
+    query: str | None = Field(default=None, max_length=12000)
+    response: str | None = Field(default=None, max_length=50000)
 
 
 class FeedbackRecord(_TypedAirtableRecord):
@@ -1735,6 +1954,11 @@ class FeedbackRecord(_TypedAirtableRecord):
     from_email: str | None = Field(default=None, alias="From")
     message: str | None = Field(default=None, alias="Message")
     date_time: str | None = Field(default=None, alias="Date & Time")
+    source: str | None = Field(default=None, alias="Source")
+    impression: str | None = Field(default=None, alias="Impression")
+    message_id: str | None = Field(default=None, alias="Message ID")
+    query: str | None = Field(default=None, alias="Query")
+    response: str | None = Field(default=None, alias="Response")
 
 
 # ── Access Control ────────────────────────────────────────────────────

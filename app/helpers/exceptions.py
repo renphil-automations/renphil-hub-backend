@@ -19,6 +19,20 @@ class DomainNotAllowedError(HTTPException):
         )
 
 
+class UserNotAuthorizedError(HTTPException):
+    """Raised when an email outside the org domain, and not pre-registered in
+    the Access Control table, attempts to log in."""
+
+    def __init__(self, email: str) -> None:
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Access denied. The email '{email}' is not authorized to "
+                f"access this application."
+            ),
+        )
+
+
 class GoogleOAuthError(HTTPException):
     """Raised on any failure during the Google OAuth flow."""
 
