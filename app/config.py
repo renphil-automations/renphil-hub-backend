@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
     # Comma-separated list of email domains allowed to log in.
-    ALLOWED_EMAIL_DOMAIN: str = "renphil.org"
+    ALLOWED_EMAIL_DOMAIN: str = "renphil.org,centerforcivicfutures.org"
 
     @property
     def allowed_email_domains(self) -> list[str]:
@@ -156,6 +156,7 @@ class Settings(BaseSettings):
     USERS_STATUS_FIELD: str
     USERS_DEPARTMENT_FIELD: str
     USERS_PROGRAM_FIELD: str
+    USERS_PROGRAM_NAMES_FIELD: str
     USERS_START_DATE_FIELD: str
     USERS_PERSONAL_EMAIL_FIELD: str
     USERS_POSITION_FIELD: str
@@ -189,6 +190,7 @@ class Settings(BaseSettings):
     AT_F_EXCLUDE_FROM_LISTS: str
     AT_F_EXCLUDE_FROM_REPORTING: str
     AT_F_STATUS: str
+    AT_F_FUND_STATUS: str
     AT_F_SUB_TRACK_OF: str
     AT_F_SHARE_PUBLICLY: str
     AT_F_ONBOARDING_STATUS: str
@@ -232,6 +234,11 @@ class Settings(BaseSettings):
     # ── Feedbacks fields ───────────────────────────────────────────────
     AT_F_FEEDBACK_FROM: str
     AT_F_FEEDBACK_MESSAGE: str
+    AT_F_FEEDBACK_SOURCE: str = "Source"
+    AT_F_FEEDBACK_IMPRESSION: str = "Impression"
+    AT_F_FEEDBACK_MESSAGE_ID: str = "Message ID"
+    AT_F_FEEDBACK_QUERY: str = "Query"
+    AT_F_FEEDBACK_RESPONSE: str = "Response"
 
     # ── Tickets fields ────────────────────────────────────────────────
     AT_F_TICKET_ID: str
@@ -475,6 +482,33 @@ class Settings(BaseSettings):
     # sharing one marker between both paths.
     AIRTABLE_CACHE_REFRESH_NEGATIVE_TTL_SECONDS: int = 900
 
+    # ── Airtable widget lock-contention retry (no-live-fallback callers) ──
+    # Metric/Chart widgets have no live fallback: a base-lock loss to a
+    # sibling widget on the same base used to return `available=false` on the
+    # spot, so the same component could flip false→value between two adjacent
+    # calls purely on contention. These `patient` callers instead retry both
+    # the per-fingerprint AND the per-base lock on this shared schedule
+    # (Table/Full and the cron keep the original single-attempt behavior).
+    #
+    # Retry count and base interval are shared by BOTH locks; only the jitter
+    # ranges differ. Total worst-case wait is bounded by
+    # MAX_ATTEMPTS × (BASE_INTERVAL + jitter_max), by design — there is no
+    # separate total-wait cap because the interval is fixed, not exponential.
+    AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS: int = 4
+    AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS: float = 2.0
+    # Per-base jitter, added to the base interval each attempt.
+    AIRTABLE_CACHE_BASE_LOCK_JITTER_MIN_SECONDS: float = 0.5
+    AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS: float = 2.0
+    # Fingerprint-lock jitter starts `..._FINGERPRINT_LOCK_JITTER_GAP_SECONDS`
+    # ABOVE the per-base jitter MAX and spans this width, so a fingerprint-lock
+    # waiter's per-attempt interval is STRICTLY longer than any base-lock
+    # waiter's — the lead request (holding the fingerprint lock while waiting
+    # on the base lock) is never out-waited by the followers polling behind
+    # it, which would otherwise return `available=false` while the lead is
+    # still mid-contention.
+    AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_RANGE_SECONDS: float = 2.0
+    AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_GAP_SECONDS: float = 1.0
+
     # ── Airtable widget viewer controls (plan_airtable_widget_viewer_controls_2026-08-12.md) ──
     # Schema churns far less than rows, so it gets its own, much longer TTL
     # rather than riding the row cache's 30-minute one.
@@ -498,6 +532,18 @@ class Settings(BaseSettings):
     # Matches today's server page size so visual density is unchanged.
     AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE: int = 100
 
+    # ── Airtable Chart widget (plan_airtable_chart_widget_2026-08-13.md) ──
+    # Default number of groups a chart widget shows before the remainder is
+    # folded into a single 'Other' bucket, when the widget stores no preference.
+    AIRTABLE_CHART_DEFAULT_MAX_GROUPS: int = 10
+
+    # Hard ceiling on that number regardless of what a widget asks for. Bounds
+    # the response and the rendered DOM: a group-by on a high-cardinality field
+    # (a name, an email, a record id) would otherwise produce thousands of
+    # slices, none of them readable. The client's maxGroups is a preference
+    # clamped by this, never a ceiling of its own.
+    AIRTABLE_CHART_MAX_GROUPS: int = 50
+
     # ══════════════════════════════════════════════════════════════════
     # RenPhil Agent API (server-to-server only)
     # ══════════════════════════════════════════════════════════════════
@@ -506,8 +552,34 @@ class Settings(BaseSettings):
     AGENT_API_URL: str | None = None
     AGENT_SYNC_TOKEN: str | None = None
 
+    # ══════════════════════════════════════════════════════════════════
+    # Tab / SBN-node locking (plan_access_control_algorithm_2026-08-27.md §6.6)
+    # ══════════════════════════════════════════════════════════════════
+    # A lock past this age with no refresh is STALE and claimable by any
+    # authenticated user (§0 of the locking session: no edit(n) gate exists
+    # yet — resource_grants is empty in production, so gating locks on it
+    # today would mean only Hub Admins could lock anything). Re-entry by the
+    # same holder refreshes it. Owner-picked value, 2026-09-03: 4 hours.
+    # Shared by both lock systems — TabV2.locked_at (a real column) and an
+    # SBN node's component.props["locked_at"] (a JSONB key, no column) —
+    # so the two stay on one TTL rather than silently drifting apart.
+    TAB_LOCK_TTL_SECONDS: int = 14_400  # 4h
 
-@lru_cache
+    # ══════════════════════════════════════════════════════════════════
+    # Bookmarks (Postgres `bookmarks` table)
+    # ══════════════════════════════════════════════════════════════════
+    # Table and column names are env-driven so a rename on the database side
+    # never requires a code change — matching this codebase's convention of
+    # keeping physical names out of the source.
+    BOOKMARKS_TABLE: str = "bookmarks"
+    BOOKMARKS_ID_FIELD: str = "id"
+    BOOKMARKS_USER_ID_FIELD: str = "user_id"
+    BOOKMARKS_LINK_FIELD: str = "bookmark_link"
+    BOOKMARKS_SAVED_AT_FIELD: str = "saved_at"
+    BOOKMARKS_TYPE_FIELD: str = "type"
+    BOOKMARKS_TITLE_FIELD: str = "bookmark_title"
+
+
 def get_settings() -> Settings:
     """Return a cached singleton of the application settings."""
     return Settings()  # type: ignore[call-arg]

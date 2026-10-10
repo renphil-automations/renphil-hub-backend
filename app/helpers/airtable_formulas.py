@@ -8,7 +8,11 @@ or return the single clause / ``None`` as appropriate.
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
 
 
 def escape(value: str) -> str:
@@ -196,6 +200,32 @@ def _as_number(value: Any) -> float:
         ) from None
 
 
+def _filter_values(value: Any) -> list[str]:
+    """Normalize a widget filter condition's `value` to a list of non-blank
+    strings.
+
+    `eq`/`neq` conditions may now carry MULTIPLE values — the Property
+    Panel's tag input, e.g. Status is Active OR Pending — as a list; every
+    other operator still sends a bare scalar, which becomes a one-item
+    list here. Blank entries are dropped in BOTH shapes, so "no value
+    chosen yet" (a freshly added filter row, or every tag removed) is
+    treated the same whether it arrives as `''` (the pre-multi-value shape)
+    or `[]`: no clause, rather than an accidental blank-cell match. That is
+    a deliberate (small) behaviour change from the single-value past, where
+    `eq` + an empty value produced `{Field} = ''` — but it's the same
+    fail-open direction this module already commits to elsewhere (see this
+    function's caller's own docstring: "a dropped clause makes the result
+    set WIDER"), and it means an unfinished filter row never silently hides
+    every non-blank row while an admin is still typing.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v is not None and str(v) != ""]
+    text = str(value)
+    return [text] if text != "" else []
+
+
 def widget_filter_clause(field: str, operator: str, value: Any = "") -> str | None:
     """One clause of the widget's Filters section.
 
@@ -204,14 +234,21 @@ def widget_filter_clause(field: str, operator: str, value: Any = "") -> str | No
     take down the whole widget — but note that a dropped clause makes the
     result set WIDER, so callers that treat filters as a security boundary
     must not use this (personalize is applied separately and never dropped).
+
+    `eq`/`neq` accept either a single value or a list of values via
+    `_filter_values`, OR-combined for `eq` / AND-excluded for `neq` through
+    the existing `in_str`/`not_in_str` helpers — both already collapse a
+    one-item list to a plain equality clause, so a single legacy string
+    value formats identically to before.
     """
     name = validate_field_name(field)
-    text = "" if value is None else str(value)
+    values = _filter_values(value)
+    text = values[0] if values else ""
 
     if operator == "eq":
-        return eq_str(name, text)
+        return in_str(name, values)
     if operator == "neq":
-        return neq_str(name, text)
+        return not_in_str(name, values)
     if operator == "contains":
         return contains_str(name, text)
     if operator == "not_contains":
@@ -230,21 +267,168 @@ def widget_filter_clause(field: str, operator: str, value: Any = "") -> str | No
     return None
 
 
-def widget_filters_clause(filters: Iterable[dict[str, Any]] | None) -> str | None:
-    """AND-combine the widget's stored filter rows. Rows with no field are
-    skipped, matching the frontend's `filter((f) => f.field.trim())`."""
-    clauses: list[str] = []
-    for row in filters or []:
-        if not isinstance(row, dict):
-            continue
-        if not str(row.get("field") or "").strip():
-            continue
-        clause = widget_filter_clause(
-            row.get("field", ""), str(row.get("operator") or ""), row.get("value", "")
+# ── widget filter trees (groups + conjunctions) ────────────────────────
+#
+# The stored `filters` value is EITHER the legacy flat list of conditions
+# (every widget saved before advanced filters, AND-combined) OR a root group:
+#
+#   {"type": "group", "id": str, "conjunction": "and" | "or", "items": [...]}
+#   {"type": "condition", "id": str, "field": str, "operator": str, "value": ...}
+#
+# A list item / group item with no `type` is a condition (legacy shape).
+# `id` exists for the frontend's drag-and-drop and is ignored here.
+#
+# The frontend mirrors these two limits (the filter modal stops at them); the
+# backend only enforces them against a hand-edited or stale payload.
+MAX_FILTER_DEPTH = 3  # the root group is depth 1
+MAX_FILTER_CONDITIONS = 50  # counted in document (depth-first) order
+
+# The stored/wire shape: a legacy flat list or a root group object.
+WidgetFilters = list[dict[str, Any]] | dict[str, Any]
+
+_FILTER_CONJUNCTIONS = ("and", "or")
+
+
+def _normalize_filter_group(
+    node: dict[str, Any], items: Any, depth: int
+) -> dict[str, Any] | None:
+    """Rebuild one group with only well-formed children (see
+    `normalize_filter_tree`). Returns None when the group itself is invalid."""
+    raw_conjunction = node.get("conjunction")
+    conjunction = (
+        raw_conjunction.strip().lower() if isinstance(raw_conjunction, str) else ""
+    )
+    if conjunction not in _FILTER_CONJUNCTIONS:
+        logger.warning("Widget filter group dropped: unknown conjunction.")
+        return None
+    if depth > MAX_FILTER_DEPTH:
+        logger.warning(
+            "Widget filter group dropped: nested deeper than %d levels.",
+            MAX_FILTER_DEPTH,
         )
-        if clause:
-            clauses.append(clause)
-    return AND(*clauses)
+        return None
+    if not isinstance(items, list):
+        if items is not None:
+            logger.warning("Widget filter group items ignored: not a list.")
+        items = []
+
+    children: list[dict[str, Any]] = []
+    for child in items:
+        if not isinstance(child, dict):
+            logger.warning("Widget filter item dropped: not an object.")
+            continue
+        kind = child.get("type")
+        if kind is None or kind == "condition":
+            children.append({**child, "type": "condition"})
+        elif kind == "group":
+            group = _normalize_filter_group(child, child.get("items"), depth + 1)
+            if group is not None:
+                children.append(group)
+        else:
+            logger.warning("Widget filter item dropped: unknown type.")
+    return {"type": "group", "conjunction": conjunction, "items": children}
+
+
+def normalize_filter_tree(raw: Any) -> dict[str, Any] | None:
+    """Normalize a stored `filters` value to a root group, or None.
+
+    * a list (the legacy shape) → a root AND group of its items;
+    * a dict with `type == "group"` → that group;
+    * anything else (None, `{}`, a bare condition, a string…) → None.
+
+    Malformed nodes (non-objects, an unknown `type`, a conjunction other
+    than and/or, groups nested past `MAX_FILTER_DEPTH`) are dropped with a
+    warning, never raised: the same "one stale filter row cannot take down
+    the whole widget" stance as `widget_filter_clause`, with the same caveat
+    that dropping a node makes the result set WIDER. Conditions are passed
+    through untouched; field/operator/value validation stays in
+    `widget_filter_clause`.
+
+    Returns new dicts; the stored value is never mutated (it is hashed raw
+    into the widget cache fingerprint).
+    """
+    if isinstance(raw, list):
+        return _normalize_filter_group({"conjunction": "and"}, raw, 1)
+    if isinstance(raw, dict):
+        if raw.get("type") == "group":
+            return _normalize_filter_group(raw, raw.get("items"), 1)
+        if raw:
+            logger.warning("Widget filters ignored: object is not a group.")
+        return None
+    if raw is not None:
+        logger.warning("Widget filters ignored: neither a list nor a group.")
+    return None
+
+
+@dataclass
+class _FilterConditionBudget:
+    """How many more conditions a single compile may still emit."""
+
+    remaining: int = MAX_FILTER_CONDITIONS
+    overflow_logged: bool = False
+
+
+def _filter_node_clause(
+    node: dict[str, Any] | None,
+    depth: int,
+    budget: _FilterConditionBudget | None = None,
+) -> str | None:
+    """Compile one normalized node (see `normalize_filter_tree`).
+
+    A group is `AND(...)`/`OR(...)` of its children; `AND`/`OR` already drop
+    None children and collapse a single child, so an empty or all-incomplete
+    group is ignored (None) rather than "match everything", and
+    `OR(A, <empty group>)` compiles to `A`. Conditions go through the
+    unchanged `widget_filter_clause`, and its `FormulaFieldError` is
+    deliberately NOT caught at any depth: callers turn it into an error
+    response, and swallowing it would silently widen the result set.
+    """
+    if node is None:
+        return None
+    if budget is None:
+        budget = _FilterConditionBudget()
+
+    if node.get("type") == "group":
+        if depth > MAX_FILTER_DEPTH:
+            # Unreachable after normalize_filter_tree; kept so a caller that
+            # skips it still can't recurse without bound.
+            logger.warning(
+                "Widget filter group dropped: nested deeper than %d levels.",
+                MAX_FILTER_DEPTH,
+            )
+            return None
+        combine = OR if node.get("conjunction") == "or" else AND
+        return combine(
+            *[
+                _filter_node_clause(child, depth + 1, budget)
+                for child in node.get("items") or []
+                if isinstance(child, dict)
+            ]
+        )
+
+    if budget.remaining <= 0:
+        if not budget.overflow_logged:
+            logger.warning(
+                "Widget filter conditions past %d dropped.", MAX_FILTER_CONDITIONS
+            )
+            budget.overflow_logged = True
+        return None
+    budget.remaining -= 1
+
+    # Rows with no field are skipped, matching the frontend's
+    # `filter((f) => f.field.trim())`.
+    if not str(node.get("field") or "").strip():
+        return None
+    return widget_filter_clause(
+        node.get("field", ""), str(node.get("operator") or ""), node.get("value", "")
+    )
+
+
+def widget_filters_clause(filters: WidgetFilters | None) -> str | None:
+    """Compile the widget's stored filters: a legacy flat list (AND-combined,
+    byte-identical to the pre-tree compiler) or a root group of nested AND/OR
+    groups. None when nothing applies."""
+    return _filter_node_clause(normalize_filter_tree(filters), 1)
 
 
 # Separators an admin's "who owns this row" column might realistically use
@@ -307,7 +491,7 @@ def personalize_clause(column: str, email: str) -> str | None:
 
 def widget_formula(
     *,
-    filters: Iterable[dict[str, Any]] | None = None,
+    filters: WidgetFilters | None = None,
     personalize_enabled: bool = False,
     personalize_column: str | None = None,
     email: str | None = None,

@@ -22,6 +22,22 @@ class CalendarSearchResult(BaseModel):
     recurring: bool = False
 
 
+class CalendarIndexEvent(BaseModel):
+    """Viewer-independent event snapshot used only for search ingestion."""
+
+    id: str
+    summary: str
+    start: str | None = None
+    end: str | None = None
+    is_all_day: bool = False
+    location: str | None = None
+    description: str | None = None
+    html_link: str | None = None
+    meeting_link: str | None = None
+    meeting_label: str | None = None
+    recurring: bool = False
+
+
 class CalendarEvent(BaseModel):
     """The resolved next occurrence of a stored event, for the viewer."""
 
