@@ -16,13 +16,16 @@ import hashlib
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 import jwt
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
+from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.helpers.exceptions import DomainNotAllowedError, GoogleOAuthError
+from app.db_v2.models.hub_user import HubUserV2
+from app.helpers.exceptions import GoogleOAuthError, UserNotAuthorizedError
 from app.helpers.google_client import build_oauth_flow
 from app.models.auth import TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
@@ -32,6 +35,9 @@ logger = logging.getLogger(__name__)
 # In-memory PKCE store: state → (code_verifier, frontend_redirect_uri)
 # Fine for single-process / dev; replace with Redis/cache in production.
 _pkce_store: dict[str, tuple[str, str]] = {}
+
+# Which rule in `_enforce_login_allowed` let an email through.
+LoginAdmission = Literal["domain", "hub_users", "airtable"]
 
 
 def _generate_code_verifier() -> str:
@@ -62,7 +68,6 @@ class AuthService:
 
         auth_url, state = flow.authorization_url(
             access_type="offline",
-            hd=self._settings.ALLOWED_EMAIL_DOMAIN,  # hint — enforced server-side too
             # select_account renders the account chooser; without it Google can
             # route users to "add a Google account" and reject an account that
             # already exists on the device. consent keeps the refresh token.
@@ -81,12 +86,13 @@ class AuthService:
         code: str,
         state: str,
         airtable_service: AirtableService,
+        db: Session,
     ) -> tuple[TokenResponse, str]:
         """
         Complete the OAuth callback:
           - exchange auth code for tokens (with PKCE verifier)
           - verify & decode the id_token
-          - enforce domain
+          - enforce the login allow-list (domain, hub_users, Airtable)
           - resolve the user's roles from the Airtable Access Control table
           - mint a local JWT
 
@@ -124,11 +130,15 @@ class AuthService:
         name: str = id_info.get("name", "")
         picture: str | None = id_info.get("picture")
 
-        # Enforce domain
-        self._enforce_domain(email)
+        # Gate login: org domain, or a pre-registered external email
+        admitted_by = await self._enforce_login_allowed(email, airtable_service, db)
 
-        # Auto-provision a Hub Member Access Control record for first-time users
-        await airtable_service.ensure_access_control_member(email)
+        # Auto-provision a Hub Member Access Control record for first-time
+        # users — except someone admitted through `hub_users` (owner
+        # decision, 2026-10-04): their sign-in must keep depending on
+        # `hub_users` alone, not on an Airtable record this would create.
+        if admitted_by != "hub_users":
+            await airtable_service.ensure_access_control_member(email)
 
         # Resolve roles from the Airtable Access Control table
         roles: list[str] = await airtable_service.get_user_roles(email)
@@ -184,8 +194,29 @@ class AuthService:
             roles=payload.get("roles") or [],
         )
 
-    # ── Domain restriction ─────────────────────────────────────────────
-    def _enforce_domain(self, email: str) -> None:
+    # ── Login allow-list ────────────────────────────────────────────────
+    async def _enforce_login_allowed(
+        self, email: str, airtable_service: AirtableService, db: Session
+    ) -> LoginAdmission:
+        """Gate login by email, returning which rule admitted it.
+
+        Org-domain emails are always allowed. A non-org email is allowed only
+        when an admin pre-registered it: first a `hub_users` row (added from
+        the Access Control page's Users tab), then — as a fallback until the
+        AC cutover, after which only `hub_users` will count — a record in the
+        Airtable Access Control table. Otherwise login is refused. Runs
+        BEFORE auto-provisioning so an unknown external email is never
+        provisioned into existence.
+
+        `hub_users.is_active` is deliberately NOT checked (owner decision,
+        2026-10-04): any row admits.
+        """
         domain = email.rsplit("@", 1)[-1].lower()
-        if domain not in self._settings.allowed_email_domains:
-            raise DomainNotAllowedError(email, self._settings.ALLOWED_EMAIL_DOMAIN)
+        if domain in self._settings.allowed_email_domains:
+            return "domain"
+        normalized = email.strip().lower()
+        if db.query(HubUserV2.id).filter(HubUserV2.email == normalized).first() is not None:
+            return "hub_users"
+        if await airtable_service.access_control_email_exists(email):
+            return "airtable"
+        raise UserNotAuthorizedError(email)

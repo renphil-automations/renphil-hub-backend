@@ -72,10 +72,21 @@ DATABASE_URL = _resolve_database_url()
 # few minutes. Without ``pool_pre_ping`` the pool hands out a stale socket and
 # the next query fails with ``SSL connection has been closed unexpectedly``.
 # ``pool_recycle`` proactively refreshes connections older than the value.
+#
+# ``pool_size``/``max_overflow`` are tunable via env so deployments can scale the
+# pool without a code change. Defaults are higher than SQLAlchemy's 5/10 because
+# concurrent requests under load were exhausting the pool and timing out.
+_pool_size = int(os.getenv("DB_POOL_SIZE", "20"))
+_max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "40"))
+_pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=300,
+    pool_size=_pool_size,
+    max_overflow=_max_overflow,
+    pool_timeout=_pool_timeout,
     connect_args={"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30,
                   "keepalives_interval": 10, "keepalives_count": 3},
 )

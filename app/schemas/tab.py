@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import (
@@ -102,8 +103,53 @@ class TabSummaryResponse(BaseModel):
     title: StrictStr | None = None
     order: int = 0
 
+    # plan_access_control_algorithm_2026-08-27.md §5.2's triple —
+    # server-computed, never re-derived on the client. `revealed = view and
+    # not granted`: the node appears and opens, but its own payload is
+    # filtered to (usually) nothing but the child that earned the reveal.
+    # All three are None when the caller (an internal mutation-response
+    # echo, not a read endpoint) built this summary without a ViewerAccess
+    # — see gridstack_service._format_tab_summary's own `access` parameter.
+    # A read endpoint always supplies one, so they are never None there.
+    view: bool | None = None
+    edit: bool | None = None
+    revealed: bool | None = None
+    # `seed_edit(n)` — added 2026-09-07 (edit-mode-gap follow-up), alongside
+    # the §5.2 triple above but not part of it (see NodeVerdict.edit_seed).
+    # TRUE iff a resource_grant is written DIRECTLY on this node, regardless
+    # of whether an ancestor's grant also makes `edit` True. Drives pencil
+    # placement client-side — replaces the old client-derived
+    # `isEditFrontier(edit, parentEdit)` approximation, which could not tell
+    # "no grant of my own" apart from "my own grant that an ancestor's
+    # grant also happens to cover". None under the same conditions as the
+    # triple above (no `access` passed).
+    edit_seed: bool | None = None
+
     locked: StrictBool = False
     locked_by: StrictStr = ""
+    # plan §6.6 Fix 2. `locked_at` is None for an unlocked tab AND for a
+    # locked one with no timestamp (every lock taken before this column
+    # existed — see TabV2.locked_at's own comment); `lock_is_stale` is
+    # server-computed (is_lock_stale in gridstack_service.py) rather than
+    # left for the client to re-derive from `locked_at` + a TTL it would
+    # have to know separately — always False when `locked` is False.
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
+
+    # plan_lock_propagation_2026-09-08.md §4.3 — ADDITIVE. The four fields
+    # above keep their exact existing meaning (this node's own row); these
+    # four are new and DERIVED across the whole ancestor/descendant chain
+    # (edit_lock_service.LockView.state_for), so no existing read path
+    # breaks mid-migration. `lock_state` is None under the same conditions
+    # `view`/`edit`/`revealed` above are — an internal mutation-response
+    # echo built with no LockView, never a real read endpoint.
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+    # Owner decision 2026-09-26 — an admin holds a fresh session on this
+    # node or beneath it, so a forced takeover from here would be refused.
+    lock_takeover_blocked: StrictBool = False
 
     has_children: StrictBool = False
     has_content: StrictBool = False
@@ -130,6 +176,20 @@ class TabSummaryResponse(BaseModel):
     # GridCanvasContent.schemaVersion (the JSONB content-shape version).
     apiVersion: Literal["v1", "v2"] = "v1"
 
+    # The resource_grants node (plan_access_control_algorithm_2026-08-27.md
+    # §9) this row's "Manage Access" should actually edit — the same NodeRef
+    # `resolve_gridstack_node` already resolves to produce view/edit/revealed
+    # above, just also serialized. For a root tab or variant this equals
+    # `("tab", self.id)`; for a nested SGS sub-tab it is the SUB-GRID'S
+    # REPRESENTATION COMPONENT (§3.1), a different id than `id` above, which
+    # for a sub-tab is the gridstack's own id — there was previously no way
+    # for the frontend to resolve one from the other. `None` for v1 tabs
+    # (no resource_grants equivalent exists) and for an orphaned v2 row
+    # (§3.3 fail-closed). Independent of `access` — populated on every read,
+    # including internal mutation-response echoes that pass none.
+    node_kind: Literal["hub", "nav_tab", "tab", "component"] | None = None
+    node_id: int | None = None
+
     # Empty for reads; populated by v2 mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
 
@@ -140,45 +200,61 @@ class TabWorkspaceResponse(BaseModel):
     title: StrictStr | None = None
     order: int = 0
 
+    # See TabSummaryResponse's identical fields for what these mean. Absence
+    # of `view=True` here for a real tab is impossible from a read endpoint
+    # — an invisible node's workspace 404s instead (plan §9).
+    view: bool | None = None
+    edit: bool | None = None
+    revealed: bool | None = None
+    edit_seed: bool | None = None
+
     parent: TabParentResponse | None = None
     page_content: PageContentWorkspaceResponse | None = None
 
     # Allows normalized DB rows that may return a plain dict. Nullable: a
-    # v2 SBN node's access_control is None on the wire whenever it means
-    # "inherit" (§3.4/§5.2's NULL-through fix, get_sbn_workspace) rather
-    # than a manufactured default -- this field being non-nullable was a
-    # latent bug (pre-existing, session 6) that 500'd this response model
-    # for exactly that case; no test caught it because the engine-level
-    # test called get_sbn_workspace directly, bypassing response
-    # validation. Found while adding resolved_parent_access_control (commit
-    # 8a) and its test, which is the first thing to exercise this through
-    # the actual HTTP router.
+    # v2 SBN node's access_control is None on the wire whenever nothing has
+    # been set on it (get_sbn_workspace) rather than a manufactured
+    # default -- this field being non-nullable was a latent bug
+    # (pre-existing, session 6) that 500'd this response model for exactly
+    # that case.
     access_control: AccessControlResponse | dict[str, Any] | None = Field(
         default_factory=AccessControlResponse
     )
 
-    # Populated by get_tab_workspace_v2 (v2 root/variant/sub-tab reads): this
-    # node's own EFFECTIVE access_control, resolved past any NULL ancestors
-    # (landmine 14) -- also the exact ceiling a canvas widget sitting on
-    # this node is validated against (§3.4). None for v1 / callers that
-    # don't resolve it.
-    resolved_access_control: AccessControlResponse | dict[str, Any] | None = None
-
-    # Populated by get_sbn_workspace (v2 SBN node reads) only: the ceiling
-    # THIS node's own access_control is validated against on write (§3.4) --
-    # its resolved PARENT's effective AC, not its own. None for every other
-    # caller of this shape (a tab/sub-tab is a propagating tab-family node,
-    # not itself subset-constrained, so it has no such ceiling).
-    resolved_parent_access_control: AccessControlResponse | dict[str, Any] | None = None
-
     locked: StrictBool = False
     locked_by: StrictStr = ""
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
+
+    # See TabSummaryResponse's identical fields for what these mean.
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+    # Owner decision 2026-09-26 — an admin holds a fresh session on this
+    # node or beneath it, so a forced takeover from here would be refused.
+    lock_takeover_blocked: StrictBool = False
+
+    # plan_lock_propagation_2026-09-08.md §4.1 — "return the token +
+    # expires_at". SENSITIVE, and deliberately narrow: populated ONLY by
+    # `lock_tab_by_document_id_v2`'s own response (the one place a caller
+    # who just acquired a session needs to learn their own token so they
+    # can present it back via `X-Edit-Tokens`), never by an ordinary
+    # workspace GET or any other write's echo — this field must never leak
+    # a token to a caller who merely has VIEW access to the tab. None
+    # everywhere else, matching every other "only when this specific
+    # caller populates it" field in this schema.
+    lock_token: StrictStr | None = None
 
     children: list[TabSummaryResponse] = Field(default_factory=list)
 
     has_variants: StrictBool = False
 
     apiVersion: Literal["v1", "v2"] = "v1"
+
+    # See TabSummaryResponse's identical fields for what these mean.
+    node_kind: Literal["hub", "nav_tab", "tab", "component"] | None = None
+    node_id: int | None = None
 
     # Empty for reads; populated by v2 mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
@@ -202,11 +278,54 @@ class NavTabResponse(BaseModel):
     title: StrictStr | None = None
     order: int = 0
 
+    # See TabSummaryResponse's identical fields for what these mean.
+    view: bool | None = None
+    edit: bool | None = None
+    revealed: bool | None = None
+    # 2026-10-07 — edit holds on this nav tab OR on any node beneath it
+    # (root, variant, sub-tab, sub-grid, component). Not part of the §5.2
+    # triple: it gates whether the frontend offers its Edit Mode toggle,
+    # which a caller with only a deep, narrow grant still needs. Same
+    # "only when a ViewerAccess was supplied" convention as the triple.
+    edit_within: bool | None = None
+
     access_control: AccessControlResponse | dict[str, Any] | None = None
 
     protected: StrictBool = False
 
     icon: StrictStr | None = None
+
+    # plan_lock_propagation_2026-09-08.md §1/§3.1 decision 3 — a nav tab is
+    # now a real lock node (its edit-mode toggle acquires an actual lock,
+    # §6.7), not just an AC one. Own-row fields, new here (nav tabs had no
+    # lock columns at all before this plan) but the SAME shape/meaning as
+    # TabSummaryResponse's identical four; the four after them are the same
+    # additive derived state described there.
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
+
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+    # Owner decision 2026-09-26 — an admin holds a fresh session on this
+    # node or beneath it, so a forced takeover from here would be refused.
+    lock_takeover_blocked: StrictBool = False
+
+    # plan_lock_propagation_2026-09-08.md §8 phase 5 — SAME sensitive,
+    # narrow-population field as TabWorkspaceResponse.lock_token above (see
+    # that field's own comment): populated ONLY by
+    # `lock_nav_tab_by_document_id_v2`'s own response, never by an ordinary
+    # nav-tab list/read or any other write's echo. None everywhere else.
+    lock_token: StrictStr | None = None
+
+    # See TabSummaryResponse's identical fields — a nav tab maps straight to
+    # its own node (`("nav_tab", self.id)`), no gridstack indirection to
+    # resolve, unlike a tab/sub-grid.
+    node_kind: Literal["hub", "nav_tab", "tab", "component"] | None = None
+    node_id: int | None = None
 
     # Empty for reads; populated by mutations after their DB commit.
     search_updates: list[SearchUpdateReceipt] = Field(default_factory=list)
@@ -214,6 +333,15 @@ class NavTabResponse(BaseModel):
 
 class NavTabListAPIResponse(BaseModel):
     data: list[NavTabResponse] = Field(default_factory=list)
+    # findings_dev_login_live_testing_2026-09-12.md #4: the ONE signal the
+    # frontend had no channel for — "do I hold edit(hub)" — needed to gate
+    # nav-tab Delete/reorder correctly (§6.3: both are edit(parent(n)), a
+    # STRICTER gate than the plain edit(n) every `NavTabResponse.edit`
+    # already carries per row, which only ever answers for that one row).
+    # Sits on the list envelope, not per-row, since it is one caller-wide
+    # fact about the Hub, not something that varies row to row — and
+    # useNavTabs.ts already fetches this same list, so no second request.
+    hub_edit: bool = False
 
 
 # ---------------------------------------------------------
@@ -228,8 +356,77 @@ class TabWorkspaceAPIResponse(BaseModel):
     data: TabWorkspaceResponse
 
 
+class ComponentLockResponse(BaseModel):
+    """Body of the three per-component lock doors
+    (`PUT /v2/tabs/components/by-link/{link}/lock`, `/lock/renew`,
+    `/unlock` — plan_component_locking_and_sbn_2026-09-17.md §5.1).
+    Deliberately small: no content, no workspace — the per-widget modal
+    already holds the widget's data and only needs to learn its session.
+
+    `lock_token`/`lock_expires_at` are populated ONLY on lock and renew,
+    never on unlock — the same sensitive, narrow-population rule
+    `TabWorkspaceResponse.lock_token`'s comment sets. `locked`/`locked_by`
+    are the row's own raw state, same meaning as everywhere else."""
+
+    link: StrictStr | None = None
+    type: StrictStr | None = None
+    title: StrictStr | None = None
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    lock_token: StrictStr | None = None
+    lock_expires_at: datetime | None = None
+
+
+class ComponentLockAPIResponse(BaseModel):
+    data: ComponentLockResponse
+
+
 class BreadcrumbAPIResponse(BaseModel):
     data: list[BreadcrumbItemResponse] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------
+# Lock-state poll (POST /v2/locks/state)
+# ---------------------------------------------------------
+
+# Per-kind cap on how many ids one poll may name. The frontend only ever
+# sends what is currently on screen (tens, not hundreds); this just bounds
+# the `IN (...)` lists a hand-crafted request could make the server build.
+MAX_LOCK_STATE_IDS_PER_KIND = 500
+
+
+class LockStateResponse(BaseModel):
+    """Exactly the lock block `TabSummaryResponse`/`NavTabResponse` already
+    carry — the node's own raw row (first four) plus the derived
+    `LockView.state_for` state (last five) — and nothing else, so the
+    frontend can patch these fields over a list row it already holds
+    without touching anything the user may be editing."""
+
+    locked: StrictBool = False
+    locked_by: StrictStr = ""
+    locked_at: datetime | None = None
+    lock_is_stale: StrictBool = False
+
+    lock_state: Literal["free", "self", "locked_here", "locked_by_ancestor", "blocked_by_descendant"] | None = None
+    lock_holder: StrictStr = ""
+    lock_holder_node_label: StrictStr = ""
+    lock_expires_at: datetime | None = None
+    lock_takeover_blocked: StrictBool = False
+
+
+class LockStatesResponse(BaseModel):
+    """Keyed by the same id each list endpoint returns as `documentId` —
+    a nav tab's / gridstack's `document_id`, an SBN node's `link`. An id
+    that does not exist, or that the caller cannot view, is simply absent
+    (§9: the two must not be distinguishable)."""
+
+    nav_tabs: dict[str, LockStateResponse] = Field(default_factory=dict)
+    tabs: dict[str, LockStateResponse] = Field(default_factory=dict)
+    sbn: dict[str, LockStateResponse] = Field(default_factory=dict)
+
+
+class LockStatesAPIResponse(BaseModel):
+    data: LockStatesResponse
 
 
 # ---------------------------------------------------------
@@ -281,6 +478,28 @@ class CreateTabRequest(StrictRequestModel):
 
 
 class UpdateTabRequest(StrictRequestModel):
+    """NO `locked` / `locked_by` FIELDS — DELIBERATELY, NOT AN OVERSIGHT.
+
+    plan_access_control_algorithm_2026-08-27.md §6.6 Fix 1 calls this the
+    "third door": `update_tab_by_document_id_v2` used to accept these two
+    fields and write them straight onto the row with NO ownership check at
+    all — a client could set `{locked: true, locked_by: "anyone"}` on any
+    root tab, or silently clear someone else's lock, without going near
+    `PUT .../lock` or `PUT .../unlock`.
+
+    Removed outright rather than accepted-and-ignored: `StrictRequestModel`
+    is `extra="forbid"`, so a client that still sends either field now gets
+    a 422 — the loud failure this door needs, matching how `LockTabRequest`
+    / `UnlockTabRequest` below dropped their own client-supplied identity
+    fields for the same reason. Nothing in the frontend ever sent these
+    (verified against every `updateTab`/`updateTabV2` call site), so this
+    is uncoupled from the frontend change those two request classes require.
+
+    Locking stays reachable only through `PUT .../lock` and
+    `PUT .../unlock`, which derive the holder from the authenticated
+    identity — never from a request body — and which still refuse a nested
+    gridstack (hazard 4)."""
+
     title: StrictStr | None = Field(
         default=None,
         min_length=1,
@@ -295,14 +514,6 @@ class UpdateTabRequest(StrictRequestModel):
     )
 
     access_control: AccessControlResponse | dict[str, Any] | None = None
-
-    locked: StrictBool | None = None
-
-    locked_by: StrictStr | None = Field(
-        default=None,
-        max_length=255,
-        pattern=CLEAN_TEXT_PATTERN,
-    )
 
     @field_validator("order", mode="before")
     @classmethod
@@ -381,22 +592,156 @@ class UpdateTabContentRequest(StrictRequestModel):
     content: dict[str, Any] | list[Any] | None = None
 
 
+class UpdateComponentContentRequest(StrictRequestModel):
+    """Body of the per-component content write (§6.7 of
+    plan_access_control_algorithm_2026-08-27.md).
+
+    Partial: only the fields actually present are applied — the router reads
+    `model_fields_set` — so a caller can rename a widget without resending
+    its whole data blob.
+
+    WHAT IS ABSENT IS THE INTERESTING PART, and `extra="forbid"` (inherited
+    from StrictRequestModel) is what makes the absences enforceable rather
+    than merely conventional:
+
+      * `x`/`y`/`w`/`h` — repositioning is DELIBERATELY not implemented;
+        §11.3 defers it pending team discussion.
+      * `access_control` — authorization, not content. Grants are edited
+        through the grants surface, which has its own gate (§6.3).
+      * `type`, `link` — a type change re-interprets the stored blob, and
+        `type` is the only route by which the `restricted` redaction
+        sentinel could reach `components.type`. A client that posts a whole
+        serialized widget entry therefore gets a 422 instead of a partial
+        write, which is the intended outcome: that body was built for the
+        canvas save, and the canvas save is exactly what §6.7 says a
+        component-scoped editor must not use.
+
+    See `gridstack_service.update_component_content` for the full rationale.
+    """
+
+    title: StrictStr | None = Field(default=None, max_length=255)
+    description: StrictStr | None = None
+
+    # Nullable in the ANNOTATION so an absent key is representable, but an
+    # EXPLICIT null is refused below. See `_reject_explicit_null_data`.
+    data: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _reject_explicit_null_data(self) -> "UpdateComponentContentRequest":
+        """`data: null` is a 422, while an omitted `data` means "leave it
+        alone" and `data: {}` means "empty this widget".
+
+        THIS IS THE SECOND HALF OF THE SENTINEL GUARD. A widget the caller
+        may not see is served as `{"type": "restricted", "data": null}`
+        (tab_service.py:100), and that entry KEEPS ITS KEY, so it round-trips
+        through a stale client and comes back on the next save. `type` is
+        already refused by `extra="forbid"`; `data: null` is the other half
+        of that same body. Accepting it would overwrite a real widget's
+        stored content with `{}` — the precise data-loss path the canvas save
+        was fixed for on 2026-08-30, rebuilt on a new door.
+
+        Refusing rather than ignoring, because unlike the canvas save there
+        is nothing to degrade gracefully FOR here: this endpoint edits one
+        component the caller named explicitly, so a null blob is a
+        malformed request about that component, not an incidental sibling
+        entry that can be skipped. "Clear this widget" stays expressible as
+        `data: {}`.
+        """
+        if "data" in self.model_fields_set and self.data is None:
+            raise ValueError(
+                "data must be an object; send {} to empty the widget, or omit "
+                "the field to leave it unchanged"
+            )
+        return self
+
+
 class LockTabRequest(StrictRequestModel):
-    locked_by: StrictStr = Field(
-        min_length=1,
-        max_length=255,
-        pattern=CLEAN_TEXT_PATTERN,
-    )
+    """NO `locked_by` FIELD — DELIBERATELY, NOT AN OVERSIGHT.
+
+    plan_access_control_algorithm_2026-08-27.md §6.6 Fix 1: `locked_by` used
+    to be a required client-supplied string, compared verbatim against the
+    stored holder — so a lock could be taken over by sending the right name.
+    The router already authenticates every request (`get_current_user`); it
+    simply never used who the caller actually was. Removed rather than
+    accepted-and-ignored: `StrictRequestModel` is `extra="forbid"`, so a
+    client that still sends the field now gets a 422 — the loud failure
+    intended here, not a silent ignore.
+
+    Owner's decision, 2026-09-02 (carried into the 2026-09-03 locking
+    session): both `renphil-hub-backend` and `renphil-hub-frontend` change
+    in the same session and deploy together, so there is no transitional
+    accept-and-ignore period — the field is gone outright on both sides.
+    Shipping only one half is a 422 on every lock.
+
+    `force` — NEW, plan_lock_propagation_2026-09-08.md §4.2 decision 8.
+    Takes over `document_id`'s whole subtree in one transaction when
+    something in it is held fresh by someone else, instead of refusing —
+    replacing the old unlock(force) -> lock two-step, which had a real race
+    (someone else could grab the node between the two calls). Does NOT
+    reopen Fix 1 above: `force` is not an identity field, `locked_by` stays
+    JWT-derived. Body is now `{}` or `{"force": true}`.
+
+    `link` — NEW, session_handoff_2026-09-16 follow-up. A caller whose edit
+    grant begins at exactly one component (never `edit(n)` on `document_id`
+    itself — edit only folds DOWN the tree, never up) names that component
+    here so the service can check `edit(component)` as an alternate path to
+    the SAME whole-canvas lock a full editor acquires. Optional and additive:
+    every existing full-canvas/sub-grid caller (who already holds `edit(n)`
+    on `document_id`) omits it and is unaffected. See
+    `lock_tab_by_document_id_v2`'s own docstring for the verification this
+    performs (the named component must actually belong to `document_id`)."""
+
+    force: StrictBool = False
+    link: StrictStr | None = None
 
 
 class UnlockTabRequest(StrictRequestModel):
-    unlocked_by: StrictStr | None = Field(
-        default=None,
-        max_length=255,
-        pattern=CLEAN_TEXT_PATTERN,
-    )
+    """NO `unlocked_by` FIELD — same reasoning as `LockTabRequest` above,
+    PLUS it closes a second, undocumented bypass by construction.
+
+    `unlocked_by` used to be OPTIONAL (`str | None = None`), and the
+    ownership check in `unlock_tab_by_document_id_v2` was
+    `... and unlocked_by and ...` — a caller that omitted the field (or sent
+    `null`) short-circuited that check to `False` and the unlock proceeded
+    with NO ownership check at all. `force: true` was never required to
+    steal a lock; simply not sending `unlocked_by` was an equally effective,
+    entirely undocumented way in. Removing the field closes this
+    structurally: an identity that cannot be supplied by the client cannot
+    be omitted by the client either — the server derives it from the JWT on
+    every call, with nothing left for an absent/null value to short-circuit.
+
+    `force` is Hub Admin only (owner decision 2026-09-25, replacing the
+    2026-09-03 "unrestricted" one) — see
+    `access_visibility_service.require_force_allowed`.
+
+    `link` — NEW, same reasoning and same optional/additive shape as
+    `LockTabRequest.link` above. A component-only editor's own release must
+    pass the same alternate `edit(component)` check its acquire did, or it
+    would lock successfully and then be unable to ever unlock its own
+    session."""
 
     force: StrictBool = False
+    link: StrictStr | None = None
+
+
+class RenewLockRequest(StrictRequestModel):
+    """Body of `PUT /v2/tabs/{id}/lock/renew` and
+    `PUT /v2/nav-tabs/{id}/lock/renew` — the save preflight's VALIDATE
+    door (2026-09-16 TTL fix; see `edit_lock_service.renew`). The session
+    being renewed is identified by the `X-Edit-Tokens` header, exactly as
+    on every other token-checked write — never by a body field. No
+    `force`: a renewal has nothing to take over; it either finds the
+    caller's own live session on this node or refuses with one of the
+    §5.5 codes.
+
+    `link` — same optional alternate `edit(component)` path as
+    `LockTabRequest.link`, and NOT optional in practice for
+    `ComponentContentEditModal`: a component-only editor who could only
+    acquire by naming their component must name it again to renew, or
+    this 403s before the session is even looked at. Ignored by the
+    nav-tab route (a nav tab has no component-scoped acquire path)."""
+
+    link: StrictStr | None = None
 
 
 # ---------------------------------------------------------
@@ -457,64 +802,20 @@ class ReorderNavTabsRequest(StrictRequestModel):
     orderedDocumentIds: list[StrictStr] = Field(default_factory=list)
 
 
+class LockStatesRequest(StrictRequestModel):
+    """`documentId`s to report lock state for, grouped by the three id
+    namespaces the frontend holds: nav tabs, v2 tabs (root tabs, variants
+    and SGS sub-tabs — all addressed by their gridstack's `document_id`),
+    and Super Block Note nodes (addressed by `link`)."""
+
+    nav_tabs: list[StrictStr] = Field(default_factory=list, max_length=MAX_LOCK_STATE_IDS_PER_KIND)
+    tabs: list[StrictStr] = Field(default_factory=list, max_length=MAX_LOCK_STATE_IDS_PER_KIND)
+    sbn: list[StrictStr] = Field(default_factory=list, max_length=MAX_LOCK_STATE_IDS_PER_KIND)
+
+
 class MoveTabToNavTabRequest(StrictRequestModel):
     navTabDocumentId: StrictStr = Field(
         min_length=1,
         max_length=255,
         pattern=CLEAN_DOCUMENT_ID_PATTERN,
     )
-
-
-# ---------------------------------------------------------
-# Hub schemas (phase 2, §5.4) — one row, no title/slug of its own.
-# ---------------------------------------------------------
-
-class HubResponse(BaseModel):
-    documentId: StrictStr | None = None
-    title: StrictStr = "Hub"
-    access_control: AccessControlResponse | dict[str, Any] | None = None
-
-
-class HubAPIResponse(BaseModel):
-    data: HubResponse
-
-
-class UpdateHubRequest(StrictRequestModel):
-    access_control: AccessControlResponse | dict[str, Any] | None = None
-
-
-# ---------------------------------------------------------
-# Preview / purge / reset schemas (§5.4, §5.5, §6.3, §6.4) — shared across
-# the hub, nav-tab, and tab routers; none of the three surfaces need their
-# own request shape beyond "which access_control would be written" or
-# "which principal to strip".
-# ---------------------------------------------------------
-
-class PreviewAccessWriteRequest(StrictRequestModel):
-    """Backs POST .../access/preview on all three routers (hub, nav tab,
-    tab). Read-only — plan_write is never applied from this request."""
-    access_control: AccessControlResponse | dict[str, Any] | None = None
-
-
-class PrincipalRequest(StrictRequestModel):
-    """A user or a role, named by type rather than by which group (admins
-    vs viewers) it currently sits in — purge strips a principal from both,
-    wherever it's found."""
-    type: Literal["user", "role"]
-    email: StrictStr | None = None
-    name: StrictStr | None = None
-    scope: StrictStr = ""
-    program: StrictStr = ""
-    function: StrictStr = ""
-
-    @model_validator(mode="after")
-    def _check_required_field(self) -> "PrincipalRequest":
-        if self.type == "user" and not self.email:
-            raise ValueError("email is required when type is 'user'")
-        if self.type == "role" and not self.name:
-            raise ValueError("name is required when type is 'role'")
-        return self
-
-
-class PurgePrincipalRequest(StrictRequestModel):
-    principal: PrincipalRequest

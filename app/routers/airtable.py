@@ -16,6 +16,9 @@ When ``opportunity_rec_type`` is a list, an ``OR`` (IN) match is used.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import hmac
 import logging
 import time
@@ -40,23 +43,36 @@ from fastapi import (
 
 from app.config import get_settings
 from app.db_v2.database import SessionLocalV2, get_db_v2
+from app.db_v2.models.component import ComponentV2
+from app.db_v2.models.hub_user import HubUserV2
 from app.dependencies import (
+    CurrentHubUser,
+    _ensure_hub_user,
     get_airtable_service,
+    get_current_hub_user,
     get_current_user,
+    get_edit_session,
     get_gemini_service,
+    get_viewer_access,
+    is_hub_admin,
 )
+from app.helpers import airtable_ordering as ao
 from app.helpers.cache import airtable_cache, invalidates_cache
 from app.helpers.slack import (
     post_to_response_url,
     verify_slack_signature,
 )
 from app.models.airtable import (
+    AirtableChartPreviewRequest,
     AirtableComponentConfigResponse,
     AirtableComponentConfigUpdate,
     AirtableEditorPreviewRequest,
     AirtableEditorPreviewResponse,
     AirtablePreviewResponse,
+    AirtableWidgetChartResponse,
+    AirtableWidgetDrilldownResponse,
     AirtableWidgetFullRowsResponse,
+    AirtableWidgetIndexSnapshotResponse,
     AirtableWidgetMetricResponse,
     AirtableWidgetRowsResponse,
     AirtableRecord,
@@ -149,22 +165,152 @@ from app.models.airtable import (
     OrganizationInfoRecord,
     OrganizationInfoCreate,
     OrganizationInfoUpdate,
+    WidgetFilters,
 )
 from app.models.auth import UserInfo
+from app.routers.tabs_v2 import access_denied_to_http_exception
+from app.services.access_visibility_service import (
+    AccessDeniedError,
+    ViewerAccess,
+    granted_single_node,
+    resolve_viewer_access,
+)
 from app.services.airtable_service import AirtableService
+from app.services.edit_lock_service import EditSession
 from app.services.gemini_service import GeminiService
 from app.services.gridstack_service import (
+    AirtableComponentBundle,
     get_airtable_component_bundle,
     get_airtable_component_config,
     list_airtable_component_links,
     update_airtable_component_config,
 )
-from app.services.tab_service import HUB_ADMIN_ROLE, _user_can_view_widget
+from app.services.rbac_graph_service import RbacClosures
 from app.services import user_db_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["Data"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   Access control for the six component-data routes below
+#   (plan_ac_enforcement_closeout_2026-09-09.md §5)
+#
+#   Two independent answers to "can you see this widget" used to exist: the
+#   canvas serializer's fold (redacting a hidden widget to the `restricted`
+#   sentinel) and this router's OWN legacy predicate against the component's
+#   raw `access_control` JSONB, where an empty blob meant open to everyone.
+#   A caller who already knew (or guessed) a widget's `link` could bypass the
+#   canvas fold entirely by hitting these six routes directly. This closes
+#   that gap by running the SAME fold the canvas uses, `is_granted` (payload,
+#   not `visible`/chrome — Airtable rows are content, exactly like SBN text
+#   and thread discussions), against a NOT-FOUND response rather than a
+#   FORBIDDEN one (matching `get_component_location`, tabs_v2.py:179-186 —
+#   a deep link to a hidden node must not confirm the node exists).
+# ══════════════════════════════════════════════════════════════════════
+class _LazyRbacClosures:
+    """A `RbacClosures` stand-in whose four eager queries (`__init__`'s own
+    role/scope-edge and is_public reads) are deferred until something on it
+    is actually used.
+
+    `_resolve_airtable_bundle_and_access` passes ONE of these to both
+    `is_hub_admin` and `granted_single_node`. If `is_hub_admin`'s branch 1
+    (the JWT role check — zero queries) already answers `True`, this is
+    never touched and the underlying `RbacClosures(db)` never gets built at
+    all. If branch 1 fails and branch 2 — or `granted_single_node`
+    afterward — actually calls a method on it, the real `RbacClosures` is
+    built ONCE, right here, and reused by whichever of the two reaches it
+    second. Passing bare `closures=None` to both instead (the previous
+    shape) built two independent snapshots for that path — this is the
+    fix for that.
+
+    DUCK-TYPED, NOT A SUBCLASS, AND DELIBERATELY SO. Every caller of a
+    `closures` object in this codebase (`effective_pairs`/`held_closures`
+    in `rbac_graph_service.py`, `granted_single_node` here) only ever
+    attribute-accesses it — `.role_descendants(...)`, `.scope_descendants(
+    ...)` — never `isinstance`-checks it (confirmed by grep before writing
+    this). `__getattr__` forwarding is therefore a safe, minimal way to
+    share one snapshot across two independent callers without changing
+    `RbacClosures`, `is_hub_admin`, or `effective_pairs`'s own signatures —
+    all three are shared by every other AC-gated surface in the app, so
+    changing any of them to support this would be a far bigger, riskier
+    edit than this file's own scope.
+    """
+
+    def __init__(self, db: Session) -> None:
+        self._db = db
+        self._real: RbacClosures | None = None
+
+    def __getattr__(self, name: str):
+        if self._real is None:
+            self._real = RbacClosures(self._db)
+        return getattr(self._real, name)
+
+
+def _resolve_airtable_bundle_and_access(
+    db: Session, link: str, current: CurrentHubUser
+) -> tuple[AirtableComponentBundle | None, bool]:
+    """Bundle fetch + access check, run TOGETHER in one `asyncio.to_thread`
+    call from each of the six routes below.
+
+    WHY THIS ISN'T JUST `Depends(get_viewer_access)`. That dependency
+    (`dependencies.py:395`) is `async def` with a fully SYNCHRONOUS body —
+    no `await` inside it at all — so FastAPI runs it straight on the shared
+    event loop. This file already goes to deliberate lengths to keep
+    synchronous SQLAlchemy work (the bundle fetch, right below) off that
+    loop, via `asyncio.to_thread`, with a comment naming the ~165ms Neon
+    round trip. Adding `Depends(get_viewer_access)` on top would reintroduce
+    exactly that class of blocking call a second time, on every one of these
+    six routes. Folding the access check into the SAME `to_thread` call the
+    bundle fetch already uses avoids a second blocking dependency without
+    duplicating `get_viewer_access`'s own three-line body — see
+    `access_visibility_service.granted_single_node`'s docstring for the
+    Option A vs. Option B measurement that also lives on this call.
+
+    Uses `granted_single_node` (Option B — a single-node O(depth) fast
+    path), not `resolve_viewer_access`/`compute_visibility` (Option A — the
+    whole-tree fold `get_viewer_access` builds). Measured against live Neon
+    before choosing: the whole-tree fold cost ~2.4s end to end for one
+    non-admin request, almost entirely five full-table scans that scale with
+    hub size; the single-node walk pays the same closure/grant cost but
+    replaces those scans with a walk bounded by THIS component's own depth.
+    See `scripts/profile_viewer_access.py` and that function's own
+    docstring for the numbers and the reasoning in full.
+
+    Returns `(None, False)` for an unknown link. Returns `(bundle, False)`
+    for a link that resolves to a component the caller cannot see — the
+    router turns BOTH into the identical 404, so neither response tells an
+    unauthorized caller which case they hit.
+
+    ONE `_LazyRbacClosures`, SHARED BETWEEN `is_hub_admin` AND
+    `granted_single_node`, BUILT AT MOST ONCE. `is_hub_admin`'s branch 1
+    (the JWT role — today's dominant path; `dependencies.py`'s own
+    docstring notes `role_assignments` still holds only a handful of rows)
+    short-circuits with ZERO queries and never touches the object at all,
+    so an admin caller here still builds nothing. A non-JWT-admin caller
+    reaches `is_hub_admin`'s branch 2, which builds the real `RbacClosures`
+    on first use; if that caller then also isn't found admin,
+    `granted_single_node` reuses the SAME already-built snapshot rather
+    than building a second one — the fix for the double-build the previous
+    shape of this function had (bare `closures=None` to both calls).
+    """
+    bundle = get_airtable_component_bundle(db, link)
+    if bundle is None:
+        return None, False
+
+    closures = _LazyRbacClosures(db)
+    if is_hub_admin(db, current, closures=closures):
+        return bundle, True
+
+    granted = granted_single_node(
+        db,
+        current.hub_user_id,
+        ("component", bundle.component_id),
+        is_admin=False,
+        closures=closures,
+    )
+    return bundle, granted
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -277,6 +423,8 @@ def update_airtable_component_config_endpoint(
     background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_v2),
     _user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+    session: EditSession = Depends(get_edit_session),
 ):
     # `model_fields_set` distinguishes "absent" from "explicitly null" —
     # which is the difference between preserving and clearing the PAT.
@@ -293,7 +441,26 @@ def update_airtable_component_config_endpoint(
     if "access_control" in provided:
         updates["access_control"] = body.access_control
 
-    config = update_airtable_component_config(db, link, **updates)
+    try:
+        # plan_lock_propagation_2026-09-08.md §5.3 — this endpoint had NO
+        # require_edit gate at all before this plan (called inside the Save
+        # wave, handleSave step 4, but never itself checked); "add both
+        # gates here, or a stale session keeps a live door into widget
+        # config." BOTH means the full mechanical pair, not decision 6's
+        # ancestor-only treatment — this write is part of the same save
+        # wave the canvas save's own token covers.
+        config = update_airtable_component_config(db, link, access=access, session=session, **updates)
+    except AccessDeniedError as exc:
+        raise access_denied_to_http_exception(exc)
+    except ValueError as exc:
+        # §4.2 (plan_airtable_chart_widget_2026-08-13.md) — an access_control
+        # that widens past the widget's gridstack ceiling. Every other
+        # validation failure in this module surfaces the same way (see the
+        # canvas-save path's own ValueError -> 400 handling).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     if config is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -340,6 +507,7 @@ async def _warm_after_config_save(link: str) -> None:
             return  # nothing to fetch yet — same guard `_refresh_one` uses
         stored = bundle.data or {}
         outcome = await get_airtable_service().warm_widget_cache(
+            widget_type=bundle.widget_type,
             link=link,
             url=source_url,
             api_key=bundle.pat,
@@ -380,9 +548,11 @@ async def get_airtable_component_rows(
         description="Opaque next-page cursor from a previous response.",
     ),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    user = current.info
+
     # ONE bundle instead of three independent accessors: config + pat + data
     # each used to re-query the same ComponentV2 and PageContentV2 rows, so
     # this endpoint issued 6 queries to read 2 rows on EVERY request — cache
@@ -391,31 +561,22 @@ async def get_airtable_component_rows(
     #
     # Plain sync SQLAlchemy (finding #8) — off the event loop via to_thread
     # so this ~165ms Neon round trip doesn't stall every other in-flight
-    # request on the shared asyncio loop.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    # request on the shared asyncio loop. The access-control check (§5 of
+    # plan_ac_enforcement_closeout_2026-09-09.md) runs in the SAME thread —
+    # see `_resolve_airtable_bundle_and_access`'s own docstring for why it
+    # is not a second `Depends(get_viewer_access)`.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
+        # Same message and status for "no such widget" and "you cannot see
+        # this widget" — a deep link to a hidden node must not confirm the
+        # node exists (§5.4; matches get_component_location, tabs_v2.py:179).
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-
-    # Access control, matching the existing (deliberately narrow) pattern in
-    # tab_service.filter_widget_content_for_user: Hub Admins bypass, and only
-    # a widget's OWN explicit access_control is enforced. A widget with no
-    # explicit AC is readable by any authenticated caller here — it inherits
-    # from its tab, which nothing enforces server-side today. That residual
-    # gap is documented in
-    # AI Docs/plan_airtable_personalize_backend_enforcement.md.
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -438,6 +599,10 @@ async def get_airtable_component_rows(
     # Cache sits strictly BELOW the access-control check above — never
     # decorate this handler with @airtable_cache, which would serve a
     # cached hit before that check ever ran (plan §3.1).
+    #
+    # The default order (group, then sort; advanced-filters plan §11) comes
+    # from STORAGE only. There is deliberately no ordering query parameter:
+    # the caller supplies a cursor and nothing else.
     return await airtable_service.fetch_widget_rows_cached(
         link=link,
         url=source_url,
@@ -448,6 +613,10 @@ async def get_airtable_component_rows(
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
         cursor=cursor,
+        order=ao.widget_default_order(
+            default_group=stored.get("defaultGroup"),
+            default_sort=stored.get("defaultSort"),
+        ),
     )
 
 
@@ -476,28 +645,24 @@ aggregate.
 async def get_airtable_component_metric(
     link: str = Path(..., description="The component's stable `link`."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    # Same bundle/AC/source-url/pat shape as get_airtable_component_rows —
-    # see the comments there. Plain sync SQLAlchemy off the event loop
-    # (finding #8), same reasoning.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_rows
+    # — see the comments there, including why the access check rides the
+    # same to_thread call as the bundle fetch instead of a second
+    # Depends(get_viewer_access).
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -526,7 +691,1151 @@ async def get_airtable_component_metric(
         filters=stored.get("filters") or None,
         personalize_enabled=bool(config.get("personalizeEnabled")),
         personalize_column=config.get("personalizeColumn"),
+        **_metric_count_options(stored),
     )
+
+
+def _metric_count_options(stored: dict) -> dict:
+    """The Metric widget's Count-dedupe settings, read from the widget's OWN
+    stored data (never the request). The single reader shared by BOTH
+    `fetch_widget_metric_cached` callers — the `/metric` route and
+    `get_airtable_personal_context` (the Agent path) — so the Agent can never
+    report a different number from the one the dashboard shows.
+    """
+    return {
+        "count_field": str(stored.get("countField") or "").strip() or None,
+        "count_distinct": bool(stored.get("countDistinct")),
+        "count_ignore_empty": bool(stored.get("countIgnoreEmpty")),
+    }
+
+
+# Registered BEFORE its /{link}-shaped GET sibling below, so a request here
+# is never captured as a link lookup — same precedent as
+# /airtable/component/preview vs. the /{link}/... GET routes (decision 3,
+# plan §3.6/L1). Methods differ (POST vs GET) so the two can never actually
+# collide, but the ordering is kept as the deliberate, defensive convention.
+@router.post(
+    "/airtable/component/chart/preview",
+    response_model=AirtableWidgetChartResponse,
+    summary="Preview a Chart widget's in-progress settings (Property Panel)",
+    description="""
+Preview settings that have not been saved yet — used by the Property Panel's
+Chart configuration fields and the in-canvas edit preview.
+
+Same two-shape resolution as `/airtable/component/preview`: send **either**
+your own `pat` + `sourceUrl`, **or** a `link` alone (token and source URL
+come from storage, and the widget's access control applies). A `sourceUrl`
+that differs from the stored one while relying on the stored token is
+rejected.
+
+Answered from the widget's already-warmed cache entry when one exists and
+matches the requested filters (`partial: false`); otherwise from one
+Airtable read capped at 100 records (`partial: true`). Never warms the
+cache itself — see `AirtableService.preview_widget_chart`'s docstring.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def preview_airtable_component_chart(
+    body: AirtableChartPreviewRequest = Body(...),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    user = current.info
+
+    # Same two-shape resolution as preview_airtable_component — see the
+    # comments there. Deliberately not extracted into a shared helper for
+    # this first duplication (two call sites); a third would earn one.
+    body_pat = (body.pat or "").strip()
+    body_url = (body.sourceUrl or "").strip()
+    link = (body.link or "").strip() or None
+
+    if body_pat:
+        if not body_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="sourceUrl is required when supplying a pat",
+            )
+        url, api_key = body_url, body_pat
+        link = None
+
+    elif link:
+        # §5 of plan_ac_enforcement_closeout_2026-09-09.md gates only THIS
+        # branch — the body-pat branch above never resolves a component and
+        # needs no fold, the caller supplied their own credential.
+        bundle, granted = await asyncio.to_thread(
+            _resolve_airtable_bundle_and_access, db, link, current
+        )
+        if bundle is None or not granted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Airtable component not found",
+            )
+        config = bundle.config
+
+        stored_url = (config.get("sourceUrl") or "").strip()
+
+        if body_url and body_url != stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Enter the access token for the new source URL — the "
+                    "stored token is only valid for the stored URL."
+                ),
+            )
+
+        if not stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Airtable widget has no source URL configured",
+            )
+
+        stored_pat = bundle.pat
+        if not stored_pat:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This Airtable widget has no access token configured",
+            )
+
+        url, api_key = stored_url, stored_pat
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either a link, or a pat with a sourceUrl",
+        )
+
+    return await airtable_service.preview_widget_chart(
+        link=link,
+        url=url,
+        api_key=api_key,
+        caller_email=user.email,
+        group_field=body.groupField,
+        aggregation=body.aggregation,
+        sum_field=body.sumField,
+        filters=body.filters or None,
+        personalize_enabled=bool(body.personalizeEnabled),
+        personalize_column=body.personalizeColumn,
+        max_groups=body.maxGroups,
+        group_sort=body.groupSort,
+        # The preview legitimately takes the UNSAVED dedupe settings from
+        # the body — same as every other field here.
+        count_field=(body.countField or "").strip() or None,
+        count_distinct=bool(body.countDistinct),
+        count_ignore_empty=bool(body.countIgnoreEmpty),
+    )
+
+
+@router.get(
+    "/airtable/component/{link}/chart",
+    response_model=AirtableWidgetChartResponse,
+    summary="Grouped Count/Sum aggregation for a dashboard Airtable Chart widget",
+    description="""
+Returns one computed value PER GROUP (Count of matching records, or Sum of
+one field) for a Chart widget, fetched server-side under the widget's stored
+token — the group-by field, aggregation, and (for Sum) the summed field are
+all read from the widget's OWN stored configuration, never from the request,
+same "caller cannot widen what they're shown" contract as
+`/airtable/component/{link}/rows`. When personalization is enabled, the
+groups are computed over just the caller's own matching rows.
+
+Computed over the SAME cached full row set the Table and Metric widgets'
+endpoints use. A table too large to cache reports `available: false` rather
+than an approximate value — there is no partial-fetch equivalent for an
+aggregate. High-cardinality group-by fields are folded into a single
+'Other' bucket past the widget's configured (or default) group limit.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_chart(
+    link: str = Path(..., description="The component's stable `link`."),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_metric
+    # — see the comments there.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+    config = bundle.config
+
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = bundle.pat
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    stored = bundle.data or {}
+
+    return await airtable_service.fetch_widget_chart_cached(
+        link=link,
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        group_field=stored.get("groupField") or None,
+        aggregation=stored.get("aggregation") or "count",
+        sum_field=stored.get("sumField") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
+        max_groups=stored.get("maxGroups"),
+        group_sort=stored.get("groupSort") or "value_desc",
+        # Stored data only, never the request — the Metric's own reader.
+        **_metric_count_options(stored),
+    )
+
+
+@router.get(
+    "/airtable/component/{link}/drilldown",
+    response_model=AirtableWidgetDrilldownResponse,
+    summary="Records behind a Metric widget's number or one Chart group (drill-down modal)",
+    description="""
+Returns the records behind a Metric widget's value, or behind one Chart
+group (bar, slice or line point), for the widget's click-to-open modal.
+
+Only available when the widget's stored `clickAction` is `modal` and a
+`drilldownTitleField` is set. Which rows qualify, and which fields are
+returned (the title field, `drilldownFields`, and the summed field for Sum),
+come from the widget's OWN stored configuration — the caller picks only
+which chart group, via `group` (a label exactly as `/chart` returned it) or
+`other=true` for the folded 'Other' bucket. Personalization and access
+control apply exactly as on `/metric` and `/chart`.
+""",
+    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+)
+async def get_airtable_component_drilldown(
+    link: str = Path(..., description="The component's stable `link`."),
+    group: str | None = Query(
+        default=None,
+        description="Chart only: the clicked group's label, as returned by /chart.",
+    ),
+    other: bool = Query(
+        default=False,
+        description="Chart only: drill into the folded 'Other' bucket instead of `group`.",
+    ),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_metric
+    # — see the comments there.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    widget_type = (bundle.widget_type or "").strip().lower()
+    if widget_type not in ("airtable_metric", "chart"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Drill-down is only available for Metric and Chart widgets",
+        )
+
+    stored = bundle.data or {}
+    title_field = str(stored.get("drilldownTitleField") or "").strip()
+    # The gate is the widget's own stored setting: a viewer cannot pull rows
+    # out of a widget whose editor never turned the modal on.
+    if stored.get("clickAction") != "modal" or not title_field:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This widget does not have a drill-down modal enabled",
+        )
+    if widget_type == "chart" and not other and group is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide the chart group to drill into",
+        )
+
+    config = bundle.config
+    source_url = (config.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no source URL configured",
+        )
+
+    pat = bundle.pat
+    if not pat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Airtable widget has no access token configured",
+        )
+
+    raw_details = stored.get("drilldownFields")
+    detail_fields = [
+        str(f).strip()
+        for f in (raw_details if isinstance(raw_details, list) else [])
+        if str(f or "").strip()
+    ]
+    # Both widget types: a Metric drops uncounted rows, a Chart also ranks
+    # 'Other' with the same dedupe its /chart response used.
+    count_options = _metric_count_options(stored)
+
+    return await airtable_service.fetch_widget_drilldown_cached(
+        widget_type=widget_type,
+        link=link,
+        url=source_url,
+        api_key=pat,
+        caller_email=user.email,
+        title_field=title_field,
+        detail_fields=detail_fields,
+        aggregation=stored.get("aggregation") or "count",
+        sum_field=stored.get("sumField") or None,
+        filters=stored.get("filters") or None,
+        personalize_enabled=bool(config.get("personalizeEnabled")),
+        personalize_column=config.get("personalizeColumn"),
+        count_field=count_options.get("count_field"),
+        count_ignore_empty=bool(count_options.get("count_ignore_empty")),
+        group_field=stored.get("groupField") or None,
+        max_groups=stored.get("maxGroups"),
+        group=group if widget_type == "chart" else None,
+        other=other if widget_type == "chart" else False,
+        count_distinct=bool(count_options.get("count_distinct")),
+    )
+
+
+
+def _require_airtable_index_sync_token(
+    x_sync_token: str | None = Header(
+        default=None,
+        alias="X-Sync-Token",
+    ),
+) -> None:
+    """Authenticate the Agent's server-to-server Airtable ingestion read."""
+
+    expected = (get_settings().AGENT_SYNC_TOKEN or "").strip()
+
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Airtable ingestion service authentication "
+                "is not configured."
+            ),
+        )
+
+    provided = (x_sync_token or "").strip()
+
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid sync token.",
+        )
+
+
+_AIRTABLE_PERSONAL_CONTEXT_DOMAIN = b"renphil-airtable-personal-v1:"
+_AIRTABLE_PERSONAL_IDENTITY_TTL_SECONDS = 60
+_AIRTABLE_PERSONAL_IDENTITY_FUTURE_SKEW_SECONDS = 30
+_AIRTABLE_PERSONAL_CONTEXT_MAX_BYTES = 4096
+
+
+def _invalid_airtable_personal_identity() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid Agent identity context",
+    )
+
+
+def _verify_airtable_personal_identity(
+    encoded_context: str | None,
+    signature: str | None,
+) -> dict[str, Any]:
+    """Verify a short-lived HMAC-bound identity produced by the trusted Agent."""
+
+    secret = (get_settings().AGENT_SYNC_TOKEN or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent sync authentication is not configured",
+        )
+
+    encoded = (encoded_context or "").strip()
+    supplied_signature = (signature or "").strip()
+    if (
+        not encoded
+        or not supplied_signature
+        or len(encoded.encode("utf-8")) > _AIRTABLE_PERSONAL_CONTEXT_MAX_BYTES
+    ):
+        raise _invalid_airtable_personal_identity()
+
+    try:
+        encoded_bytes = encoded.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise _invalid_airtable_personal_identity() from exc
+
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        _AIRTABLE_PERSONAL_CONTEXT_DOMAIN + encoded_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(supplied_signature, expected):
+        raise _invalid_airtable_personal_identity()
+
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(
+            (encoded + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _invalid_airtable_personal_identity() from exc
+
+    if not isinstance(payload, dict):
+        raise _invalid_airtable_personal_identity()
+
+    version = payload.get("v")
+    issued_at = payload.get("iat")
+    email = payload.get("email")
+    raw_roles = payload.get("roles")
+
+    if type(version) is not int or version != 1:
+        raise _invalid_airtable_personal_identity()
+    if type(issued_at) is not int:
+        raise _invalid_airtable_personal_identity()
+    if not isinstance(email, str) or not email.strip():
+        raise _invalid_airtable_personal_identity()
+    if not isinstance(raw_roles, list) or any(
+        not isinstance(role, str) for role in raw_roles
+    ):
+        raise _invalid_airtable_personal_identity()
+
+    now = int(time.time())
+    if issued_at > now + _AIRTABLE_PERSONAL_IDENTITY_FUTURE_SKEW_SECONDS:
+        raise _invalid_airtable_personal_identity()
+    if now - issued_at > _AIRTABLE_PERSONAL_IDENTITY_TTL_SECONDS:
+        raise _invalid_airtable_personal_identity()
+
+    normalized_roles: list[str] = []
+    seen_roles: set[str] = set()
+    for role in raw_roles:
+        cleaned = role.strip()
+        if not cleaned or cleaned in seen_roles:
+            continue
+        seen_roles.add(cleaned)
+        normalized_roles.append(cleaned)
+
+    return {
+        "email": email.strip().lower(),
+        "roles": normalized_roles,
+    }
+
+
+def _require_airtable_personal_identity(
+    x_sync_token: str | None = Header(
+        default=None,
+        alias="X-Sync-Token",
+    ),
+    x_agent_context: str | None = Header(
+        default=None,
+        alias="X-RenPhil-Agent-Context",
+    ),
+    x_agent_signature: str | None = Header(
+        default=None,
+        alias="X-RenPhil-Agent-Signature",
+    ),
+) -> dict[str, Any]:
+    """Authenticate the Agent service and bind the authenticated end-user identity."""
+
+    _require_airtable_index_sync_token(x_sync_token)
+    return _verify_airtable_personal_identity(
+        x_agent_context,
+        x_agent_signature,
+    )
+
+
+def _agent_acl_authorization_fingerprint(
+    *,
+    email: str,
+    is_admin: bool,
+    granted_node_keys: list[str],
+) -> str:
+    """Stable, non-secret cache partition for one live ACL decision."""
+
+    canonical = json.dumps(
+        {
+            "email": email,
+            "is_admin": is_admin,
+            "granted_node_keys": granted_node_keys,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_agent_granted_nodes(
+    db: Session,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the Agent's signed end-user identity through the Hub ACL fold.
+
+    The Agent authenticates with the shared sync token and a short-lived,
+    HMAC-bound user envelope. The database-backed Hub access graph remains the
+    authority for the resulting admin bypass or granted resource nodes.
+    """
+
+    email = str(identity["email"]).strip().lower()
+    roles = list(identity.get("roles") or [])
+    hub_user = _ensure_hub_user(db, email=email, name=email)
+    if hub_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to resolve the Agent user identity.",
+        )
+
+    current = CurrentHubUser(
+        info=UserInfo(email=email, name=hub_user.name or email, roles=roles),
+        hub_user_id=hub_user.id,
+        email=email,
+    )
+    closures = RbacClosures(db)
+    is_admin = is_hub_admin(db, current, closures=closures)
+
+    if is_admin:
+        granted_node_keys: list[str] = []
+    else:
+        access = resolve_viewer_access(
+            db,
+            current.hub_user_id,
+            is_admin=False,
+            closures=closures,
+        )
+        granted_node_keys = sorted(
+            f"{node_kind}:{node_id}"
+            for node_kind, node_id in (access.visibility.granted_view if access.visibility else set())
+        )
+
+    return {
+        "email": email,
+        "is_admin": is_admin,
+        "granted_node_keys": granted_node_keys,
+        "authorization_fingerprint": _agent_acl_authorization_fingerprint(
+            email=email,
+            is_admin=is_admin,
+            granted_node_keys=granted_node_keys,
+        ),
+    }
+
+
+@router.get(
+    "/agent/access/granted-nodes",
+    include_in_schema=False,
+)
+def get_agent_granted_nodes(
+    identity: dict[str, Any] = Depends(_require_airtable_personal_identity),
+    db: Session = Depends(get_db_v2),
+) -> dict[str, Any]:
+    """Return only the live Hub ACL inputs required by Agent retrieval."""
+
+    return _resolve_agent_granted_nodes(db, identity)
+
+
+
+
+@router.get(
+    "/airtable/component/{link}/index-snapshot",
+    response_model=AirtableWidgetIndexSnapshotResponse,
+    include_in_schema=False,
+)
+async def get_airtable_component_index_snapshot(
+    link: str = Path(
+        ...,
+        description="The component's stable link.",
+    ),
+    _service_auth: None = Depends(
+        _require_airtable_index_sync_token
+    ),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(
+        get_airtable_service
+    ),
+):
+    """Return only viewer-independent Airtable data safe for shared indexing."""
+
+    bundle = await asyncio.to_thread(
+        get_airtable_component_bundle,
+        db,
+        link,
+    )
+
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Airtable component not found",
+        )
+
+    config = bundle.config or {}
+    stored = bundle.data or {}
+
+    widget_type = str(
+        bundle.widget_type or ""
+    ).strip().lower()
+
+    if widget_type not in {
+        "airtable",
+        "airtable_metric",
+        "chart",
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget type is not supported "
+                "by component ingestion."
+            ),
+        )
+
+    source_url = str(
+        config.get("sourceUrl") or ""
+    ).strip()
+
+    if not source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget has no source URL "
+                "configured"
+            ),
+        )
+
+    try:
+        base_id, table_id, view_id = (
+            AirtableService._parse_airtable_share_url(
+                source_url
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This Airtable widget has an invalid "
+                "source URL configured"
+            ),
+        ) from exc
+
+    selected_columns: list[str] = []
+
+    raw_selected = stored.get("selectedColumns")
+
+    if isinstance(raw_selected, list):
+        for value in raw_selected:
+            name = str(value or "")
+            if name.strip() and name not in selected_columns:
+                selected_columns.append(name)
+
+    # Chart-only extras, reported on EVERY chart snapshot branch below: the
+    # stored Count-dedupe settings (as stored, even for Sum — same as the
+    # Metric's), so the Agent knows each bar is deduped.
+    chart_extras: dict[str, Any] = {}
+
+    if widget_type == "chart":
+        chart_extras = _metric_count_options(stored)
+        group_name = str(stored.get("groupField") or "").strip()
+        chart_fields = [group_name]
+        chart_aggregation = str(stored.get("aggregation") or "").strip().lower()
+        if chart_aggregation == "sum":
+            chart_fields.append(
+                str(stored.get("sumField") or "").strip()
+            )
+        elif chart_extras["count_field"] and chart_extras["count_field"] != group_name:
+            # Count with a dedupe field: the Agent counts the indexed rows
+            # itself, so it needs the dedupe field's values too.
+            chart_fields.append(chart_extras["count_field"])
+        for name in chart_fields:
+            if name and name not in selected_columns:
+                selected_columns.append(name)
+
+    raw_filters = stored.get("filters")
+
+    # `filters` is a legacy flat list OR a root group object (advanced
+    # filters). Both must reach the walk below: collapsing a group to `[]`
+    # would index the widget's UNFILTERED rows. A list keeps its old
+    # dict-items-only cleanup so a stray non-dict can't fail the response
+    # model; a group passes through as-is (the compiler cleans it).
+    filters: WidgetFilters
+    if isinstance(raw_filters, list):
+        filters = [
+            dict(item)
+            for item in raw_filters
+            if isinstance(item, dict)
+        ]
+    elif isinstance(raw_filters, dict):
+        filters = dict(raw_filters)
+    else:
+        filters = []
+
+    personalize_enabled = bool(
+        config.get("personalizeEnabled")
+    )
+
+    personalize_column = (
+        str(config.get("personalizeColumn") or "").strip()
+        or None
+    )
+
+    pat_available = bool(
+        str(bundle.pat or "").strip()
+    )
+
+    common = {
+        "widget_type": widget_type,
+        "base_id": base_id,
+        "table_id": table_id,
+        "view_id": view_id,
+        "selected_columns": selected_columns,
+        "filters": filters,
+        "personalize_enabled": personalize_enabled,
+        "personalize_column": personalize_column,
+        # Empty for every non-chart widget (the Metric passes its own).
+        **chart_extras,
+    }
+
+    # Metric values are mutable structured facts. They remain a live-query
+    # concern and are never copied into the shared semantic index.
+    if widget_type == "airtable_metric":
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=[],
+            rows=[],
+            row_data_included=False,
+            available=pat_available,
+            reason="metric_live_only",
+            aggregation=(
+                str(
+                    stored.get("aggregation")
+                    or "count"
+                ).strip()
+                or "count"
+            ),
+            sum_field=(
+                str(
+                    stored.get("sumField")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_description=(
+                str(
+                    stored.get("description")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_note=(
+                str(
+                    stored.get("note")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_url=(
+                str(
+                    stored.get("url")
+                    or ""
+                ).strip()
+                or None
+            ),
+            metric_title=(
+                str(
+                    stored.get("title")
+                    or ""
+                ).strip()
+                or None
+            ),
+            # Same reader as both live metric callers, so the Agent's
+            # description of the number matches how it was computed.
+            **_metric_count_options(stored),
+        )
+
+    # Personalized row data is viewer-specific. The index gets only the
+    # component's shared configuration/schema context; no caller identity
+    # is supplied and no row fetch is performed.
+    if personalize_enabled:
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=selected_columns,
+            rows=[],
+            row_data_included=False,
+            available=pat_available,
+            reason="personalized_live_only",
+        )
+
+    # A missing PAT means row material cannot be refreshed. Report that
+    # explicitly; the Agent will treat it as unavailable rather than
+    # replacing previously-good indexed rows with an empty snapshot.
+    if not pat_available:
+        return AirtableWidgetIndexSnapshotResponse(
+            **common,
+            fields=selected_columns,
+            rows=[],
+            row_data_included=False,
+            available=False,
+            reason="source_credentials_unavailable",
+        )
+
+    # Shared indexing must not depend on the optional viewer cache.
+    # Perform a bounded filters-only full walk; partial/oversized results are
+    # reported unavailable so the Agent preserves the previous valid vectors.
+    full = await airtable_service.fetch_widget_index_rows(
+        url=source_url,
+        api_key=bundle.pat,
+        selected_columns=selected_columns or None,
+        filters=filters or None,
+    )
+
+    available = bool(full.available)
+
+    return AirtableWidgetIndexSnapshotResponse(
+        **common,
+        fields=list(full.fields or []),
+        rows=list(full.rows or []) if available else [],
+        row_data_included=available,
+        available=available,
+        reason=(
+            "shared_rows"
+            if available
+            else "shared_rows_unavailable"
+        ),
+    )
+
+
+_AIRTABLE_PERSONAL_MAX_COMPONENTS = 50
+_AIRTABLE_PERSONAL_MAX_PAGES = 4
+_AIRTABLE_PERSONAL_MAX_ROWS_PER_COMPONENT = 100
+
+
+def _airtable_component_visible_to(
+    db: Session,
+    link: str,
+    email: str,
+    roles: list[str],
+) -> ComponentV2 | None:
+    """Return the component for `link` only when `email`/`roles` can view it.
+
+    Rebuilt during the 2026-09-15 sandbox merge: the access_control_service
+    engine this originally called (`can_view` over an `effective_ac` blob)
+    was torn out on this branch for the granted_single_node/effective_pairs
+    design — mirrors `_resolve_airtable_bundle_and_access`'s own
+    is_hub_admin-or-granted_single_node shape, the same primitive this
+    file's other six routes already use. `email`/`roles` here are an
+    arbitrary verified Agent identity (see get_airtable_personal_context's
+    own docstring), not necessarily the caller's own JWT, so this resolves
+    hub_user_id itself rather than taking a CurrentHubUser — an identity
+    with no hub_users row (never logged in) has no grants either way and
+    fails closed to None, exactly like an unknown link does.
+    """
+    bundle = get_airtable_component_bundle(db, link)
+    if bundle is None:
+        return None
+
+    hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
+    if hub_user is None:
+        return None
+
+    closures = _LazyRbacClosures(db)
+    current = CurrentHubUser(
+        info=UserInfo(email=email, name="", picture=None, roles=list(roles or [])),
+        hub_user_id=hub_user.id,
+        email=email,
+    )
+    granted = is_hub_admin(db, current, closures=closures) or granted_single_node(
+        db,
+        hub_user.id,
+        ("component", bundle.component_id),
+        is_admin=False,
+        closures=closures,
+    )
+    if not granted:
+        return None
+
+    return db.query(ComponentV2).filter(ComponentV2.id == bundle.component_id).first()
+
+
+def _airtable_personal_source_shell(
+    *,
+    component: Any,
+    link: str,
+    widget_type: str,
+) -> dict[str, Any]:
+    return {
+        "component_link": link,
+        "widget_type": widget_type,
+        "title": str(getattr(component, "title", "") or "").strip() or None,
+        "description": (
+            str(getattr(component, "description", "") or "").strip() or None
+        ),
+    }
+
+
+@router.get(
+    "/airtable/personal-context",
+    include_in_schema=False,
+)
+async def get_airtable_personal_context(
+    identity: dict[str, Any] = Depends(_require_airtable_personal_identity),
+    db: Session = Depends(get_db_v2),
+    airtable_service: AirtableService = Depends(get_airtable_service),
+):
+    """Return live, ACL-scoped personalized Airtable evidence for this caller.
+
+    Identity is infrastructure-controlled: there is no user email, role, formula,
+    base, table, or personalization column request argument. The endpoint only
+    discovers saved personalized widgets the caller can actually view, applies
+    each widget's saved filters and saved personalization column, and uses the
+    verified Agent identity as the row-level email.
+    """
+
+    email = str(identity.get("email") or "").strip().lower()
+    roles = [
+        str(role).strip()
+        for role in (identity.get("roles") or [])
+        if str(role).strip()
+    ]
+
+    links = await asyncio.to_thread(list_airtable_component_links, db)
+    total_links = len(links)
+    links = links[:_AIRTABLE_PERSONAL_MAX_COMPONENTS]
+
+    sources: list[dict[str, Any]] = []
+    overall_complete = total_links <= _AIRTABLE_PERSONAL_MAX_COMPONENTS
+
+    for link in links:
+        component = await asyncio.to_thread(
+            _airtable_component_visible_to,
+            db,
+            link,
+            email,
+            roles,
+        )
+        if component is None:
+            continue
+
+        widget_type = str(getattr(component, "type", "") or "").strip()
+        if widget_type not in {"airtable", "airtable_metric"}:
+            continue
+
+        bundle = await asyncio.to_thread(
+            get_airtable_component_bundle,
+            db,
+            link,
+        )
+        if bundle is None:
+            continue
+
+        config = bundle.config or {}
+        personalize_enabled = bool(config.get("personalizeEnabled"))
+        personalize_column = str(config.get("personalizeColumn") or "").strip()
+
+        if not personalize_enabled or not personalize_column:
+            continue
+
+        shell = _airtable_personal_source_shell(
+            component=component,
+            link=link,
+            widget_type=widget_type,
+        )
+
+        source_url = str(config.get("sourceUrl") or "").strip()
+        pat = bundle.pat
+        if not source_url or not pat:
+            sources.append(
+                {
+                    **shell,
+                    "available": False,
+                    "complete": False,
+                    "reason": "source_unavailable",
+                }
+            )
+            overall_complete = False
+            continue
+
+        stored = bundle.data or {}
+
+        try:
+            if widget_type == "airtable_metric":
+                metric = await airtable_service.fetch_widget_metric_cached(
+                    link=link,
+                    url=source_url,
+                    api_key=pat,
+                    caller_email=email,
+                    aggregation=stored.get("aggregation") or "count",
+                    sum_field=stored.get("sumField") or None,
+                    filters=stored.get("filters") or None,
+                    personalize_enabled=True,
+                    personalize_column=personalize_column,
+                    **_metric_count_options(stored),
+                )
+
+                blocked = bool(getattr(metric, "personalize_blocked", False))
+                available = bool(getattr(metric, "available", False)) and not blocked
+
+                source = {
+                    **shell,
+                    "aggregation": getattr(metric, "aggregation", None)
+                    or stored.get("aggregation")
+                    or "count",
+                    "available": available,
+                    "complete": available,
+                }
+
+                if available:
+                    source["value"] = getattr(metric, "value", None)
+                else:
+                    source["reason"] = (
+                        "personalization_blocked"
+                        if blocked
+                        else "metric_unavailable"
+                    )
+                    overall_complete = False
+
+                sources.append(source)
+                continue
+
+            rows: list[dict[str, Any]] = []
+            fields: list[str] = []
+            seen_fields: set[str] = set()
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            blocked = False
+            component_complete = True
+
+            for _ in range(_AIRTABLE_PERSONAL_MAX_PAGES):
+                page = await airtable_service.fetch_widget_rows_cached(
+                    link=link,
+                    url=source_url,
+                    api_key=pat,
+                    caller_email=email,
+                    selected_columns=stored.get("selectedColumns") or None,
+                    filters=stored.get("filters") or None,
+                    personalize_enabled=True,
+                    personalize_column=personalize_column,
+                    cursor=cursor,
+                )
+
+                if bool(getattr(page, "personalize_blocked", False)):
+                    blocked = True
+                    rows = []
+                    fields = []
+                    component_complete = False
+                    break
+
+                for field in list(getattr(page, "fields", None) or []):
+                    field_name = str(field)
+                    if field_name and field_name not in seen_fields:
+                        seen_fields.add(field_name)
+                        fields.append(field_name)
+
+                for row in list(getattr(page, "rows", None) or []):
+                    if not isinstance(row, dict):
+                        continue
+                    rows.append(
+                        {
+                            key: value
+                            for key, value in row.items()
+                            if key != "id"
+                        }
+                    )
+                    if len(rows) >= _AIRTABLE_PERSONAL_MAX_ROWS_PER_COMPONENT:
+                        component_complete = False
+                        break
+
+                if len(rows) >= _AIRTABLE_PERSONAL_MAX_ROWS_PER_COMPONENT:
+                    break
+
+                next_cursor_raw = getattr(page, "next_cursor", None)
+                next_cursor = str(next_cursor_raw or "").strip() or None
+                if next_cursor is None:
+                    cursor = None
+                    break
+                if next_cursor in seen_cursors:
+                    component_complete = False
+                    cursor = next_cursor
+                    break
+
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                if cursor is not None:
+                    component_complete = False
+
+            if blocked:
+                sources.append(
+                    {
+                        **shell,
+                        "fields": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "available": False,
+                        "complete": False,
+                        "reason": "personalization_blocked",
+                    }
+                )
+                overall_complete = False
+                continue
+
+            if cursor is not None:
+                component_complete = False
+
+            sources.append(
+                {
+                    **shell,
+                    "fields": fields,
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "available": True,
+                    "complete": component_complete,
+                }
+            )
+            if not component_complete:
+                overall_complete = False
+
+        except Exception as exc:
+            logger.warning(
+                "Airtable personal-context read failed link=%s error_type=%s",
+                link,
+                type(exc).__name__,
+            )
+            sources.append(
+                {
+                    **shell,
+                    "available": False,
+                    "complete": False,
+                    "reason": "source_error",
+                }
+            )
+            overall_complete = False
+
+    return {
+        "sources": sources,
+        "source_count": len(sources),
+        "complete": overall_complete,
+    }
+
+
 
 
 @router.get(
@@ -538,14 +1847,22 @@ Returns the widget's ENTIRE cached row set in one response, for the viewer
 Filter/Sort/Group/Search toolbar to run client-side over. Reads the same
 Upstash-cached table `/rows` warms — no second Airtable walk.
 
-Gated on the widget's own `viewerControlsEnabled` toggle (admin opt-in,
-off by default): when the toggle is off, `available: false` is returned
-rather than 403/404, so a stale client degrades to the paginated `/rows`
-view instead of erroring.
+Gated on the widget's own display settings: open when `viewerControlsEnabled`
+is on (admin opt-in, off by default) OR the widget has a valid default
+grouping (`defaultGroup`, on a displayed column), since grouping needs the
+whole table for group counts, collapse and the group-aware pager (see
+advanced-filters plan §11.3). A default SORT alone doesn't open it: sorting
+is served paginated by `/rows`. When the gate is closed, `available: false`
+is returned rather than 403/404, so a stale client degrades to the paginated
+`/rows` view instead of erroring.
+
+Rows come back UNSORTED: the client orders and groups the whole table
+itself, starting from the stored defaults.
 
 **This gate is a product control, not a security boundary.**
-`viewerControlsEnabled` rides the ordinary canvas save, which requires login
-but no per-widget authorization, so a determined caller could flip it. That
+`viewerControlsEnabled` and `defaultGroup` ride the ordinary canvas save,
+which requires login but no per-widget authorization, so a determined caller
+could flip either. That
 is acceptable only because the gate does not widen what anyone may see:
 access control, the fail-closed personalize gate, and the `selectedColumns`
 projection all run below it, unchanged, and every row this endpoint can
@@ -563,27 +1880,22 @@ Every case falls back to the paginated `/rows` view rather than erroring.
 async def get_airtable_component_rows_full(
     link: str = Path(..., description="The component's stable `link`."),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    # Same bundle/AC/source-url/pat shape as get_airtable_component_rows and
-    # get_airtable_component_metric — see the comments there.
-    bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-    if bundle is None:
+    user = current.info
+
+    # Same bundle+access/source-url/pat shape as get_airtable_component_rows
+    # and get_airtable_component_metric — see the comments there.
+    bundle, granted = await asyncio.to_thread(
+        _resolve_airtable_bundle_and_access, db, link, current
+    )
+    if bundle is None or not granted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Airtable component not found",
         )
     config = bundle.config
-
-    roles = list(user.roles)
-    widget_ac = config.get("access_control")
-    if widget_ac and HUB_ADMIN_ROLE not in roles:
-        if not _user_can_view_widget(widget_ac, user.email, roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this widget",
-            )
 
     source_url = (config.get("sourceUrl") or "").strip()
     if not source_url:
@@ -604,7 +1916,9 @@ async def get_airtable_component_rows_full(
     # Product-control gate (see docstring above), enforced HERE rather than
     # in the service — everything below this point is exactly as safe to
     # call as fetch_widget_rows_cached is, toggle or no toggle.
-    if not bool(stored.get("viewerControlsEnabled")):
+    if not (
+        bool(stored.get("viewerControlsEnabled")) or ao.default_group_is_valid(stored)
+    ):
         settings = get_settings()
         base_id, table_id, view_id = AirtableService._parse_airtable_share_url(source_url)
         return AirtableWidgetFullRowsResponse(
@@ -721,6 +2035,7 @@ async def _refresh_one(
 
         stored = bundle.data or {}
         outcome = await airtable_service.warm_widget_cache(
+            widget_type=bundle.widget_type,
             link=link,
             url=source_url,
             api_key=pat,
@@ -861,9 +2176,11 @@ when your own row set is empty; `rows` reflects what you would actually see.
 async def preview_airtable_component(
     body: AirtableEditorPreviewRequest = Body(...),
     db: Session = Depends(get_db_v2),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
+    user = current.info
+
     body_pat = (body.pat or "").strip()
     body_url = (body.sourceUrl or "").strip()
     link = (body.link or "").strip()
@@ -879,25 +2196,21 @@ async def preview_airtable_component(
         url, api_key = body_url, body_pat
 
     elif link:
-        # config + pat from one resolve rather than two.
-        # Plain sync SQLAlchemy (finding #8) — off the event loop via
-        # to_thread, same as every other call site of this accessor.
-        bundle = await asyncio.to_thread(get_airtable_component_bundle, db, link)
-        if bundle is None:
+        # config + pat + access from one resolve rather than two. Plain sync
+        # SQLAlchemy (finding #8) — off the event loop via to_thread, same
+        # as every other call site of this accessor. §5 of
+        # plan_ac_enforcement_closeout_2026-09-09.md gates only THIS
+        # branch — the body-pat branch above never resolves a component and
+        # needs no fold, the caller supplied their own credential.
+        bundle, granted = await asyncio.to_thread(
+            _resolve_airtable_bundle_and_access, db, link, current
+        )
+        if bundle is None or not granted:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Airtable component not found",
             )
         config = bundle.config
-
-        roles = list(user.roles)
-        widget_ac = config.get("access_control")
-        if widget_ac and HUB_ADMIN_ROLE not in roles:
-            if not _user_can_view_widget(widget_ac, user.email, roles):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have access to this widget",
-                )
 
         stored_url = (config.get("sourceUrl") or "").strip()
 
@@ -942,6 +2255,9 @@ async def preview_airtable_component(
         filters=body.filters or None,
         personalize_enabled=bool(body.personalizeEnabled),
         personalize_column=body.personalizeColumn,
+        order=ao.widget_default_order(
+            default_group=body.defaultGroup, default_sort=body.defaultSort
+        ),
     )
 
 
@@ -1596,7 +2912,7 @@ async def get_active_programs(
     response_model=CountResponse,
     summary=(
         "Number of fellows: distinct Work Emails resolved from the Master "
-        "List's 'Program Lead/Fellow' values (Status = 'Fellowship')"
+        "List's 'Program Lead/Fellow' values (Fund Status = 'Fellowship') "
         "matched against the Users table by Name."
     ),
 )
@@ -1614,7 +2930,7 @@ async def get_distinct_fellows_count(
     response_model=list[PersonContactItem],
     summary=(
         "Unique fellows (First Name, Last Name, Work Email) resolved from the "
-        "Master List's 'Program Lead/Fellow' values (Status = 'Fellowship')"
+        "Master List's 'Program Lead/Fellow' values (Fund Status = 'Fellowship') "
         "matched against the Users table by Name."
     ),
 )
@@ -2949,10 +4265,13 @@ async def create_announcement(
 )
 async def create_feedback(
     payload: FeedbackCreate = Body(...),
-    _user: UserInfo = Depends(get_current_user),
+    user: UserInfo = Depends(get_current_user),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    return await airtable_service.create_feedback(payload)
+    return await airtable_service.create_feedback(
+        payload,
+        from_email=str(user.email),
+    )
 
 
 @router.patch(

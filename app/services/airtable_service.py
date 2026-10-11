@@ -12,22 +12,30 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from pyairtable import Api
 from pyairtable import retry_strategy as _pyairtable_retry_strategy
-from requests.exceptions import RequestException
+from requests.exceptions import HTTPError, RequestException
 from fastapi import HTTPException, status as _http_status
 
 from app.config import Settings, get_settings
 from app.helpers import airtable_formulas as af
+from app.helpers import airtable_ordering as ao
 from app.helpers import airtable_personalize as ap
 from app.helpers.exceptions import AirtableError
 from app.services.cache_service import CacheService, encoded_length, get_cache_service
+from app.services.gridstack_service import (
+    AIRTABLE_CHART_WIDGET_TYPE,
+    AIRTABLE_METRIC_WIDGET_TYPE,
+    AIRTABLE_WIDGET_TYPE,
+)
 from app.models.airtable import (
     AccessControlAssign,
     AccessControlRecord,
@@ -141,6 +149,7 @@ _F_ACCOUNT_NAME = _S.AT_F_ACCOUNT_NAME
 _F_EXCLUDE_FROM_LISTS = _S.AT_F_EXCLUDE_FROM_LISTS
 _F_EXCLUDE_FROM_REPORTING = _S.AT_F_EXCLUDE_FROM_REPORTING
 _F_STATUS = _S.AT_F_STATUS
+_F_FUND_STATUS = _S.AT_F_FUND_STATUS
 _F_SUB_TRACK_OF = _S.AT_F_SUB_TRACK_OF
 _F_SHARE_PUBLICLY = _S.AT_F_SHARE_PUBLICLY
 _F_ONBOARDING_STATUS = _S.AT_F_ONBOARDING_STATUS
@@ -218,6 +227,51 @@ _WIDGET_RETRY_STRATEGY = _pyairtable_retry_strategy(
     status_forcelist=(429, 500, 502, 503, 504)
 )
 
+
+def _list_records_page(api: Api, table: Any, options: dict[str, Any]) -> Any:
+    """One raw "list records" page — `records` AND `offset` together, which
+    `table.all()`/`.iterate()` can't hand back (they swallow `offset`).
+
+    Every raw list-records GET in this module goes through here so it carries
+    the same `fallback=` pyairtable's own `Table.iterate` passes
+    (pyairtable/api/table.py): once the prepared GET URL reaches
+    `Api.MAX_URL_LENGTH` (16,000), `Api.request` re-issues it as
+    `POST …/listRecords` with the options in a JSON body. Without it an
+    over-long URL (a filter formula with many multi-value `eq` tags — the
+    condition caps don't bound that) goes out as a GET and Airtable rejects
+    it. The POST response has the same `records`/`offset` shape, and
+    `offset` travels in the body, so paging works unchanged.
+
+    A `sort` option (the Table widget's stored default order, plan §11) is
+    carried the same way: pyairtable encodes it as `sort[i][…]` query params
+    on the GET and as `[{field, direction}]` in the POST body. When the
+    widget has no `selectedColumns`, nothing can check a sort field against
+    the table before this call, so a stale default (column since renamed or
+    deleted) gets Airtable's 422. That page is retried once WITHOUT `sort`:
+    a stale default is ignored, never an error (Part B decision 3)."""
+    try:
+        return api.request(
+            "get",
+            table.urls.records,
+            fallback=("post", table.urls.records_post),
+            options=options,
+        )
+    except HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if "sort" not in options or status_code != 422:
+            raise
+        logger.warning(
+            "Airtable rejected the widget's default sort (422): retrying without it: %s", exc
+        )
+        unsorted = {key: value for key, value in options.items() if key != "sort"}
+        return api.request(
+            "get",
+            table.urls.records,
+            fallback=("post", table.urls.records_post),
+            options=unsorted,
+        )
+
+
 # ── Field-type hints for the viewer Filter/Sort/Group/Search toolbar ───────
 # (plan_airtable_widget_viewer_controls_2026-08-12.md §2.2). Deliberately
 # narrow: a field type not in this map renders as plain text, same as today.
@@ -292,10 +346,11 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """One page of rows for a dashboard Airtable widget, filtered
         server-side under the app's own identity.
@@ -304,6 +359,13 @@ class AirtableService:
         URL or token. Everything else comes from the widget's stored config
         and the caller's authenticated email, so a viewer cannot widen what
         they are shown.
+
+        `order` is the widget's stored default order (group level, then sort
+        level; `airtable_ordering.widget_default_order`), sent as Airtable's
+        native `sort` so the order holds across Airtable's own pages. A level
+        on a column outside `selected_columns` is dropped (not displayed).
+        Airtable's type-aware ordering can differ slightly from the cached
+        path's JS-parity comparator on mixed-type columns (plan §11.3).
 
         FAILS CLOSED: if personalization is enabled but could not be applied
         (no email, no column, unusable column name), this returns an EMPTY
@@ -347,6 +409,11 @@ class AirtableService:
             options["formula"] = formula
         if cursor:
             options["offset"] = cursor
+        if selected_columns:
+            order = ao.restrict_order_to_fields(order, selected_columns)
+        sort = ao.airtable_sort_option(order)
+        if sort:
+            options["sort"] = sort
 
         # `table.all()` / `.iterate()` both swallow the response's `offset`,
         # so neither can hand back a next-page cursor. Drop to the raw
@@ -355,7 +422,7 @@ class AirtableService:
         table = api.table(base_id, table_id)
         try:
             payload = await asyncio.to_thread(
-                api.request, "get", table.urls.records, options=options
+                _list_records_page, api, table, options
             )
         except RequestException as exc:
             logger.error("Airtable widget row fetch failed: %s", exc)
@@ -531,7 +598,7 @@ class AirtableService:
 
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable widget cache walk failed: %s", exc)
@@ -589,7 +656,7 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> tuple[dict[str, Any] | None, str]:
@@ -747,7 +814,7 @@ class AirtableService:
         serializing, and taking that lock here would let a schema call block
         a row walk.
         """
-        hints, _available = await self._fetch_table_field_hints_impl(
+        hints, _names, _available = await self._fetch_table_field_hints_impl(
             base_id=base_id, table_id=table_id, api_key=api_key
         )
         return hints
@@ -770,11 +837,12 @@ class AirtableService:
 
     async def fetch_table_field_hints_with_status(
         self, *, base_id: str, table_id: str, api_key: str
-    ) -> tuple[dict[str, str], bool]:
-        """`fetch_table_field_hints` plus an `available` flag, for the admin
-        preview only. A table with no URL/select columns legitimately returns
-        ({}, True); a PAT without `schema.bases:read` returns ({}, False). The
-        two are indistinguishable from the hints alone, and the Property
+    ) -> tuple[dict[str, str], list[str], bool]:
+        """`fetch_table_field_hints` plus the full ordered field-name list and
+        an `available` flag, for the admin preview only. A table with no
+        URL/select columns legitimately returns ({}, [...names], True); a PAT
+        without `schema.bases:read` returns ({}, [], False). The hints and the
+        flag are indistinguishable from the hints alone, and the Property
         Panel needs to say something different for each.
 
         Not used by the viewer-facing `/rows` and `/rows/full` paths — a
@@ -805,7 +873,7 @@ class AirtableService:
 
     async def _fetch_table_field_hints_impl(
         self, *, base_id: str, table_id: str, api_key: str, force_live: bool = False,
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, str], list[str], bool]:
         """Shared worker `fetch_table_field_hints` and
         `fetch_table_field_hints_with_status` both project from — one code
         path, so `available` is derived directly from the control flow that
@@ -837,13 +905,15 @@ class AirtableService:
             # per-viewer traffic, so paying for a live call while the cache
             # is down is cheap here.)
             if not cache.enabled:
-                return {}, True
+                return {}, [], True
 
             cached = await cache.get(cache_key)
             if isinstance(cached, dict):
-                return cached, True
+                # No field-name list on a cache hit; only the force_live
+                # (preview) path needs it, and that path skips this shortcut.
+                return cached, [], True
             if await cache.get(f"{cache_key}{self._SCHEMA_NEGATIVE_CACHE_SUFFIX}") is not None:
-                return {}, False
+                return {}, [], False
 
         try:
             api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
@@ -857,7 +927,7 @@ class AirtableService:
                 base_id, table_id, exc,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="fetch_failed")
-            return {}, False
+            return {}, [], False
         except Exception:
             # `BaseSchema.table(id)` raises a bare KeyError (NOT
             # RequestException) for a stale/renamed table_id — `_find` ends
@@ -868,19 +938,53 @@ class AirtableService:
                 base_id, table_id,
             )
             await self._mark_schema_unavailable(cache, cache_key, reason="unexpected_error")
-            return {}, False
+            return {}, [], False
 
         hints = {
             f.name: hint
             for f in table_schema.fields
             if (hint := _FIELD_TYPE_HINTS.get(f.type))
         }
+        # Full ordered field-name list from the SAME schema read, so a caller
+        # that needs every column (the editor preview's dropdowns) doesn't pay
+        # for a second Metadata call.
+        field_names = [f.name for f in table_schema.fields]
         await cache.set(
             cache_key,
             hints,
             ttl_seconds=self._settings.AIRTABLE_SCHEMA_CACHE_TTL_SECONDS,
         )
-        return hints, True
+        return hints, field_names, True
+
+    def _base_lock_retry_delay(self) -> float:
+        """One `patient` per-base-lock retry interval: the shared base
+        interval plus per-base jitter. Its jitter MAX is the floor of the
+        fingerprint-lock jitter (see `_fingerprint_lock_retry_delay`), so a
+        base-lock waiter is never out-waited by a fingerprint-lock follower.
+        """
+        s = self._settings
+        return s.AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS + random.uniform(
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MIN_SECONDS,
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS,
+        )
+
+    def _fingerprint_lock_retry_delay(self) -> float:
+        """One `patient` per-fingerprint-lock poll interval: the shared base
+        interval plus jitter starting one `..._FINGERPRINT_LOCK_JITTER_GAP_
+        SECONDS` ABOVE the per-base jitter MAX and spanning `..._RANGE_
+        SECONDS`, so it is strictly longer than any `_base_lock_retry_delay`
+        — the lead request must not finish its base-lock wait after the
+        followers polling behind it have already given up (`available=false`).
+        """
+        s = self._settings
+        fp_min = (
+            s.AIRTABLE_CACHE_BASE_LOCK_JITTER_MAX_SECONDS
+            + s.AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_GAP_SECONDS
+        )
+        fp_max = fp_min + s.AIRTABLE_CACHE_FINGERPRINT_LOCK_JITTER_RANGE_SECONDS
+        return s.AIRTABLE_CACHE_LOCK_RETRY_BASE_INTERVAL_SECONDS + random.uniform(
+            fp_min, fp_max
+        )
 
     async def _get_or_warm_widget_cache(
         self,
@@ -889,20 +993,47 @@ class AirtableService:
         url: str,
         api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
+        allow_warm: bool = True,
+        patient: bool = False,
     ) -> dict[str, Any] | None:
         """Returns the cached envelope, warming it on a miss. Returns None
         when the table turned out to be oversized (never cached), the walk
         itself failed, or this call gave up waiting on another request's
         warm with nothing to show for it — either way the caller falls back
-        to the live, uncached path (`fetch_widget_rows`)."""
+        to the live, uncached path (`fetch_widget_rows`).
+
+        `allow_warm=False` (plan_airtable_chart_widget_2026-08-13.md §3.4,
+        L3) makes this call READ-ONLY: a hit still returns normally, but a
+        miss returns None immediately — no negative-marker read, no lock
+        acquisition, no walk, no `cache.set`. Used by the Chart widget's
+        editor preview, whose fingerprint includes `filters`: an admin
+        typing into the filter box would otherwise start a full table walk
+        (plus a whole-table Upstash entry) per keystroke, for cache entries
+        no viewer will ever read. Keyword-only and defaulted to `True` (L11)
+        so every existing caller — `fetch_widget_rows_cached`,
+        `fetch_widget_full_rows_cached`, `fetch_widget_metric_cached` — is
+        unaffected.
+
+        `patient=True` is for the no-live-fallback callers (Metric/Chart):
+        instead of returning None on the FIRST base-lock loss (a sibling
+        widget on the same base mid-walk) — which those callers surface as
+        `available=false` — it retries both the per-fingerprint and the
+        per-base lock on the bounded, jittered schedule in `config.py`
+        (`AIRTABLE_CACHE_LOCK_RETRY_*`), re-checking the cache before each
+        wait. Left `False` for Table/Full, which already degrade gracefully
+        to a live read on the first loss.
+        """
         cache = get_cache_service()
 
         cached = await cache.get(cache_key)
         if isinstance(cached, dict) and "rows" in cached:
             return cached
+
+        if not allow_warm:
+            return None
 
         # A widget recently confirmed oversized or failing — skip the walk
         # (and the lock contention around it) entirely rather than paying
@@ -919,71 +1050,169 @@ class AirtableService:
             lock_key, ttl_seconds=self._settings.AIRTABLE_CACHE_REFRESH_LOCK_SECONDS
         )
         if not lock_token:
-            # Someone else is warming this exact key. Wait briefly rather
-            # than starting a second concurrent full-table walk — the whole
-            # point of the lock (plan §4.4): without it, a cold key plus a
-            # burst of viewers would each start their own walk and breach
-            # Airtable's per-base rate limit.
-            for _ in range(4):
-                await asyncio.sleep(1.5)
+            # Someone else is warming this exact key. Wait rather than
+            # starting a second concurrent full-table walk — the whole point
+            # of the lock (plan §4.4). `patient` callers poll on the longer,
+            # base-lock-aligned schedule so a follower never gives up while
+            # the lead request (which holds this same fingerprint lock) is
+            # still inside its own base-lock wait; everyone else keeps the
+            # original short poll.
+            fp_attempts = (
+                self._settings.AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS
+                if patient
+                else 4
+            )
+            for _ in range(fp_attempts):
+                await asyncio.sleep(
+                    self._fingerprint_lock_retry_delay() if patient else 1.5
+                )
                 cached = await cache.get(cache_key)
                 if isinstance(cached, dict) and "rows" in cached:
                     return cached
             return None
 
         try:
-            try:
-                envelope, status = await self._build_widget_cache_envelope(
-                    cache=cache,
-                    url=url,
-                    api_key=api_key,
-                    selected_columns=selected_columns,
-                    filters=filters,
-                    personalize_enabled=personalize_enabled,
-                    personalize_column=personalize_column,
-                )
-            except AirtableError:
-                # Every OTHER miss-path exit degrades to the live fallback;
-                # a walk failure (e.g. an Airtable 429 mid-walk) must too,
-                # rather than propagating as a 502 to the caller (finding
-                # #2) — the failure rate scales with table size now that a
-                # miss makes N Airtable requests instead of 1.
-                logger.warning(
-                    "Airtable widget cache: walk failed (url=%s) — "
-                    "serving live instead",
-                    url,
-                    exc_info=True,
-                )
-                await self._mark_walk_unwarmable(cache, cache_key, reason="walk_failed")
-                return None
-            if status == "locked":
-                # A DIFFERENT widget on the same base is walking right now
-                # (finding #6) — not a confirmed bad table, just contention,
-                # so no negative marker. And unlike the fingerprint-lock
-                # wait above, there is nothing to poll for: another widget's
-                # walk will never populate THIS cache key. Degrade to live
-                # immediately.
-                return None
-            if status == "oversized":
-                logger.warning(
-                    "Airtable widget cache: table too large to cache "
-                    "(url=%s) — serving live instead, never truncated",
-                    url,
-                )
-                await self._mark_walk_unwarmable(cache, cache_key, reason="oversized")
-                return None
-            await cache.set(
-                cache_key,
-                envelope,
-                ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
-                # ~4.8x smaller stored AND transferred, on a payload that is
-                # by far the largest thing in this cache (§4.3). Opt-in, so
-                # the decorator-cached endpoints are untouched.
-                compress=True,
+            # `patient` callers retry a base-lock loss (a DIFFERENT widget on
+            # the same base mid-walk) instead of giving up on the first miss;
+            # the cache is re-checked before each wait in case the cron (or
+            # any other warmer) populated this key meanwhile. Non-patient
+            # callers keep the original single attempt.
+            base_attempts = (
+                self._settings.AIRTABLE_CACHE_LOCK_RETRY_MAX_ATTEMPTS
+                if patient
+                else 1
             )
-            return envelope
+            for base_attempt in range(base_attempts):
+                try:
+                    envelope, status = await self._build_widget_cache_envelope(
+                        cache=cache,
+                        url=url,
+                        api_key=api_key,
+                        selected_columns=selected_columns,
+                        filters=filters,
+                        personalize_enabled=personalize_enabled,
+                        personalize_column=personalize_column,
+                    )
+                except AirtableError:
+                    # Every OTHER miss-path exit degrades to the live
+                    # fallback; a walk failure (e.g. an Airtable 429 mid-walk)
+                    # must too, rather than propagating as a 502 to the caller
+                    # (finding #2) — the failure rate scales with table size
+                    # now that a miss makes N Airtable requests instead of 1.
+                    logger.warning(
+                        "Airtable widget cache: walk failed (url=%s) — "
+                        "serving live instead",
+                        url,
+                        exc_info=True,
+                    )
+                    await self._mark_walk_unwarmable(
+                        cache, cache_key, reason="walk_failed"
+                    )
+                    return None
+                if status == "locked":
+                    # A DIFFERENT widget on the same base is walking right now
+                    # (finding #6) — not a confirmed bad table, just
+                    # contention, so no negative marker. A `patient` caller
+                    # waits and retries (re-checking the cache first, since a
+                    # concurrent warmer may have filled THIS key); everyone
+                    # else degrades to live immediately as before.
+                    if patient and base_attempt < base_attempts - 1:
+                        await asyncio.sleep(self._base_lock_retry_delay())
+                        cached = await cache.get(cache_key)
+                        if isinstance(cached, dict) and "rows" in cached:
+                            return cached
+                        continue
+                    if patient:
+                        logger.warning(
+                            "Airtable widget cache: base lock still held after "
+                            "%d patient attempts (url=%s) — reporting unavailable",
+                            base_attempts,
+                            url,
+                        )
+                    return None
+                if status == "oversized":
+                    logger.warning(
+                        "Airtable widget cache: table too large to cache "
+                        "(url=%s) — serving live instead, never truncated",
+                        url,
+                    )
+                    await self._mark_walk_unwarmable(
+                        cache, cache_key, reason="oversized"
+                    )
+                    return None
+                await cache.set(
+                    cache_key,
+                    envelope,
+                    ttl_seconds=self._settings.AIRTABLE_CACHE_TTL_SECONDS,
+                    # ~4.8x smaller stored AND transferred, on a payload that
+                    # is by far the largest thing in this cache (§4.3).
+                    # Opt-in, so the decorator-cached endpoints are untouched.
+                    compress=True,
+                )
+                return envelope
+            return None
         finally:
             await cache.release_lock(lock_key, lock_token)
+
+    @staticmethod
+    def _widget_cache_fingerprint(
+        *,
+        widget_type: str,
+        link: str,
+        url: str,
+        selected_columns: list[str] | None,
+        filters: af.WidgetFilters | None,
+        personalize_enabled: bool,
+        personalize_column: str | None,
+    ) -> dict[str, Any]:
+        """The ONE place a `widget_rows` cache fingerprint is shaped, for
+        every widget type that caches one (Table, Metric, Chart alike).
+        plan_warm_key_divergence_2026-08-14.md §3.1.
+
+        A Table widget caches a row set projected AND personalized to the
+        admin's own settings (`fetch_widget_rows_cached`,
+        `fetch_widget_full_rows_cached`), so its fingerprint reflects
+        `selected_columns`/`personalize_enabled`/`personalize_column`
+        directly — they describe what's actually IN the cached entry.
+
+        A Metric or Chart widget instead caches ONE unprojected,
+        unpersonalized row set per widget and applies personalization
+        per-viewer in Python afterward (`fetch_widget_metric_cached`,
+        `fetch_widget_chart_cached`) — so for those two types this pins
+        `selectedColumns: []` / `personalizeEnabled: False` /
+        `personalizeColumn: None` regardless of what's passed in,
+        because THAT is what actually describes the cached bytes, not
+        the widget's own settings.
+
+        Before this method existed, `warm_widget_cache` built its
+        fingerprint straight from the widget's stored config with no
+        knowledge of widget type — so a Metric/Chart widget with
+        personalization on (or merely a stored `personalizeColumn` left
+        over from a prior save) warmed a key its own read path never
+        looks up: a wasted whole-table Upstash entry, and the widget
+        stayed cold until a real viewer's request warmed the RIGHT key
+        via `_get_or_warm_widget_cache`. This is the fix.
+
+        A caller passing a Metric/Chart `widget_type` must ALSO
+        normalize the values it feeds to the actual walk
+        (`_build_widget_cache_envelope`) the same way — seeing
+        `warm_widget_cache`'s own normalization is not optional: a
+        pinned key over a WALK that still projects columns would cache
+        rows missing a field a reader expects (the L2 projection trap,
+        in reverse).
+        """
+        if widget_type in (AIRTABLE_METRIC_WIDGET_TYPE, AIRTABLE_CHART_WIDGET_TYPE):
+            selected_columns = None
+            personalize_enabled = False
+            personalize_column = None
+        return {
+            "link": link,
+            "sourceUrl": url,
+            "selectedColumns": list(selected_columns or []),
+            "filters": filters or [],
+            "personalizeEnabled": bool(personalize_enabled),
+            "personalizeColumn": personalize_column or None,
+        }
 
     async def fetch_widget_rows_cached(
         self,
@@ -993,15 +1222,23 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
         cursor: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """Cache-aware sibling of `fetch_widget_rows` — same contract, same
         response shape, backing `GET /airtable/component/{link}/rows` once
         the cache is wired in below the endpoint's access-control check
         (plan §3.1, §4).
+
+        `order` (the stored default order, advanced-filters plan §11) is
+        applied at SERVE time: after personalization, before slicing, so an
+        `idx:<offset>` cursor is an offset into the ordered list and page 2
+        continues it. The cache envelope and fingerprint don't carry it, so a
+        default change costs no re-warm (Part B decision 7). The live
+        fallbacks pass it to Airtable as a native `sort` instead.
 
         Personalization is applied in Python against an unpersonalized,
         filters-only cached row set (§6) rather than baked into the
@@ -1059,16 +1296,18 @@ class AirtableService:
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
                 cursor=self._live_cursor(cursor),
+                order=order,
             )
 
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": list(selected_columns or []),
-            "filters": filters or [],
-            "personalizeEnabled": bool(personalize_enabled),
-            "personalizeColumn": personalize_column or None,
-        }
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=AIRTABLE_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         envelope = await self._get_or_warm_widget_cache(
@@ -1095,6 +1334,7 @@ class AirtableService:
                 personalize_enabled=personalize_enabled,
                 personalize_column=personalize_column,
                 cursor=self._live_cursor(cursor),
+                order=order,
             )
 
         rows = envelope["rows"]
@@ -1113,6 +1353,17 @@ class AirtableService:
         # "stable across pages" reasoning as `fetch_widget_rows`.
         response_fields = list(selected_columns) if selected_columns else envelope["fields"]
         field_set = set(response_fields)
+
+        # Default order (plan §11.3): AFTER personalization, so it orders only
+        # this caller's rows, and BEFORE the slice, so `idx:` cursors index
+        # the ordered list. Only displayed columns count (a stale default is
+        # ignored). `sort_rows` returns a new list; the envelope's own
+        # `rows` is never reordered in place. Off the event loop: it's pure
+        # CPU, ~0.5 s for two all-distinct string levels at the 50,000-row
+        # cache ceiling (tens of ms for a few thousand rows).
+        effective_order = ao.restrict_order_to_fields(order, response_fields)
+        if effective_order:
+            rows = await asyncio.to_thread(ao.sort_rows, rows, effective_order)
 
         start = self._parse_synthetic_cursor(cursor)
         page = rows[start : start + self._WIDGET_PAGE_SIZE]
@@ -1142,6 +1393,98 @@ class AirtableService:
             field_types=field_types,
         )
 
+    async def fetch_widget_index_rows(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        selected_columns: list[str] | None = None,
+        filters: af.WidgetFilters | None = None,
+    ):
+        """Return one complete viewer-independent row set for shared indexing.
+
+        Unlike ``fetch_widget_full_rows_cached`` this path is intentionally
+        independent of the optional viewer cache.  It performs the same
+        filters-only Airtable walk used to warm that cache, honors the existing
+        hard row/byte caps, and never returns a partial result as complete.
+        """
+        from app.models.airtable import AirtableWidgetFullRowsResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+        formula, allowed = af.widget_formula(
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+            email="",
+        )
+        if not allowed:
+            # This should be unreachable because personalization is forced off,
+            # but fail closed if formula semantics ever change.
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=list(selected_columns or []),
+                field_types={},
+                rows=[],
+                personalize_blocked=True,
+                available=False,
+                page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+            )
+
+        fetch_fields = list(selected_columns) if selected_columns else None
+        api = Api(api_key.strip(), retry_strategy=_WIDGET_RETRY_STRATEGY)
+        table = api.table(base_id, table_id)
+        rows, seen_fields, oversized = await self._walk_full_table(
+            api=api,
+            table=table,
+            view_id=view_id,
+            fetch_fields=fetch_fields,
+            formula=formula,
+        )
+
+        response_fields = (
+            list(selected_columns)
+            if selected_columns
+            else list(seen_fields)
+        )
+
+        if oversized:
+            return AirtableWidgetFullRowsResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                fields=response_fields,
+                field_types={},
+                rows=[],
+                personalize_blocked=False,
+                available=False,
+                page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+            )
+
+        field_set = set(response_fields)
+        projected_rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key == "id" or key in field_set
+            }
+            for row in rows
+        ]
+
+        return AirtableWidgetFullRowsResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            fields=response_fields,
+            field_types={},
+            rows=projected_rows,
+            personalize_blocked=False,
+            available=True,
+            page_size=self._settings.AIRTABLE_WIDGET_FULL_VIEW_PAGE_SIZE,
+        )
+
+
     async def fetch_widget_full_rows_cached(
         self,
         *,
@@ -1150,7 +1493,7 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
     ):
@@ -1168,10 +1511,11 @@ class AirtableService:
         partial number" stance — a partial aggregate is silently WRONG, a
         partial row list is merely incomplete.)
 
-        The `viewerControlsEnabled` toggle gate is the ROUTER's job (product
-        control, not a security boundary — see the router docstring), not
-        this method's: everything below is exactly as safe to call as
-        `fetch_widget_rows_cached` is.
+        The gate (`viewerControlsEnabled` or a valid `defaultGroup`) is the
+        ROUTER's job (product control, not a security boundary — see the
+        router docstring), not this method's: everything below is exactly as
+        safe to call as `fetch_widget_rows_cached` is. Rows are returned
+        unsorted; the client applies the stored default order itself.
         """
         from app.models.airtable import AirtableWidgetFullRowsResponse
 
@@ -1226,19 +1570,22 @@ class AirtableService:
                 page_size=page_size,
             )
 
-        # 3. Fingerprint built BYTE-IDENTICALLY to fetch_widget_rows_cached's
-        # own fingerprint (L1) — a mismatch silently doubles the Airtable
-        # walk and the cache storage, with no visible symptom. Do NOT copy
-        # fetch_widget_metric_cached's deliberately-different fingerprint —
-        # that one is specific to the Metric widget's no-column-picker case.
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": list(selected_columns or []),
-            "filters": filters or [],
-            "personalizeEnabled": bool(personalize_enabled),
-            "personalizeColumn": personalize_column or None,
-        }
+        # 3. Fingerprint built through the SAME shared helper
+        # fetch_widget_rows_cached uses, with the same AIRTABLE_WIDGET_TYPE
+        # (L1) — a mismatch silently doubles the Airtable walk and the
+        # cache storage, with no visible symptom. Do NOT pass
+        # AIRTABLE_METRIC_WIDGET_TYPE/AIRTABLE_CHART_WIDGET_TYPE here —
+        # those pin a deliberately different, unprojected fingerprint
+        # specific to the Metric/Chart widgets' shared-cache-entry design.
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=AIRTABLE_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         envelope = await self._get_or_warm_widget_cache(
@@ -1357,6 +1704,162 @@ class AirtableService:
             return total if found_any else None
         return None
 
+    @staticmethod
+    def _chart_group_key(value: Any) -> str:
+        """One Airtable field value -> one chart group label, for the Chart
+        widget's group-by (decisions 5 and 6, plan_airtable_chart_widget_
+        2026-08-13.md §3.2).
+
+        None / "" / [] / {} all fold into a single "(Empty)" group so a row
+        with a blank group-by value never silently disappears — the chart's
+        row total always matches the record count.
+
+        A list (multi-select, linked records, a rollup/lookup of many
+        values) becomes ONE combined group: its non-empty elements, coerced
+        individually and joined with ", ", in the ORDER Airtable returned
+        them — deliberately not sorted, so `['A','B']` and `['B','A']` are
+        two distinct groups (assumption §9.2). Every row still lands in
+        exactly one bucket, so Count/Sum and percentages stay exact.
+
+        Never raises: a group label is a display string, and a chart that
+        500s because one cell held an unexpected shape is worse than one odd
+        label.
+        """
+        if value is None:
+            return "(Empty)"
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            return str(value)
+        if isinstance(value, list):
+            # Each element goes through this same coercion (recursively
+            # handling nested dict/collaborator shapes), then any element
+            # that came out blank is dropped rather than contributing a
+            # literal "(Empty)" into the joined label.
+            parts = [
+                part
+                for item in value
+                if (part := AirtableService._chart_group_key(item)) != "(Empty)"
+            ]
+            return ", ".join(parts) if parts else "(Empty)"
+        if isinstance(value, dict):
+            if not value:
+                return "(Empty)"
+            for key in ("name", "email"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            try:
+                text = str(value)
+            except Exception:
+                return "(Empty)"
+            return text.strip() or "(Empty)"
+        try:
+            text = str(value).strip()
+        except Exception:
+            return "(Empty)"
+        return text if text else "(Empty)"
+
+    @staticmethod
+    def _normalize_dedupe_text(text: str) -> str:
+        """One text value -> its Metric-dedupe comparison form (D-M4a,
+        plan_metric_chart_feedback_2026-09-30.md §1): NFKC, lowercase, drop
+        every character that is not a Unicode letter/digit/whitespace
+        (underscores included), collapse whitespace runs, trim. So `Acme`,
+        ` ACME `, `Acme.` and `acme!` all compare equal.
+
+        Deliberately NOT shared with `_chart_group_key`: the Chart groups by
+        exact, order-sensitive value; the Metric dedupe normalises. Mirrored
+        client-side by `normalizeDedupeText` in AirtableMetricWidget.tsx.
+        """
+        text = unicodedata.normalize("NFKC", text).lower()
+        text = "".join(ch for ch in text if ch.isalnum() or ch.isspace())
+        return " ".join(text.split())
+
+    @staticmethod
+    def _dedupe_elements(value: Any) -> Iterator[str]:
+        """Yield the normalised, non-empty comparison texts of one cell value
+        (D-M4b). Lists (multi-select, linked records, lookups — nested
+        included) flatten into their elements. Real numbers keep their
+        canonical numeric text and are NOT run through
+        `_normalize_dedupe_text`, so numeric 1.5 never merges with 15
+        (D-M4a sub-decision; text "1.5" still does). Never raises.
+        """
+        if value is None:
+            return
+        if isinstance(value, bool):
+            yield "yes" if value else "no"
+            return
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value.is_integer():
+                yield str(int(value))
+            else:
+                yield str(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                yield from AirtableService._dedupe_elements(item)
+            return
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, dict):
+            if not value:
+                return
+            text = None
+            for key in ("name", "email"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    text = candidate
+                    break
+            if text is None:
+                try:
+                    text = str(value)
+                except Exception:
+                    return
+        else:
+            try:
+                text = str(value)
+            except Exception:
+                return
+        normalized = AirtableService._normalize_dedupe_text(text)
+        if normalized:
+            yield normalized
+
+    @staticmethod
+    def _dedupe_key(value: Any) -> frozenset[str] | None:
+        """One cell value -> its Metric-dedupe key, or None when empty
+        (D-M4c). A frozenset of the normalised elements implements Rule B in
+        one stroke: order-insensitive, in-record duplicates collapse, and a
+        scalar equals its one-element list.
+        """
+        elems = frozenset(AirtableService._dedupe_elements(value))
+        return elems or None
+
+    @staticmethod
+    def _count_rows(
+        rows: list[dict[str, Any]],
+        *,
+        count_field: str | None,
+        count_distinct: bool,
+        count_ignore_empty: bool,
+    ) -> int:
+        """The Metric widget's Count, honouring the two dedupe switches
+        (plan §1 "M4 semantics"). No field, or both switches off, is a plain
+        record count — today's behaviour. Distinct without ignore-empty
+        counts every empty record together as ONE extra value.
+        """
+        if not count_field or not (count_distinct or count_ignore_empty):
+            return len(rows)
+        keys = [AirtableService._dedupe_key(row.get(count_field)) for row in rows]
+        if not count_distinct:
+            return sum(k is not None for k in keys)
+        distinct = len({k for k in keys if k is not None})
+        if count_ignore_empty:
+            return distinct
+        return distinct + (1 if None in keys else 0)
+
     async def fetch_widget_metric_cached(
         self,
         *,
@@ -1366,9 +1869,12 @@ class AirtableService:
         caller_email: str,
         aggregation: str,
         sum_field: str | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
     ):
         """Count/Sum aggregation for a dashboard Airtable Metric widget.
 
@@ -1393,6 +1899,12 @@ class AirtableService:
         envelope, exactly like `fetch_widget_rows_cached` — same fail-closed
         gate, checked before the cache is even touched, so Count/Sum can be
         computed per-viewer without a second cache entry per viewer.
+
+        `count_field` / `count_distinct` / `count_ignore_empty` (Count only,
+        ignored for Sum) dedupe AFTER personalisation via `_count_rows`. They
+        deliberately do NOT enter the cache fingerprint: the walk above
+        already fetches every field, so any `count_field` is present in the
+        cached rows and warm-on-save / the cron sweep need no change.
         """
         from app.models.airtable import AirtableWidgetMetricResponse
 
@@ -1436,14 +1948,15 @@ class AirtableService:
             )
 
         cache = get_cache_service()
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": [],
-            "filters": filters or [],
-            "personalizeEnabled": False,
-            "personalizeColumn": None,
-        }
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=AIRTABLE_METRIC_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         envelope = await self._get_or_warm_widget_cache(
@@ -1454,6 +1967,7 @@ class AirtableService:
             filters=filters,
             personalize_enabled=False,
             personalize_column=None,
+            patient=True,
         )
 
         if envelope is None:
@@ -1483,7 +1997,12 @@ class AirtableService:
                     total += coerced
             value: float | int = total
         else:
-            value = len(rows)
+            value = self._count_rows(
+                rows,
+                count_field=count_field,
+                count_distinct=count_distinct,
+                count_ignore_empty=count_ignore_empty,
+            )
 
         return AirtableWidgetMetricResponse(
             base_id=base_id,
@@ -1495,20 +2014,605 @@ class AirtableService:
             personalize_blocked=False,
         )
 
-    async def warm_widget_cache(
+    @staticmethod
+    def _chart_cache_fingerprint(
+        *, link: str, url: str, filters: af.WidgetFilters | None
+    ) -> dict[str, Any]:
+        """The `widget_rows` cache fingerprint a Chart widget's aggregation
+        reads — a thin, Chart-specific alias over the shared
+        `_widget_cache_fingerprint(widget_type=AIRTABLE_CHART_WIDGET_TYPE)`,
+        which is BYTE-IDENTICAL to `fetch_widget_metric_cached`'s own
+        (`selectedColumns: []`, `personalizeEnabled: False`,
+        `personalizeColumn: None`), so the walk fetches every field and a
+        chart's own `link` keeps its entry from colliding with a Table or
+        Metric widget's differently-projected one on the same base/table.
+
+        Kept as its own named method (rather than inlining the shared call
+        at both use sites) so `preview_widget_chart`'s read-only lookup can
+        never drift from `fetch_widget_chart_cached`'s own (L1) — a drift
+        has no visible symptom, it just means the preview always misses the
+        warmed entry and always reports `partial=True`.
+        """
+        return AirtableService._widget_cache_fingerprint(
+            widget_type=AIRTABLE_CHART_WIDGET_TYPE,
+            link=link,
+            url=url,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
+
+    @staticmethod
+    def _chart_count_field(
+        *, group_field: str | None, aggregation: str, count_field: str | None
+    ) -> str | None:
+        """The Chart's effective Count-dedupe field: None for Sum, and None
+        when it names the group-by field itself (owner decision 2026-10-03 —
+        the panel never offers that pairing, so stored data carrying it is
+        ignored rather than trusted). Shared by the chart aggregation and
+        the drill-down so both always agree on whether dedupe applies.
+        """
+        if aggregation == "sum" or not count_field:
+            return None
+        if count_field.strip() == (group_field or "").strip():
+            return None
+        return count_field
+
+    def _rank_chart_groups(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        group_field: str,
+        aggregation: str,
+        sum_field: str | None,
+        max_groups: int | None,
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
+    ) -> tuple[list[str], list[str], dict[str, float], dict[str, int]]:
+        """Group `rows` and split the group keys into kept and folded-into-
+        'Other', returning `(kept_keys, other_keys, totals, counts)`.
+
+        The ONE place that decides which groups 'Other' holds — shared by
+        `_aggregate_chart_groups` (what the chart draws) and
+        `fetch_widget_drilldown_cached` (the rows behind a clicked 'Other'),
+        so a click can never list a different set of groups from the bar.
+
+        For Count, `counts[key]` is the group's Count VALUE: the record
+        count, or with a dedupe field the Metric's `_count_rows` over that
+        group's records — so ranking (and with it which groups fold into
+        'Other') uses the deduped values. A group whose deduped value is 0
+        stays and simply ranks last (owner decision 2026-10-03). Grouping
+        itself is unchanged: exact-match `_chart_group_key`.
+        """
+        totals: dict[str, float] = defaultdict(float)
+        counts: dict[str, int] = defaultdict(int)
+        order: list[str] = []
+        seen: set[str] = set()
+        dedupe_field = self._chart_count_field(
+            group_field=group_field, aggregation=aggregation, count_field=count_field
+        )
+        dedupe = bool(dedupe_field and (count_distinct or count_ignore_empty))
+        members: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            key = self._chart_group_key(row.get(group_field))
+            if key not in seen:
+                seen.add(key)
+                order.append(key)
+            counts[key] += 1
+            if dedupe:
+                members[key].append(row)
+            if aggregation == "sum":
+                coerced = self._coerce_numeric(row.get(sum_field))
+                if coerced is not None:
+                    totals[key] += coerced
+        if dedupe:
+            for key in order:
+                counts[key] = self._count_rows(
+                    members[key],
+                    count_field=dedupe_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
+                )
+
+        def _value_for(key: str) -> float | int:
+            return totals.get(key, 0.0) if aggregation == "sum" else counts.get(key, 0)
+
+        effective_max = max(
+            2,
+            min(
+                max_groups or self._settings.AIRTABLE_CHART_DEFAULT_MAX_GROUPS,
+                self._settings.AIRTABLE_CHART_MAX_GROUPS,
+            ),
+        )
+
+        # L6 — truncate BEFORE sorting for display: rank every group by
+        # value first, keep the top (effective_max - 1), fold the rest into
+        # one 'Other'. Sorting under group_sort first (e.g. label_asc) would
+        # fold the alphabetically-LAST groups into 'Other' instead of the
+        # smallest ones.
+        ranked = sorted(order, key=_value_for, reverse=True)
+        return ranked[: effective_max - 1], ranked[effective_max - 1 :], totals, counts
+
+    def _aggregate_chart_groups(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        base_id: str,
+        table_id: str,
+        view_id: str | None,
+        group_field: str,
+        aggregation: str,
+        sum_field: str | None,
+        max_groups: int | None,
+        group_sort: str,
+        partial: bool,
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
+    ):
+        """Steps 7-9 of the Chart widget's aggregation (plan §3.3): group,
+        truncate-then-sort (L6), and total (L7), over an already-resolved
+        `rows` list — personalization (step 6) is the CALLER's job, and
+        deliberately not done here, because the two callers apply it
+        differently: `fetch_widget_chart_cached` and the preview's cache-hit
+        branch post-filter an unpersonalized envelope in Python
+        (`ap.personalize_match`), while the preview's live-capped branch
+        bakes personalization into the Airtable formula itself
+        (`af.widget_formula`) before the rows ever reach here. Sharing THIS
+        half keeps a widget and its own preview computing groups identically
+        (L1) without coupling the two different personalize mechanisms.
+
+        `count_field` / `count_distinct` / `count_ignore_empty` (Count only)
+        dedupe each group with the Metric's `_count_rows` — see
+        `_rank_chart_groups`. 'Other' is ONE group: its value is
+        `_count_rows` over every folded group's records together, so a value
+        present in several folded groups counts once there and 'Other' no
+        longer equals the sum of the folded values (owner decision
+        2026-10-03). With dedupe off this is exactly the old record sum.
+        """
+        from app.models.airtable import AirtableChartGroup, AirtableWidgetChartResponse
+
+        kept_keys, other_keys, totals, counts = self._rank_chart_groups(
+            rows=rows,
+            group_field=group_field,
+            aggregation=aggregation,
+            sum_field=sum_field,
+            max_groups=max_groups,
+            count_field=count_field,
+            count_distinct=count_distinct,
+            count_ignore_empty=count_ignore_empty,
+        )
+        dedupe_field = self._chart_count_field(
+            group_field=group_field, aggregation=aggregation, count_field=count_field
+        )
+        dedupe = bool(dedupe_field and (count_distinct or count_ignore_empty))
+
+        def _value_for(key: str) -> float | int:
+            return totals.get(key, 0.0) if aggregation == "sum" else counts.get(key, 0)
+
+        kept = [
+            AirtableChartGroup(label=key, value=_value_for(key), is_other=False)
+            for key in kept_keys
+        ]
+
+        other_group_count = len(other_keys)
+        if other_keys:
+            other_value: float | int
+            if aggregation == "sum":
+                other_value = sum(totals.get(k, 0.0) for k in other_keys)
+            elif dedupe:
+                folded = set(other_keys)
+                other_value = self._count_rows(
+                    [
+                        row for row in rows
+                        if self._chart_group_key(row.get(group_field)) in folded
+                    ],
+                    count_field=dedupe_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
+                )
+            else:
+                other_value = sum(counts.get(k, 0) for k in other_keys)
+            kept.append(AirtableChartGroup(label="Other", value=other_value, is_other=True))
+
+        # Now apply the admin's display sort to the KEPT groups only —
+        # 'Other' is pinned last regardless of mode (decision 7).
+        real_groups = [g for g in kept if not g.is_other]
+        other_group = [g for g in kept if g.is_other]
+        if group_sort == "label_asc":
+            real_groups.sort(key=lambda g: g.label.lower())
+        else:
+            real_groups.sort(key=lambda g: g.value, reverse=True)
+        groups = real_groups + other_group
+
+        # L7 — the % denominator includes 'Other', so the caller's displayed
+        # labels sum to 100%: percentages are shares of the summed drawn
+        # values. Without dedupe that equals the record total (every row
+        # landed in exactly one kept-or-Other bucket); with dedupe a value
+        # may legitimately count in several bars, so it need not.
+        total = sum(g.value for g in groups)
+
+        return AirtableWidgetChartResponse(
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            aggregation=aggregation,
+            group_field=group_field,
+            groups=groups,
+            total=total,
+            other_group_count=other_group_count,
+            row_count=len(rows),
+            available=True,
+            personalize_blocked=False,
+            partial=partial,
+        )
+
+    async def fetch_widget_chart_cached(
         self,
         *,
         link: str,
         url: str,
         api_key: str,
+        caller_email: str,
+        group_field: str | None,
+        aggregation: str,
+        sum_field: str | None = None,
+        filters: af.WidgetFilters | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+        max_groups: int | None = None,
+        group_sort: str = "value_desc",
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
+    ):
+        """Grouped Count/Sum aggregation for a dashboard Airtable Chart
+        widget — one aggregate PER GROUP, over the SAME cached `widget_rows`
+        envelope `fetch_widget_metric_cached` uses (see
+        `_chart_cache_fingerprint`). No new caching mechanism.
+
+        The Count-dedupe kwargs apply per group AFTER personalisation (see
+        `_aggregate_chart_groups`). Like the Metric's, they stay out of the
+        cache fingerprint: the walk fetches every field, so any dedupe field
+        is already in the cached rows.
+
+        Same "no partial aggregate" stance as the Metric widget:
+        `available=False` on an oversized/uncacheable table rather than a
+        live, partial fetch — a count/sum (per group) over only some rows
+        would be silently WRONG, not just incomplete (L4). Same fail-closed
+        personalize gate, checked before the cache is touched (L5).
+        """
+        from app.models.airtable import AirtableWidgetChartResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            logger.warning(
+                "Airtable widget chart refused: personalization enabled but "
+                "not applicable (base=%s table=%s) — no groups computed",
+                base_id,
+                table_id,
+            )
+            return AirtableWidgetChartResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                group_field=group_field or "",
+                groups=[],
+                available=True,
+                personalize_blocked=True,
+            )
+
+        if not group_field or (aggregation == "sum" and not sum_field):
+            # Not yet configured — nothing to compute. The frontend already
+            # knows `groupField`/`sumField` locally and shouldn't call in
+            # this state; defensive fallback, mirroring
+            # fetch_widget_metric_cached's own (:1422-1436).
+            return AirtableWidgetChartResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                group_field=group_field or "",
+                groups=[],
+                available=False,
+                personalize_blocked=False,
+            )
+
+        cache = get_cache_service()
+        fingerprint = self._chart_cache_fingerprint(link=link, url=url, filters=filters)
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope = await self._get_or_warm_widget_cache(
+            cache_key=cache_key,
+            url=url,
+            api_key=api_key,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+            patient=True,
+        )
+
+        if envelope is None:
+            return AirtableWidgetChartResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                group_field=group_field,
+                groups=[],
+                available=False,
+                personalize_blocked=False,
+            )
+
+        # Step 6 — personalize-filter the envelope's (unpersonalized) rows in
+        # Python, identical to fetch_widget_metric_cached's own (:1470-1476).
+        rows = envelope["rows"]
+        if personalize_enabled:
+            rows = [
+                row
+                for row in rows
+                if ap.personalize_match(row.get(personalize_column), caller_email)
+            ]
+
+        return self._aggregate_chart_groups(
+            rows=rows,
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            group_field=group_field,
+            aggregation=aggregation,
+            sum_field=sum_field,
+            max_groups=max_groups,
+            group_sort=group_sort,
+            partial=False,
+            count_field=count_field,
+            count_distinct=count_distinct,
+            count_ignore_empty=count_ignore_empty,
+        )
+
+    async def fetch_widget_drilldown_cached(
+        self,
+        *,
+        widget_type: str,
+        link: str,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        title_field: str,
+        detail_fields: list[str],
+        aggregation: str,
+        sum_field: str | None = None,
+        filters: af.WidgetFilters | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+        count_field: str | None = None,
+        count_ignore_empty: bool = False,
+        group_field: str | None = None,
+        max_groups: int | None = None,
+        group: str | None = None,
+        other: bool = False,
+        count_distinct: bool = False,
+    ):
+        """The records behind a Metric widget's number, or behind one Chart
+        group, for the click-to-open drill-down modal.
+
+        Reads the SAME cached, unprojected `widget_rows` envelope
+        `fetch_widget_metric_cached` / `fetch_widget_chart_cached` aggregate
+        over, with the same fail-closed personalize gate, so the modal lists
+        exactly the rows the widget counted:
+
+        - Metric: every row, except that a Count with `count_ignore_empty`
+          drops rows whose `count_field` is empty (those were not counted).
+          `count_distinct` does NOT dedupe here — the owner chose "every
+          record" (2026-10-02), so the list may be longer than the number.
+        - Chart: rows whose `_chart_group_key` equals `group`; or, with
+          `other`, rows in every group `_rank_chart_groups` folded into
+          'Other' (each tagged with its own group). `other` is a separate
+          flag rather than `group="Other"` because a real group can carry
+          that label. 'Other' is ranked with the chart's own Count-dedupe
+          settings, so it folds the same groups the chart did. A Count with
+          an effective dedupe field (`_chart_count_field`) and
+          `count_ignore_empty` also drops rows whose dedupe field is empty —
+          "only counted records" (owner, 2026-10-03), as for the Metric; a
+          0-value group therefore opens an empty list. `count_distinct`
+          still lists every record.
+
+        Rows are projected to the title field, the detail fields and (for
+        Sum) the summed field — nothing else reaches the viewer — then sorted
+        A–Z by title (empty last) and capped at
+        AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS (`truncated=True` past it).
+        Unlike the aggregates, a capped list is merely incomplete, not
+        wrong, so it is returned rather than refused.
+        """
+        from app.models.airtable import AirtableDrilldownRow, AirtableWidgetDrilldownResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        fields = [f for f in dict.fromkeys(detail_fields) if f and f != title_field]
+        if aggregation == "sum" and sum_field and sum_field != title_field and sum_field not in fields:
+            fields.append(sum_field)
+
+        def _empty(*, available: bool, personalize_blocked: bool):
+            return AirtableWidgetDrilldownResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                title_field=title_field,
+                fields=fields,
+                available=available,
+                personalize_blocked=personalize_blocked,
+            )
+
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            logger.warning(
+                "Airtable widget drill-down refused: personalization enabled but "
+                "not applicable (base=%s table=%s) — no rows returned",
+                base_id,
+                table_id,
+            )
+            return _empty(available=True, personalize_blocked=True)
+
+        is_chart = widget_type == AIRTABLE_CHART_WIDGET_TYPE
+        if is_chart and not group_field:
+            return _empty(available=False, personalize_blocked=False)
+
+        cache = get_cache_service()
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=widget_type,
+            link=link,
+            url=url,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+        )
+        cache_key = cache.build_key("widget_rows", fingerprint)
+
+        envelope = await self._get_or_warm_widget_cache(
+            cache_key=cache_key,
+            url=url,
+            api_key=api_key,
+            selected_columns=None,
+            filters=filters,
+            personalize_enabled=False,
+            personalize_column=None,
+            patient=True,
+        )
+        if envelope is None:
+            return _empty(available=False, personalize_blocked=False)
+
+        rows = envelope["rows"]
+        if personalize_enabled:
+            rows = [
+                row
+                for row in rows
+                if ap.personalize_match(row.get(personalize_column), caller_email)
+            ]
+
+        group_of: dict[int, str] = {}
+        if is_chart:
+            if other:
+                _kept, other_keys, _totals, _counts = self._rank_chart_groups(
+                    rows=rows,
+                    group_field=group_field,
+                    aggregation=aggregation,
+                    sum_field=sum_field,
+                    max_groups=max_groups,
+                    count_field=count_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
+                )
+                wanted = set(other_keys)
+                selected = []
+                for row in rows:
+                    key = self._chart_group_key(row.get(group_field))
+                    if key in wanted:
+                        group_of[id(row)] = key
+                        selected.append(row)
+                rows = selected
+            else:
+                rows = [
+                    row for row in rows
+                    if self._chart_group_key(row.get(group_field)) == (group or "")
+                ]
+            chart_dedupe_field = self._chart_count_field(
+                group_field=group_field, aggregation=aggregation, count_field=count_field
+            )
+            if chart_dedupe_field and count_ignore_empty:
+                rows = [
+                    row for row in rows
+                    if self._dedupe_key(row.get(chart_dedupe_field)) is not None
+                ]
+        elif aggregation != "sum" and count_field and count_ignore_empty:
+            rows = [row for row in rows if self._dedupe_key(row.get(count_field)) is not None]
+
+        def _sort_key(row: dict[str, Any]) -> tuple[bool, str]:
+            label = self._chart_group_key(row.get(title_field))
+            return (label == "(Empty)", label.casefold())
+
+        rows = sorted(rows, key=_sort_key)
+        total_rows = len(rows)
+        cap = self._settings.AIRTABLE_WIDGET_FULL_VIEW_MAX_ROWS
+        truncated = total_rows > cap
+        if truncated:
+            rows = rows[:cap]
+
+        shown = [title_field, *fields]
+        result_rows = [
+            AirtableDrilldownRow(
+                id=str(row.get("id") or ""),
+                fields={f: row.get(f) for f in shown if row.get(f) is not None},
+                group=group_of.get(id(row)),
+            )
+            for row in rows
+        ]
+
+        field_types = await self.fetch_table_field_hints(
+            base_id=envelope["base_id"], table_id=envelope["table_id"], api_key=api_key
+        )
+
+        return AirtableWidgetDrilldownResponse(
+            base_id=envelope["base_id"],
+            table_id=envelope["table_id"],
+            view_id=envelope.get("view_id"),
+            title_field=title_field,
+            fields=fields,
+            field_types={f: t for f, t in field_types.items() if f in shown},
+            rows=result_rows,
+            total_rows=total_rows,
+            truncated=truncated,
+            available=True,
+            personalize_blocked=False,
+        )
+
+    async def warm_widget_cache(
+        self,
+        *,
+        widget_type: str,
+        link: str,
+        url: str,
+        api_key: str,
         selected_columns: list[str] | None,
-        filters: list[dict[str, Any]] | None,
+        filters: af.WidgetFilters | None,
         personalize_enabled: bool,
         personalize_column: str | None,
     ) -> str:
         """Used by `POST /airtable/cache/refresh` (the scheduled-refresh
-        endpoint). Builds the same fingerprint/key a real viewer's request
-        would use and re-warms it, ignoring whatever TTL remains.
+        endpoint) and by `_warm_after_config_save` (warm-on-save). Builds
+        the same fingerprint/key a real viewer's request would use and
+        re-warms it, ignoring whatever TTL remains.
+
+        `widget_type` (required, not defaulted —
+        plan_warm_key_divergence_2026-08-14.md §3.2) decides whether
+        `selected_columns`/`personalize_enabled`/`personalize_column` are
+        honored as given (Table) or normalized away to the Metric/Chart
+        widgets' shared "nothing projected, nothing personalized" shape —
+        see `_widget_cache_fingerprint`'s docstring for why. That
+        normalization happens ONCE, below, before either the fingerprint is
+        built or the walk is dispatched, deliberately: pinning the key
+        alone while still walking with the widget's real projection would
+        cache rows missing a field a Metric/Chart reader expects (the L2
+        projection trap, in reverse). Before `widget_type` existed, this
+        method built its fingerprint from the widget's raw stored config
+        with no notion of widget type at all — for a Metric/Chart widget
+        with personalization on (or merely a stored `personalizeColumn`
+        left over from a prior save), that fingerprint never matched what
+        `fetch_widget_metric_cached`/`fetch_widget_chart_cached` look up:
+        the warm wrote a whole-table entry nobody ever read, and the widget
+        stayed cold until a real viewer's own request warmed the RIGHT key.
 
         Takes the SAME single-flight lock the read path uses
         (plan_airtable_cache_scaling_2026-08-08.md §4.4). The original
@@ -1553,14 +2657,25 @@ class AirtableService:
         if not cache.enabled:
             return "disabled"
 
-        fingerprint = {
-            "link": link,
-            "sourceUrl": url,
-            "selectedColumns": list(selected_columns or []),
-            "filters": filters or [],
-            "personalizeEnabled": bool(personalize_enabled),
-            "personalizeColumn": personalize_column or None,
-        }
+        # Normalize BEFORE building the fingerprint, so the same (now
+        # possibly-overridden) values flow into the walk below via
+        # `_build_widget_cache_envelope` — one normalization, not two, so
+        # the key and the walked bytes can never disagree (see this
+        # method's own docstring, and `_widget_cache_fingerprint`'s).
+        if widget_type in (AIRTABLE_METRIC_WIDGET_TYPE, AIRTABLE_CHART_WIDGET_TYPE):
+            selected_columns = None
+            personalize_enabled = False
+            personalize_column = None
+
+        fingerprint = self._widget_cache_fingerprint(
+            widget_type=widget_type,
+            link=link,
+            url=url,
+            selected_columns=selected_columns,
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+        )
         cache_key = cache.build_key("widget_rows", fingerprint)
 
         # Checked before both the freshness lookup and lock acquisition, so
@@ -1698,11 +2813,17 @@ class AirtableService:
         api_key: str,
         caller_email: str,
         selected_columns: list[str] | None = None,
-        filters: list[dict[str, Any]] | None = None,
+        filters: af.WidgetFilters | None = None,
         personalize_enabled: bool = False,
         personalize_column: str | None = None,
+        order: list[dict[str, str]] | None = None,
     ):
         """Editor preview for the Property Panel.
+
+        `order` (the in-progress default group + sort, plan §11.3 mode A) is
+        applied as Airtable's native `sort` on both calls, so the capped
+        sample is the right first 100 rows rather than an arbitrary 100
+        re-sorted afterwards. Same displayed-column rule as the saved paths.
 
         Returns `fields` computed WITHOUT personalization and `rows` computed
         WITH it. The split matters: an admin configuring a widget must be
@@ -1715,8 +2836,9 @@ class AirtableService:
         personalize column is the wrong type and matches nothing" — which are
         otherwise indistinguishable and both look like a broken widget.
 
-        Costs up to two Airtable calls, which is acceptable at edit
-        frequency (and one when personalization is off).
+        Costs up to three Airtable calls (one records read, plus a second
+        when personalization is on, plus one Metadata/schema read that also
+        backs the full column list) — acceptable at edit frequency.
         """
         from app.models.airtable import AirtableEditorPreviewResponse
 
@@ -1729,6 +2851,10 @@ class AirtableService:
             base_options["view"] = view_id
         if selected_columns:
             base_options["fields"] = list(selected_columns)
+            order = ao.restrict_order_to_fields(order, selected_columns)
+        sort = ao.airtable_sort_option(order)
+        if sort:
+            base_options["sort"] = sort
 
         api = Api(api_key.strip())
         table = api.table(base_id, table_id)
@@ -1739,7 +2865,7 @@ class AirtableService:
                 options["formula"] = formula
             try:
                 payload = await asyncio.to_thread(
-                    api.request, "get", table.urls.records, options=options
+                    _list_records_page, api, table, options
                 )
             except RequestException as exc:
                 logger.error("Airtable editor preview failed: %s", exc)
@@ -1778,15 +2904,28 @@ class AirtableService:
             {"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records
         ]
 
-        # Prefer the admin's explicit column order over discovery order — see
-        # the matching comment in fetch_widget_rows. Without this, the editor
-        # preview would silently ignore the admin's custom column ordering
-        # even though the saved widget honors it once persisted.
-        fields = list(selected_columns) if selected_columns else seen_fields
-
-        field_types, field_types_available = await self.fetch_table_field_hints_with_status(
-            base_id=base_id, table_id=table_id, api_key=api_key
+        # One schema read backs BOTH the type hints and the full column list
+        # below — see fetch_table_field_hints_with_status.
+        field_types, schema_fields, field_types_available = (
+            await self.fetch_table_field_hints_with_status(
+                base_id=base_id, table_id=table_id, api_key=api_key
+            )
         )
+
+        # Prefer the admin's explicit column order; otherwise populate the
+        # dropdowns from the table's FULL schema, not just columns present in
+        # the capped preview rows — a column empty across every previewed row
+        # can never be picked otherwise. Falls back to discovery order when the
+        # schema read failed (empty schema_fields; needs schema.bases:read).
+        if selected_columns:
+            fields = list(selected_columns)
+        elif schema_fields:
+            fields = list(schema_fields)
+            for name in seen_fields:
+                if name not in fields:
+                    fields.append(name)
+        else:
+            fields = seen_fields
 
         return AirtableEditorPreviewResponse(
             base_id=base_id,
@@ -1798,6 +2937,187 @@ class AirtableService:
             unpersonalized_row_count=len(unpersonalized),
             field_types=field_types,
             field_types_available=field_types_available,
+        )
+
+    async def preview_widget_chart(
+        self,
+        *,
+        link: str | None,
+        url: str,
+        api_key: str,
+        caller_email: str,
+        group_field: str | None,
+        aggregation: str,
+        sum_field: str | None = None,
+        filters: af.WidgetFilters | None = None,
+        personalize_enabled: bool = False,
+        personalize_column: str | None = None,
+        max_groups: int | None = None,
+        group_sort: str = "value_desc",
+        count_field: str | None = None,
+        count_distinct: bool = False,
+        count_ignore_empty: bool = False,
+    ):
+        """Editor preview for a Chart widget's in-progress settings (decision
+        3, plan §3.4). Two paths, chosen by what the caller could supply
+        (both apply the unsaved Count-dedupe settings — the live path reads
+        every field, so the dedupe field is present there too):
+
+        * **Cached path** — `link` was resolved (so the widget's own stored
+          token/URL are in play) AND the cache is enabled. A READ-ONLY
+          lookup (`allow_warm=False`, L3) against the exact same fingerprint
+          `fetch_widget_chart_cached` would build from these filters. On a
+          hit, `partial=False` — an admin changing group-by/aggregation/
+          labels on a saved widget never touches `filters`, so the warmed
+          entry answers exactly.
+        * **Live capped path** — own-token shape (no `link`), cache
+          disabled, or a read-only miss (filters edited since the last warm;
+          table never cacheable). One Airtable read capped at
+          `_PREVIEW_MAX_RECORDS`, reusing `preview_widget_config`'s `run()`
+          shape — personalization is baked into the Airtable formula itself
+          here (`af.widget_formula`), not applied in Python afterward.
+          `partial=True`.
+
+        Never warms the cache (L3): an admin typing into the filter box
+        produces a new fingerprint per keystroke, and warming each one would
+        be a full table walk (plus a whole-table Upstash entry) per
+        keystroke burst, for cache entries no viewer will ever read.
+        """
+        from app.models.airtable import AirtableWidgetChartResponse
+
+        base_id, table_id, view_id = self._parse_airtable_share_url(url)
+
+        # Same fail-closed gate, same ordering (before any cache/Airtable
+        # access) as fetch_widget_chart_cached (L5).
+        if ap.resolve_personalize_gate(
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        ):
+            return AirtableWidgetChartResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                group_field=group_field or "",
+                groups=[],
+                available=True,
+                personalize_blocked=True,
+            )
+
+        if not group_field or (aggregation == "sum" and not sum_field):
+            return AirtableWidgetChartResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                group_field=group_field or "",
+                groups=[],
+                available=False,
+                personalize_blocked=False,
+            )
+
+        cache = get_cache_service()
+
+        if link and cache.enabled:
+            fingerprint = self._chart_cache_fingerprint(link=link, url=url, filters=filters)
+            cache_key = cache.build_key("widget_rows", fingerprint)
+            envelope = await self._get_or_warm_widget_cache(
+                cache_key=cache_key,
+                url=url,
+                api_key=api_key,
+                selected_columns=None,
+                filters=filters,
+                personalize_enabled=False,
+                personalize_column=None,
+                allow_warm=False,
+            )
+            if envelope is not None:
+                rows = envelope["rows"]
+                if personalize_enabled:
+                    rows = [
+                        row
+                        for row in rows
+                        if ap.personalize_match(row.get(personalize_column), caller_email)
+                    ]
+                return self._aggregate_chart_groups(
+                    rows=rows,
+                    base_id=base_id,
+                    table_id=table_id,
+                    view_id=view_id,
+                    group_field=group_field,
+                    aggregation=aggregation,
+                    sum_field=sum_field,
+                    max_groups=max_groups,
+                    group_sort=group_sort,
+                    partial=False,
+                    count_field=count_field,
+                    count_distinct=count_distinct,
+                    count_ignore_empty=count_ignore_empty,
+                )
+
+        # Live capped path — no warmed entry to read. One Airtable call,
+        # capped, personalization applied server-side via the formula
+        # (same shape as preview_widget_config's `run()`).
+        base_options: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
+        if view_id:
+            base_options["view"] = view_id
+
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
+
+        async def run(formula: str | None) -> list[dict[str, Any]]:
+            options = dict(base_options)
+            if formula:
+                options["formula"] = formula
+            try:
+                payload = await asyncio.to_thread(
+                    _list_records_page, api, table, options
+                )
+            except RequestException as exc:
+                logger.error("Airtable chart preview failed: %s", exc)
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            except Exception as exc:
+                logger.exception("Unexpected Airtable error during chart preview")
+                raise AirtableError(f"Airtable API error: {exc}") from exc
+            return payload.get("records", []) or []
+
+        formula, allowed = af.widget_formula(
+            filters=filters,
+            personalize_enabled=personalize_enabled,
+            personalize_column=personalize_column,
+            email=caller_email,
+        )
+        if not allowed:
+            return AirtableWidgetChartResponse(
+                base_id=base_id,
+                table_id=table_id,
+                view_id=view_id,
+                aggregation=aggregation,
+                group_field=group_field,
+                groups=[],
+                available=True,
+                personalize_blocked=True,
+                partial=True,
+            )
+
+        records = await run(formula)
+        rows = [{"id": r.get("id"), **(r.get("fields", {}) or {})} for r in records]
+
+        return self._aggregate_chart_groups(
+            rows=rows,
+            base_id=base_id,
+            table_id=table_id,
+            view_id=view_id,
+            group_field=group_field,
+            aggregation=aggregation,
+            sum_field=sum_field,
+            max_groups=max_groups,
+            group_sort=group_sort,
+            partial=True,
+            count_field=count_field,
+            count_distinct=count_distinct,
+            count_ignore_empty=count_ignore_empty,
         )
 
     async def preview_from_url(
@@ -1815,12 +3135,20 @@ class AirtableService:
         fetching all and discarding). ``formula`` is passed verbatim to
         Airtable's ``filterByFormula`` parameter and is applied server-side
         before the row cap, so the cap applies to already-filtered results.
+
+        When ``fields`` is not given, the full column list is taken from the
+        table's schema (Metadata API) rather than inferred from the capped
+        rows — otherwise a column that is empty across every previewed row
+        would silently disappear from ``fields``. Requires the PAT's
+        ``schema.bases:read`` scope; if the schema call fails it degrades to
+        the columns actually seen in the rows.
         """
         from app.models.airtable import AirtablePreviewResponse
 
         base_id, table_id, view_id = self._parse_airtable_share_url(url)
 
-        table = Api(api_key.strip()).table(base_id, table_id)
+        api = Api(api_key.strip())
+        table = api.table(base_id, table_id)
         kwargs: dict[str, Any] = {"max_records": self._PREVIEW_MAX_RECORDS}
         if view_id:
             kwargs["view"] = view_id
@@ -1842,18 +3170,45 @@ class AirtableService:
         seen_set: set[str] = set()
         rows: list[dict[str, Any]] = []
         for record in records:
-            fields = record.get("fields", {}) or {}
-            for key in fields:
+            record_fields = record.get("fields", {}) or {}
+            for key in record_fields:
                 if key not in seen_set:
                     seen_set.add(key)
                     seen_fields.append(key)
-            rows.append({"id": record.get("id"), **fields})
+            rows.append({"id": record.get("id"), **record_fields})
+
+        if fields:
+            # Caller projected explicit columns: return exactly those, so a
+            # requested column empty across every previewed row still appears.
+            response_fields = list(fields)
+        else:
+            response_fields = seen_fields
+            try:
+                table_schema = await asyncio.to_thread(
+                    lambda: api.base(base_id).schema().table(table_id)
+                )
+            except Exception:
+                # Best-effort: PAT lacks schema.bases:read, or the table id is
+                # stale/renamed — fall back to columns seen in the rows.
+                logger.warning(
+                    "Airtable preview schema fetch failed (base=%s table=%s) — "
+                    "returning only columns present in the previewed rows",
+                    base_id,
+                    table_id,
+                )
+            else:
+                # Full schema order first, then any column seen in the rows
+                # that the schema didn't list.
+                response_fields = [f.name for f in table_schema.fields]
+                for name in seen_fields:
+                    if name not in response_fields:
+                        response_fields.append(name)
 
         return AirtablePreviewResponse(
             base_id=base_id,
             table_id=table_id,
             view_id=view_id,
-            fields=seen_fields,
+            fields=response_fields,
             rows=rows,
         )
 
@@ -2488,15 +3843,15 @@ class AirtableService:
         # The two groups above are unioned (OR).
         status_membership_parts: list[str | None] = []
         if status_list:
-            status_membership_parts.append(af.in_str(_F_STATUS, status_list))
+            status_membership_parts.append(af.in_str(_F_FUND_STATUS, status_list))
         if not_status_list:
-            status_membership_parts.append(af.not_in_str(_F_STATUS, not_status_list))
+            status_membership_parts.append(af.not_in_str(_F_FUND_STATUS, not_status_list))
         membership_clause = af.AND(*status_membership_parts)
 
         status_clauses: list[str | None] = []
         if membership_clause:
             status_clauses.append(membership_clause)
-        status_clauses.append(af.empty_clause(_F_STATUS, status_empty))
+        status_clauses.append(af.empty_clause(_F_FUND_STATUS, status_empty))
         status_combined = af.OR(*status_clauses)
         if status_combined:
             clauses.append(status_combined)
@@ -2766,7 +4121,7 @@ class AirtableService:
         if checkin_user_id:
             program_fields_needed.append(_F_CHECKIN_HISTORY)
         if excluded_statuses:
-            program_fields_needed.append(_F_STATUS)
+            program_fields_needed.append(_F_FUND_STATUS)
 
         programs = await self._get_records_by_ids(
             self._master_list_table(),
@@ -2782,7 +4137,7 @@ class AirtableService:
                 if checkin_user_id not in user_ids:
                     return False
             if excluded_statuses:
-                status_val = pf.get(_F_STATUS)
+                status_val = pf.get(_F_FUND_STATUS)
                 if isinstance(status_val, list):
                     status_val = status_val[0] if status_val else None
                 if status_val in excluded_statuses:
@@ -3388,12 +4743,12 @@ class AirtableService:
         'Exclude from lists'.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
         records = await self._list_records(
-            self._master_list_table(), formula=formula, fields=[_F_STATUS]
+            self._master_list_table(), formula=formula, fields=[_F_FUND_STATUS]
         )
         return CountResponse(count=len(records))
 
@@ -3407,7 +4762,7 @@ class AirtableService:
         'Program Lead/Fellow' fields.
         """
         formula = af.AND(
-            af.in_str(_F_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
+            af.in_str(_F_FUND_STATUS, list(_ACTIVE_PROGRAM_STATUSES)),
             af.is_empty(_F_SUB_TRACK_OF),
             af.is_unchecked(_F_EXCLUDE_FROM_LISTS),
         )
@@ -3433,7 +4788,7 @@ class AirtableService:
     async def get_distinct_fellows_count(self) -> CountResponse:
         """Count distinct fellows sourced from the Master List.
 
-        Fellows are derived from the Master List: records whose Status
+        Fellows are derived from the Master List: records whose Fund Status
         equals 'Fellowship' contribute their 'Program Lead/Fellow'
         name(s). Names are resolved to Users by matching the 'Name' field;
         each matched user contributes its (lower-cased) Work Email to the
@@ -3484,6 +4839,10 @@ class AirtableService:
                         first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
                         last_name=fields.get(s.USERS_LAST_NAME_FIELD),
                         work_email=email,
+                        office_location=fields.get(s.USERS_OFFICE_LOCATION_FIELD),
+                        programs=self._normalize_program_names(
+                            fields.get(s.USERS_PROGRAM_NAMES_FIELD)
+                        ),
                     )
                 )
                 continue
@@ -3564,12 +4923,49 @@ class AirtableService:
             names.append(name)
         return names
 
+    @staticmethod
+    def _normalize_program_names(value: Any) -> list[str]:
+        """Normalize a 'Program Names' lookup value into a list of names.
+
+        The lookup may return a list (one entry per linked record, each of
+        which may itself hold comma-separated values) or a single string.
+        Values are split on commas, trimmed and de-duplicated (first wins).
+        """
+        if not value:
+            return []
+
+        raw: list[str] = []
+        if isinstance(value, str):
+            raw = [value]
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    raw.append(item)
+                elif isinstance(item, dict):
+                    name = item.get("name")
+                    if isinstance(name, str):
+                        raw.append(name)
+
+        seen: set[str] = set()
+        names: list[str] = []
+        for chunk in raw:
+            for part in chunk.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                key = part.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(part)
+        return names
+
     async def _fetch_fellow_entries(
         self, *, include_names: bool = False
     ) -> list[tuple[str, dict[str, Any] | None]]:
         """Return one entry per Program Lead/Fellow, matched to a User when possible.
 
-        1. Query MASTER_LIST for records with Status = 'Fellowship',
+        1. Query MASTER_LIST for records with Fund Status = 'Fellowship',
            projecting the 'Program Lead/Fellow' field.
         2. Extract the list of unique lead/fellow names.
         3. Query USERS matching those names against the 'Name' field,
@@ -3580,7 +4976,7 @@ class AirtableService:
         s = self._settings
 
         # Step 1: pull Fellowship programs from the Master List.
-        program_formula = af.eq_str(_F_STATUS, _STATUS_FELLOWSHIP)
+        program_formula = af.eq_str(_F_FUND_STATUS, _STATUS_FELLOWSHIP)
         program_records = await self._list_records(
             self._master_list_table(),
             formula=program_formula,
@@ -3611,6 +5007,8 @@ class AirtableService:
                 s.USERS_FIRST_NAME_FIELD,
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
+                s.USERS_OFFICE_LOCATION_FIELD,
+                s.USERS_PROGRAM_NAMES_FIELD,
             ]
         user_records = await self._list_records(
             self._users_table(), formula=user_formula, fields=fields
@@ -3991,6 +5389,10 @@ class AirtableService:
             raise AirtableError(f"Airtable API error: {exc}") from exc
         return records[0] if records else None
 
+    async def access_control_email_exists(self, email: str) -> bool:
+        """Return True when ``email`` already has an Access Control record."""
+        return await self._find_access_control_by_email(email) is not None
+
     async def _find_role_id_by_name(self, role_name: str) -> str | None:
         """Return the Airtable record id of the Role matching ``role_name``."""
         name_field = self._settings.ROLES_NAME_FIELD
@@ -4282,6 +5684,7 @@ class AirtableService:
                 s.USERS_LAST_NAME_FIELD,
                 s.USERS_WORK_EMAIL_FIELD,
                 s.USERS_EMPLOYMENT_TYPE_FIELD,
+                s.USERS_OFFICE_LOCATION_FIELD,
             ],
         )
         records = self._filter_by_employment_type(
@@ -4302,6 +5705,7 @@ class AirtableService:
                     first_name=fields.get(s.USERS_FIRST_NAME_FIELD),
                     last_name=fields.get(s.USERS_LAST_NAME_FIELD),
                     work_email=fields.get(s.USERS_WORK_EMAIL_FIELD),
+                    office_location=fields.get(s.USERS_OFFICE_LOCATION_FIELD),
                 )
             )
         items.sort(
@@ -6857,16 +8261,38 @@ class AirtableService:
     # Feedback field name constants (loaded from settings/.env)
     _F_FEEDBACK_FROM = _S.AT_F_FEEDBACK_FROM
     _F_FEEDBACK_MESSAGE = _S.AT_F_FEEDBACK_MESSAGE
+    _F_FEEDBACK_SOURCE = _S.AT_F_FEEDBACK_SOURCE
+    _F_FEEDBACK_IMPRESSION = _S.AT_F_FEEDBACK_IMPRESSION
+    _F_FEEDBACK_MESSAGE_ID = _S.AT_F_FEEDBACK_MESSAGE_ID
+    _F_FEEDBACK_QUERY = _S.AT_F_FEEDBACK_QUERY
+    _F_FEEDBACK_RESPONSE = _S.AT_F_FEEDBACK_RESPONSE
 
-    async def create_feedback(self, payload: FeedbackCreate) -> FeedbackRecord:
-        """Create a new feedback record.
+    async def create_feedback(
+        self,
+        payload: FeedbackCreate,
+        *,
+        from_email: str,
+    ) -> FeedbackRecord:
+        """Create a feedback record with authenticated identity.
 
-        'Date & Time' is a computed Airtable field, so it is not written here.
+        ``Date & Time`` is a computed Airtable field and is not written here.
+        V1 message-level fields are optional so the existing global feedback
+        widget remains backward-compatible.
         """
         fields: dict[str, Any] = {
-            self._F_FEEDBACK_FROM: str(payload.from_email),
+            self._F_FEEDBACK_FROM: from_email,
             self._F_FEEDBACK_MESSAGE: payload.message,
         }
+        optional_fields = (
+            (self._F_FEEDBACK_SOURCE, payload.source),
+            (self._F_FEEDBACK_IMPRESSION, payload.impression),
+            (self._F_FEEDBACK_MESSAGE_ID, payload.message_id),
+            (self._F_FEEDBACK_QUERY, payload.query),
+            (self._F_FEEDBACK_RESPONSE, payload.response),
+        )
+        for field_name, value in optional_fields:
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                fields[field_name] = value
 
         table = self._feedbacks_table()
         try:
@@ -6881,6 +8307,28 @@ class AirtableService:
         return FeedbackRecord.model_validate(
             {"id": created["id"], **created.get("fields", {})}
         )
+
+    async def list_feedbacks(self, *, limit: int = 500) -> list[FeedbackRecord]:
+        """Read the configured Feedbacks table for the protected analytics view."""
+        bounded_limit = min(max(int(limit), 1), 500)
+        try:
+            records = await asyncio.to_thread(
+                self._feedbacks_table().all,
+                max_records=bounded_limit,
+            )
+        except RequestException as exc:
+            logger.error("Airtable list feedbacks failed: %s", exc)
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected Airtable error while listing feedback")
+            raise AirtableError(f"Airtable API error: {exc}") from exc
+
+        return [
+            FeedbackRecord.model_validate(
+                {"id": record["id"], **record.get("fields", {})}
+            )
+            for record in records
+        ]
 
     def _tickets_table(self):
         return self._api.table(

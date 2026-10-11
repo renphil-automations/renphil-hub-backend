@@ -60,3 +60,14 @@ class MeResponse(BaseModel):
             "fund/program it is scoped to (null when scope is 'Hub')."
         ),
     )
+    is_hub_admin: bool = Field(
+        default=False,
+        description=(
+            "The real is_hub_admin(db, current) answer (app/dependencies.py) "
+            "— JWT `roles` OR a live `role_assignments` row — not just "
+            "whether 'Hub Admin' is in `roles`. Lets the frontend repair a "
+            "cached user object whose is_hub_admin has gone stale (e.g. an "
+            "admin grant/revoke since the last login) without forcing a "
+            "fresh login. See types/index.ts's User.is_hub_admin."
+        ),
+    )

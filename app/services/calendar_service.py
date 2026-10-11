@@ -18,7 +18,7 @@ moment cannot silently drop each other from the list.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -27,7 +27,7 @@ from googleapiclient.errors import HttpError
 from app.config import Settings
 from app.helpers.exceptions import GoogleCalendarError
 from app.helpers.google_client import build_calendar_service
-from app.models.calendar import CalendarEvent, CalendarSearchResult
+from app.models.calendar import CalendarEvent, CalendarIndexEvent, CalendarSearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,34 @@ def _start_str(node: dict[str, Any] | None) -> str | None:
 
 def _is_all_day(node: dict[str, Any] | None) -> bool:
     return bool(node) and "date" in node and "dateTime" not in node
+
+
+def _event_has_ended(
+    start_node: dict[str, Any] | None,
+    end_node: dict[str, Any] | None,
+) -> bool:
+    """Return True once a one-off event is fully in the past.
+
+    Google all-day event end dates are exclusive, so an event is expired when
+    that date is today or earlier. Timed events are compared in UTC. Missing or
+    malformed timestamps fail open here; the live Calendar API remains the
+    source of truth and callers can still render the event rather than deleting
+    it on a parsing accident.
+    """
+    raw = _start_str(end_node) or _start_str(start_node)
+    if not raw:
+        return False
+
+    try:
+        if "T" not in raw:
+            return date.fromisoformat(raw) <= datetime.now(timezone.utc).date()
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        logger.warning("Could not parse Calendar end timestamp %r", raw)
+        return False
 
 
 def _meeting_from(event: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -200,6 +228,55 @@ class CalendarService:
             meeting_label=meeting_label,
             recurring=recurring,
             attending=attending,
+        )
+
+    def get_index_event(self, event_id: str) -> CalendarIndexEvent:
+        """Return a viewer-independent upcoming snapshot for search ingestion.
+
+        Attendees and RSVP state are intentionally never read into the returned
+        model. A deleted/cancelled event, an expired one-off event, or a recurring
+        series with no future instance returns 404 so the Agent can remove stale
+        vectors instead of indexing cached widget metadata.
+        """
+        master = self._get_raw(event_id)
+        if str(master.get("status") or "").lower() == "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This event is no longer available.",
+            )
+
+        recurring = bool(master.get("recurrence"))
+        start_node = master.get("start")
+        end_node = master.get("end")
+
+        if recurring:
+            instance = self._next_instance(event_id)
+            if instance is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="This event has no upcoming occurrences.",
+                )
+            start_node = instance.get("start")
+            end_node = instance.get("end")
+        elif _event_has_ended(start_node, end_node):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This event has expired.",
+            )
+
+        meeting_link, meeting_label = _meeting_from(master)
+        return CalendarIndexEvent(
+            id=event_id,
+            summary=master.get("summary", ""),
+            start=_start_str(start_node),
+            end=_start_str(end_node),
+            is_all_day=_is_all_day(start_node),
+            location=master.get("location"),
+            description=master.get("description"),
+            html_link=master.get("htmlLink"),
+            meeting_link=meeting_link,
+            meeting_label=meeting_label,
+            recurring=recurring,
         )
 
     # ── RSVP toggle ────────────────────────────────────────────────────
