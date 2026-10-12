@@ -44,7 +44,6 @@ from fastapi import (
 from app.config import get_settings
 from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.db_v2.models.component import ComponentV2
-from app.db_v2.models.hub_user import HubUserV2
 from app.dependencies import (
     CurrentHubUser,
     _ensure_hub_user,
@@ -1552,7 +1551,7 @@ def _airtable_component_visible_to(
     if bundle is None:
         return None
 
-    hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
+    hub_user = user_db_service.find_user_by_email(db, email)
     if hub_user is None:
         return None
 

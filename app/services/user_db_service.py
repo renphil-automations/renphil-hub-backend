@@ -17,7 +17,6 @@ from datetime import date
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.user import UserV2
@@ -115,27 +114,22 @@ def _to_record(row: UserV2) -> UserRecord:
     )
 
 
-def _find_user_by_work_email(db: Session, work_email: str) -> UserV2 | None:
+def find_user_by_email(db: Session, email: str) -> UserV2 | None:
     """Find a user row by exact (case-insensitive) Work Email, falling back to
-    the Alias Email column when Work Email is empty or doesn't match."""
-    normalized = (work_email or "").strip().lower()
+    the Alias Email column when Work Email is empty or doesn't match.
+
+    This is THE sign-in identity lookup since `hub_users` was folded into
+    `users` (2026-10): the login gate, sign-in provisioning, grant targets and
+    lock holders all resolve an email to a row through here."""
+    normalized = (email or "").strip().lower()
     if not normalized:
         return None
-    return (
-        db.query(UserV2)
-        .filter(
-            or_(
-                func.lower(UserV2.work_email) == normalized,
-                func.lower(UserV2.alias_email) == normalized,
-            )
-        )
-        .first()
-    )
+    return db.query(UserV2).filter(UserV2.matches_email(normalized)).first()
 
 
 def get_user_by_work_email(db: Session, work_email: str) -> UserRecord:
     """Return the user record matching the given Work Email."""
-    row = _find_user_by_work_email(db, work_email)
+    row = find_user_by_email(db, work_email)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -163,12 +157,25 @@ def update_user_by_work_email(
             detail="At least one field must be provided to update.",
         )
 
-    row = _find_user_by_work_email(db, work_email)
+    row = find_user_by_email(db, work_email)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User with Work Email '{work_email}' not found.",
         )
+
+    # work_email is the person's sign-in identity, so it must stay unique
+    # across BOTH email columns — a named 409 instead of the unique index's
+    # IntegrityError (which would surface as a 500 below).
+    if data.get("work_email"):
+        new_email = data["work_email"].strip().lower()
+        data["work_email"] = new_email
+        owner = find_user_by_email(db, new_email)
+        if owner is not None and owner.id != row.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Another user already signs in as '{new_email}'.",
+            )
 
     for field, value in data.items():
         column = _COLUMN_BY_FIELD[field]

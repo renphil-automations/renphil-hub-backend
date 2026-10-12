@@ -22,12 +22,13 @@ from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.hub_user import HubUserV2
 from app.db_v2.models.role import RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeV2
+from app.db_v2.models.user import UserV2
 from app.services.rbac_delegation_service import can_delegate
 from app.services.rbac_graph_service import RbacGraphError, held_closures
+from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def _hub_user_email_map(db: Session, hub_user_ids: set[int]) -> dict[int, str]:
     """
     if not hub_user_ids:
         return {}
-    rows = db.query(HubUserV2.id, HubUserV2.email).filter(HubUserV2.id.in_(hub_user_ids)).all()
+    rows = db.query(UserV2.id, UserV2.email).filter(UserV2.id.in_(hub_user_ids)).all()
     return {row[0]: row[1] for row in rows}
 
 
@@ -175,9 +176,10 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     query itself must already be at least `HUB_USER_SEARCH_MIN_LENGTH`
     characters, enforced by the router's `Query(min_length=...)`, so this
     never has to decide what "no query" should return. Restricted to
-    `is_active` rows: an inactive person cannot presently be granted a role
-    either way, so surfacing them in the picker only invites a confusing
-    `target_not_provisioned`-style failure with no matching error code.
+    `is_active` rows, which since the 2026-10 merge means people who have
+    signed in at least once (owner accepted 2026-10-09 that someone an admin
+    added stays out of this picker until their first sign-in). Matches the
+    name and BOTH email columns.
 
     THE QUERY IS ESCAPED BEFORE IT BECOMES A PATTERN, and that is a privacy
     control rather than tidiness (audit finding §2.2, 2026-08-25). The
@@ -209,15 +211,16 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     )
     term = f"%{safe}%"
     rows = (
-        db.query(HubUserV2)
-        .filter(HubUserV2.is_active.is_(True))
+        db.query(UserV2)
+        .filter(UserV2.is_active.is_(True))
         .filter(
             or_(
-                HubUserV2.email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
-                HubUserV2.name.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
+                UserV2.work_email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
+                UserV2.alias_email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
+                UserV2.name.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
             )
         )
-        .order_by(HubUserV2.email)
+        .order_by(UserV2.email)
         .limit(HUB_USER_SEARCH_LIMIT)
         .all()
     )
@@ -229,19 +232,22 @@ def get_assignment(db: Session, assignment_id: int) -> RoleAssignmentV2 | None:
 
 
 def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
-    """Every `hub_users` row, each carrying every `role_assignments` row it
-    holds directly (possibly none) — the data behind the Hub-Admin-only user
-    management table (owner decision, 2026-09-12). Unlike `search_hub_users`
-    (the target picker), this is neither filtered to `is_active` nor gated
-    by a search term: the privacy boundary here is `require_hub_admin`
-    itself (enforced by the router), not a query-length minimum.
+    """Every `users` row someone can sign in as, each carrying every
+    `role_assignments` row it holds directly (possibly none) — the data
+    behind the Hub-Admin-only user management table (owner decision,
+    2026-09-12). Unlike `search_hub_users` (the target picker), this is
+    neither filtered to `is_active` nor gated by a search term: the privacy
+    boundary here is `require_hub_admin` itself (enforced by the router), not
+    a query-length minimum. So since the 2026-10 merge it also lists HR rows
+    nobody has signed in as yet (`is_active` False). HR rows with no email
+    at all are left out — nobody can sign in as them or be granted to them.
 
     Two queries total, not one-per-user: same N+1 avoidance as
     `_hub_user_email_map` and `list_revocable`'s hoisted closure — at 182
     hub_users rows, one-per-user would be 182 round-trips against Neon for a
     single page load.
     """
-    users = db.query(HubUserV2).order_by(HubUserV2.email).all()
+    users = db.query(UserV2).filter(UserV2.email.isnot(None)).order_by(UserV2.email).all()
     all_assignments = db.query(RoleAssignmentV2).order_by(RoleAssignmentV2.created_at.desc()).all()
 
     by_user_id: dict[int, list[RoleAssignmentV2]] = {}
@@ -261,23 +267,29 @@ def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
 
 
 def create_hub_user(db: Session, *, email: str, name: str) -> dict:
-    """Admin pre-registration of a `hub_users` row (owner decision,
+    """Admin pre-registration of a login-only `users` row (owner decision,
     2026-10-04) — the row that lets an external (non-org-domain) email pass
     `AuthService._enforce_login_allowed`. Same email normalization as
     `_ensure_hub_user`. Flushes but does not commit; the router commits.
 
+    Created with `is_active` False — "has not signed in yet" (owner decision,
+    2026-10-09); their first sign-in flips it (`_ensure_hub_user`).
+
     Raises `RbacGraphError("hub_user_exists")` for an email that already has
-    a row, whether found by the pre-check or by the UNIQUE constraint in a
-    concurrent-insert race (the caller must roll back in that case).
+    a row — including an HR row whose work or alias email it is — whether
+    found by the pre-check or by the unique index in a concurrent-insert race
+    (the caller must roll back in that case). The code keeps its old name so
+    the frontend contract does not change.
     """
     normalized = email.strip().lower()
-    if db.query(HubUserV2.id).filter(HubUserV2.email == normalized).first() is not None:
+    if find_user_by_email(db, normalized) is not None:
         raise RbacGraphError(
             "hub_user_exists",
             f"A user with email {normalized} already exists.",
             email=normalized,
         )
-    user = HubUserV2(email=normalized, name=name, is_active=True, created_at=_utc_now())
+    now = _utc_now()
+    user = UserV2(work_email=normalized, name=name, is_active=False, created_at=now, updated_at=now)
     db.add(user)
     try:
         db.flush()
@@ -359,12 +371,12 @@ def _assert_update_does_not_remove_last_hub_admin(
 
     active_remaining = (
         db.query(RoleAssignmentV2)
-        .join(HubUserV2, HubUserV2.id == RoleAssignmentV2.user_id)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
         .filter(
             RoleAssignmentV2.role_id == hub_admin_role_id,
             RoleAssignmentV2.scope_id.in_(universal_scope_ids),
             RoleAssignmentV2.id != assignment.id,
-            HubUserV2.is_active.is_(True),
+            UserV2.is_active.is_(True),
         )
         .count()
     )
@@ -460,19 +472,21 @@ def create_assignment(
     router's job — see `rbac_assignments.py`).
 
     Target provisioning is deliberately NOT done here (plan session handoff
-    2026-08-24 §3.2): granting requires the target to already hold a
-    `hub_users` row, i.e. to have logged in at least once. No
-    auto-create-on-grant — that is `target_not_provisioned`, below.
+    2026-08-24 §3.2): granting requires the target to already have a `users`
+    row signing in as that email. Since the 2026-10 merge that includes HR
+    rows nobody has signed in as yet and admin-added people, so a role can
+    now be granted BEFORE someone's first sign-in. No auto-create-on-grant —
+    an unknown email is `target_not_provisioned`, below.
     """
     normalized_target = target_email.strip().lower()
-    target = db.query(HubUserV2).filter(HubUserV2.email == normalized_target).first()
+    target = find_user_by_email(db, normalized_target)
     if target is None:
         raise RbacGraphError(
             "target_not_provisioned",
             (
-                f"{target_email!r} has not signed in yet, so there is no "
-                f"account to grant a role to. They must log in at least "
-                f"once first."
+                f"{target_email!r} is not a Hub user, so there is no account "
+                f"to grant a role to. Add them on the Access Control page's "
+                f"Users tab first."
             ),
             email=normalized_target,
         )
@@ -669,12 +683,12 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     # is the observable signal that it would have mattered.
     active_remaining = (
         db.query(RoleAssignmentV2)
-        .join(HubUserV2, HubUserV2.id == RoleAssignmentV2.user_id)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
         .filter(
             RoleAssignmentV2.role_id == hub_admin_role_id,
             RoleAssignmentV2.scope_id.in_(universal_scope_ids),
             RoleAssignmentV2.id != assignment.id,
-            HubUserV2.is_active.is_(True),
+            UserV2.is_active.is_(True),
         )
         .count()
     )

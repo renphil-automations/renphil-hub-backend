@@ -67,7 +67,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.db_v2.models.hub_user import HubUserV2
+from app.db_v2.models.user import UserV2
 from app.dependencies import CurrentHubUser, get_current_hub_user, is_hub_admin, require_hub_admin
 from app.schemas.resource_grants import (
     AudienceCountAPIResponse,
@@ -323,7 +323,7 @@ def get_user_access(
     `list_visible_nodes`'s docstring for why the invisible majority is
     omitted rather than returned as `view: false` rows.
     """
-    if db.query(HubUserV2.id).filter(HubUserV2.id == user_id).first() is None:
+    if db.query(UserV2.id).filter(UserV2.id == user_id).first() is None:
         raise HTTPException(status_code=404, detail="Hub user not found")
 
     visibility = compute_visibility(db, user_id)
