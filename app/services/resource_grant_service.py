@@ -56,7 +56,7 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.hub import HubV2
-from app.db_v2.models.hub_user import HubUserV2
+from app.db_v2.models.user import UserV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.resource_grant import (
     GRANT_LEVELS,
@@ -238,7 +238,7 @@ def _hub_user_email_map(db: Session, user_ids: set[int]) -> dict[int, str]:
     """
     if not user_ids:
         return {}
-    rows = db.query(HubUserV2.id, HubUserV2.email).filter(HubUserV2.id.in_(user_ids)).all()
+    rows = db.query(UserV2.id, UserV2.email).filter(UserV2.id.in_(user_ids)).all()
     return {row[0]: row[1] for row in rows}
 
 
@@ -310,7 +310,7 @@ def _assert_principal(
         )
 
     if has_user:
-        if db.query(HubUserV2.id).filter(HubUserV2.id == user_id).first() is None:
+        if db.query(UserV2.id).filter(UserV2.id == user_id).first() is None:
             raise RbacGraphError(
                 "user_not_found", f"Hub user {user_id} does not exist", user_id=user_id
             )
@@ -409,7 +409,7 @@ def get_grant(db: Session, grant_id: int) -> dict | None:
         return None
     user_email = None
     if grant.user_id is not None:
-        row = db.query(HubUserV2.email).filter(HubUserV2.id == grant.user_id).first()
+        row = db.query(UserV2.email).filter(UserV2.id == grant.user_id).first()
         user_email = row[0] if row is not None else None
     return serialize_grant(grant, user_email=user_email)
 
@@ -528,7 +528,7 @@ def create_grant(
     db.flush()
     user_email = None
     if grant.user_id is not None:
-        row = db.query(HubUserV2.email).filter(HubUserV2.id == grant.user_id).first()
+        row = db.query(UserV2.email).filter(UserV2.id == grant.user_id).first()
         user_email = row[0] if row is not None else None
     return serialize_grant(grant, user_email=user_email)
 

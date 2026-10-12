@@ -92,7 +92,7 @@ from app.db_v2.database import BaseV2
 from app.db_v2.models.component import ComponentV2  # noqa: F401
 from app.db_v2.models.gridstack import GridstackV2  # noqa: F401
 from app.db_v2.models.hub import HubV2  # noqa: F401
-from app.db_v2.models.hub_user import HubUserV2  # noqa: F401
+from app.db_v2.models.user import UserV2  # noqa: F401
 from app.db_v2.models.nav_tab import NavTabV2  # noqa: F401
 from app.db_v2.models.page_content import PageContentV2  # noqa: F401
 from app.db_v2.models.role import RoleV2  # noqa: F401
@@ -271,7 +271,7 @@ class ResourceGrantV2(BaseV2):
     # form: `automations@renphil.org` depends on it today through
     # DEFAULT_ACCESS_CONTROL.
     user_id = Column(
-        Integer, ForeignKey("hub_users.id", ondelete="CASCADE"), nullable=True, index=True
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
 
     # 'view' | 'edit'. See GRANT_LEVELS above for why this is a row rather
@@ -287,7 +287,7 @@ class ResourceGrantV2(BaseV2):
     # confirmation reads both — "granted directly by Sam, 3 Feb" is the whole
     # point of the affordance, and it has to keep working after Sam leaves.
     granted_by_user_id = Column(
-        Integer, ForeignKey("hub_users.id", ondelete="SET NULL"), nullable=True, index=True
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     # Immutable snapshot of the granter's email as it read at grant time.
     # Never updated, never an FK — it has to outlive the row above.

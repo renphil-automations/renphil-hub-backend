@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db_v2.database import get_db_v2
-from app.db_v2.models.hub_user import HubUserV2
+from app.db_v2.models.user import UserV2
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
@@ -35,6 +35,7 @@ from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_K
     hub_admin_target_ids,
     is_bootstrap_admin_email,
 )
+from app.services.user_db_service import find_user_by_email
 
 _bearer_scheme = HTTPBearer()
 
@@ -101,6 +102,10 @@ async def get_current_user(
 # ── hub_users auto-provisioning (session_handoff_2026-08-24-permission-
 # management-plan.md §5.1) ──────────────────────────────────────────────
 #
+# `hub_users` was folded into `users` in 2026-10: every "hub_users row" below
+# is now a `users` row, and `hub_user_id` is a `users.id`. The names stay so
+# the ~15 modules built on them did not have to move.
+#
 # Blocking prerequisite for the whole Permission Management phase: without
 # this, no signed-in person — including a would-be granter — resolves to a
 # hub_users row, so §6's delegation check has nothing to query.
@@ -127,33 +132,41 @@ class CurrentHubUser:
 
     info: UserInfo
     hub_user_id: int
-    email: str  # normalized: the same value stored on the hub_users row
+    email: str  # normalized: the JWT email the row was found by (work or alias email)
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _ensure_hub_user(db: Session, *, email: str, name: str) -> HubUserV2 | None:
-    """Look up or create the `hub_users` row for `email` (already normalized
-    by the caller). Extracted from `get_current_hub_user` below so a second
-    caller — the dev-only `/auth/dev-login` route
-    (session_handoff_2026-09-10-dev-login-tool.md) — can provision the same
-    row synchronously, before minting a token, instead of waiting for the
-    next authenticated request to trigger the lazy upsert. Pure extraction:
-    no behavior change to the upsert itself.
+def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
+    """Look up or create the signed-in `users` row for `email` (already
+    normalized by the caller), and mark it signed in. Extracted from
+    `get_current_hub_user` below so the OAuth callback and the dev-only
+    `/auth/dev-login` route (session_handoff_2026-09-10-dev-login-tool.md)
+    can provision the same row synchronously, before minting a token,
+    instead of waiting for the next authenticated request.
+
+    Since `hub_users` was folded into `users` (2026-10), the lookup goes
+    through `work_email` then `alias_email`, so someone on the HR roster
+    claims their EXISTING row on first sign-in rather than getting a second
+    one. Only an email no row has gets a new login-only row (named from the
+    Google profile, else the email). `is_active` means "has signed in"
+    (owner decision, 2026-10-09): an HR row or an admin-added person starts
+    False and is flipped True here — the HR `name` is never overwritten.
 
     UNLIKE every other dependency in this module, this commits. A GET
     endpoint (e.g. "my assignments") never calls `db.commit()` itself, but
     provisioning has to survive past this request regardless of whether the
-    route that triggered it writes anything — so the insert is committed
+    route that triggered it writes anything — so the write is committed
     right here, in its own small transaction, rather than left for the
-    caller to remember.
+    caller to remember. A signed-in row costs no write at all.
 
     Handles the concurrent-first-login race explicitly: two simultaneous
     requests can both miss the SELECT and both attempt the INSERT, and only
-    one wins the UNIQUE constraint on `email`. The loser rolls back and
-    re-reads rather than 500ing.
+    one wins the unique index on `lower(work_email)`. The loser rolls back
+    and re-reads rather than 500ing. Two concurrent is_active flips write the
+    same value, so that path needs no guard.
 
     A newly created row gets the default ⊥ assignment in the SAME commit
     (`rbac_assignment_service.add_default_assignment`, owner decision
@@ -162,20 +175,31 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> HubUserV2 | None:
     back a default someone revoked. The race loser's rollback discards its
     assignment along with its row; the winner's row already carries one.
     """
-    hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
-    if hub_user is None:
-        hub_user = HubUserV2(email=email, name=name, is_active=True, created_at=_utc_now())
-        db.add(hub_user)
+    user = find_user_by_email(db, email)
+    if user is None:
+        now = _utc_now()
+        user = UserV2(
+            work_email=email,
+            name=(name or "").strip() or email,
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(user)
         try:
             db.flush()
             rbac_assignment_service.add_default_assignment(db, hub_user.id)
             db.commit()
         except IntegrityError:
             db.rollback()
-            hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
+            user = find_user_by_email(db, email)
         else:
-            db.refresh(hub_user)
-    return hub_user
+            db.refresh(user)
+    elif not user.is_active:
+        user.is_active = True
+        db.commit()
+        db.refresh(user)
+    return user
 
 
 async def get_current_hub_user(
