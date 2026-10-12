@@ -69,8 +69,8 @@ async def callback(
     # actually calls GET /me after this redirect (AuthCallbackPage.tsx builds
     # `user` straight from these query params), so `is_hub_admin` has to ride
     # along here to be seen at all — computed the same way `/dev-login` below
-    # computes it, via the real `is_hub_admin` closure (JWT roles OR a live
-    # `role_assignments` row), not the JWT-roles-only check the ~20 frontend
+    # computes it, via the real `is_hub_admin` closure (BOOTSTRAP_ADMIN_EMAILS
+    # OR a live `role_assignments` row), not the JWT-roles-only check the ~20 frontend
     # call sites used to do. Provisions the `hub_users` row synchronously
     # (same helper `/dev-login` uses) since this can be a brand-new user's
     # very first request — nothing has provisioned it yet, and branch 2 of
@@ -120,8 +120,8 @@ async def me(
     Control table, with each entry's ``role_name``, ``scope``, and
     ``fund_or_program_name`` (null when the role's scope is ``Hub``).
 
-    Also includes the real ``is_hub_admin(db, current)`` answer (JWT
-    `roles` OR a live `role_assignments` row) — NOT just whether "Hub
+    Also includes the real ``is_hub_admin(db, current)`` answer
+    (``BOOTSTRAP_ADMIN_EMAILS`` OR a live `role_assignments` row) — NOT whether "Hub
     Admin" is in `roles`. This is the frontend's repair path for a
     `localStorage`-cached `user.is_hub_admin` that has gone stale (e.g.
     someone was granted or revoked admin after their last login): unlike

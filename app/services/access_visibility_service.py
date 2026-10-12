@@ -70,6 +70,7 @@ from app.db_v2.models.tab import TabV2
 from app.services.rbac_graph_service import (
     RbacClosures,
     audience_user_ids,
+    bootstrap_admin_user_ids,
     hub_admin_pairs,
 )
 from app.services.resource_grant_service import (
@@ -1478,13 +1479,12 @@ def users_granted_on_node(
       returns True before it looks at the node). The property test pins
       exactly that: orphan → admins-by-assignment and nobody else.
     - **Hub Admins (M10).** The forward side's bypass is ``full_access``,
-      set from ``dependencies.is_hub_admin`` — JWT roles OR the
-      ``(hub_admin, universal)`` assignment closure. Only the second half is
-      knowable for another user, so the virtual admin pair
-      (``hub_admin_pairs``) is folded into the audience read and JWT-only
-      admins are absent. That is a documented data gap with one seam
-      (``hub_admin_user_ids`` / ``hub_admin_pairs`` in
-      ``rbac_graph_service``), not something to paper over here.
+      set from ``dependencies.is_hub_admin`` — ``BOOTSTRAP_ADMIN_EMAILS`` OR
+      the ``(hub_admin, universal)`` assignment closure (phase 3,
+      2026-10-12; no JWT role names). Both halves are knowable for another
+      user: the virtual admin pair (``hub_admin_pairs``) is folded into the
+      audience read, and ``bootstrap_admin_user_ids`` is unioned into every
+      return below.
     - **⊥ (§4.4, landmine 13).** ``(Any Role, Any Scope)`` reaches everyone
       WITH AN ASSIGNMENT ROW in both directions — ``audience_user_ids``
       walks ``role_assignments``, and a ``hub_users`` row with none matches
@@ -1513,6 +1513,7 @@ def users_granted_on_node(
     """
     graph = closures if closures is not None else RbacClosures(db)
     admin_pairs = hub_admin_pairs(db, closures=graph)
+    bootstrap_admins = bootstrap_admin_user_ids(db)
 
     kind, node_id = node
     # A component node is read ONCE, here, and reused for both the mirror
@@ -1532,7 +1533,7 @@ def users_granted_on_node(
     # (``resolve_hub_node`` is ``None`` then, and ``build_node_tree``'s root
     # is too). The grant bag contributes nothing; only the bypass does.
     if chain[-1][0] != "hub" or chain[-1] != resolve_hub_node(db):
-        return audience_user_ids(db, admin_pairs, closures=graph)
+        return audience_user_ids(db, admin_pairs, closures=graph) | bootstrap_admins
 
     grants = grants_on_nodes(db, chain)
     granted: set[int] = {g.user_id for g in grants if g.user_id is not None}
@@ -1541,6 +1542,7 @@ def users_granted_on_node(
     # the union is the answer, and reading the table twice for two subsets
     # of the same predicate was the single largest avoidable cost here.
     granted |= audience_user_ids(db, pairs | admin_pairs, closures=graph)
+    granted |= bootstrap_admins
 
     if component is not None and component.type == MIRROR_WIDGET_TYPE:
         target_link = (component.props or {}).get("target_link")
@@ -1551,7 +1553,7 @@ def users_granted_on_node(
         )
         if target is None or target.type == MIRROR_WIDGET_TYPE:
             # Dangling — nobody but the bypass (§3.4).
-            return audience_user_ids(db, admin_pairs, closures=graph)
+            return audience_user_ids(db, admin_pairs, closures=graph) | bootstrap_admins
         # The target's own set already contains the admins, so the
         # intersection keeps them — no separate union needed.
         granted &= users_granted_on_node(db, ("component", target.id), closures=graph)
