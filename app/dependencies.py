@@ -33,8 +33,8 @@ from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_K
     RbacClosures,
     effective_pairs,
     hub_admin_target_ids,
+    is_bootstrap_admin_email,
 )
-from app.services.tab_service import HUB_ADMIN_ROLE
 
 _bearer_scheme = HTTPBearer()
 
@@ -192,8 +192,9 @@ async def get_current_hub_user(
 
 
 # ── Hub Admin identity resolver ─────────────────────────────────────────
-# (plan_access_control_algorithm_2026-08-27.md §6.8, §10 item 6 — PHASE 2
-# of 3, "parallel run", 2026-09-03)
+# (plan_access_control_algorithm_2026-08-27.md §6.8, §10 item 6 — phase 2
+# "parallel run" 2026-09-03; PHASE 3, assignments + BOOTSTRAP_ADMIN_EMAILS
+# only, no Airtable, 2026-10-12)
 #
 # `require_hub_admin` used to gate two unrelated surfaces (its own old
 # docstring said so): nav-tab/hub mutations, which are becoming an ordinary
@@ -215,8 +216,9 @@ async def get_current_hub_user(
 # would move the gate without moving the cutover's sequencing, and that
 # sequencing is exactly what this section now implements). All three call
 # sites now call `is_hub_admin(db, current)` below.
-# `HUB_ADMIN_ROLE_KEY` is `roles.key` ("hub_admin"). NOT `HUB_ADMIN_ROLE`
-# above, which is "Hub Admin" — a JWT DISPLAY NAME sourced from Airtable, a
+# `HUB_ADMIN_ROLE_KEY` is `roles.key` ("hub_admin"). NOT
+# `tab_service.HUB_ADMIN_ROLE`, which is "Hub Admin" — a JWT DISPLAY NAME
+# sourced from Airtable, no longer read by this module at all, a
 # different namespace entirely (same split
 # `rbac_assignment_service.HUB_ADMIN_ROLE_KEY` documents for the admin-floor
 # guard; that module's copy of this same role/universal-scope lookup is
@@ -245,32 +247,25 @@ def is_hub_admin(
     """Is ``current`` a Hub Admin? THE ONE PLACE THIS QUESTION IS ANSWERED.
 
     ══════════════════════════════════════════════════════════════════════
-    THE `OR` IS THE ENTIRE SAFETY PROPERTY OF THE PARALLEL RUN. DO NOT
-    COLLAPSE IT TO ONE SIDE. DO NOT GATE EITHER BRANCH BEHIND A FEATURE
-    FLAG THAT COULD DISABLE IT. THIS IS A PHASE, NOT AN END STATE.
+    PHASE 3 (§10 item 6, 2026-10-12): AIRTABLE IS NO LONGER CONSULTED.
     ══════════════════════════════════════════════════════════════════════
-    Two independent sources, either one sufficient:
+    Two sources, either one sufficient:
 
-      1. The JWT's role NAMES, sourced from Airtable at login (unchanged
-         from before this task — the ORIGINAL admin path, still the only
-         one most people have today).
+      1. ``BOOTSTRAP_ADMIN_EMAILS`` (settings, plan §6.5) — checked FIRST
+         and unconditionally. A permanent recovery floor, not a transition
+         device: nothing ranks above `hub_admin`, so if every admin
+         assignment were revoked nobody could write one back from inside
+         the app. Do not remove it once assignments are "complete".
       2. `role_assignments`, via the closures every ordinary grant match
-         already uses (NEW as of this task).
+         already uses.
 
-    §10 item 6 states why both must stay live at once: *"while assignments
-    are being populated, neither source alone can lock anyone out."*
-    `role_assignments` holds exactly one row as of 2026-09-03 — if this
-    resolved from assignments ALONE today, every admin but the one person
-    named in that row would be locked out of the tool that populates the
-    table. If it resolved from the JWT alone forever, `role_assignments`
-    would never need populating and §10's cutover could never happen. Only
-    the `OR` lets population and enforcement-readiness proceed
-    concurrently, which is the entire point of calling this "phase 2 of 3"
-    rather than "the fix."
-
-    The NEXT session's job (§10 item 6, phase 3) is to drop branch 1 and add
-    a settings-level `BOOTSTRAP_ADMIN_EMAILS` backstop in its place — NOT to
-    delete this docstring's warning, which stays true until that happens.
+    The JWT's role NAMES (sourced from Airtable at login) are deliberately
+    NOT read here any more. Phase 2 (2026-09-03) ran them in parallel with
+    branch 2 while `role_assignments` was populated; phase 3 dropped them
+    once the parity report (`scripts/survey_hub_admin_parity.py`) could be
+    driven to zero missing. A token carrying "Hub Admin" with no assignment
+    row and no bootstrap entry is NOT an admin — do not add that branch
+    back as a "fallback"; it would make Airtable authoritative again.
 
     ══════════════════════════════════════════════════════════════════════
     §0.1's decision: CLOSURE membership, not a literal row (owner-confirmed
@@ -307,12 +302,15 @@ def is_hub_admin(
     and shared with `assert_can_administer_node` / `assert_can_grant` /
     `assert_can_delegate`); omitted, `effective_pairs` builds its own.
 
-    Branch 1 is checked FIRST and short-circuits branch 2 entirely — a Hub
-    Admin recognized by JWT never needs a `hub_users` row to exist in
-    `role_assignments` at all, which matters because `role_assignments` is
-    still mostly empty.
+    Branch 1 is checked FIRST and short-circuits branch 2 entirely — a
+    bootstrap admin needs no `role_assignments` row at all, which is the
+    point of a floor. It matches ``current.email`` (already stripped and
+    lower-cased by `get_current_hub_user`), the verified Google sign-in
+    address, never anything client-supplied.
     """
-    if HUB_ADMIN_ROLE in (current.info.roles or []):
+    # Branch 1 is currently DISABLED (always False) pending a team decision;
+    # see `rbac_graph_service.is_bootstrap_admin_email`.
+    if is_bootstrap_admin_email(current.email):
         return True
 
     hub_admin_role_id, universal_scope_ids = _hub_admin_target_ids(db, closures=closures)
@@ -360,12 +358,10 @@ async def require_hub_admin(
 ) -> UserInfo:
     """Gate for role/scope definition writes and nav-tab mutations.
 
-    PHASE 2 OF 3 (plan §10 item 6, 2026-09-03): resolves from `is_hub_admin`
-    above — the JWT role check this dependency has always done, `OR` a
-    `role_assignments` closure check that is new as of this task. Neither
-    source alone is authoritative yet; see `is_hub_admin`'s docstring for
-    why the `OR` must stay live until phase 3 (assignments-only, plus a
-    `BOOTSTRAP_ADMIN_EMAILS` backstop — not this session).
+    PHASE 3 (plan §10 item 6, 2026-10-12): resolves from `is_hub_admin`
+    above — `BOOTSTRAP_ADMIN_EMAILS` OR a `role_assignments` closure check.
+    The JWT's Airtable-sourced role names are no longer consulted; see
+    `is_hub_admin`'s docstring.
 
     THIS NOW TAKES `CurrentHubUser`, NOT BARE `UserInfo` — a change from
     before this task, and it has a real side effect. `get_current_hub_user`
@@ -380,14 +376,11 @@ async def require_hub_admin(
     from arbitrarily many routes on arbitrarily many requests, and its race
     handling does not care which route triggered it.
 
-    WIDENING, STATED PLAINLY (not "purely additive"): someone who holds
-    `(hub_admin, universal_scope)` in `role_assignments` but lacks the
-    Airtable "Hub Admin" role in their JWT now newly passes THIS gate too —
-    including on nav-tab and hub mutations, which this task does not
-    otherwise touch. That is exactly what phase 2 is for (populating and
-    proving out assignments before Airtable is retired), but it is a real
-    behaviour change on every surface this dependency guards, not a
-    no-op affecting only the assignments/grants routers.
+    NARROWING, STATED PLAINLY (phase 3): someone with the Airtable "Hub
+    Admin" role in their JWT but no `(hub_admin, universal_scope)`
+    assignment and no bootstrap entry NO LONGER passes this gate — on every
+    surface it guards, nav-tab and hub mutations included. Run the parity
+    report to zero missing before deploying this.
     """
     if not is_hub_admin(db, current):
         raise HTTPException(status_code=403, detail="Hub Admin access required")

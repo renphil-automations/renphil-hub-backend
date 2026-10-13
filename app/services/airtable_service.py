@@ -3312,16 +3312,6 @@ class AirtableService:
     #     }
     #     return email.strip().lower() in overrides
 
-    # Role name that grants RenPhil Hub administrator privileges.
-    HUB_ADMIN_ROLE = "Hub Admin"
-
-    async def is_hub_admin(self, email: str) -> bool:
-        """Return True if ``email`` has the ``Hub Admin`` role in the
-        Access Control table.
-        """
-        roles = await self.get_user_roles(email)
-        return self.HUB_ADMIN_ROLE in roles
-
     # Role scope value that represents a global (non-scoped) role.
     HUB_SCOPE = "Hub"
 
