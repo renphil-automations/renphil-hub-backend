@@ -24,6 +24,23 @@ class Settings(BaseSettings):
     # never honored in production.
     # DEV_ADMIN_OVERRIDE_EMAILS: str = ""
 
+    # Comma-separated emails that are ALWAYS Hub Admins, regardless of
+    # `role_assignments` (plan_access_control_algorithm_2026-08-27.md §6.5,
+    # §10 item 6 phase 3). A permanent recovery floor, not a transition
+    # device: nothing ranks above `hub_admin`, so if every admin assignment
+    # were revoked no one could restore one from inside the app. Set it in
+    # the environment (Render / .env), never hardcoded here.
+    BOOTSTRAP_ADMIN_EMAILS: str = ""
+
+    @property
+    def bootstrap_admin_emails(self) -> frozenset[str]:
+        """Parsed, stripped, lower-cased ``BOOTSTRAP_ADMIN_EMAILS``."""
+        return frozenset(
+            e.strip().lower()
+            for e in self.BOOTSTRAP_ADMIN_EMAILS.split(",")
+            if e.strip()
+        )
+
     # ── Google OAuth ───────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str
     GOOGLE_CLIENT_SECRET: str
