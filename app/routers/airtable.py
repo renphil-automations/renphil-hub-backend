@@ -3041,10 +3041,11 @@ async def get_grant_app_resources(
 @invalidates_cache(["get_grant_app_resources"])
 async def create_grant_app_resource(
     payload: GrantAppResourceCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -3066,10 +3067,11 @@ async def create_grant_app_resource(
 async def update_grant_app_resource(
     pf_id: int,
     payload: GrantAppResourceUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -3089,10 +3091,11 @@ async def update_grant_app_resource(
 @invalidates_cache(["get_grant_app_resources"])
 async def delete_grant_app_resource(
     pf_id: int,
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -3133,10 +3136,11 @@ async def update_finance_link(
         description="The current 'Document URL' of the record to update.",
     ),
     payload: FinanceLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Finance Links records.",
@@ -3173,10 +3177,11 @@ async def get_office_spaces(
 @invalidates_cache(["get_office_spaces"])
 async def create_office_space(
     payload: OfficeSpaceCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Office Spaces records.",
@@ -3199,10 +3204,11 @@ async def update_office_space(
         description="The current 'Branch' value of the record to update.",
     ),
     payload: OfficeSpaceUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Office Spaces records.",
@@ -3324,10 +3330,11 @@ async def get_partnerships_links(
 @invalidates_cache(["get_partnerships_links"])
 async def create_partnerships_link(
     payload: PartnershipsLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Partnerships Links records.",
@@ -3347,10 +3354,11 @@ async def create_partnerships_link(
 async def update_partnerships_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: PartnershipsLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Partnerships Links records.",
@@ -3374,10 +3382,11 @@ async def delete_partnerships_link(
             "Omit to delete every record in the table."
         ),
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Partnerships Links records.",
@@ -3411,10 +3420,11 @@ async def get_policy_links(
 @invalidates_cache(["get_policy_links"])
 async def create_policy_link(
     payload: PolicyLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Policy Links records.",
@@ -3434,10 +3444,11 @@ async def create_policy_link(
 async def update_policy_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: PolicyLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Policy Links records.",
@@ -3455,10 +3466,11 @@ async def delete_policy_link(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Policy Links records.",
@@ -3495,10 +3507,11 @@ async def get_events_quick_links(
 @invalidates_cache(["get_events_quick_links"])
 async def create_events_quick_link(
     payload: EventsQuickLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Events Quick Links records.",
@@ -3518,10 +3531,11 @@ async def create_events_quick_link(
 async def update_events_quick_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: EventsQuickLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Events Quick Links records.",
@@ -3539,10 +3553,11 @@ async def delete_events_quick_link(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Events Quick Links records.",
@@ -3576,10 +3591,11 @@ async def get_finance_quick_links(
 @invalidates_cache(["get_finance_quick_links"])
 async def create_finance_quick_link(
     payload: FinanceQuickLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Finance Quick Links records.",
@@ -3599,10 +3615,11 @@ async def create_finance_quick_link(
 async def update_finance_quick_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: FinanceQuickLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Finance Quick Links records.",
@@ -3620,10 +3637,11 @@ async def delete_finance_quick_link(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Finance Quick Links records.",
@@ -3657,10 +3675,11 @@ async def get_comms_quick_links(
 @invalidates_cache(["get_comms_quick_links"])
 async def create_comms_quick_link(
     payload: CommsQuickLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Comms Quick Links records.",
@@ -3680,10 +3699,11 @@ async def create_comms_quick_link(
 async def update_comms_quick_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: CommsQuickLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Comms Quick Links records.",
@@ -3701,10 +3721,11 @@ async def delete_comms_quick_link(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Comms Quick Links records.",
@@ -3738,10 +3759,11 @@ async def get_hr_quick_links(
 @invalidates_cache(["get_hr_quick_links"])
 async def create_hr_quick_link(
     payload: HrQuickLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create HR Quick Links records.",
@@ -3761,10 +3783,11 @@ async def create_hr_quick_link(
 async def update_hr_quick_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: HrQuickLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit HR Quick Links records.",
@@ -3782,10 +3805,11 @@ async def delete_hr_quick_link(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete HR Quick Links records.",
@@ -3822,10 +3846,11 @@ async def get_renphil_due_diligence_links(
 @invalidates_cache(["get_renphil_due_diligence_links"])
 async def create_renphil_due_diligence_link(
     payload: RenphilDueDiligenceLinkCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -3847,10 +3872,11 @@ async def create_renphil_due_diligence_link(
 async def update_renphil_due_diligence_link(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: RenphilDueDiligenceLinkUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -3870,10 +3896,11 @@ async def delete_renphil_due_diligence_link(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -3916,10 +3943,11 @@ async def get_board_members(
 @invalidates_cache(["get_board_members"])
 async def create_board_member(
     payload: BoardMemberCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Board Member List records.",
@@ -3939,10 +3967,11 @@ async def create_board_member(
 async def update_board_member(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: BoardMemberUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Board Member List records.",
@@ -3960,10 +3989,11 @@ async def delete_board_member(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Board Member List records.",
@@ -4003,10 +4033,11 @@ async def get_organization_info(
 @invalidates_cache(["get_organization_info"])
 async def create_organization_info(
     payload: OrganizationInfoCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create Organization Info records.",
@@ -4026,10 +4057,11 @@ async def create_organization_info(
 async def update_organization_info(
     id: int = Query(..., description="Value of the 'Id' (autonumber) field."),
     payload: OrganizationInfoUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to edit Organization Info records.",
@@ -4047,10 +4079,11 @@ async def delete_organization_info(
         ...,
         description="Value of the 'Id' (autonumber) field of the record to delete.",
     ),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete Organization Info records.",
@@ -4115,10 +4148,11 @@ async def get_quick_links(
 @invalidates_cache(["get_quick_links"])
 async def create_quick_link(
     payload: QuickLinkCreate,
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create a quick link.",
@@ -4135,10 +4169,11 @@ async def create_quick_link(
 async def update_quick_link(
     payload: QuickLinkUpdate,
     quick_link_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to update a quick link.",
@@ -4153,10 +4188,11 @@ async def update_quick_link(
 @invalidates_cache(["get_quick_links"])
 async def delete_quick_link(
     quick_link_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete a quick link.",
@@ -4190,10 +4226,11 @@ async def get_quick_actions(
 @invalidates_cache(["get_quick_actions", "get_quick_links"])
 async def create_quick_action(
     payload: QuickActionCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to create a quick action.",
@@ -4210,10 +4247,11 @@ async def create_quick_action(
 async def update_quick_action(
     payload: QuickActionUpdate,
     quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to update a quick action.",
@@ -4228,10 +4266,11 @@ async def update_quick_action(
 @invalidates_cache(["get_quick_actions", "get_quick_links"])
 async def delete_quick_action(
     quick_action_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete a quick action.",
@@ -4292,10 +4331,10 @@ async def update_announcement(
 # cache layer, so a non-admin can never receive a cached full-list response.
 async def _list_announcements_authz(
     all: bool = Query(default=False),
-    user: UserInfo = Depends(get_current_user),
-    airtable_service: AirtableService = Depends(get_airtable_service),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
 ) -> None:
-    if all and not await airtable_service.is_hub_admin(user.email):
+    if all and not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to list all announcements.",
@@ -4359,10 +4398,11 @@ async def list_announcements_by_author(
 @invalidates_cache(["list_announcements", "get_announcement_categories", "list_announcements_by_author"])
 async def delete_announcement(
     announcement_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    if not await airtable_service.is_hub_admin(user.email):
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin privileges required to delete an announcement.",
@@ -4376,10 +4416,8 @@ async def delete_announcement(
 _ADMIN_REQUIRED_DETAIL = "Admin privileges required to manage access control."
 
 
-async def _require_admin(
-    user: UserInfo, airtable_service: AirtableService
-) -> None:
-    if not await airtable_service.is_hub_admin(user.email):
+def _require_admin(db: Session, current: CurrentHubUser) -> None:
+    if not is_hub_admin(db, current):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=_ADMIN_REQUIRED_DETAIL,
@@ -4389,10 +4427,10 @@ async def _require_admin(
 # Dependency form — runs BEFORE the cache layer so cached responses can never
 # be served to a non-admin.
 async def _require_admin_dep(
-    user: UserInfo = Depends(get_current_user),
-    airtable_service: AirtableService = Depends(get_airtable_service),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
 ) -> None:
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
 
 
 @router.get(
@@ -4416,10 +4454,11 @@ async def list_access_control(
 @invalidates_cache(["list_access_control"])
 async def assign_access_control(
     payload: AccessControlAssign = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service.upsert_access_control(payload)
 
 
@@ -4431,10 +4470,11 @@ async def assign_access_control(
 @invalidates_cache(["list_access_control"])
 async def revoke_access_control(
     payload: AccessControlRevoke = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service.revoke_access_control(payload)
 
 
@@ -4486,10 +4526,11 @@ async def get_permissions(
 @invalidates_cache(["get_roles", "list_access_control"])
 async def create_role(
     payload: RoleCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service.create_role(payload)
 
 
@@ -4502,10 +4543,11 @@ async def create_role(
 async def update_role(
     role_id: str = Path(..., description="Role record id."),
     payload: RoleUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service.update_role(role_id, payload)
 
 
@@ -4517,10 +4559,11 @@ async def update_role(
 @invalidates_cache(["get_roles", "list_access_control"])
 async def delete_role(
     role_id: str = Path(..., description="Role record id."),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     await airtable_service.delete_role(role_id)
     return None
 
@@ -4566,10 +4609,11 @@ async def delete_role(
 async def update_funds_and_subprograms_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._master_list_table(),
         record_id,
@@ -4587,10 +4631,11 @@ async def update_funds_and_subprograms_record(
 async def update_glossary_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._glossary_table(),
         record_id,
@@ -4608,10 +4653,11 @@ async def update_glossary_record(
 async def update_org_friends_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._org_friends_table(),
         record_id,
@@ -4629,10 +4675,11 @@ async def update_org_friends_record(
 async def update_funders_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._funders_table(),
         record_id,
@@ -4659,10 +4706,11 @@ async def update_funders_record(
 async def update_monthly_checkin_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._monthly_checkin_table(),
         record_id,
@@ -4680,10 +4728,11 @@ async def update_monthly_checkin_record(
 async def update_checkin_reporting_period_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._checkin_periods_table(),
         record_id,
@@ -4702,10 +4751,11 @@ async def update_checkin_reporting_period_record(
 async def update_shareable_docs_record(
     record_id: str = Path(..., description="Airtable record id."),
     payload: RecordFieldsUpdate = Body(...),
-    user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    await _require_admin(user, airtable_service)
+    _require_admin(db, current)
     return await airtable_service._update_typed_record(
         airtable_service._shareable_docs_table(),
         record_id,
@@ -5272,10 +5322,12 @@ async def update_ticket(
     ticket_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     payload: TicketUpdate = Body(...),
     user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     existing = await airtable_service.get_ticket_by_id(ticket_id)
-    is_admin = await airtable_service.is_hub_admin(user.email)
+    is_admin = is_hub_admin(db, current)
     is_owner = _is_ticket_owner(existing, user.email)
     is_assignee = _is_ticket_assignee(existing, user.email)
 
@@ -5326,10 +5378,12 @@ async def update_ticket(
 async def delete_ticket(
     ticket_id: int = Path(..., description="Value of the 'Id' (Autonumber) field."),
     user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     existing = await airtable_service.get_ticket_by_id(ticket_id)
-    is_admin = await airtable_service.is_hub_admin(user.email)
+    is_admin = is_hub_admin(db, current)
     if not (is_admin or _is_ticket_owner(existing, user.email)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -5385,10 +5439,10 @@ async def update_user_by_email(
     work_email: str = Path(..., description="Work Email of the user to update."),
     payload: UserUpdate = Body(...),
     user: UserInfo = Depends(get_current_user),
+    current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
-    airtable_service: AirtableService = Depends(get_airtable_service),
 ):
-    is_admin = await airtable_service.is_hub_admin(user.email)
+    is_admin = is_hub_admin(db, current)
     is_self = (user.email or "").strip().lower() == (work_email or "").strip().lower()
 
     if not (is_admin or is_self):

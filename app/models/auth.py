@@ -64,7 +64,7 @@ class MeResponse(BaseModel):
         default=False,
         description=(
             "The real is_hub_admin(db, current) answer (app/dependencies.py) "
-            "— JWT `roles` OR a live `role_assignments` row — not just "
+            "— BOOTSTRAP_ADMIN_EMAILS OR a live `role_assignments` row — not "
             "whether 'Hub Admin' is in `roles`. Lets the frontend repair a "
             "cached user object whose is_hub_admin has gone stale (e.g. an "
             "admin grant/revoke since the last login) without forcing a "

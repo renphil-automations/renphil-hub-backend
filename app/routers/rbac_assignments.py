@@ -20,10 +20,11 @@ is the surface that made hub_users auto-provisioning a hard prerequisite
 granter — can be resolved to a row without it.
 
 This router also owns the one rule that keeps the ⊥ flags
-("Any Role" / "Any Scope", plan_access_control_algorithm_2026-08-27.md §4.4)
-from being a delegation hole: they may never be assigned. See
-`_assert_not_public`, which explains why it lives here and why it runs where
-it runs.
+("Any Role" / "Any Scope", renamed "User" / "Hub" 2026-10-14;
+plan_access_control_algorithm_2026-08-27.md §4.4) from being a delegation
+hole: they may never be assigned, except as the exact default pair every new
+user gets. See `_assert_not_public`, which explains why it lives here and why
+it runs where it runs.
 """
 
 from __future__ import annotations
@@ -77,13 +78,15 @@ FORBIDDEN_RESPONSE = {403: {"description": "Hub Admin access required"}}
 
 # TEMPORARY (owner decision, 2026-09-24, testing phase only): lets "Any
 # Scope" (the ⊥ scope) be ASSIGNED to any user, under the normal delegation
-# rules. "Any Role" stays refused regardless. This deliberately reopens the
-# scope half of the hole `_assert_not_public` documents — anyone holding a
-# non-leaf role can grant `(<a role beneath theirs>, Any Scope)` to anyone,
-# and that reaches every object grant written on `(<that role>, Any Scope)`.
-# Flip back to False (and the frontend twin, `ALLOW_ANY_SCOPE_ASSIGNMENT`
-# in UserManagementPage.tsx) when testing ends. Existing ⊥ assignments are
-# NOT cleaned up by flipping it — revoke them first.
+# rules. "Any Role" stays refused regardless, except as the exact default
+# pair (see `_assert_not_public`), which does not depend on this flag. This
+# deliberately reopens the scope half of the hole `_assert_not_public`
+# documents — anyone holding a non-leaf role can grant
+# `(<a role beneath theirs>, Any Scope)` to anyone, and that reaches every
+# object grant written on `(<that role>, Any Scope)`. Flip back to False (and
+# the frontend twin, `ALLOW_ANY_SCOPE_ASSIGNMENT` in UserManagementPage.tsx)
+# when testing ends. Existing ⊥ assignments are NOT cleaned up by flipping it
+# — revoke them first, but leave the `(⊥, ⊥)` defaults alone.
 TEMP_ALLOW_PUBLIC_SCOPE_ASSIGNMENT = True
 
 
@@ -101,8 +104,20 @@ def _conflict(error: RbacGraphError) -> HTTPException:
 
 
 def _assert_not_public(role: dict | None, scope: dict | None) -> None:
-    """⊥ IS NEVER VALID AS AN ASSIGNMENT
+    """⊥ IS NEVER VALID AS AN ASSIGNMENT — EXCEPT AS THE EXACT DEFAULT PAIR
     (plan_access_control_algorithm_2026-08-27.md §4.4).
+
+    THE EXCEPTION (owner decision, 2026-10-14): `(public role, public scope)`
+    — "User" on "Hub" — is every new user's default assignment
+    (`rbac_assignment_service.add_default_assignment`), and it may be granted
+    back under the normal delegation rules once revoked. That pair is safe to
+    let through where either half alone is not: it reaches only grants
+    written on `(⊥, ⊥)`, i.e. content published to everyone, and its holder
+    can delegate nothing (the public role has nothing strictly beneath it).
+    The public role on any REAL scope stays refused: `(⊥, X)` would let
+    anyone holding a role on X add anyone to X's "everyone" audience. The
+    exception sits above `TEMP_ALLOW_PUBLIC_SCOPE_ASSIGNMENT` and does not
+    depend on it, so it survives that flag being turned off.
 
     "Any Role" and "Any Scope" are the two lattice bottoms. They exist so
     that a grant written on an OBJECT can be reached from whatever anyone
@@ -132,14 +147,18 @@ def _assert_not_public(role: dict | None, scope: dict | None) -> None:
     with the widest reach in the system and no way to remove it through the
     UI. Refuse the way in, never the way out.
 
-    `role`/`scope` are individually optional so the admin update endpoint
-    below can call this having looked up only whichever of role_id/scope_id
-    the request actually changed — a `None` here means "not part of this
-    write", not "checked and fine", and is simply skipped.
+    `role`/`scope` are individually optional — a `None` here means "not part
+    of this write", not "checked and fine", and is simply skipped. Both
+    callers now pass the full pair the row will END UP holding (the admin
+    update endpoint fills the unchanged half in from the existing row),
+    because the exception above is a property of the pair, not of either
+    half: editing only the scope of a default row must not yield `(⊥, X)`.
 
     TEMPORARILY WEAKENED for the scope half — see
     `TEMP_ALLOW_PUBLIC_SCOPE_ASSIGNMENT`.
     """
+    if role is not None and scope is not None and role.get("is_public") and scope.get("is_public"):
+        return
     for kind, row, key in (("role", role, "role_id"), ("scope", scope, "scope_id")):
         if row is None:
             continue
@@ -150,9 +169,9 @@ def _assert_not_public(role: dict | None, scope: dict | None) -> None:
                 "public_not_assignable",
                 (
                     f"{row['name']!r} is the public {kind} — the bottom of the "
-                    f"{kind} lattice. It cannot be assigned to anyone: holding "
-                    f"it grants only what everybody already reaches. It is "
-                    f"meant for grants written ON CONTENT, to publish "
+                    f"{kind} lattice. It can only be assigned as the default "
+                    f"pair, the public role on the public scope. Otherwise it "
+                    f"is meant for grants written ON CONTENT, to publish "
                     f"something to the whole hub."
                 ),
                 **{key: row["id"]},
@@ -419,9 +438,10 @@ async def update_assignment_admin(
     db: Session = Depends(get_db_v2),
 ):
     """404s for a bad `role_id`/`scope_id` are checked before the write,
-    matching `create_assignment`'s ordering, and `_assert_not_public` runs
-    only against whichever of the two was actually provided — see its
-    docstring's note on why `None` there means "not part of this write"."""
+    matching `create_assignment`'s ordering. `_assert_not_public` runs
+    against the RESULTING pair — the provided half or halves plus the row's
+    current value for the other — because the default-pair exception is a
+    property of the pair (see its docstring)."""
     if not request.model_fields_set:
         raise HTTPException(
             status_code=400,
@@ -439,6 +459,16 @@ async def update_assignment_admin(
         scope = rbac_service.get_scope(db, request.scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail="Scope not found")
+
+    # The ⊥ check is about the pair the row ends up holding (see
+    # `_assert_not_public`), so fill the unchanged half in from the row.
+    existing = rbac_assignment_service.get_assignment(db, assignment_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    if role is None:
+        role = rbac_service.get_role(db, existing.role_id)
+    if scope is None:
+        scope = rbac_service.get_scope(db, existing.scope_id)
 
     try:
         _assert_not_public(role, scope)

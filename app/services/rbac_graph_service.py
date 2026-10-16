@@ -45,12 +45,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
+from app.db_v2.models.user import UserV2
 
 # Distinct constants so the two graphs never serialize against each other.
 # Arbitrary, but must stay stable — the lock is only meaningful if every
@@ -600,34 +602,63 @@ def hub_admin_pairs(db: Session, *, closures: RbacClosures | None = None) -> set
     return {(hub_admin_role_id, scope_id) for scope_id in universal_scope_ids}
 
 
+def is_bootstrap_admin_email(email: str | None) -> bool:
+    """Is ``email`` on the ``BOOTSTRAP_ADMIN_EMAILS`` list (plan §6.5, §10
+    item 6 phase 3)? Stripped and lower-cased like every other email
+    comparison in this codebase. ``dependencies.is_hub_admin`` checks this
+    FIRST and unconditionally — it is a permanent recovery floor, not a
+    transition device.
+
+    DISABLED 2026-10-13 pending a team decision: an unconditional floor
+    means a listed person who is demoted in the app silently stays an admin
+    (only editing the env var removes them). Until the team picks between
+    unconditional and "only when no assignment admin exists", this always
+    answers False and `bootstrap_admin_user_ids` below always answers
+    empty, so admin status comes from `role_assignments` alone. To restore,
+    uncomment the bodies of both functions."""
+    return False
+    # if not email:
+    #     return False
+    # return email.strip().lower() in get_settings().bootstrap_admin_emails
+
+
+def bootstrap_admin_user_ids(db: Session) -> set[int]:
+    """``users`` ids of the ``BOOTSTRAP_ADMIN_EMAILS`` people who have a
+    row (matched on work or alias email; someone with no row is simply
+    absent).
+    The reverse-side twin of ``is_bootstrap_admin_email``: every "who else
+    is an admin" answer (``hub_admin_user_ids``, and the admin half of
+    ``access_visibility_service.users_granted_on_node``) unions this in so
+    it agrees with ``is_hub_admin`` for the caller.
+
+    DISABLED 2026-10-13, see ``is_bootstrap_admin_email``."""
+    return set()
+    # emails = get_settings().bootstrap_admin_emails
+    # if not emails:
+    #     return set()
+    # rows = db.query(UserV2.id).filter(UserV2.matches_any_email(emails)).all()
+    # return {row[0] for row in rows}
+
+
 def hub_admin_user_ids(db: Session, *, closures: RbacClosures | None = None) -> set[int]:
-    """Every ``hub_users`` id that is a Hub Admin BY ASSIGNMENT — the
-    audience of the virtual ``(hub_admin, universal)`` pair, resolved the
-    same way ``dependencies.is_hub_admin``'s branch 2 resolves it for the
-    caller (closure membership, owner-confirmed 2026-09-03), but for every
-    user at once (moderation plan M10).
+    """Every ``users`` id that is a Hub Admin — the audience of the
+    virtual ``(hub_admin, universal)`` pair, resolved the same way
+    ``dependencies.is_hub_admin`` resolves it for the caller (closure
+    membership, owner-confirmed 2026-09-03), plus the
+    ``BOOTSTRAP_ADMIN_EMAILS`` people, for every user at once (moderation
+    plan M10).
 
-    THIS IS THE ONE SEAM FOR "WHO ELSE IS AN ADMIN", and it is deliberately
-    incomplete today. ``is_hub_admin`` has a branch 1 — the caller's own JWT
-    role names, sourced from Airtable at login — and nothing server-side can
-    ask that question about ANY OTHER user. So a JWT-only admin (17 of the 22
-    Airtable admins on the 2026-09-19 parity run — `scripts/survey_hub_admin_
-    parity.py`; it was 21 of 22 on 2026-09-03) is invisible here: not
-    mentionable on a widget they hold no grant on, even though they can open
-    every thread.
-    That is the AC cutover's data gap (project_ac_cutover_state) surfacing in
-    a new place, not a bug in this function, and the fix is data (backfill
-    the admin assignments) plus, when phase 3's ``BOOTSTRAP_ADMIN_EMAILS``
-    lands, a union HERE — in this one function — so every consumer picks it
-    up at once. ``tests/test_thread_mentions_scoping.py::HubAdminByAssignment``
-    pins the gap so the day the backstop lands the test goes red and someone
-    has to look.
+    THIS IS THE ONE SEAM FOR "WHO ELSE IS AN ADMIN". Since phase 3
+    (2026-10-12) ``is_hub_admin`` no longer reads the Airtable role names in
+    the caller's JWT, so there is no admin this function cannot see: its
+    two sources are exactly ``is_hub_admin``'s two sources.
 
-    Empty when the ``hub_admin`` role or the universal scope does not exist,
-    matching ``is_hub_admin``'s own early return — the shape of a
-    fresh/misconfigured database, not an error.
+    Empty when the ``hub_admin`` role or the universal scope does not exist
+    and no bootstrap admin has a row, matching ``is_hub_admin``'s own early
+    return — the shape of a fresh/misconfigured database, not an error.
     """
-    return audience_user_ids(db, hub_admin_pairs(db, closures=closures), closures=closures)
+    by_assignment = audience_user_ids(db, hub_admin_pairs(db, closures=closures), closures=closures)
+    return by_assignment | bootstrap_admin_user_ids(db)
 
 
 # ---------------------------------------------------------

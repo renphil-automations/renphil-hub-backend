@@ -162,7 +162,7 @@ _F_FOCUS_AREAS = _S.AT_F_FOCUS_AREAS
 _F_PROGRAM_LEAD_FELLOW = _S.AT_F_PROGRAM_LEAD_FELLOW
 _STATUS_ACTIVE_PROGRAM = "Active Program"
 _STATUS_PUBLICLY_LAUNCHED = "Publicly Launched"
-_STATUS_FELLOWSHIP_SCOPING = "Fellowship"
+_STATUS_FELLOWSHIP = "Fellowship"
 _ACTIVE_PROGRAM_STATUSES = (_STATUS_ACTIVE_PROGRAM, _STATUS_PUBLICLY_LAUNCHED)
 
 _F_DAYS_UNTIL_DEADLINE = _S.AT_F_DAYS_UNTIL_DEADLINE
@@ -3312,16 +3312,6 @@ class AirtableService:
     #     }
     #     return email.strip().lower() in overrides
 
-    # Role name that grants RenPhil Hub administrator privileges.
-    HUB_ADMIN_ROLE = "Hub Admin"
-
-    async def is_hub_admin(self, email: str) -> bool:
-        """Return True if ``email`` has the ``Hub Admin`` role in the
-        Access Control table.
-        """
-        roles = await self.get_user_roles(email)
-        return self.HUB_ADMIN_ROLE in roles
-
     # Role scope value that represents a global (non-scoped) role.
     HUB_SCOPE = "Hub"
 
@@ -4976,7 +4966,7 @@ class AirtableService:
         s = self._settings
 
         # Step 1: pull Fellowship programs from the Master List.
-        program_formula = af.eq_str(_F_FUND_STATUS, _STATUS_FELLOWSHIP_SCOPING)
+        program_formula = af.eq_str(_F_FUND_STATUS, _STATUS_FELLOWSHIP)
         program_records = await self._list_records(
             self._master_list_table(),
             formula=program_formula,

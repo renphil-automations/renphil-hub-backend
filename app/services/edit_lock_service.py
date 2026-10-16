@@ -769,21 +769,17 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
     longer authorized" before releasing; anything uncertain is treated as
     "still authorized" and left alone.
 
-    THIS IS WHY THE AIRTABLE CALL EXISTS AND MUST NOT BE REMOVED. `is_hub_
-    admin`'s branch 1 (the JWT `roles` claim, sourced from Airtable at
-    login) cannot be reconstructed from a stored `locked_by` — it is a
-    bare email, not a live token. `role_assignments` holds exactly 1 row
-    against 22 real Hub Admins as of the last parity survey
-    (project-ac-hub-admin-resolver), so "not a role_assignments admin" is
-    NOT "not an admin" — it is the common case for a real admin today.
-    Skipping the live Airtable check and trusting the DB-only closure
-    alone would silently force-release a genuine admin's lock the next
-    time ANYONE revokes ANYTHING ELSE, anywhere in the system, while that
-    admin is mid-edit — a strictly worse bug than the one this function
-    exists to fix. `AirtableService.is_hub_admin` is awaited here for
-    every holder the DB-only check doesn't already clear, and ANY failure
-    of that call (network, rate limit, timeout) is caught and treated the
-    same as "yes, admin" — never as "no, not admin" — for that holder.
+    PHASE 3 (plan §10 item 6, 2026-10-12): THE LIVE AIRTABLE FALLBACK IS
+    GONE. It existed because `is_hub_admin` used to admit on the JWT's
+    Airtable-sourced `roles` claim, which a stored `locked_by` email cannot
+    reconstruct, so "not a role_assignments admin" was not "not an admin".
+    Phase 3 dropped that branch: `is_hub_admin` is now exactly
+    `BOOTSTRAP_ADMIN_EMAILS` OR the `role_assignments` closure, and BOTH are
+    fully reconstructable from the holder's email + `users` row. So
+    `is_hub_admin(db, synthetic)` below is the whole answer, the same one the
+    holder would get on their own next request. Do not re-add an Airtable
+    lookup here; it would make Airtable authoritative again for this one
+    path only.
     ══════════════════════════════════════════════════════════════════════
     """
     # Local imports: `app.dependencies` and `access_visibility_service` both
@@ -792,7 +788,7 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
     # services, not below one") — a top-level import here would risk the
     # exact cycle `gridstack_service.py`'s own local import of this module
     # already has to dodge. See this file's own module docstring.
-    from app.dependencies import CurrentHubUser, get_airtable_service, is_hub_admin
+    from app.dependencies import CurrentHubUser, is_hub_admin
     from app.models.auth import UserInfo
     from app.services.access_visibility_service import resolve_gridstack_node, resolve_viewer_access
     from app.services.rbac_graph_service import RbacClosures
@@ -805,12 +801,8 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
         return released
 
     closures = RbacClosures(db)
-    airtable = get_airtable_service()
-    # Caches the FINAL "may still be an admin, leave them alone" verdict —
-    # true for a DB-closure admin, a live-Airtable admin, OR an unresolved
-    # Airtable call (fail-safe) — never just the fast DB-only half, and
-    # computed at most once per distinct holder regardless of how many
-    # locks they hold.
+    # Caches the "still an admin, leave them alone" verdict, computed at
+    # most once per distinct holder regardless of how many locks they hold.
     protected_by_hub_user_id: dict[int, bool] = {}
 
     for node, row in rows:
@@ -832,15 +824,7 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
                 hub_user_id=hub_user.id,
                 email=holder,
             )
-            is_db_admin = is_hub_admin(db, synthetic, closures=closures)
-            if is_db_admin:
-                protected = True
-            else:
-                try:
-                    protected = await airtable.is_hub_admin(holder)
-                except Exception:
-                    protected = True  # uncertain -> leave them alone
-            protected_by_hub_user_id[hub_user.id] = protected
+            protected_by_hub_user_id[hub_user.id] = is_hub_admin(db, synthetic, closures=closures)
         if protected_by_hub_user_id[hub_user.id]:
             continue
 

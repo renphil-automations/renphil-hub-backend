@@ -280,6 +280,9 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
     found by the pre-check or by the unique index in a concurrent-insert race
     (the caller must roll back in that case). The code keeps its old name so
     the frontend contract does not change.
+
+    The new row gets the default ⊥ assignment (`add_default_assignment`
+    below), returned in `assignments` so the admin's detail modal shows it.
     """
     normalized = email.strip().lower()
     if find_user_by_email(db, normalized) is not None:
@@ -299,13 +302,74 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
             f"A user with email {normalized} already exists.",
             email=normalized,
         ) from exc
+    default = add_default_assignment(db, user.id)
     return {
         "id": user.id,
         "email": user.email,
         "name": user.name,
         "is_active": user.is_active,
-        "assignments": [],
+        "assignments": [_serialize(default, user.email)] if default is not None else [],
     }
+
+
+# ---------------------------------------------------------
+# The default assignment (owner decision, 2026-10-14)
+# ---------------------------------------------------------
+
+
+def public_pair_ids(db: Session) -> tuple[int, int] | None:
+    """`(public role id, public scope id)` — the ⊥ pair, i.e. "User" on
+    "Hub" — or `None` if either row is missing. Looked up by `is_public`,
+    never by `key` or `name`, so renaming either row changes nothing here.
+    Ordered by id only so the answer is deterministic; the partial unique
+    indexes already keep each to one row."""
+    role_row = db.query(RoleV2.id).filter(RoleV2.is_public.is_(True)).order_by(RoleV2.id).first()
+    scope_row = db.query(ScopeV2.id).filter(ScopeV2.is_public.is_(True)).order_by(ScopeV2.id).first()
+    if role_row is None or scope_row is None:
+        return None
+    return role_row[0], scope_row[0]
+
+
+def add_default_assignment(db: Session, user_id: int) -> RoleAssignmentV2 | None:
+    """Give a NEWLY CREATED `users` row the ⊥ pair, so that a user who
+    holds nothing else still reaches content published to everyone — a user
+    with zero assignment rows reaches no pair at all, ⊥ included (see
+    `rbac_graph_service.audience_user_ids`).
+
+    Called only from the two places a `users` row is born
+    (`dependencies._ensure_hub_user` and `create_hub_user` above), in the same
+    transaction as the insert, and only on the insert branch: existing users
+    are deliberately not backfilled, and a default that was revoked must not
+    come back on the next request. Revoking and re-granting it afterwards
+    follow the normal delegation rules (`routers/rbac_assignments.py`).
+
+    The ⊥ pair confers no delegation power: its role has nothing strictly
+    beneath it, so `can_delegate` fails every row it would be checked against.
+
+    `granted_by_*` stay NULL — the system granted it, not a person. Returns
+    `None` without writing anything if either ⊥ row is missing (logged), so
+    a database without them can still provision users. Flushes, never
+    commits; the caller owns the transaction.
+    """
+    pair = public_pair_ids(db)
+    if pair is None:
+        logger.warning(
+            "Default assignment skipped for user %s: no public role and/or public scope row",
+            user_id,
+        )
+        return None
+    role_id, scope_id = pair
+    assignment = RoleAssignmentV2(
+        user_id=user_id,
+        role_id=role_id,
+        scope_id=scope_id,
+        granted_by_user_id=None,
+        granted_by_email=None,
+        created_at=_utc_now(),
+    )
+    db.add(assignment)
+    db.flush()
+    return assignment
 
 
 def _assert_update_does_not_remove_last_hub_admin(
@@ -403,7 +467,8 @@ def update_assignment(
     decision, 2026-09-12 — the Hub-Admin management table's "update" action).
     Caller (the router) must already have: validated `require_hub_admin`,
     confirmed any provided `role_id`/`scope_id` exist, and refused a ⊥
-    (public) role or scope via `_assert_not_public`.
+    (public) role or scope other than the exact default pair via
+    `_assert_not_public`.
 
     Deliberately a true in-place mutation — same `id`, same `created_at`,
     same `granted_by_*` — rather than delete-and-recreate, so editing an
