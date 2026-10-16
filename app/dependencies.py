@@ -26,7 +26,7 @@ from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
-from app.services import edit_lock_service
+from app.services import edit_lock_service, rbac_assignment_service
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_KEY is re-exported, see below
     HUB_ADMIN_ROLE_KEY,
@@ -154,12 +154,21 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> HubUserV2 | None:
     requests can both miss the SELECT and both attempt the INSERT, and only
     one wins the UNIQUE constraint on `email`. The loser rolls back and
     re-reads rather than 500ing.
+
+    A newly created row gets the default ⊥ assignment in the SAME commit
+    (`rbac_assignment_service.add_default_assignment`, owner decision
+    2026-10-14). Only on the insert branch: this runs on every request, so
+    doing it for existing rows would both backfill (not wanted) and bring
+    back a default someone revoked. The race loser's rollback discards its
+    assignment along with its row; the winner's row already carries one.
     """
     hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
     if hub_user is None:
         hub_user = HubUserV2(email=email, name=name, is_active=True, created_at=_utc_now())
         db.add(hub_user)
         try:
+            db.flush()
+            rbac_assignment_service.add_default_assignment(db, hub_user.id)
             db.commit()
         except IntegrityError:
             db.rollback()
