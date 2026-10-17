@@ -38,6 +38,8 @@ from app.services.rbac_graph_service import effective_pairs, hub_admin_target_id
 
 DEFAULT_SETTINGS = {
     "active_model_key": "anthropic_claude_haiku_45",
+    "bot_enabled": True,
+    "hub_search_enabled": True,
     "general_assistant_mode_enabled": True,
     "answer_cache_enabled": True,
     "google_drive_knowledge_enabled": False,
@@ -141,6 +143,8 @@ class UpdateBotSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     active_model_key: str = Field(min_length=1, max_length=128)
+    bot_enabled: bool | None = None
+    hub_search_enabled: bool | None = None
     general_assistant_mode_enabled: bool | None = None
     answer_cache_enabled: bool | None = None
     google_drive_knowledge_enabled: bool | None = None
@@ -219,11 +223,21 @@ def _analytics_rows(
     limit: int,
     offset: int,
     search: str | None = None,
+    sort_by: Literal["when", "user", "model", "duration", "outcome"] = "when",
+    sort_direction: Literal["asc", "desc"] = "desc",
 ) -> tuple[list[dict], int]:
     where_sql, params = _analytics_filters(
         date_from=date_from, date_to=date_to, actor_email=actor_email,
         model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
     )
+    order_columns = {
+        "when": "runs.started_at",
+        "user": "COALESCE(runs.actor_email, runs.job_name, '')",
+        "model": "COALESCE(runs.model_key, '')",
+        "duration": "runs.elapsed_ms",
+        "outcome": "runs.status",
+    }
+    order_sql = f"{order_columns[sort_by]} {sort_direction.upper()} NULLS LAST, runs.started_at DESC, runs.id DESC"
     try:
         total = int(db.execute(text(f"SELECT COUNT(*) FROM bot_telemetry_runs AS runs WHERE {where_sql}"), params).scalar_one())
         rows = db.execute(text(f"""
@@ -237,7 +251,7 @@ def _analytics_rows(
             GROUP BY runs.id, runs.actor_email, runs.kind, runs.job_name, runs.model_key,
                      runs.configuration_version_id, runs.started_at, runs.finished_at,
                      runs.elapsed_ms, runs.status, runs.error_code
-            ORDER BY runs.started_at DESC, runs.id DESC
+            ORDER BY {order_sql}
             LIMIT :limit OFFSET :offset
         """), {**params, "limit": limit, "offset": offset}).mappings().all()
     except Exception as exc:
@@ -701,6 +715,10 @@ def update_settings(
 
     settings = _normalized_settings(_active_version(db).settings)
     settings["active_model_key"] = active_model_key
+    if request.bot_enabled is not None:
+        settings["bot_enabled"] = request.bot_enabled
+    if request.hub_search_enabled is not None:
+        settings["hub_search_enabled"] = request.hub_search_enabled
     if request.general_assistant_mode_enabled is not None:
         settings["general_assistant_mode_enabled"] = request.general_assistant_mode_enabled
     if request.answer_cache_enabled is not None:
@@ -844,6 +862,8 @@ def list_bot_analytics_runs(
     kind: str | None = None,
     tool_name: str | None = None,
     search: str | None = None,
+    sort_by: Literal["when", "user", "model", "duration", "outcome"] = "when",
+    sort_direction: Literal["asc", "desc"] = "desc",
     db: Session = Depends(get_db_v2),
 ):
     bounded_page_size = min(max(page_size, 1), 200)
@@ -851,6 +871,7 @@ def list_bot_analytics_runs(
     data, total = _analytics_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
         model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        sort_by=sort_by, sort_direction=sort_direction,
         limit=bounded_page_size, offset=(bounded_page - 1) * bounded_page_size,
     )
     return {"data": data, "page": bounded_page, "page_size": bounded_page_size, "total": total}
