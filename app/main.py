@@ -26,6 +26,7 @@ from app.routers import (
     calendar,
     dify,
     drive,
+    forms,
     knowledge,
     locks_v2,
     nav_tabs,
@@ -112,6 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(rbac_assignments.router, prefix=api_prefix)
     app.include_router(resource_grants.router, prefix=api_prefix)
     app.include_router(bookmarks.router, prefix=api_prefix)
+    app.include_router(forms.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────
     @app.get("/health", tags=["Health"])
