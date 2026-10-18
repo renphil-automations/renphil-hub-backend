@@ -672,13 +672,13 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     THE GAP THIS GUARD CANNOT SEE, stated rather than papered over.
     ─────────────────────────────────────────────────────────────────────
     `role_assignments.user_id` is `ON DELETE CASCADE` (`role_assignment.py`).
-    Deleting a `hub_users` row therefore removes that person's assignments
-    WITHOUT passing through this function — including the last admin's. No
-    endpoint exposes a hub_users delete or deactivate today, so the path is
-    reachable only by direct DB access, but the guard is not complete and
-    should not be described as if it were. Closing it properly means either a
-    database trigger or an application-level pre-check wherever a hub_users
-    delete is eventually built.
+    Deleting a `users` row therefore removes that person's assignments
+    WITHOUT passing through this function — including the last admin's. The
+    one endpoint that deletes users (`DELETE /v2/rbac/admin/hub-users/{id}`,
+    2026-10-18) closes that for itself with its own pre-check,
+    `user_admin_service._refuse_last_hub_admin`, which counts other USERS
+    rather than other assignments. Direct database access is still
+    unguarded; only a database trigger would close that.
 
     ─────────────────────────────────────────────────────────────────────
     WHAT COUNTS AS AN ADMIN (§6.8, confirmed with the owner 2026-08-31).

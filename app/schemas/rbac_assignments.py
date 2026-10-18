@@ -102,6 +102,50 @@ class HubUserAdminAPIResponse(BaseModel):
     data: HubUserAdminResponse
 
 
+# ---------------------------------------------------------
+# Admin delete-user preview (plan_admin_delete_user_2026-10-18.md §3)
+# ---------------------------------------------------------
+
+
+class DeleteUserGrantedCounts(BaseModel):
+    """Rows this user GRANTED to other people. Kept by the delete, with
+    `granted_by_user_id` nulled and the `granted_by_email` snapshot intact."""
+
+    assignments: int
+    resource_grants: int
+
+
+class DeleteUserCounts(BaseModel):
+    assignments: int
+    resource_grants: int
+    bookmarks: int
+    locks_held: int
+    notifications: int
+    unread_notifications: int
+    granted_by_others: DeleteUserGrantedCounts
+
+
+class DeleteUserBlocker(BaseModel):
+    code: str
+    message: str
+
+
+class DeleteUserPreviewResponse(BaseModel):
+    id: int
+    email: str
+    name: str | None = None
+    has_signed_in: bool
+    is_self: bool
+    is_hub_admin: bool
+    counts: DeleteUserCounts
+    # Every guard that would refuse the delete; empty means it would go through.
+    blockers: list[DeleteUserBlocker] = Field(default_factory=list)
+
+
+class DeleteUserPreviewAPIResponse(BaseModel):
+    data: DeleteUserPreviewResponse
+
+
 class CreateHubUserRequest(StrictRequestModel):
     """Admin pre-registration of a person (owner decision, 2026-10-04). The
     main reason this exists is to let someone OUTSIDE the org email domains

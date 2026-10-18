@@ -80,7 +80,7 @@ async def callback(
     # docstring) — falling back to `admin=False` there rather than raising,
     # so that edge case never breaks login itself over a nice-to-have flag.
     normalized_email = token_response.email.strip().lower()
-    hub_user = _ensure_hub_user(db, email=normalized_email, name=token_response.name)
+    hub_user = _ensure_hub_user(db, email=normalized_email, name=token_response.name, allow_insert_external=True)
     admin = False
     if hub_user is not None:
         current = CurrentHubUser(
@@ -235,7 +235,7 @@ async def dev_login(
     except ValidationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid email: {email}") from exc
 
-    hub_user = _ensure_hub_user(db, email=normalized_email, name=user.name)
+    hub_user = _ensure_hub_user(db, email=normalized_email, name=user.name, allow_insert_external=True)
 
     access_token = auth_service._create_access_token(user)
 
