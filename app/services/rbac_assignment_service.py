@@ -176,10 +176,9 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     query itself must already be at least `HUB_USER_SEARCH_MIN_LENGTH`
     characters, enforced by the router's `Query(min_length=...)`, so this
     never has to decide what "no query" should return. Restricted to
-    `is_active` rows, which since the 2026-10 merge means people who have
-    signed in at least once (owner accepted 2026-10-09 that someone an admin
-    added stays out of this picker until their first sign-in). Matches the
-    name and BOTH email columns.
+    `has_signed_in` rows: people who have signed in at least once (owner
+    accepted 2026-10-09 that someone an admin added stays out of this picker
+    until their first sign-in). Matches the name and BOTH email columns.
 
     THE QUERY IS ESCAPED BEFORE IT BECOMES A PATTERN, and that is a privacy
     control rather than tidiness (audit finding §2.2, 2026-08-25). The
@@ -196,7 +195,7 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     then re-escape that into `\\\\%` — the escape character escaping itself,
     leaving the `%` unguarded and the hole exactly where it was.
 
-    This deliberately does NOT touch `is_active` (open finding §2.4 — the
+    This deliberately does NOT touch `has_signed_in` (open finding §2.4 — the
     flag is enforced nowhere else, and making this the exception is a
     separate decision) or the silent truncation at `HUB_USER_SEARCH_LIMIT`
     (open finding §2.6). Both are pinned by tests so a later fix has
@@ -212,7 +211,7 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     term = f"%{safe}%"
     rows = (
         db.query(UserV2)
-        .filter(UserV2.is_active.is_(True))
+        .filter(UserV2.has_signed_in.is_(True))
         .filter(
             or_(
                 UserV2.work_email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
@@ -236,10 +235,10 @@ def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
     `role_assignments` row it holds directly (possibly none) — the data
     behind the Hub-Admin-only user management table (owner decision,
     2026-09-12). Unlike `search_hub_users` (the target picker), this is
-    neither filtered to `is_active` nor gated by a search term: the privacy
+    neither filtered to `has_signed_in` nor gated by a search term: the privacy
     boundary here is `require_hub_admin` itself (enforced by the router), not
     a query-length minimum. So since the 2026-10 merge it also lists HR rows
-    nobody has signed in as yet (`is_active` False). HR rows with no email
+    nobody has signed in as yet (`has_signed_in` False). HR rows with no email
     at all are left out — nobody can sign in as them or be granted to them.
 
     Two queries total, not one-per-user: same N+1 avoidance as
@@ -259,7 +258,7 @@ def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
             "id": u.id,
             "email": u.email,
             "name": u.name,
-            "is_active": u.is_active,
+            "has_signed_in": u.has_signed_in,
             "assignments": [_serialize(a, u.email) for a in by_user_id.get(u.id, [])],
         }
         for u in users
@@ -272,7 +271,7 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
     `AuthService._enforce_login_allowed`. Same email normalization as
     `_ensure_hub_user`. Flushes but does not commit; the router commits.
 
-    Created with `is_active` False — "has not signed in yet" (owner decision,
+    Created with `has_signed_in` False — "has not signed in yet" (owner decision,
     2026-10-09); their first sign-in flips it (`_ensure_hub_user`).
 
     Raises `RbacGraphError("hub_user_exists")` for an email that already has
@@ -292,7 +291,7 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
             email=normalized,
         )
     now = _utc_now()
-    user = UserV2(work_email=normalized, name=name, is_active=False, created_at=now, updated_at=now)
+    user = UserV2(work_email=normalized, name=name, has_signed_in=False, created_at=now, updated_at=now)
     db.add(user)
     try:
         db.flush()
@@ -307,7 +306,7 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
         "id": user.id,
         "email": user.email,
         "name": user.name,
-        "is_active": user.is_active,
+        "has_signed_in": user.has_signed_in,
         "assignments": [_serialize(default, user.email)] if default is not None else [],
     }
 
@@ -433,23 +432,23 @@ def _assert_update_does_not_remove_last_hub_admin(
             scope_id=assignment.scope_id,
         )
 
-    active_remaining = (
+    signed_in_remaining = (
         db.query(RoleAssignmentV2)
         .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
         .filter(
             RoleAssignmentV2.role_id == hub_admin_role_id,
             RoleAssignmentV2.scope_id.in_(universal_scope_ids),
             RoleAssignmentV2.id != assignment.id,
-            UserV2.is_active.is_(True),
+            UserV2.has_signed_in.is_(True),
         )
         .count()
     )
-    if active_remaining == 0:
+    if signed_in_remaining == 0:
         logger.warning(
             "Admin floor is nominal: assignment %s was moved off Hub Admin "
             "leaving %s hub-wide Hub Admin assignment(s), none of which "
-            "belong to an active hub user. Nobody who can sign in can "
-            "administer the hub. BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the "
+            "belong to a hub user who has signed in. Nobody who has signed in "
+            "can administer the hub. BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the "
             "recovery path.",
             assignment.id,
             remaining,
@@ -692,13 +691,12 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     the intended reading — the floor should not silently change meaning when
     somebody edits the role DAG.
 
-    `is_active` is deliberately NOT part of the count (owner decision, same
+    `has_signed_in` is deliberately NOT part of the count (owner decision, same
     date). The flag is enforced nowhere else in this codebase — open finding
     §2.4 — and making the admin floor the single exception would be
-    inconsistent, as well as letting a deactivation silently tighten a rule
-    no endpoint exposes. Instead, an allowed delete that leaves no ACTIVE
-    admin logs a warning: the floor is then nominal, satisfied by somebody
-    who cannot log in.
+    inconsistent. Instead, an allowed delete that leaves no SIGNED-IN admin
+    logs a warning: the floor is then nominal, satisfied by somebody who has
+    never signed in.
     """
     hub_admin_role_id, universal_scope_ids = _hub_admin_pair_ids(db)
 
@@ -744,24 +742,25 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
         )
 
     # Allowed — but say so when the floor is only nominally standing. See the
-    # `is_active` note above: the count deliberately ignores the flag, so this
+    # `has_signed_in` note above: the count deliberately ignores the flag, so this
     # is the observable signal that it would have mattered.
-    active_remaining = (
+    signed_in_remaining = (
         db.query(RoleAssignmentV2)
         .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
         .filter(
             RoleAssignmentV2.role_id == hub_admin_role_id,
             RoleAssignmentV2.scope_id.in_(universal_scope_ids),
             RoleAssignmentV2.id != assignment.id,
-            UserV2.is_active.is_(True),
+            UserV2.has_signed_in.is_(True),
         )
         .count()
     )
-    if active_remaining == 0:
+    if signed_in_remaining == 0:
         logger.warning(
             "Admin floor is nominal: assignment %s was revoked leaving %s "
-            "hub-wide Hub Admin assignment(s), none of which belong to an "
-            "active hub user. Nobody who can sign in can administer the hub. "
+            "hub-wide Hub Admin assignment(s), none of which belong to a "
+            "hub user who has signed in. Nobody who has signed in can "
+            "administer the hub. "
             "BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the recovery path.",
             assignment.id,
             remaining,

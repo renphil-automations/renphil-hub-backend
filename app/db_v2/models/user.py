@@ -53,9 +53,10 @@ class UserV2(BaseV2):
     email and another's alias. Look people up with ``matches_email`` — it
     checks both columns — and use the ``email`` hybrid only to display or sort.
 
-    ``is_active`` means "has signed in" (owner decision, 2026-10-09): HR rows
-    and admin-added people start False, and the first sign-in flips it
-    (``app.dependencies._ensure_hub_user``).
+    ``has_signed_in`` (owner decision, 2026-10-09; renamed from ``is_active``
+    2026-10-18): HR rows and admin-added people start False, and the first
+    sign-in flips it (``app.dependencies._ensure_hub_user``). It never meant
+    "deactivated".
 
     Rows are either HR rows (the Airtable mirror, refreshed by a sync this
     repo does not contain) or login-only rows (test personas, external
@@ -99,7 +100,7 @@ class UserV2(BaseV2):
     add_to_website_date = Column(DateTime(timezone=True), nullable=True)
     alias_email = Column(String, nullable=True)
 
-    is_active = Column(Boolean, nullable=False, default=False, server_default=false())
+    has_signed_in = Column(Boolean, nullable=False, default=False, server_default=false())
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
     )

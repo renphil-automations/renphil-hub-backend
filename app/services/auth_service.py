@@ -209,8 +209,8 @@ class AuthService:
         BEFORE auto-provisioning so an unknown external email is never
         provisioned into existence.
 
-        `users.is_active` is deliberately NOT checked (owner decision,
-        2026-10-04): it only means "has signed in", and an admin-added person
+        `users.has_signed_in` is deliberately NOT checked (owner decision,
+        2026-10-04): an admin-added person
         has not yet — that is the whole point of adding them.
         """
         domain = email.rsplit("@", 1)[-1].lower()
