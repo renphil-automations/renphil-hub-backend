@@ -39,12 +39,13 @@ from app.schemas.rbac_assignments import (
     AssignmentListAPIResponse,
     CreateAssignmentRequest,
     CreateHubUserRequest,
+    DeleteUserPreviewAPIResponse,
     HubUserAdminAPIResponse,
     HubUserAdminListAPIResponse,
     HubUserListAPIResponse,
     UpdateAssignmentRequest,
 )
-from app.services import edit_lock_service, rbac_assignment_service, rbac_service
+from app.services import edit_lock_service, rbac_assignment_service, rbac_service, user_admin_service
 from app.services.rbac_delegation_service import assert_can_delegate
 from app.services.rbac_graph_service import RbacClosures, RbacGraphError
 
@@ -418,6 +419,61 @@ def create_hub_user_admin(
         raise _conflict(e)
     db.commit()
     return {"data": created}
+
+
+@router.get(
+    "/admin/hub-users/{user_id}/delete-preview",
+    response_model=DeleteUserPreviewAPIResponse,
+    summary="What deleting this user would remove and keep, and what would refuse it (Hub Admin only)",
+    responses={404: {"description": "User not found"}, **FORBIDDEN_RESPONSE},
+    dependencies=ADMIN_ONLY,
+)
+def delete_hub_user_preview(
+    user_id: int,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Read-only (plan_admin_delete_user_2026-10-18.md §3). `blockers` lists
+    every guard in `user_admin_service.DELETE_GUARDS` that would refuse, so
+    the confirm dialog can show it before the click."""
+    preview = user_admin_service.delete_preview(db, user_id, current)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"data": preview}
+
+
+@router.delete(
+    "/admin/hub-users/{user_id}",
+    status_code=204,
+    summary="Hard-delete a user row (Hub Admin only)",
+    responses={
+        404: {"description": "User not found"},
+        409: {"description": "A delete guard refused: self, the last Hub Admin, or bookmarks"},
+        **FORBIDDEN_RESPONSE,
+    },
+    dependencies=ADMIN_ONLY,
+)
+async def delete_hub_user_admin(
+    user_id: int,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Owner decision 2026-10-18 (plan_admin_delete_user_2026-10-18.md):
+    removes the `users` row, the pairs and grants it holds, and its
+    notifications; keeps its threads, comments, votes and mentions. See
+    `user_admin_service` for the guards and what is kept. The last-admin
+    guard closes, for this path, the CASCADE gap
+    `_assert_not_the_last_hub_admin`'s docstring describes."""
+    try:
+        deleted = user_admin_service.delete_user(db, user_id, current)
+    except RbacGraphError as e:
+        db.rollback()
+        raise _conflict(e)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.commit()
+    # Locks held by a holder with no `users` row are released by the sweep.
+    await _release_now_unauthorized_locks(db)
 
 
 @router.patch(

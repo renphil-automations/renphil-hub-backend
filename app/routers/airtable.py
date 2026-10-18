@@ -54,6 +54,7 @@ from app.dependencies import (
     get_gemini_service,
     get_viewer_access,
     is_hub_admin,
+    is_org_domain_email,
 )
 from app.helpers import airtable_ordering as ao
 from app.helpers.cache import airtable_cache, invalidates_cache
@@ -1201,6 +1202,13 @@ def _resolve_agent_granted_nodes(
     email = str(identity["email"]).strip().lower()
     roles = list(identity.get("roles") or [])
     hub_user = _ensure_hub_user(db, email=email, name=email)
+    if hub_user is None and not is_org_domain_email(email):
+        # No `users` row for an external email: never inserted from here
+        # (dependencies._ensure_hub_user, plan_admin_delete_user §4).
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Agent identity has not signed in to the Hub yet.",
+        )
     if hub_user is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

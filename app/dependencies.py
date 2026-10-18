@@ -139,7 +139,16 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
+def is_org_domain_email(email: str) -> bool:
+    """True for an email in one of `ALLOWED_EMAIL_DOMAIN`'s domains — the
+    people the login gate admits by domain alone."""
+    domain = (email or "").rsplit("@", 1)[-1].strip().lower()
+    return domain in get_settings().allowed_email_domains
+
+
+def _ensure_hub_user(
+    db: Session, *, email: str, name: str, allow_insert_external: bool = False
+) -> UserV2 | None:
     """Look up or create the signed-in `users` row for `email` (already
     normalized by the caller), and mark it signed in. Extracted from
     `get_current_hub_user` below so the OAuth callback and the dev-only
@@ -175,9 +184,22 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
     doing it for existing rows would both backfill (not wanted) and bring
     back a default someone revoked. The race loser's rollback discards its
     assignment along with its row; the winner's row already carries one.
+
+    WHO MAY BE INSERTED (plan_admin_delete_user_2026-10-18.md §4, option B,
+    owner 2026-10-18). An org-domain email always may. A non-org-domain
+    email only when `allow_insert_external` is set, which only the OAuth
+    callback (the login gate has just admitted the email) and dev-login
+    pass. The lazy callers (`get_current_hub_user`, the Agent envelope path)
+    never re-check the gate, so for them an external email with no row
+    returns None instead: otherwise an admin-deleted external person with a
+    still-valid JWT would be re-created on their next request, and that new
+    row would then re-admit them at the gate. A deleted org-domain person
+    still comes back (accepted; the delete dialog says so).
     """
     user = find_user_by_email(db, email)
     if user is None:
+        if not allow_insert_external and not is_org_domain_email(email):
+            return None
         now = _utc_now()
         user = UserV2(
             work_email=email,
@@ -216,6 +238,14 @@ async def get_current_hub_user(
 
     hub_user = _ensure_hub_user(db, email=email, name=user.name)
 
+    if hub_user is None and not is_org_domain_email(email):
+        # An external email with no `users` row: an admin deleted it (or it
+        # never had one). Not re-created here — see `_ensure_hub_user`. 401
+        # so the frontend's session-expired handling signs them out.
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "user_removed", "message": "Your account was removed."},
+        )
     if hub_user is None:
         # Only reachable if the concurrent INSERT that won the race was
         # itself rolled back by something else entirely — effectively
