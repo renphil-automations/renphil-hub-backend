@@ -151,9 +151,10 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
     through `work_email` then `alias_email`, so someone on the HR roster
     claims their EXISTING row on first sign-in rather than getting a second
     one. Only an email no row has gets a new login-only row (named from the
-    Google profile, else the email). `is_active` means "has signed in"
-    (owner decision, 2026-10-09): an HR row or an admin-added person starts
-    False and is flipped True here — the HR `name` is never overwritten.
+    Google profile, else the email). `has_signed_in` (owner decision,
+    2026-10-09; renamed from `is_active` 2026-10-18): an HR row or an
+    admin-added person starts False and is flipped True here — the HR `name`
+    is never overwritten.
 
     UNLIKE every other dependency in this module, this commits. A GET
     endpoint (e.g. "my assignments") never calls `db.commit()` itself, but
@@ -165,7 +166,7 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
     Handles the concurrent-first-login race explicitly: two simultaneous
     requests can both miss the SELECT and both attempt the INSERT, and only
     one wins the unique index on `lower(work_email)`. The loser rolls back
-    and re-reads rather than 500ing. Two concurrent is_active flips write the
+    and re-reads rather than 500ing. Two concurrent has_signed_in flips write the
     same value, so that path needs no guard.
 
     A newly created row gets the default ⊥ assignment in the SAME commit
@@ -181,7 +182,7 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
         user = UserV2(
             work_email=email,
             name=(name or "").strip() or email,
-            is_active=True,
+            has_signed_in=True,
             created_at=now,
             updated_at=now,
         )
@@ -195,8 +196,8 @@ def _ensure_hub_user(db: Session, *, email: str, name: str) -> UserV2 | None:
             user = find_user_by_email(db, email)
         else:
             db.refresh(user)
-    elif not user.is_active:
-        user.is_active = True
+    elif not user.has_signed_in:
+        user.has_signed_in = True
         db.commit()
         db.refresh(user)
     return user

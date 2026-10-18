@@ -59,7 +59,7 @@ class CreateAssignmentRequest(StrictRequestModel):
 
 
 class HubUserResponse(BaseModel):
-    """Deliberately minimal — id, email, name only, never is_active or
+    """Deliberately minimal — id, email, name only, never has_signed_in or
     anything else. This is a people-directory search, a different kind of
     exposure than role/scope names (handoff §5.4)."""
 
@@ -77,7 +77,7 @@ class HubUserListAPIResponse(BaseModel):
 # row plus every role_assignments row it holds. Deliberately NOT the same
 # shape as HubUserResponse above: that one is the privacy-conscious search
 # picker (handoff §5.4); this is the Hub-Admin-only management surface, so
-# is_active is included and there is no query-length gate at all — the
+# has_signed_in is included and there is no query-length gate at all — the
 # privacy boundary here is `require_hub_admin` itself (see the router).
 # ---------------------------------------------------------
 
@@ -86,7 +86,7 @@ class HubUserAdminResponse(BaseModel):
     id: int
     email: str
     name: str | None = None
-    is_active: bool
+    has_signed_in: bool
     # Every (role, scope) row this user holds directly, one row per grant —
     # never the expanded closure, same convention as AssignmentResponse
     # everywhere else on this router. Empty for the (currently: 181 of 182)

@@ -43,13 +43,13 @@ def _authorization_fingerprint(
 def _build_live_acl_response(identity: AgentIdentity, db: Session) -> dict[str, object]:
     """Resolve the Agent caller's current Hub grants without mutating data."""
 
-    # `is_active` = "has signed in" (2026-10 merge): an HR row nobody has
-    # signed in as still has no grants worth resolving, same as before.
+    # An HR row nobody has signed in as (`has_signed_in` False, 2026-10
+    # merge) still has no grants worth resolving, same as before.
     hub_user = find_user_by_email(db, identity.email)
-    if hub_user is None or not hub_user.is_active:
+    if hub_user is None or not hub_user.has_signed_in:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Agent identity does not have an active Hub user.",
+            detail="Agent identity has not signed in to the Hub yet.",
         )
 
     current = CurrentHubUser(

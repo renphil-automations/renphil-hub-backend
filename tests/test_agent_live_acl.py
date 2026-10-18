@@ -112,7 +112,7 @@ class AgentLiveAclTests(unittest.TestCase):
         ):
             response = agent_access._build_live_acl_response(
                 AgentIdentity(email="person@example.org", roles=("Member",)),
-                _Db(SimpleNamespace(id=9, is_active=True, name="Person")),
+                _Db(SimpleNamespace(id=9, has_signed_in=True, name="Person")),
             )
 
         self.assertEqual(response["email"], "person@example.org")
@@ -146,8 +146,18 @@ class AgentLiveAclTests(unittest.TestCase):
         ):
             response = agent_access._build_live_acl_response(
                 AgentIdentity(email="admin@example.org", roles=("Hub Admin",)),
-                _Db(SimpleNamespace(id=1, is_active=True, name="Admin")),
+                _Db(SimpleNamespace(id=1, has_signed_in=True, name="Admin")),
             )
 
         self.assertTrue(response["is_admin"])
         self.assertEqual(response["granted_node_keys"], [])
+
+    def test_live_acl_refuses_a_user_who_has_not_signed_in(self) -> None:
+        for hub_user in (None, SimpleNamespace(id=9, has_signed_in=False, name="Person")):
+            with self.assertRaises(HTTPException) as error:
+                agent_access._build_live_acl_response(
+                    AgentIdentity(email="person@example.org", roles=("Member",)),
+                    _Db(hub_user),
+                )
+            self.assertEqual(error.exception.status_code, 403)
+            self.assertEqual(error.exception.detail, "Agent identity has not signed in to the Hub yet.")
