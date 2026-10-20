@@ -33,6 +33,21 @@ class UserNotAuthorizedError(HTTPException):
         )
 
 
+class UserRemovedError(HTTPException):
+    """Raised at sign-in (OAuth callback, dev-login) when the email belongs
+    to a soft-deleted `users` row, whatever its domain
+    (plan_admin_soft_delete_user_2026-10-19.md §3.3)."""
+
+    def __init__(self, email: str) -> None:
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Access denied. The account '{email}' was removed from "
+                f"this application. Ask a Hub Admin to restore it."
+            ),
+        )
+
+
 class GoogleOAuthError(HTTPException):
     """Raised on any failure during the Google OAuth flow."""
 

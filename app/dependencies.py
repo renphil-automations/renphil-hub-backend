@@ -146,6 +146,18 @@ def is_org_domain_email(email: str) -> bool:
     return domain in get_settings().allowed_email_domains
 
 
+class HubUserRemoved(Exception):
+    """`_ensure_hub_user` found a soft-deleted row for the email
+    (plan_admin_soft_delete_user_2026-10-19.md §3.3). Deliberately NOT an
+    HTTPException: each caller maps it to its own refusal (401
+    `user_removed`, the sign-in 403, the Agent 403), and a caller that
+    forgets to fails closed with a 500 rather than admitting the person."""
+
+    def __init__(self, user: UserV2) -> None:
+        super().__init__(f"users row {user.id} is deleted")
+        self.user = user
+
+
 def _ensure_hub_user(
     db: Session, *, email: str, name: str, allow_insert_external: bool = False
 ) -> UserV2 | None:
@@ -185,18 +197,24 @@ def _ensure_hub_user(
     back a default someone revoked. The race loser's rollback discards its
     assignment along with its row; the winner's row already carries one.
 
-    WHO MAY BE INSERTED (plan_admin_delete_user_2026-10-18.md §4, option B,
-    owner 2026-10-18). An org-domain email always may. A non-org-domain
-    email only when `allow_insert_external` is set, which only the OAuth
-    callback (the login gate has just admitted the email) and dev-login
-    pass. The lazy callers (`get_current_hub_user`, the Agent envelope path)
-    never re-check the gate, so for them an external email with no row
-    returns None instead: otherwise an admin-deleted external person with a
-    still-valid JWT would be re-created on their next request, and that new
-    row would then re-admit them at the gate. A deleted org-domain person
-    still comes back (accepted; the delete dialog says so).
+    A SOFT-DELETED ROW (plan_admin_soft_delete_user_2026-10-19.md §3.3, SD4)
+    raises `HubUserRemoved`, whatever the email's domain: never an insert
+    (the kept row still holds the email in the unique indexes) and never a
+    `has_signed_in` flip. The lookup therefore passes `include_deleted=True`;
+    with the default it would see "no row" and try to insert.
+
+    WHO MAY BE INSERTED (option B, owner 2026-10-18), for an email with NO
+    row at all. An org-domain email always may. A non-org-domain email only
+    when `allow_insert_external` is set, which only the OAuth callback (the
+    login gate has just admitted the email) and dev-login pass. The lazy
+    callers (`get_current_hub_user`, the Agent envelope path) never re-check
+    the gate, so for them an external email with no row returns None
+    instead: a live JWT must not provision an external person the gate
+    never admitted.
     """
-    user = find_user_by_email(db, email)
+    user = find_user_by_email(db, email, include_deleted=True)
+    if user is not None and user.is_deleted:
+        raise HubUserRemoved(user)
     if user is None:
         if not allow_insert_external and not is_org_domain_email(email):
             return None
@@ -215,7 +233,9 @@ def _ensure_hub_user(
             db.commit()
         except IntegrityError:
             db.rollback()
-            user = find_user_by_email(db, email)
+            user = find_user_by_email(db, email, include_deleted=True)
+            if user is not None and user.is_deleted:
+                raise HubUserRemoved(user)
         else:
             db.refresh(user)
     elif not user.has_signed_in:
@@ -236,12 +256,19 @@ async def get_current_hub_user(
     """
     email = (user.email or "").strip().lower()
 
-    hub_user = _ensure_hub_user(db, email=email, name=user.name)
+    try:
+        hub_user = _ensure_hub_user(db, email=email, name=user.name)
+    except HubUserRemoved:
+        # Soft-deleted by an admin, any domain (plan_admin_soft_delete_user
+        # §3.3). 401 so the frontend's session-expired handling signs them out.
+        hub_user = None
+        removed = True
+    else:
+        # An external email with no `users` row at all: not provisioned from
+        # a bare JWT — see `_ensure_hub_user`.
+        removed = hub_user is None and not is_org_domain_email(email)
 
-    if hub_user is None and not is_org_domain_email(email):
-        # An external email with no `users` row: an admin deleted it (or it
-        # never had one). Not re-created here — see `_ensure_hub_user`. 401
-        # so the frontend's session-expired handling signs them out.
+    if removed:
         raise HTTPException(
             status_code=401,
             detail={"code": "user_removed", "message": "Your account was removed."},

@@ -46,6 +46,7 @@ from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.db_v2.models.component import ComponentV2
 from app.dependencies import (
     CurrentHubUser,
+    HubUserRemoved,
     _ensure_hub_user,
     get_airtable_service,
     get_current_hub_user,
@@ -1201,8 +1202,13 @@ def _resolve_agent_granted_nodes(
 
     email = str(identity["email"]).strip().lower()
     roles = list(identity.get("roles") or [])
-    hub_user = _ensure_hub_user(db, email=email, name=email)
-    if hub_user is None and not is_org_domain_email(email):
+    try:
+        hub_user = _ensure_hub_user(db, email=email, name=email)
+        removed = False
+    except HubUserRemoved:
+        # Soft-deleted, any domain (plan_admin_soft_delete_user §3.3).
+        hub_user, removed = None, True
+    if removed or (hub_user is None and not is_org_domain_email(email)):
         # No `users` row for an external email: never inserted from here
         # (dependencies._ensure_hub_user, plan_admin_delete_user §4).
         raise HTTPException(

@@ -43,6 +43,7 @@ from app.schemas.rbac_assignments import (
     HubUserAdminAPIResponse,
     HubUserAdminListAPIResponse,
     HubUserListAPIResponse,
+    RestoreUserPreviewAPIResponse,
     UpdateAssignmentRequest,
 )
 from app.services import edit_lock_service, rbac_assignment_service, rbac_service, user_admin_service
@@ -395,7 +396,12 @@ def list_hub_users_admin(db: Session = Depends(get_db_v2)):
     status_code=201,
     summary="Pre-register a hub user by email + name (Hub Admin only)",
     responses={
-        409: {"description": "A hub user with this email already exists"},
+        409: {
+            "description": (
+                "A hub user with this email already exists (`hub_user_exists`), or it "
+                "belongs to a deleted user (`hub_user_deleted`, with `user_id`: offer Restore)"
+            )
+        },
         **FORBIDDEN_RESPONSE,
     },
     dependencies=ADMIN_ONLY,
@@ -424,7 +430,7 @@ def create_hub_user_admin(
 @router.get(
     "/admin/hub-users/{user_id}/delete-preview",
     response_model=DeleteUserPreviewAPIResponse,
-    summary="What deleting this user would remove and keep, and what would refuse it (Hub Admin only)",
+    summary="What deleting this user keeps and releases, and what would refuse it (Hub Admin only)",
     responses={404: {"description": "User not found"}, **FORBIDDEN_RESPONSE},
     dependencies=ADMIN_ONLY,
 )
@@ -433,9 +439,9 @@ def delete_hub_user_preview(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ):
-    """Read-only (plan_admin_delete_user_2026-10-18.md §3). `blockers` lists
-    every guard in `user_admin_service.DELETE_GUARDS` that would refuse, so
-    the confirm dialog can show it before the click."""
+    """Read-only (plan_admin_soft_delete_user_2026-10-19.md §3.1). `blockers`
+    lists every guard in `user_admin_service.DELETE_GUARDS` that would
+    refuse, so the confirm dialog can show it before the click."""
     preview = user_admin_service.delete_preview(db, user_id, current)
     if preview is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -445,10 +451,10 @@ def delete_hub_user_preview(
 @router.delete(
     "/admin/hub-users/{user_id}",
     status_code=204,
-    summary="Hard-delete a user row (Hub Admin only)",
+    summary="Soft-delete a user (Hub Admin only)",
     responses={
         404: {"description": "User not found"},
-        409: {"description": "A delete guard refused: self, the last Hub Admin, or bookmarks"},
+        409: {"description": "A delete guard refused: already deleted, self, or the last Hub Admin"},
         **FORBIDDEN_RESPONSE,
     },
     dependencies=ADMIN_ONLY,
@@ -458,12 +464,11 @@ async def delete_hub_user_admin(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ):
-    """Owner decision 2026-10-18 (plan_admin_delete_user_2026-10-18.md):
-    removes the `users` row, the pairs and grants it holds, and its
-    notifications; keeps its threads, comments, votes and mentions. See
-    `user_admin_service` for the guards and what is kept. The last-admin
-    guard closes, for this path, the CASCADE gap
-    `_assert_not_the_last_hub_admin`'s docstring describes."""
+    """Owner and colleague, 2026-10-19 (plan_admin_soft_delete_user, option
+    B): marks the row deleted and keeps everything else — assignments,
+    grants, bookmarks, notifications, attributions. They can't sign in and
+    drop out of every picker, list and audience; their locks are released.
+    `POST .../restore` undoes it. See `user_admin_service`."""
     try:
         deleted = user_admin_service.delete_user(db, user_id, current)
     except RbacGraphError as e:
@@ -472,8 +477,59 @@ async def delete_hub_user_admin(
     if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
     db.commit()
-    # Locks held by a holder with no `users` row are released by the sweep.
+    # The delete released the user's own locks in its transaction; the sweep
+    # (whose holder lookup no longer sees a deleted row) is only a backstop.
     await _release_now_unauthorized_locks(db)
+
+
+@router.get(
+    "/admin/hub-users/{user_id}/restore-preview",
+    response_model=RestoreUserPreviewAPIResponse,
+    summary="What restoring this deleted user brings back (Hub Admin only)",
+    responses={404: {"description": "User not found"}, **FORBIDDEN_RESPONSE},
+    dependencies=ADMIN_ONLY,
+)
+def restore_hub_user_preview(
+    user_id: int,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Read-only (plan_admin_soft_delete_user §3.2). `restores_hub_admin`
+    drives the dialog's Hub Admin warning."""
+    preview = user_admin_service.restore_preview(db, user_id, current)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"data": preview}
+
+
+@router.post(
+    "/admin/hub-users/{user_id}/restore",
+    response_model=HubUserAdminAPIResponse,
+    summary="Restore a soft-deleted user (Hub Admin only)",
+    responses={
+        404: {"description": "User not found"},
+        409: {"description": "The user is not deleted"},
+        **FORBIDDEN_RESPONSE,
+    },
+    dependencies=ADMIN_ONLY,
+)
+def restore_hub_user_admin(
+    user_id: int,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Clears the deleted flag. Nothing is re-created: every row was kept,
+    so all of their access returns as it was. Returns the user's row of
+    the admin table."""
+    try:
+        row = user_admin_service.restore_user(db, user_id, current)
+    except RbacGraphError as e:
+        db.rollback()
+        raise _conflict(e)
+    if row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.commit()
+    return {"data": row}
 
 
 @router.patch(

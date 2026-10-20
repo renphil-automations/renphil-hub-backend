@@ -101,6 +101,13 @@ class UserV2(BaseV2):
     alias_email = Column(String, nullable=True)
 
     has_signed_in = Column(Boolean, nullable=False, default=False, server_default=false())
+    # Soft delete (AI Docs/plan_admin_soft_delete_user_2026-10-19.md): the row
+    # and everything pointing at it are KEPT; `not_deleted()` is the filter
+    # every "count / list / audience" query uses. `deleted_by` is the deleting
+    # admin's email, a snapshot (no FK), like `granted_by_email`.
+    is_deleted = Column(Boolean, nullable=False, default=False, server_default=false())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    deleted_by = Column(String(320), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
     )
@@ -151,6 +158,13 @@ class UserV2(BaseV2):
     def matches_email(cls, email: str):
         """Filter clause: this row signs in as ``email`` (already normalized)."""
         return or_(func.lower(cls.work_email) == email, func.lower(cls.alias_email) == email)
+
+    @classmethod
+    def not_deleted(cls):
+        """Filter clause: the row is not soft-deleted. Use it wherever a
+        user's rows would COUNT toward access, an audience, the admin set, a
+        picker or a roster."""
+        return cls.is_deleted.is_(False)
 
     @classmethod
     def matches_any_email(cls, emails):
