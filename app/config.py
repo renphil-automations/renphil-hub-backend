@@ -86,6 +86,15 @@ class Settings(BaseSettings):
     DIFY_API_BASE_URL: str = "https://api.dify.ai/v1"
     DIFY_API_KEY: str
 
+    # ── Form builder (embedded forms) ──────────────────────────────────
+    # The form-builder service the `/forms/*` endpoints proxy. Both are
+    # optional so the app boots without them; the form endpoints answer a
+    # clean 422 until they're set. The PAT itself is never configured here —
+    # each caller supplies their own per request.
+    FORM_BUILDER_BASE_URL: str | None = None
+    # Sent as the `sourceUi` query param on every form-builder call.
+    FORM_BUILDER_SOURCE_UI: str | None = None
+
     # ══════════════════════════════════════════════════════════════════
     # Airtable
     # ══════════════════════════════════════════════════════════════════

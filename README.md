@@ -9,6 +9,7 @@ Production-grade FastAPI backend for the Renaissance Philanthropy Hub.
 | **Google OAuth** | `/auth` | Sign-in restricted to `@renphil.org` emails |
 | **Google Drive** | `/drive` | List / retrieve files from a shared Drive folder |
 | **Dify.ai Chat** | `/dify` | Proxy chat queries to Dify.ai and return responses |
+| **Embedded forms** | `/forms` | Proxy the form-builder service (list forms / embed info), save `form` component settings, and resolve a form component's embed URL (per-user token when required) |
 | **Health** | `/health` | Simple liveness check |
 
 ## Project structure
