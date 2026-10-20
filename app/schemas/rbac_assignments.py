@@ -87,10 +87,16 @@ class HubUserAdminResponse(BaseModel):
     email: str
     name: str | None = None
     has_signed_in: bool
+    # Soft delete (plan_admin_soft_delete_user_2026-10-19.md §3.5). The list
+    # includes deleted users; the frontend shows them in their own tab.
+    # `deleted_by` is the deleting admin's email (a snapshot).
+    is_deleted: bool = False
+    deleted_at: datetime | None = None
+    deleted_by: str | None = None
     # Every (role, scope) row this user holds directly, one row per grant —
     # never the expanded closure, same convention as AssignmentResponse
     # everywhere else on this router. Empty for the (currently: 181 of 182)
-    # users who hold none.
+    # users who hold none. A deleted user's rows are kept (inert until Restore).
     assignments: list[AssignmentResponse] = Field(default_factory=list)
 
 
@@ -103,19 +109,23 @@ class HubUserAdminAPIResponse(BaseModel):
 
 
 # ---------------------------------------------------------
-# Admin delete-user preview (plan_admin_delete_user_2026-10-18.md §3)
+# Admin soft delete / restore previews
+# (plan_admin_soft_delete_user_2026-10-19.md §3.1, §3.2, §3.5)
 # ---------------------------------------------------------
 
 
 class DeleteUserGrantedCounts(BaseModel):
-    """Rows this user GRANTED to other people. Kept by the delete, with
-    `granted_by_user_id` nulled and the `granted_by_email` snapshot intact."""
+    """Rows this user GRANTED to other people. Kept, attribution intact."""
 
     assignments: int
     resource_grants: int
 
 
 class DeleteUserCounts(BaseModel):
+    """What the user has. A soft delete KEEPS all of it (inert while they
+    are deleted, live again on Restore) except `locks_held`, which the
+    delete releases."""
+
     assignments: int
     resource_grants: int
     bookmarks: int
@@ -130,12 +140,18 @@ class DeleteUserBlocker(BaseModel):
     message: str
 
 
-class DeleteUserPreviewResponse(BaseModel):
+class _UserLifecycleBase(BaseModel):
     id: int
     email: str
     name: str | None = None
     has_signed_in: bool
     is_self: bool
+    is_deleted: bool
+    deleted_at: datetime | None = None
+    deleted_by: str | None = None
+
+
+class DeleteUserPreviewResponse(_UserLifecycleBase):
     is_hub_admin: bool
     counts: DeleteUserCounts
     # Every guard that would refuse the delete; empty means it would go through.
@@ -144,6 +160,28 @@ class DeleteUserPreviewResponse(BaseModel):
 
 class DeleteUserPreviewAPIResponse(BaseModel):
     data: DeleteUserPreviewResponse
+
+
+class RestoreUserCounts(BaseModel):
+    """What comes back on Restore: every row was kept."""
+
+    assignments: int
+    resource_grants: int
+    bookmarks: int
+    notifications: int
+
+
+class RestoreUserPreviewResponse(_UserLifecycleBase):
+    # They hold the literal (Hub Admin, universal scope) pair, so a Restore
+    # makes them a Hub Admin again. The dialog warns prominently.
+    restores_hub_admin: bool
+    counts: RestoreUserCounts
+    # `not_deleted` when there is nothing to restore; empty otherwise.
+    blockers: list[DeleteUserBlocker] = Field(default_factory=list)
+
+
+class RestoreUserPreviewAPIResponse(BaseModel):
+    data: RestoreUserPreviewResponse
 
 
 class CreateHubUserRequest(StrictRequestModel):

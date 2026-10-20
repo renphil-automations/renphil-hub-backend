@@ -199,7 +199,11 @@ def resolve_node_labels(db: Session, refs: set[tuple[str, int]]) -> dict[tuple[s
 
 
 def serialize_grant(
-    grant: ResourceGrantV2, *, user_email: str | None = None, node_label: str | None = None
+    grant: ResourceGrantV2,
+    *,
+    user_email: str | None = None,
+    node_label: str | None = None,
+    user_is_deleted: bool = False,
 ) -> dict:
     """`user_email` and `node_label` are both resolved by the CALLER, never
     looked up in here — this stays a one-row, no-query function so a caller
@@ -210,6 +214,10 @@ def serialize_grant(
     when the caller has not resolved a label; the schema treats an absent
     label as "the caller didn't need one" (e.g. `list_node_grants`, where
     every row's node is already known from context).
+
+    ``user_is_deleted``: the grantee of a user-form grant is soft-deleted
+    (plan_admin_soft_delete_user §3.4). The row is kept and shown greyed
+    out; it grants nothing until they are restored.
     """
     node_kind, node_id = node_of(grant)
     return {
@@ -221,6 +229,7 @@ def serialize_grant(
         "scope_id": grant.scope_id,
         "user_id": grant.user_id,
         "user_email": user_email,
+        "user_is_deleted": user_is_deleted,
         "level": grant.level,
         "granted_by_user_id": grant.granted_by_user_id,
         "granted_by_email": grant.granted_by_email,
@@ -242,12 +251,26 @@ def _hub_user_email_map(db: Session, user_ids: set[int]) -> dict[int, str]:
     return {row[0]: row[1] for row in rows}
 
 
+def _deleted_user_ids(db: Session, user_ids: set[int]) -> set[int]:
+    """Which of ``user_ids`` are soft-deleted — for the display flag."""
+    if not user_ids:
+        return set()
+    rows = db.query(UserV2.id).filter(UserV2.id.in_(user_ids), UserV2.is_deleted.is_(True)).all()
+    return {row[0] for row in rows}
+
+
 def _serialize_many(db: Session, rows: list[ResourceGrantV2]) -> list[dict]:
     """``serialize_grant`` over a whole result set, resolving every
     user-form grantee's email in ONE bulk query rather than N."""
-    emails = _hub_user_email_map(db, {g.user_id for g in rows if g.user_id is not None})
+    user_ids = {g.user_id for g in rows if g.user_id is not None}
+    emails = _hub_user_email_map(db, user_ids)
+    deleted = _deleted_user_ids(db, user_ids)
     return [
-        serialize_grant(g, user_email=emails.get(g.user_id) if g.user_id is not None else None)
+        serialize_grant(
+            g,
+            user_email=emails.get(g.user_id) if g.user_id is not None else None,
+            user_is_deleted=g.user_id in deleted,
+        )
         for g in rows
     ]
 
@@ -310,9 +333,16 @@ def _assert_principal(
         )
 
     if has_user:
-        if db.query(UserV2.id).filter(UserV2.id == user_id).first() is None:
+        row = db.query(UserV2.is_deleted).filter(UserV2.id == user_id).first()
+        if row is None:
             raise RbacGraphError(
                 "user_not_found", f"Hub user {user_id} does not exist", user_id=user_id
+            )
+        if row[0]:
+            # Soft-deleted (plan_admin_soft_delete_user §3.4): a new grant
+            # would do nothing while they're deleted. Restore them first.
+            raise RbacGraphError(
+                "user_deleted", f"Hub user {user_id} is deleted. Restore them first.", user_id=user_id
             )
         return
 
@@ -407,11 +437,12 @@ def get_grant(db: Session, grant_id: int) -> dict | None:
     grant = db.query(ResourceGrantV2).filter(ResourceGrantV2.id == grant_id).first()
     if grant is None:
         return None
-    user_email = None
+    user_email, user_is_deleted = None, False
     if grant.user_id is not None:
-        row = db.query(UserV2.email).filter(UserV2.id == grant.user_id).first()
-        user_email = row[0] if row is not None else None
-    return serialize_grant(grant, user_email=user_email)
+        row = db.query(UserV2.email, UserV2.is_deleted).filter(UserV2.id == grant.user_id).first()
+        if row is not None:
+            user_email, user_is_deleted = row[0], bool(row[1])
+    return serialize_grant(grant, user_email=user_email, user_is_deleted=user_is_deleted)
 
 
 def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
@@ -439,7 +470,9 @@ def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
         return []
     rows = db.query(ResourceGrantV2).filter(ResourceGrantV2.id.in_(set(grant_ids))).all()
     by_id = {row.id: row for row in rows}
-    emails = _hub_user_email_map(db, {row.user_id for row in rows if row.user_id is not None})
+    user_ids = {row.user_id for row in rows if row.user_id is not None}
+    emails = _hub_user_email_map(db, user_ids)
+    deleted = _deleted_user_ids(db, user_ids)
     # `covering_grants` rows name an ANCESTOR, not the node the caller asked
     # about (that's the whole point of "already granted by Nav 1") — so
     # unlike `_serialize_many`, every row here can sit on a different node
@@ -451,6 +484,7 @@ def list_grants_by_ids(db: Session, grant_ids: list[int]) -> list[dict]:
             by_id[gid],
             user_email=emails.get(by_id[gid].user_id) if by_id[gid].user_id is not None else None,
             node_label=labels.get(node_of(by_id[gid])),
+            user_is_deleted=by_id[gid].user_id in deleted,
         )
         for gid in grant_ids
         if gid in by_id

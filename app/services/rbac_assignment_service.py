@@ -157,7 +157,15 @@ def list_revocable(db: Session, hub_user_id: int, *, is_hub_admin: bool) -> list
     against: properness ("strictly below a role you hold") is a per-row fact
     that flattening destroys.
     """
-    rows = db.query(RoleAssignmentV2).order_by(RoleAssignmentV2.created_at.desc()).all()
+    # Soft-deleted users' rows are kept but inert (plan_admin_soft_delete_user
+    # §3.4): nothing to revoke while they're deleted.
+    rows = (
+        db.query(RoleAssignmentV2)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
+        .filter(UserV2.not_deleted())
+        .order_by(RoleAssignmentV2.created_at.desc())
+        .all()
+    )
     if not is_hub_admin:
         # ONE snapshot, ONE expansion of the caller's own assignments, reused
         # for every candidate. Built here rather than inside the comprehension
@@ -211,7 +219,7 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     term = f"%{safe}%"
     rows = (
         db.query(UserV2)
-        .filter(UserV2.has_signed_in.is_(True))
+        .filter(UserV2.has_signed_in.is_(True), UserV2.not_deleted())
         .filter(
             or_(
                 UserV2.work_email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
@@ -245,6 +253,10 @@ def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
     `_hub_user_email_map` and `list_revocable`'s hoisted closure — at 182
     hub_users rows, one-per-user would be 182 round-trips against Neon for a
     single page load.
+
+    Soft-deleted rows are INCLUDED, flagged with `is_deleted` /
+    `deleted_at` / `deleted_by` (plan_admin_soft_delete_user §3.4): the
+    frontend shows them in their own "Deleted users" tab.
     """
     users = db.query(UserV2).filter(UserV2.email.isnot(None)).order_by(UserV2.email).all()
     all_assignments = db.query(RoleAssignmentV2).order_by(RoleAssignmentV2.created_at.desc()).all()
@@ -253,16 +265,38 @@ def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
     for a in all_assignments:
         by_user_id.setdefault(a.user_id, []).append(a)
 
-    return [
-        {
-            "id": u.id,
-            "email": u.email,
-            "name": u.name,
-            "has_signed_in": u.has_signed_in,
-            "assignments": [_serialize(a, u.email) for a in by_user_id.get(u.id, [])],
-        }
-        for u in users
-    ]
+    return [_admin_row(u, by_user_id.get(u.id, [])) for u in users]
+
+
+def _deleted_fields(user: UserV2) -> dict:
+    return {
+        "is_deleted": bool(user.is_deleted),
+        "deleted_at": user.deleted_at,
+        "deleted_by": user.deleted_by,
+    }
+
+
+def _admin_row(user: UserV2, assignments: list[RoleAssignmentV2]) -> dict:
+    return {
+        **_deleted_fields(user),
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "has_signed_in": user.has_signed_in,
+        "assignments": [_serialize(a, user.email) for a in assignments],
+    }
+
+
+def admin_row_for_user(db: Session, user: UserV2) -> dict:
+    """One user's row of `list_all_hub_users_with_assignments` (the Restore
+    response, so the table can update that row in place)."""
+    assignments = (
+        db.query(RoleAssignmentV2)
+        .filter(RoleAssignmentV2.user_id == user.id)
+        .order_by(RoleAssignmentV2.created_at.desc())
+        .all()
+    )
+    return _admin_row(user, assignments)
 
 
 def create_hub_user(db: Session, *, email: str, name: str) -> dict:
@@ -282,9 +316,24 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
 
     The new row gets the default ⊥ assignment (`add_default_assignment`
     below), returned in `assignments` so the admin's detail modal shows it.
+
+    An email that belongs to a SOFT-DELETED row raises
+    `RbacGraphError("hub_user_deleted")` with that row's id and deletion
+    date, so the UI can offer Restore instead (plan_admin_soft_delete_user
+    §3.4): the kept row still holds the email in the unique indexes.
     """
     normalized = email.strip().lower()
-    if find_user_by_email(db, normalized) is not None:
+    existing = find_user_by_email(db, normalized, include_deleted=True)
+    if existing is not None and existing.is_deleted:
+        raise RbacGraphError(
+            "hub_user_deleted",
+            f"{normalized} belongs to a deleted user. Restore them instead.",
+            email=normalized,
+            user_id=existing.id,
+            deleted_at=existing.deleted_at.isoformat() if existing.deleted_at else None,
+            deleted_by=existing.deleted_by,
+        )
+    if existing is not None:
         raise RbacGraphError(
             "hub_user_exists",
             f"A user with email {normalized} already exists.",
@@ -302,13 +351,7 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
             email=normalized,
         ) from exc
     default = add_default_assignment(db, user.id)
-    return {
-        "id": user.id,
-        "email": user.email,
-        "name": user.name,
-        "has_signed_in": user.has_signed_in,
-        "assignments": [_serialize(default, user.email)] if default is not None else [],
-    }
+    return _admin_row(user, [default] if default is not None else [])
 
 
 # ---------------------------------------------------------
@@ -401,20 +444,17 @@ def _assert_update_does_not_remove_last_hub_admin(
     was_admin_pair = (
         assignment.role_id == hub_admin_role_id and assignment.scope_id in universal_scope_ids
     )
-    if not was_admin_pair:
+    if not was_admin_pair or _holder_is_deleted(db, assignment):
         return  # nothing protected about this row today; nothing to check
 
     still_admin_pair = new_role_id == hub_admin_role_id and new_scope_id in universal_scope_ids
     if still_admin_pair:
         return  # moved between admin pairs (e.g. one universal scope to another) — fine
 
+    # Only non-deleted holders count (plan_admin_soft_delete_user §3.4).
     remaining = (
-        db.query(RoleAssignmentV2)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-        )
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id)
         .count()
     )
     if remaining == 0:
@@ -433,14 +473,8 @@ def _assert_update_does_not_remove_last_hub_admin(
         )
 
     signed_in_remaining = (
-        db.query(RoleAssignmentV2)
-        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-            UserV2.has_signed_in.is_(True),
-        )
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id, UserV2.has_signed_in.is_(True))
         .count()
     )
     if signed_in_remaining == 0:
@@ -622,6 +656,28 @@ def _hub_admin_pair_ids(db: Session) -> tuple[int | None, set[int]]:
     return (role_row[0] if role_row else None), universal_ids
 
 
+def live_admin_pairs(db: Session, hub_admin_role_id: int, universal_scope_ids: set[int]):
+    """Query over the literal admin pairs whose holder is NOT soft-deleted —
+    the only ones the admin floor counts (plan_admin_soft_delete_user §3.4).
+    A deleted admin's pair is kept for Restore but administers nothing, so
+    counting it would let the floor be "satisfied" by nobody."""
+    return (
+        db.query(RoleAssignmentV2)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
+        .filter(
+            RoleAssignmentV2.role_id == hub_admin_role_id,
+            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
+            UserV2.not_deleted(),
+        )
+    )
+
+
+def _holder_is_deleted(db: Session, assignment: RoleAssignmentV2) -> bool:
+    """A deleted user's pair is not a live admin, so moving or removing it
+    can't lower the floor."""
+    return bool(db.query(UserV2.is_deleted).filter(UserV2.id == assignment.user_id).scalar())
+
+
 def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) -> None:
     """THE ADMIN FLOOR. Refuses the removal of the final
     `(hub_admin, universal_scope)` row in `role_assignments`.
@@ -674,11 +730,17 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     `role_assignments.user_id` is `ON DELETE CASCADE` (`role_assignment.py`).
     Deleting a `users` row therefore removes that person's assignments
     WITHOUT passing through this function — including the last admin's. The
-    one endpoint that deletes users (`DELETE /v2/rbac/admin/hub-users/{id}`,
-    2026-10-18) closes that for itself with its own pre-check,
+    app never hard-deletes a user: the admin delete
+    (`DELETE /v2/rbac/admin/hub-users/{id}`) is a SOFT delete since
+    2026-10-19 and keeps every assignment, but it still removes a live
+    admin, so it runs its own pre-check,
     `user_admin_service._refuse_last_hub_admin`, which counts other USERS
     rather than other assignments. Direct database access is still
     unguarded; only a database trigger would close that.
+
+    SOFT-DELETED HOLDERS DON'T COUNT (plan_admin_soft_delete_user §3.4):
+    `remaining` goes through `live_admin_pairs`, and a deleted holder's own
+    pair is not protected (removing it can't lower the floor).
 
     ─────────────────────────────────────────────────────────────────────
     WHAT COUNTS AS AN ADMIN (§6.8, confirmed with the owner 2026-08-31).
@@ -714,16 +776,14 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     if (
         assignment.role_id != hub_admin_role_id
         or assignment.scope_id not in universal_scope_ids
+        or _holder_is_deleted(db, assignment)
     ):
         return
 
+    # Only non-deleted holders count (plan_admin_soft_delete_user §3.4).
     remaining = (
-        db.query(RoleAssignmentV2)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-        )
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id)
         .count()
     )
     if remaining == 0:
@@ -745,14 +805,8 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     # `has_signed_in` note above: the count deliberately ignores the flag, so this
     # is the observable signal that it would have mattered.
     signed_in_remaining = (
-        db.query(RoleAssignmentV2)
-        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-            UserV2.has_signed_in.is_(True),
-        )
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id, UserV2.has_signed_in.is_(True))
         .count()
     )
     if signed_in_remaining == 0:
