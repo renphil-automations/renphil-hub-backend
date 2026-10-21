@@ -9,12 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.db_v2.models.hub_user import HubUserV2
 from app.dependencies import CurrentHubUser, is_hub_admin
 from app.models.auth import UserInfo
 from app.services.access_visibility_service import list_visible_nodes, resolve_viewer_access
 from app.services.agent_identity import AgentIdentity, require_agent_identity
 from app.services.rbac_graph_service import RbacClosures
+from app.services.user_db_service import find_user_by_email
 
 
 router = APIRouter(prefix="/data/agent/access", tags=["Agent access"])
@@ -43,15 +43,13 @@ def _authorization_fingerprint(
 def _build_live_acl_response(identity: AgentIdentity, db: Session) -> dict[str, object]:
     """Resolve the Agent caller's current Hub grants without mutating data."""
 
-    hub_user = (
-        db.query(HubUserV2)
-        .filter(HubUserV2.email == identity.email)
-        .first()
-    )
-    if hub_user is None or not hub_user.is_active:
+    # An HR row nobody has signed in as (`has_signed_in` False, 2026-10
+    # merge) still has no grants worth resolving, same as before.
+    hub_user = find_user_by_email(db, identity.email)
+    if hub_user is None or not hub_user.has_signed_in:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Agent identity does not have an active Hub user.",
+            detail="Agent identity has not signed in to the Hub yet.",
         )
 
     current = CurrentHubUser(

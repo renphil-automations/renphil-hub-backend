@@ -22,12 +22,13 @@ from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.hub_user import HubUserV2
 from app.db_v2.models.role import RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeV2
+from app.db_v2.models.user import UserV2
 from app.services.rbac_delegation_service import can_delegate
 from app.services.rbac_graph_service import RbacGraphError, held_closures
+from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def _hub_user_email_map(db: Session, hub_user_ids: set[int]) -> dict[int, str]:
     """
     if not hub_user_ids:
         return {}
-    rows = db.query(HubUserV2.id, HubUserV2.email).filter(HubUserV2.id.in_(hub_user_ids)).all()
+    rows = db.query(UserV2.id, UserV2.email).filter(UserV2.id.in_(hub_user_ids)).all()
     return {row[0]: row[1] for row in rows}
 
 
@@ -156,7 +157,15 @@ def list_revocable(db: Session, hub_user_id: int, *, is_hub_admin: bool) -> list
     against: properness ("strictly below a role you hold") is a per-row fact
     that flattening destroys.
     """
-    rows = db.query(RoleAssignmentV2).order_by(RoleAssignmentV2.created_at.desc()).all()
+    # Soft-deleted users' rows are kept but inert (plan_admin_soft_delete_user
+    # §3.4): nothing to revoke while they're deleted.
+    rows = (
+        db.query(RoleAssignmentV2)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
+        .filter(UserV2.not_deleted())
+        .order_by(RoleAssignmentV2.created_at.desc())
+        .all()
+    )
     if not is_hub_admin:
         # ONE snapshot, ONE expansion of the caller's own assignments, reused
         # for every candidate. Built here rather than inside the comprehension
@@ -175,9 +184,9 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     query itself must already be at least `HUB_USER_SEARCH_MIN_LENGTH`
     characters, enforced by the router's `Query(min_length=...)`, so this
     never has to decide what "no query" should return. Restricted to
-    `is_active` rows: an inactive person cannot presently be granted a role
-    either way, so surfacing them in the picker only invites a confusing
-    `target_not_provisioned`-style failure with no matching error code.
+    `has_signed_in` rows: people who have signed in at least once (owner
+    accepted 2026-10-09 that someone an admin added stays out of this picker
+    until their first sign-in). Matches the name and BOTH email columns.
 
     THE QUERY IS ESCAPED BEFORE IT BECOMES A PATTERN, and that is a privacy
     control rather than tidiness (audit finding §2.2, 2026-08-25). The
@@ -194,7 +203,7 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     then re-escape that into `\\\\%` — the escape character escaping itself,
     leaving the `%` unguarded and the hole exactly where it was.
 
-    This deliberately does NOT touch `is_active` (open finding §2.4 — the
+    This deliberately does NOT touch `has_signed_in` (open finding §2.4 — the
     flag is enforced nowhere else, and making this the exception is a
     separate decision) or the silent truncation at `HUB_USER_SEARCH_LIMIT`
     (open finding §2.6). Both are pinned by tests so a later fix has
@@ -209,15 +218,16 @@ def search_hub_users(db: Session, query: str) -> list[dict]:
     )
     term = f"%{safe}%"
     rows = (
-        db.query(HubUserV2)
-        .filter(HubUserV2.is_active.is_(True))
+        db.query(UserV2)
+        .filter(UserV2.has_signed_in.is_(True), UserV2.not_deleted())
         .filter(
             or_(
-                HubUserV2.email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
-                HubUserV2.name.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
+                UserV2.work_email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
+                UserV2.alias_email.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
+                UserV2.name.ilike(term, escape=HUB_USER_SEARCH_ESCAPE),
             )
         )
-        .order_by(HubUserV2.email)
+        .order_by(UserV2.email)
         .limit(HUB_USER_SEARCH_LIMIT)
         .all()
     )
@@ -229,58 +239,108 @@ def get_assignment(db: Session, assignment_id: int) -> RoleAssignmentV2 | None:
 
 
 def list_all_hub_users_with_assignments(db: Session) -> list[dict]:
-    """Every `hub_users` row, each carrying every `role_assignments` row it
-    holds directly (possibly none) — the data behind the Hub-Admin-only user
-    management table (owner decision, 2026-09-12). Unlike `search_hub_users`
-    (the target picker), this is neither filtered to `is_active` nor gated
-    by a search term: the privacy boundary here is `require_hub_admin`
-    itself (enforced by the router), not a query-length minimum.
+    """Every `users` row someone can sign in as, each carrying every
+    `role_assignments` row it holds directly (possibly none) — the data
+    behind the Hub-Admin-only user management table (owner decision,
+    2026-09-12). Unlike `search_hub_users` (the target picker), this is
+    neither filtered to `has_signed_in` nor gated by a search term: the privacy
+    boundary here is `require_hub_admin` itself (enforced by the router), not
+    a query-length minimum. So since the 2026-10 merge it also lists HR rows
+    nobody has signed in as yet (`has_signed_in` False). HR rows with no email
+    at all are left out — nobody can sign in as them or be granted to them.
 
     Two queries total, not one-per-user: same N+1 avoidance as
     `_hub_user_email_map` and `list_revocable`'s hoisted closure — at 182
     hub_users rows, one-per-user would be 182 round-trips against Neon for a
     single page load.
+
+    Soft-deleted rows are INCLUDED, flagged with `is_deleted` /
+    `deleted_at` / `deleted_by` (plan_admin_soft_delete_user §3.4): the
+    frontend shows them in their own "Deleted users" tab.
     """
-    users = db.query(HubUserV2).order_by(HubUserV2.email).all()
+    users = db.query(UserV2).filter(UserV2.email.isnot(None)).order_by(UserV2.email).all()
     all_assignments = db.query(RoleAssignmentV2).order_by(RoleAssignmentV2.created_at.desc()).all()
 
     by_user_id: dict[int, list[RoleAssignmentV2]] = {}
     for a in all_assignments:
         by_user_id.setdefault(a.user_id, []).append(a)
 
-    return [
-        {
-            "id": u.id,
-            "email": u.email,
-            "name": u.name,
-            "is_active": u.is_active,
-            "assignments": [_serialize(a, u.email) for a in by_user_id.get(u.id, [])],
-        }
-        for u in users
-    ]
+    return [_admin_row(u, by_user_id.get(u.id, [])) for u in users]
+
+
+def _deleted_fields(user: UserV2) -> dict:
+    return {
+        "is_deleted": bool(user.is_deleted),
+        "deleted_at": user.deleted_at,
+        "deleted_by": user.deleted_by,
+    }
+
+
+def _admin_row(user: UserV2, assignments: list[RoleAssignmentV2]) -> dict:
+    return {
+        **_deleted_fields(user),
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "has_signed_in": user.has_signed_in,
+        "assignments": [_serialize(a, user.email) for a in assignments],
+    }
+
+
+def admin_row_for_user(db: Session, user: UserV2) -> dict:
+    """One user's row of `list_all_hub_users_with_assignments` (the Restore
+    response, so the table can update that row in place)."""
+    assignments = (
+        db.query(RoleAssignmentV2)
+        .filter(RoleAssignmentV2.user_id == user.id)
+        .order_by(RoleAssignmentV2.created_at.desc())
+        .all()
+    )
+    return _admin_row(user, assignments)
 
 
 def create_hub_user(db: Session, *, email: str, name: str) -> dict:
-    """Admin pre-registration of a `hub_users` row (owner decision,
+    """Admin pre-registration of a login-only `users` row (owner decision,
     2026-10-04) — the row that lets an external (non-org-domain) email pass
     `AuthService._enforce_login_allowed`. Same email normalization as
     `_ensure_hub_user`. Flushes but does not commit; the router commits.
 
+    Created with `has_signed_in` False — "has not signed in yet" (owner decision,
+    2026-10-09); their first sign-in flips it (`_ensure_hub_user`).
+
     Raises `RbacGraphError("hub_user_exists")` for an email that already has
-    a row, whether found by the pre-check or by the UNIQUE constraint in a
-    concurrent-insert race (the caller must roll back in that case).
+    a row — including an HR row whose work or alias email it is — whether
+    found by the pre-check or by the unique index in a concurrent-insert race
+    (the caller must roll back in that case). The code keeps its old name so
+    the frontend contract does not change.
 
     The new row gets the default ⊥ assignment (`add_default_assignment`
     below), returned in `assignments` so the admin's detail modal shows it.
+
+    An email that belongs to a SOFT-DELETED row raises
+    `RbacGraphError("hub_user_deleted")` with that row's id and deletion
+    date, so the UI can offer Restore instead (plan_admin_soft_delete_user
+    §3.4): the kept row still holds the email in the unique indexes.
     """
     normalized = email.strip().lower()
-    if db.query(HubUserV2.id).filter(HubUserV2.email == normalized).first() is not None:
+    existing = find_user_by_email(db, normalized, include_deleted=True)
+    if existing is not None and existing.is_deleted:
+        raise RbacGraphError(
+            "hub_user_deleted",
+            f"{normalized} belongs to a deleted user. Restore them instead.",
+            email=normalized,
+            user_id=existing.id,
+            deleted_at=existing.deleted_at.isoformat() if existing.deleted_at else None,
+            deleted_by=existing.deleted_by,
+        )
+    if existing is not None:
         raise RbacGraphError(
             "hub_user_exists",
             f"A user with email {normalized} already exists.",
             email=normalized,
         )
-    user = HubUserV2(email=normalized, name=name, is_active=True, created_at=_utc_now())
+    now = _utc_now()
+    user = UserV2(work_email=normalized, name=name, has_signed_in=False, created_at=now, updated_at=now)
     db.add(user)
     try:
         db.flush()
@@ -291,13 +351,7 @@ def create_hub_user(db: Session, *, email: str, name: str) -> dict:
             email=normalized,
         ) from exc
     default = add_default_assignment(db, user.id)
-    return {
-        "id": user.id,
-        "email": user.email,
-        "name": user.name,
-        "is_active": user.is_active,
-        "assignments": [_serialize(default, user.email)] if default is not None else [],
-    }
+    return _admin_row(user, [default] if default is not None else [])
 
 
 # ---------------------------------------------------------
@@ -318,13 +372,13 @@ def public_pair_ids(db: Session) -> tuple[int, int] | None:
     return role_row[0], scope_row[0]
 
 
-def add_default_assignment(db: Session, hub_user_id: int) -> RoleAssignmentV2 | None:
-    """Give a NEWLY CREATED `hub_users` row the ⊥ pair, so that a user who
+def add_default_assignment(db: Session, user_id: int) -> RoleAssignmentV2 | None:
+    """Give a NEWLY CREATED `users` row the ⊥ pair, so that a user who
     holds nothing else still reaches content published to everyone — a user
     with zero assignment rows reaches no pair at all, ⊥ included (see
     `rbac_graph_service.audience_user_ids`).
 
-    Called only from the two places a `hub_users` row is born
+    Called only from the two places a `users` row is born
     (`dependencies._ensure_hub_user` and `create_hub_user` above), in the same
     transaction as the insert, and only on the insert branch: existing users
     are deliberately not backfilled, and a default that was revoked must not
@@ -342,13 +396,13 @@ def add_default_assignment(db: Session, hub_user_id: int) -> RoleAssignmentV2 | 
     pair = public_pair_ids(db)
     if pair is None:
         logger.warning(
-            "Default assignment skipped for hub_user %s: no public role and/or public scope row",
-            hub_user_id,
+            "Default assignment skipped for user %s: no public role and/or public scope row",
+            user_id,
         )
         return None
     role_id, scope_id = pair
     assignment = RoleAssignmentV2(
-        user_id=hub_user_id,
+        user_id=user_id,
         role_id=role_id,
         scope_id=scope_id,
         granted_by_user_id=None,
@@ -390,20 +444,17 @@ def _assert_update_does_not_remove_last_hub_admin(
     was_admin_pair = (
         assignment.role_id == hub_admin_role_id and assignment.scope_id in universal_scope_ids
     )
-    if not was_admin_pair:
+    if not was_admin_pair or _holder_is_deleted(db, assignment):
         return  # nothing protected about this row today; nothing to check
 
     still_admin_pair = new_role_id == hub_admin_role_id and new_scope_id in universal_scope_ids
     if still_admin_pair:
         return  # moved between admin pairs (e.g. one universal scope to another) — fine
 
+    # Only non-deleted holders count (plan_admin_soft_delete_user §3.4).
     remaining = (
-        db.query(RoleAssignmentV2)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-        )
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id)
         .count()
     )
     if remaining == 0:
@@ -421,23 +472,17 @@ def _assert_update_does_not_remove_last_hub_admin(
             scope_id=assignment.scope_id,
         )
 
-    active_remaining = (
-        db.query(RoleAssignmentV2)
-        .join(HubUserV2, HubUserV2.id == RoleAssignmentV2.user_id)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-            HubUserV2.is_active.is_(True),
-        )
+    signed_in_remaining = (
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id, UserV2.has_signed_in.is_(True))
         .count()
     )
-    if active_remaining == 0:
+    if signed_in_remaining == 0:
         logger.warning(
             "Admin floor is nominal: assignment %s was moved off Hub Admin "
             "leaving %s hub-wide Hub Admin assignment(s), none of which "
-            "belong to an active hub user. Nobody who can sign in can "
-            "administer the hub. BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the "
+            "belong to a hub user who has signed in. Nobody who has signed in "
+            "can administer the hub. BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the "
             "recovery path.",
             assignment.id,
             remaining,
@@ -525,19 +570,21 @@ def create_assignment(
     router's job — see `rbac_assignments.py`).
 
     Target provisioning is deliberately NOT done here (plan session handoff
-    2026-08-24 §3.2): granting requires the target to already hold a
-    `hub_users` row, i.e. to have logged in at least once. No
-    auto-create-on-grant — that is `target_not_provisioned`, below.
+    2026-08-24 §3.2): granting requires the target to already have a `users`
+    row signing in as that email. Since the 2026-10 merge that includes HR
+    rows nobody has signed in as yet and admin-added people, so a role can
+    now be granted BEFORE someone's first sign-in. No auto-create-on-grant —
+    an unknown email is `target_not_provisioned`, below.
     """
     normalized_target = target_email.strip().lower()
-    target = db.query(HubUserV2).filter(HubUserV2.email == normalized_target).first()
+    target = find_user_by_email(db, normalized_target)
     if target is None:
         raise RbacGraphError(
             "target_not_provisioned",
             (
-                f"{target_email!r} has not signed in yet, so there is no "
-                f"account to grant a role to. They must log in at least "
-                f"once first."
+                f"{target_email!r} is not a Hub user, so there is no account "
+                f"to grant a role to. Add them on the Access Control page's "
+                f"Users tab first."
             ),
             email=normalized_target,
         )
@@ -609,6 +656,28 @@ def _hub_admin_pair_ids(db: Session) -> tuple[int | None, set[int]]:
     return (role_row[0] if role_row else None), universal_ids
 
 
+def live_admin_pairs(db: Session, hub_admin_role_id: int, universal_scope_ids: set[int]):
+    """Query over the literal admin pairs whose holder is NOT soft-deleted —
+    the only ones the admin floor counts (plan_admin_soft_delete_user §3.4).
+    A deleted admin's pair is kept for Restore but administers nothing, so
+    counting it would let the floor be "satisfied" by nobody."""
+    return (
+        db.query(RoleAssignmentV2)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
+        .filter(
+            RoleAssignmentV2.role_id == hub_admin_role_id,
+            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
+            UserV2.not_deleted(),
+        )
+    )
+
+
+def _holder_is_deleted(db: Session, assignment: RoleAssignmentV2) -> bool:
+    """A deleted user's pair is not a live admin, so moving or removing it
+    can't lower the floor."""
+    return bool(db.query(UserV2.is_deleted).filter(UserV2.id == assignment.user_id).scalar())
+
+
 def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) -> None:
     """THE ADMIN FLOOR. Refuses the removal of the final
     `(hub_admin, universal_scope)` row in `role_assignments`.
@@ -659,13 +728,19 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     THE GAP THIS GUARD CANNOT SEE, stated rather than papered over.
     ─────────────────────────────────────────────────────────────────────
     `role_assignments.user_id` is `ON DELETE CASCADE` (`role_assignment.py`).
-    Deleting a `hub_users` row therefore removes that person's assignments
-    WITHOUT passing through this function — including the last admin's. No
-    endpoint exposes a hub_users delete or deactivate today, so the path is
-    reachable only by direct DB access, but the guard is not complete and
-    should not be described as if it were. Closing it properly means either a
-    database trigger or an application-level pre-check wherever a hub_users
-    delete is eventually built.
+    Deleting a `users` row therefore removes that person's assignments
+    WITHOUT passing through this function — including the last admin's. The
+    app never hard-deletes a user: the admin delete
+    (`DELETE /v2/rbac/admin/hub-users/{id}`) is a SOFT delete since
+    2026-10-19 and keeps every assignment, but it still removes a live
+    admin, so it runs its own pre-check,
+    `user_admin_service._refuse_last_hub_admin`, which counts other USERS
+    rather than other assignments. Direct database access is still
+    unguarded; only a database trigger would close that.
+
+    SOFT-DELETED HOLDERS DON'T COUNT (plan_admin_soft_delete_user §3.4):
+    `remaining` goes through `live_admin_pairs`, and a deleted holder's own
+    pair is not protected (removing it can't lower the floor).
 
     ─────────────────────────────────────────────────────────────────────
     WHAT COUNTS AS AN ADMIN (§6.8, confirmed with the owner 2026-08-31).
@@ -678,13 +753,12 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     the intended reading — the floor should not silently change meaning when
     somebody edits the role DAG.
 
-    `is_active` is deliberately NOT part of the count (owner decision, same
+    `has_signed_in` is deliberately NOT part of the count (owner decision, same
     date). The flag is enforced nowhere else in this codebase — open finding
     §2.4 — and making the admin floor the single exception would be
-    inconsistent, as well as letting a deactivation silently tighten a rule
-    no endpoint exposes. Instead, an allowed delete that leaves no ACTIVE
-    admin logs a warning: the floor is then nominal, satisfied by somebody
-    who cannot log in.
+    inconsistent. Instead, an allowed delete that leaves no SIGNED-IN admin
+    logs a warning: the floor is then nominal, satisfied by somebody who has
+    never signed in.
     """
     hub_admin_role_id, universal_scope_ids = _hub_admin_pair_ids(db)
 
@@ -702,16 +776,14 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
     if (
         assignment.role_id != hub_admin_role_id
         or assignment.scope_id not in universal_scope_ids
+        or _holder_is_deleted(db, assignment)
     ):
         return
 
+    # Only non-deleted holders count (plan_admin_soft_delete_user §3.4).
     remaining = (
-        db.query(RoleAssignmentV2)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-        )
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id)
         .count()
     )
     if remaining == 0:
@@ -730,24 +802,19 @@ def _assert_not_the_last_hub_admin(db: Session, assignment: RoleAssignmentV2) ->
         )
 
     # Allowed — but say so when the floor is only nominally standing. See the
-    # `is_active` note above: the count deliberately ignores the flag, so this
+    # `has_signed_in` note above: the count deliberately ignores the flag, so this
     # is the observable signal that it would have mattered.
-    active_remaining = (
-        db.query(RoleAssignmentV2)
-        .join(HubUserV2, HubUserV2.id == RoleAssignmentV2.user_id)
-        .filter(
-            RoleAssignmentV2.role_id == hub_admin_role_id,
-            RoleAssignmentV2.scope_id.in_(universal_scope_ids),
-            RoleAssignmentV2.id != assignment.id,
-            HubUserV2.is_active.is_(True),
-        )
+    signed_in_remaining = (
+        live_admin_pairs(db, hub_admin_role_id, universal_scope_ids)
+        .filter(RoleAssignmentV2.id != assignment.id, UserV2.has_signed_in.is_(True))
         .count()
     )
-    if active_remaining == 0:
+    if signed_in_remaining == 0:
         logger.warning(
             "Admin floor is nominal: assignment %s was revoked leaving %s "
-            "hub-wide Hub Admin assignment(s), none of which belong to an "
-            "active hub user. Nobody who can sign in can administer the hub. "
+            "hub-wide Hub Admin assignment(s), none of which belong to a "
+            "hub user who has signed in. Nobody who has signed in can "
+            "administer the hub. "
             "BOOTSTRAP_ADMIN_EMAILS (plan §6.5) is the recovery path.",
             assignment.id,
             remaining,

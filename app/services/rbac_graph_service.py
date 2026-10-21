@@ -49,10 +49,10 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db_v2.models.hub_user import HubUserV2
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
+from app.db_v2.models.user import UserV2
 
 # Distinct constants so the two graphs never serialize against each other.
 # Arbitrary, but must stay stable — the lock is only meaningful if every
@@ -490,6 +490,14 @@ def audience_user_ids(
     the reverse answer "yes" for someone the forward fold answers "no" for,
     i.e. name someone as reachable who cannot open the node.
 
+    SOFT-DELETED USERS ARE NEVER IN THE AUDIENCE
+    (plan_admin_soft_delete_user_2026-10-19.md §3.4). Their assignment rows
+    are kept for Restore, but they can't sign in, so they reach nothing:
+    not a mention roster, not a notification, not the admin set
+    (``hub_admin_user_ids``), not ``audience_count``. The forward/reverse
+    agreement above holds for every NON-deleted user; a deleted user has no
+    forward direction (no request of theirs gets past sign-in).
+
     An empty ``pairs`` returns an empty set without touching the database.
 
     Does not validate that the ids in ``pairs`` exist — a pair that names an
@@ -498,9 +506,12 @@ def audience_user_ids(
     if not pairs:
         return set()
     graph = closures if closures is not None else RbacClosures(db)
-    rows = db.query(
-        RoleAssignmentV2.user_id, RoleAssignmentV2.role_id, RoleAssignmentV2.scope_id
-    ).all()
+    rows = (
+        db.query(RoleAssignmentV2.user_id, RoleAssignmentV2.role_id, RoleAssignmentV2.scope_id)
+        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
+        .filter(UserV2.not_deleted())
+        .all()
+    )
 
     reached: set[int] = set()
     for user_id, held_role_id, held_scope_id in rows:
@@ -623,24 +634,32 @@ def is_bootstrap_admin_email(email: str | None) -> bool:
 
 
 def bootstrap_admin_user_ids(db: Session) -> set[int]:
-    """``hub_users`` ids of the ``BOOTSTRAP_ADMIN_EMAILS`` people who have a
-    row (someone who has never signed in has none, and is simply absent).
+    """``users`` ids of the ``BOOTSTRAP_ADMIN_EMAILS`` people who have a
+    row (matched on work or alias email; someone with no row is simply
+    absent).
     The reverse-side twin of ``is_bootstrap_admin_email``: every "who else
     is an admin" answer (``hub_admin_user_ids``, and the admin half of
     ``access_visibility_service.users_granted_on_node``) unions this in so
     it agrees with ``is_hub_admin`` for the caller.
+
+    Soft-deleted rows are excluded (plan_admin_soft_delete_user §3.4) —
+    keep the ``not_deleted()`` filter when re-enabling.
 
     DISABLED 2026-10-13, see ``is_bootstrap_admin_email``."""
     return set()
     # emails = get_settings().bootstrap_admin_emails
     # if not emails:
     #     return set()
-    # rows = db.query(HubUserV2.id).filter(func.lower(HubUserV2.email).in_(emails)).all()
+    # rows = (
+    #     db.query(UserV2.id)
+    #     .filter(UserV2.matches_any_email(emails), UserV2.not_deleted())
+    #     .all()
+    # )
     # return {row[0] for row in rows}
 
 
 def hub_admin_user_ids(db: Session, *, closures: RbacClosures | None = None) -> set[int]:
-    """Every ``hub_users`` id that is a Hub Admin — the audience of the
+    """Every ``users`` id that is a Hub Admin — the audience of the
     virtual ``(hub_admin, universal)`` pair, resolved the same way
     ``dependencies.is_hub_admin`` resolves it for the caller (closure
     membership, owner-confirmed 2026-09-03), plus the

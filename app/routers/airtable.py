@@ -44,9 +44,9 @@ from fastapi import (
 from app.config import get_settings
 from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.db_v2.models.component import ComponentV2
-from app.db_v2.models.hub_user import HubUserV2
 from app.dependencies import (
     CurrentHubUser,
+    HubUserRemoved,
     _ensure_hub_user,
     get_airtable_service,
     get_current_hub_user,
@@ -55,6 +55,7 @@ from app.dependencies import (
     get_gemini_service,
     get_viewer_access,
     is_hub_admin,
+    is_org_domain_email,
 )
 from app.helpers import airtable_ordering as ao
 from app.helpers.cache import airtable_cache, invalidates_cache
@@ -1201,7 +1202,19 @@ def _resolve_agent_granted_nodes(
 
     email = str(identity["email"]).strip().lower()
     roles = list(identity.get("roles") or [])
-    hub_user = _ensure_hub_user(db, email=email, name=email)
+    try:
+        hub_user = _ensure_hub_user(db, email=email, name=email)
+        removed = False
+    except HubUserRemoved:
+        # Soft-deleted, any domain (plan_admin_soft_delete_user §3.3).
+        hub_user, removed = None, True
+    if removed or (hub_user is None and not is_org_domain_email(email)):
+        # No `users` row for an external email: never inserted from here
+        # (dependencies._ensure_hub_user, plan_admin_delete_user §4).
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Agent identity has not signed in to the Hub yet.",
+        )
     if hub_user is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1552,7 +1565,7 @@ def _airtable_component_visible_to(
     if bundle is None:
         return None
 
-    hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
+    hub_user = user_db_service.find_user_by_email(db, email)
     if hub_user is None:
         return None
 
