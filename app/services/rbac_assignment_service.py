@@ -407,6 +407,7 @@ def add_default_assignment(db: Session, user_id: int) -> RoleAssignmentV2 | None
         scope_id=scope_id,
         granted_by_user_id=None,
         granted_by_email=None,
+        source="default",
         created_at=_utc_now(),
     )
     db.add(assignment)

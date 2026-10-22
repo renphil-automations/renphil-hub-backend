@@ -415,6 +415,16 @@ class Settings(BaseSettings):
     ORG_DOMAIN: str | None = None
 
     # ══════════════════════════════════════════════════════════════════
+    # Airtable → Hub sync (AI Docs/plan_airtable_sync_v2_2026-10-21.md)
+    # ══════════════════════════════════════════════════════════════════
+    # All in the RenPhil Hub base (RENPHIL_HUB_BASE_ID). Prefixed
+    # AIRTABLE_SYNC_ because CLUSTERS_TABLE above already names the Fund &
+    # Program base's clusters table. Optional so the app boots without them;
+    # the sync endpoints that need one report it missing.
+    AIRTABLE_SYNC_PROGRAM_ROLES_TABLE: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_DESIGNATION_FIELD: str | None = None
+
+    # ══════════════════════════════════════════════════════════════════
     # Gemini (Google Generative AI)
     # ══════════════════════════════════════════════════════════════════
     GEMINI_API_KEY: str | None = None

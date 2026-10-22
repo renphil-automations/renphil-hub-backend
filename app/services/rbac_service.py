@@ -107,6 +107,8 @@ def serialize_scope(
         "is_universal": bool(scope.is_universal),
         "is_system": bool(scope.is_system),
         "is_public": bool(scope.is_public),
+        # 'cluster' / 'program' / None — set only by the Airtable sync.
+        "type": scope.type,
         "parent_ids": sorted(parents.get(scope.id, [])),
         "child_ids": sorted(children.get(scope.id, [])),
     }

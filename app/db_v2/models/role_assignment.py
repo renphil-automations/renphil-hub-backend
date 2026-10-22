@@ -21,7 +21,7 @@ No relationship() here, matching every other model in db_v2/.
 
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
 
 from app.db_v2.database import BaseV2
 
@@ -91,9 +91,22 @@ class RoleAssignmentV2(BaseV2):
     # Never updated, never an FK — it has to outlive the row above.
     granted_by_email = Column(String(320), nullable=True)
 
+    # Where the row came from (AI Docs/plan_airtable_sync_v2_2026-10-21.md):
+    #   'manual'        an admin or delegator granted it
+    #   'default'       the (User, Hub) pair given to a newly created user
+    #                   (rbac_assignment_service.add_default_assignment)
+    #   'airtable_sync' the Airtable sync made it from a Program Roles row
+    # The sync only ever modifies or removes 'airtable_sync' rows. Choosing
+    # "Keep" on a removal warning turns its row into 'manual'.
+    source = Column(String(16), nullable=False, default="manual", server_default="manual")
+
     created_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
+        CheckConstraint(
+            "source IN ('manual', 'default', 'airtable_sync')",
+            name="ck_role_assignments_source",
+        ),
         # The same person cannot hold the same role on the same scope twice.
         # Also the index serving the per-request closure expansion.
         UniqueConstraint(
