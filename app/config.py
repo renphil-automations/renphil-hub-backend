@@ -423,6 +423,25 @@ class Settings(BaseSettings):
     # the sync endpoints that need one report it missing.
     AIRTABLE_SYNC_PROGRAM_ROLES_TABLE: str | None = None
     AIRTABLE_SYNC_PROGRAM_ROLES_DESIGNATION_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_EMPLOYEE_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_PROGRAM_RECORD_ID_FIELD: str | None = None
+    # Cluster table
+    AIRTABLE_SYNC_CLUSTERS_TABLE: str | None = None
+    AIRTABLE_SYNC_CLUSTERS_NAME_FIELD: str | None = None
+    AIRTABLE_SYNC_CLUSTERS_RECORD_ID_FIELD: str | None = None
+    # "Public incl. Finance Dashboard" (the programs)
+    AIRTABLE_SYNC_PROGRAMS_TABLE: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_NAME_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_CLUSTER_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_CLUSTER_LINK_FIELD: str | None = None
+    # Users (USERS_TABLE): the fields the USERS_* settings above don't cover.
+    AIRTABLE_SYNC_USERS_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_IS_FELLOW_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_BIRTHDAY_OPT_OUT_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_POST_ON_WEBSITE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_NEW_HEADSHOT_BIO_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_ADD_TO_WEBSITE_DATE_FIELD: str | None = None
 
     # ══════════════════════════════════════════════════════════════════
     # Gemini (Google Generative AI)

@@ -1,15 +1,20 @@
 """Airtable → Hub sync router (AI Docs/plan_airtable_sync_v2_2026-10-21.md §9;
 v1 plan §7).
 
-Hub Admins only, for every endpoint. Phase 1 exposes the configuration:
+Hub Admins only, for every endpoint.
 
   GET  /v2/airtable-sync/settings   the schedule
   PUT  /v2/airtable-sync/settings
   GET  /v2/airtable-sync/mappings   Designation → role, plus the live
                                      Designation choices from Airtable
   PUT  /v2/airtable-sync/mappings   full replace
+  POST /v2/airtable-sync/runs       start a run (202) or 409 if one is going
+  GET  /v2/airtable-sync/runs       history, newest first
+  GET  /v2/airtable-sync/runs/{id}  one run (the tab polls it)
+  GET  /v2/airtable-sync/runs/{id}/log   a run's log, paginated
+  GET  /v2/airtable-sync/status     schedule, current/last run, open items
 
-Runs, items and the scheduler tick come in later phases.
+Items, resolutions and the scheduler tick come in later phases.
 """
 
 from __future__ import annotations
@@ -17,18 +22,26 @@ from __future__ import annotations
 import logging
 from datetime import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
 from app.dependencies import CurrentHubUser, get_current_hub_user, get_current_user, require_hub_admin
 from app.schemas.airtable_sync import (
     DesignationMappingsAPIResponse,
+    LogEntity,
     ReplaceDesignationMappingsRequest,
+    StartRunAPIResponse,
+    StartRunRequest,
+    SyncLogAPIResponse,
+    SyncRunAPIResponse,
+    SyncRunListAPIResponse,
     SyncSettingsAPIResponse,
+    SyncStatusAPIResponse,
     UpdateSyncSettingsRequest,
 )
-from app.services.airtable_sync import airtable_reader, settings_service
+from app.services.airtable_sync import airtable_reader, runs_service, settings_service
+from app.services.airtable_sync.runner import SyncRunner, get_sync_runner
 from app.services.airtable_sync.settings_service import AirtableSyncError, MappingEntry
 
 logger = logging.getLogger(__name__)
@@ -154,3 +167,98 @@ def replace_designation_mappings(
         raise _conflict(e)
     db.commit()
     return {"data": _mappings_payload(db)}
+
+
+# ---------------------------------------------------------
+# Runs
+# ---------------------------------------------------------
+
+NOT_FOUND_RESPONSE = {404: {"description": "No such run"}}
+
+
+@router.post(
+    "/runs",
+    status_code=202,
+    response_model=StartRunAPIResponse,
+    summary="Start a run (or a preview)",
+    responses={**FORBIDDEN_RESPONSE, 409: {"description": "A run is already in progress"}},
+)
+def start_run(
+    request: StartRunRequest,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    runner: SyncRunner = Depends(get_sync_runner),
+):
+    """Takes the one-run lock and returns at once; the run continues in the
+    background. Poll `GET /runs/{id}` for its status."""
+    try:
+        started = runner.start(
+            db,
+            steps=request.steps,
+            preview=request.preview,
+            started_by_user_id=current.hub_user_id,
+            started_by_email=current.email,
+        )
+    except AirtableSyncError as e:
+        raise _conflict(e)
+    # Commit BEFORE launching: the run's thread reads with its own session.
+    db.commit()
+    runner.launch(started)
+    return {"data": {"run_id": started.run_id}}
+
+
+@router.get(
+    "/runs",
+    response_model=SyncRunListAPIResponse,
+    summary="Run history, newest first",
+    responses=FORBIDDEN_RESPONSE,
+)
+def list_runs(limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db_v2)):
+    return {"data": runs_service.list_runs(db, limit)}
+
+
+@router.get(
+    "/runs/{run_id}",
+    response_model=SyncRunAPIResponse,
+    summary="One run",
+    responses={**FORBIDDEN_RESPONSE, **NOT_FOUND_RESPONSE},
+)
+def get_run(run_id: int, db: Session = Depends(get_db_v2)):
+    run = runs_service.get_run(db, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"data": runs_service.serialize_run(run)}
+
+
+@router.get(
+    "/runs/{run_id}/log",
+    response_model=SyncLogAPIResponse,
+    summary="A run's log, oldest first, paginated",
+    responses={**FORBIDDEN_RESPONSE, **NOT_FOUND_RESPONSE},
+)
+def get_run_log(
+    run_id: int,
+    entity: LogEntity | None = None,
+    action: str | None = Query(None, max_length=48),
+    q: str | None = Query(None, max_length=200),
+    cursor: int | None = Query(None, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db_v2),
+):
+    if runs_service.get_run(db, run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {
+        "data": runs_service.list_log(db, run_id, entity=entity, action=action, q=q, cursor=cursor, limit=limit)
+    }
+
+
+@router.get(
+    "/status",
+    response_model=SyncStatusAPIResponse,
+    summary="The tab's status: schedule, current and last run, open items",
+    responses=FORBIDDEN_RESPONSE,
+)
+def get_sync_status(db: Session = Depends(get_db_v2), runner: SyncRunner = Depends(get_sync_runner)):
+    data = runs_service.status_payload(db, runner.settings_provider())
+    db.commit()  # persists the settings row if this read created it
+    return {"data": data}

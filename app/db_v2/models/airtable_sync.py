@@ -62,6 +62,8 @@ DESIGNATION_ACTIONS = ("role", "dont_sync")
 FREQUENCIES = ("daily", "weekly")
 RUN_TRIGGERS = ("manual", "scheduled", "preview")
 RUN_STATUSES = ("running", "succeeded", "failed", "interrupted")
+# The steps a run may tick, in the only order they ever run (plan v2 R1).
+RUN_STEPS = ("clusters", "programs", "users", "program_roles")
 ITEM_STATUSES = ("open", "resolved", "superseded")
 
 DEFAULT_TIMEZONE = "America/New_York"
@@ -136,7 +138,16 @@ class AirtableDesignationMappingV2(BaseV2):
 
 
 class AirtableSyncRunV2(BaseV2):
-    """One run: manual, scheduled or preview (v1 plan §5.1)."""
+    """One run: manual, scheduled or preview (v1 plan §5.1).
+
+    The `running` row IS the sync's lock (v1 C1: one run at a time, of any
+    kind). `uq_airtable_sync_runs_running` lets at most one row be `running`,
+    so starting a run = inserting that row, and a second start fails on the
+    index. Chosen by the owner (2026-10-22) over v1's session advisory lock,
+    which a transaction-mode pooler (Neon `-pooler`) can't hold reliably and
+    SQLite doesn't have. A row whose `heartbeat_at` is 5 minutes old is
+    taken as dead (a restart killed its thread) and marked `interrupted` by
+    the next start."""
 
     __tablename__ = "airtable_sync_runs"
 
@@ -158,6 +169,15 @@ class AirtableSyncRunV2(BaseV2):
         CheckConstraint(_in("trigger", RUN_TRIGGERS), name="ck_airtable_sync_runs_trigger"),
         CheckConstraint(_in("status", RUN_STATUSES), name="ck_airtable_sync_runs_status"),
         Index("ix_airtable_sync_runs_started_at", "started_at"),
+        Index(
+            "uq_airtable_sync_runs_running",
+            "status",
+            unique=True,
+            # BOTH dialect predicates (see uq_airtable_sync_items_open): a
+            # missing one would allow only ONE run row, ever, per status.
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
     )
 
 

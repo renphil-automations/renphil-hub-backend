@@ -7,7 +7,7 @@ bodies, so an unknown field is a 422 rather than silently ignored.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
 
@@ -97,3 +97,99 @@ class ReplaceDesignationMappingsRequest(StrictRequestModel):
     """The whole mapping. Designations left out are deleted."""
 
     mappings: list[DesignationMappingEntry] = Field(default_factory=list, max_length=MAX_MAPPINGS)
+
+
+# ---------------------------------------------------------
+# Runs (plan v2 §3.6, §9; v1 plan §5.1, §7)
+# ---------------------------------------------------------
+
+# Keep in step with models.airtable_sync.RUN_STEPS (a Literal needs the
+# values spelled out).
+SyncStep = Literal["clusters", "programs", "users", "program_roles"]
+LogEntity = Literal["cluster", "program", "user", "program_role"]
+
+
+class StartRunRequest(StrictRequestModel):
+    """The ticked steps, in any order (they always run clusters → programs
+    → users → program_roles); at least one. `preview` computes everything
+    but writes only the run row and its log."""
+
+    steps: list[SyncStep] = Field(min_length=1, max_length=16)
+    preview: StrictBool = False
+
+
+class StartRunData(BaseModel):
+    run_id: int
+
+
+class StartRunAPIResponse(BaseModel):
+    data: StartRunData
+
+
+class SyncRunResponse(BaseModel):
+    id: int
+    steps: list[str]
+    trigger: Literal["manual", "scheduled", "preview"]
+    preview: bool
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    started_by_user_id: int | None = None
+    started_by_email: str | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    # True for a `running` run with no heartbeat for 5 minutes.
+    stale: bool = False
+    # {"preview", "read": {table counts, optional_fields_missing},
+    #  "steps": {step: counts}, "failed_step"?}
+    summary: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class SyncRunAPIResponse(BaseModel):
+    data: SyncRunResponse
+
+
+class SyncRunListAPIResponse(BaseModel):
+    data: list[SyncRunResponse]
+
+
+class SyncLogEntryResponse(BaseModel):
+    id: int
+    run_id: int | None = None
+    resolution_item_id: int | None = None
+    entity: str
+    airtable_record_id: str | None = None
+    hub_id: int | None = None
+    subject: str | None = None
+    action: str
+    field: str | None = None
+    old_value: str | None = None
+    new_value: str | None = None
+    actor_email: str | None = None
+    created_at: datetime
+
+
+class SyncLogPage(BaseModel):
+    entries: list[SyncLogEntryResponse] = Field(default_factory=list)
+    # Pass back as `cursor` for the next page; null on the last page.
+    next_cursor: int | None = None
+
+
+class SyncLogAPIResponse(BaseModel):
+    data: SyncLogPage
+
+
+class SyncStatusData(BaseModel):
+    settings: SyncSettingsResponse
+    # Names every missing sync setting; null when the configuration is
+    # complete. Checked locally (Airtable is not called).
+    config_error: str | None = None
+    current_run: SyncRunResponse | None = None
+    last_run: SyncRunResponse | None = None
+    # Open conflicts/warnings by kind; the tab's badge is the total.
+    open_items: dict[str, int] = Field(default_factory=dict)
+    open_items_total: int = 0
+
+
+class SyncStatusAPIResponse(BaseModel):
+    data: SyncStatusData

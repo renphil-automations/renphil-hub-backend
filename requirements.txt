@@ -37,3 +37,6 @@ recurring-ical-events>=3.0,<4.0
 
 # ── Cache (Upstash Redis over REST) ───────────────
 upstash-redis>=1.4.0,<2.0.0
+
+# ── Certification ─────────────────────────────────────────
+certifi>=2026.10.19
