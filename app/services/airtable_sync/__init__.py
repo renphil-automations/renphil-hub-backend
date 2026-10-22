@@ -6,5 +6,9 @@
   normalize          pure value normalizers (trim, emails, dates, sets…)
   runner             the run lock, background execution, heartbeat, preview
   steps              the four steps a run executes, in their fixed order
+  scopes_step        the Clusters and Programs steps: scopes, C2 aliases,
+                     sync edges
+  items              conflicts / warnings: open, refresh, supersede, remember
+                     a Skip, auto-close
   runs_service       run history, a run's log, the tab's status payload
 """

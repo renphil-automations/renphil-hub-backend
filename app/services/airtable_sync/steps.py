@@ -8,27 +8,23 @@ A step is `fn(ctx: RunContext) -> dict`:
     never `db.commit()` directly;
   - in a preview (`ctx.dry_run`) it computes everything but writes ONLY log
     rows; the runner's preview guard fails the run if it tries more;
+  - it raises and closes its items through `items.ItemBook`;
+  - it may leave something for a later step of the same run in `ctx.state`;
   - it returns its summary counts, stored under `summary.steps[<step>]`.
 A step whose prerequisite is missing waits and logs; it never fails (R3).
 
-Phase 2: every step is a stub that only reports what it read. Phases 3–5
-replace them (clusters + programs → 3, users → 4, program_roles → 5).
+Phase 3: Clusters and Programs (scopes_step.py). Users and Program Roles are
+still stubs that only report what they read (phases 4 and 5).
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from app.services.airtable_sync.scopes_step import clusters_step, programs_step
+
 if TYPE_CHECKING:
     from app.services.airtable_sync.runner import RunContext
-
-
-def clusters_step(ctx: RunContext) -> dict:
-    return {"records": len(ctx.snapshot.clusters), "stub": True}
-
-
-def programs_step(ctx: RunContext) -> dict:
-    return {"records": len(ctx.snapshot.programs), "stub": True}
 
 
 def users_step(ctx: RunContext) -> dict:

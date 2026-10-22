@@ -24,7 +24,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -150,6 +150,10 @@ class RunContext:
     steps: tuple[str, ...]
     snapshot: Snapshot
     config: SyncConfig
+    # What one step hands a later step of the same run. A preview writes no
+    # scopes, so the Clusters step leaves its would-be cluster scopes here
+    # for the Programs step's edges (scopes_step.VIRTUAL_SCOPES).
+    state: dict[str, Any] = field(default_factory=dict)
 
     def log(
         self,
