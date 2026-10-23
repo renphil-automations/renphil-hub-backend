@@ -8,10 +8,11 @@ Provides:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -26,7 +27,7 @@ from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
-from app.services import edit_lock_service, rbac_assignment_service
+from app.services import edit_lock_service, rbac_assignment_service, view_as_service
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_KEY is re-exported, see below
     HUB_ADMIN_ROLE_KEY,
@@ -36,6 +37,8 @@ from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_K
     is_bootstrap_admin_email,
 )
 from app.services.user_db_service import find_user_by_email
+
+logger = logging.getLogger(__name__)
 
 _bearer_scheme = HTTPBearer()
 
@@ -505,6 +508,97 @@ async def get_viewer_access(
     closures = RbacClosures(db)
     admin = is_hub_admin(db, current, closures=closures)
     return resolve_viewer_access(db, current.hub_user_id, is_admin=admin, closures=closures)
+
+
+# ── View As ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ViewAsAccess:
+    """``access`` is what the read endpoint gates content on; ``view_as`` is
+    True when it was built from the ``view_as_role``/``view_as_scope``
+    parameters rather than from the caller's own assignments."""
+
+    access: ViewerAccess
+    view_as: bool
+
+
+async def get_view_as_access(
+    view_as_role: str | None = Query(
+        default=None,
+        description="View As: name of the role to adopt. Must be sent together with `view_as_scope`.",
+    ),
+    view_as_scope: str | None = Query(
+        default=None,
+        description="View As: name of the scope to adopt. Must be sent together with `view_as_role`.",
+    ),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+) -> ViewAsAccess:
+    """``get_viewer_access`` for the read endpoints that support View As.
+
+    Runs AFTER ``get_current_hub_user``, so authentication and first-login
+    provisioning are never skipped. With neither parameter it is exactly
+    ``get_viewer_access``. With both, the caller must be allowed to adopt
+    the pair (``view_as_service.verify_view_as``); the returned access is
+    then that pair's. With only one, 400.
+    """
+    role_name = view_as_service.normalize_param(view_as_role)
+    scope_name = view_as_service.normalize_param(view_as_scope)
+
+    if role_name is None and scope_name is None:
+        return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
+
+    logger.info(
+        "View As requested by %s: view_as_role=%r view_as_scope=%r", current.email, role_name, scope_name
+    )
+    if role_name is None or scope_name is None:
+        logger.warning(
+            "View As refused for %s: both view_as_role and view_as_scope are required (role=%r, scope=%r)",
+            current.email,
+            role_name,
+            scope_name,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "view_as_incomplete",
+                "message": "Both view_as_role and view_as_scope must be provided together.",
+            },
+        )
+
+    user_id = view_as_service.resolve_user_id(db, current.email)
+    if user_id is None:
+        user_id = current.hub_user_id
+    closures = RbacClosures(db)
+    try:
+        target = view_as_service.verify_view_as(
+            db, user_id, role_name=role_name, scope_name=scope_name, closures=closures
+        )
+    except view_as_service.ViewAsError as e:
+        logger.warning(
+            "View As verification failed for %s (user %s): role=%r scope=%r — %s (%s)",
+            current.email,
+            user_id,
+            role_name,
+            scope_name,
+            e.code,
+            e.message,
+        )
+        raise HTTPException(status_code=e.status_code, detail={"code": e.code, "message": e.message})
+
+    logger.info(
+        "View As verified for %s (user %s): adopting role %r (id %s) in scope %r (id %s)",
+        current.email,
+        user_id,
+        target.role_name,
+        target.role_id,
+        target.scope_name,
+        target.scope_id,
+    )
+    return ViewAsAccess(
+        access=view_as_service.resolve_view_as_access(db, target, closures=closures), view_as=True
+    )
 
 
 # ── Lock propagation (plan_lock_propagation_2026-09-08.md §4.3) ──────────
