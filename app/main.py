@@ -116,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(bookmarks.router, prefix=api_prefix)
     app.include_router(view_as.router, prefix=api_prefix)
     app.include_router(forms.router, prefix=api_prefix)
+    app.include_router(view_as.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────
     @app.get("/health", tags=["Health"])
