@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.config import get_settings as get_app_settings
 from app.db_v2.database import get_db_v2
 from app.db_v2.models.bot_management import (
     BotConfigurationStateV2,
@@ -108,7 +109,7 @@ def _validate_active_model_key(
         response = httpx.get(
             f"{agent_url}/agent/models",
             headers={"Authorization": authorization},
-            timeout=10.0,
+            timeout=_agent_models_timeout_seconds(),
         )
         response.raise_for_status()
         payload = response.json()
@@ -153,6 +154,11 @@ router = APIRouter(
     tags=["Bot Management"],
     dependencies=[Depends(require_bot_management_admin)],
 )
+
+def _agent_models_timeout_seconds() -> float:
+    """Return the validated server setting for Agent model-registry probes."""
+
+    return float(get_app_settings().AGENT_MODELS_TIMEOUT_SECONDS)
 
 
 class UpdateBotSettingsRequest(BaseModel):
@@ -668,7 +674,11 @@ def list_models_for_bot_management(http_request: Request):
     if authorization:
         headers["Authorization"] = authorization
     try:
-        response = httpx.get(f"{agent_url}/agent/models", headers=headers, timeout=10.0)
+        response = httpx.get(
+            f"{agent_url}/agent/models",
+            headers=headers,
+            timeout=_agent_models_timeout_seconds(),
+        )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="Agent model list is unavailable") from exc
     if response.status_code >= 400:
