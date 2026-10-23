@@ -68,9 +68,12 @@ if TYPE_CHECKING:
     from app.services.airtable_sync.airtable_reader import SnapshotRecord
     from app.services.airtable_sync.runner import RunContext
 
-# ctx.state key: the Clusters step's would-be scopes, for a preview's
-# Programs step.
+# ctx.state keys. VIRTUAL_SCOPES: a preview's would-be scopes — the Clusters
+# step's for the Programs step's edges, then both steps' for the Program
+# Roles step. PROGRAM_ALIASES: C2 alias Record ID → its cluster's Record Id,
+# from the Programs step (a preview writes no alias records).
 VIRTUAL_SCOPES = "virtual_scopes"
+PROGRAM_ALIASES = "program_aliases"
 
 SCOPE_KINDS = (
     "scope_type_mismatch",
@@ -607,6 +610,7 @@ class _ProgramsStep(_ScopeStep):
         self.cluster_names = names
         # A-2: a program may never take a cluster's name.
         self.reserved_names = {k: rids[0] for k, rids in names.items()}
+        self.alias_clusters: dict[str, str] = {}  # → ctx.state[PROGRAM_ALIASES]
 
     def cluster_name(self, crid: str) -> str | None:
         c = self.clusters.get(crid)
@@ -626,6 +630,7 @@ class _ProgramsStep(_ScopeStep):
             same_named = self.cluster_names.get(name_key(name), [])
             if not air and len(same_named) == 1:
                 aliases.add(rid)
+                self.alias_clusters[rid] = same_named[0]
                 self._alias(rec, rid, name, same_named[0])
                 continue
             if air and same_named and rid not in self.index.by_record_id:
@@ -642,6 +647,9 @@ class _ProgramsStep(_ScopeStep):
         # A program row that became a cluster alias no longer owns a program
         # scope: if one is still linked to its Record ID, that's S4 too.
         self.detect_deleted(seen - aliases, item_kinds_for_gone=SCOPE_KINDS + EDGE_KINDS)
+        self.ctx.state[PROGRAM_ALIASES] = dict(self.alias_clusters)
+        if self.ctx.dry_run:
+            self.ctx.state[VIRTUAL_SCOPES] = [replace(hs) for hs in self.index.scopes if hs.virtual]
         return self.summary()
 
     # ── C2 ──────────────────────────────────────────────────────────────

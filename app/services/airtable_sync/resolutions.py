@@ -13,7 +13,11 @@ A resolution
 A person-level answer (Link / Create new / Assign default) is applied only
 when no other person-level item is open for that person and no answered
 item of theirs still in force is a Skip; otherwise the next run applies it
-(remembered answers drive the Users step). Skip / Keep are remembered by
+(remembered answers drive the Users step). A pair answer (Accept Airtable,
+Remove, Keep) applies at once when the person is a live, linked Hub user
+with no open person-level item and no other item holds the pair; otherwise
+the Program Roles step applies the remembered answer next run. Keep current
+only moves the base, so it always applies. Skip / Keep are remembered by
 fingerprint (G1).
 
 Items with no buttons ("—") and kinds a later phase answers → 409.
@@ -33,11 +37,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.airtable_sync import AirtableSyncItemV2, AirtableSyncLogV2, AirtableSyncRecordV2
+from app.db_v2.models.role import RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
 from app.db_v2.models.user import UserV2
 from app.services import rbac_assignment_service, rbac_service, user_admin_service
 from app.services.airtable_sync.items import NOT_REMEMBERED
+from app.services.airtable_sync.program_roles_step import PairWriter, Target, retire_person_pairs, split_key
 from app.services.airtable_sync.runner import _as_text, as_utc, refuse_if_running
 from app.services.airtable_sync.runs_service import _like_pattern
 from app.services.airtable_sync.scopes_step import SYNC_EDGE, name_key
@@ -66,6 +72,9 @@ CHOICES: dict[str, tuple[str, ...]] = {
     "ambiguous_match": ("link", "create_new", "skip"),
     "no_program_roles": ("assign_default", "skip"),
     "user_deleted": ("remove_synced_access", "keep", "delete_user"),
+    "assignment_conflict": ("accept_airtable", "keep_current"),
+    "assignment_removed": ("remove", "keep"),
+    "unmapped_designation": ("skip",),
 }
 # "—" items: they close by themselves once the data is fixed.
 NO_CHOICES = frozenset(
@@ -76,6 +85,8 @@ NO_CHOICES = frozenset(
         "no_work_email",
         "duplicate_work_email",
         "email_taken",
+        "duplicate_program_role",
+        "missing_program",
     }
 )
 
@@ -461,13 +472,104 @@ def _user_deleted(res: _Res) -> dict:
             res.write("assignment_removed", hub_id=user.id, old_value=removed)
         if record is not None:
             record.managed_assignment_id = None
-    # Both Remove and Keep unlink the row: it becomes a plain Hub row.
+    # Both Remove and Keep unlink the row: it becomes a plain Hub row. Its
+    # Program Roles pairs stop being agreed, so a return links them afresh.
     user.airtable_record_id = None
     user.updated_at = _utc_now()
     if record is not None:
         record.hub_id = None
+    retire_person_pairs(db, res.rid)
     res.write("unlinked", hub_id=user.id, old_value=res.rid)
     return {"applied": True, "user_id": user.id}
+
+
+# ── program roles (pairs) ───────────────────────────────────────────────
+
+
+def _pair_person(res: _Res, record: AirtableSyncRecordV2 | None) -> tuple[UserV2 | None, list[str]]:
+    """The pair's person, when a pair answer can apply now: a live, linked
+    Hub user, the record's own, with no open person-level item (v2 §3.5).
+    Otherwise (None, what it waits on) and the next run applies the answer."""
+    db = res.db
+    employee, _program = split_key(res.rid)
+    if record is None:
+        raise _stale("sync record")
+    user = db.query(UserV2).filter(UserV2.airtable_record_id == employee).one_or_none()
+    if user is None:
+        return None, ["user_not_synced"]
+    if user.is_deleted:
+        return None, ["skipped_deleted_in_hub"]
+    if record.hub_id != user.id:
+        raise _stale("user")
+    held = sorted(
+        {
+            k
+            for (k,) in db.query(AirtableSyncItemV2.kind).filter(
+                AirtableSyncItemV2.entity == "user",
+                AirtableSyncItemV2.airtable_record_id == employee,
+                AirtableSyncItemV2.status == "open",
+            )
+        }
+    )
+    return (None, held) if held else (user, [])
+
+
+def _pair_log(res: _Res, user: UserV2) -> dict:
+    return {"airtable_record_id": res.rid, "hub_id": user.id, "subject": res.item.subject}
+
+
+def _assignment_conflict(res: _Res) -> dict:
+    db, record = res.db, res.record()
+    target = Target.from_dict((record.latest_airtable or {}).get("target")) if record is not None else None
+    if target is None:
+        raise _stale("Airtable record")
+    if res.choice == "keep_current":
+        record.base = target.as_base()  # M3: the Hub is untouched
+        return {"applied": True}
+    user, waiting = _pair_person(res, record)
+    if user is None:
+        return {"applied": False, "waiting_on": waiting}
+    others = sorted(
+        k
+        for (k,) in db.query(AirtableSyncItemV2.kind).filter(
+            AirtableSyncItemV2.entity == res.item.entity,
+            AirtableSyncItemV2.airtable_record_id == res.rid,
+            AirtableSyncItemV2.status == "open",
+        )
+    )
+    if others:  # the pair is held by another item
+        return {"applied": False, "waiting_on": others}
+    if db.get(RoleV2, target.role_id) is None or db.get(ScopeV2, target.scope_id) is None:
+        raise _stale("mapped role or program scope")
+    writer = PairWriter(db, res.log, dry_run=False, run_id=None)
+    writer.apply_target(
+        res.rid, user.id, target, record.latest_airtable, log=_pair_log(res, user), replaced=writer.managed_row(res.rid, user.id)
+    )
+    return {"applied": True, "assignment_id": record.managed_assignment_id}
+
+
+def _assignment_removed(res: _Res) -> dict:
+    record = res.record()
+    user, waiting = _pair_person(res, record)
+    if user is None:
+        return {"applied": False, "waiting_on": waiting}
+    writer = PairWriter(res.db, res.log, dry_run=False, run_id=None)
+    row = writer.managed_row(res.rid, user.id)
+    log = _pair_log(res, user)
+    if row is None or row.source != SYNC_SOURCE:  # an admin removed it meanwhile
+        writer.retire(res.rid, hub_id=user.id, subject=res.item.subject)
+        return {"applied": True, "assignment_found": False}
+    if res.choice == "remove":
+        writer.remove(res.rid, row, log=log)  # last-admin guard → 409
+    else:
+        writer.keep_as_manual(res.rid, row, log=log)
+    return {"applied": True, "assignment_id": row.id}
+
+
+def _unmapped_designation(res: _Res) -> dict:
+    # Skip only: remembered by fingerprint, it holds the pair until the
+    # Designation changes; mapping the Designation closes the item.
+    return {"applied": True}
 
 
 APPLIERS = {
@@ -479,6 +581,9 @@ APPLIERS = {
     "ambiguous_match": _match_item,
     "no_program_roles": _no_program_roles,
     "user_deleted": _user_deleted,
+    "assignment_conflict": _assignment_conflict,
+    "assignment_removed": _assignment_removed,
+    "unmapped_designation": _unmapped_designation,
 }
 
 

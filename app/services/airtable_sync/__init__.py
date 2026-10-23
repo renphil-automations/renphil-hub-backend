@@ -10,6 +10,8 @@
                      sync edges
   users_step         the Users step: K2 matching, M7, person-level items,
                      user creation, user_deleted (no HR fields yet)
+  program_roles_step the Program Roles step: (employee, program) pairs →
+                     sync-managed role assignments, three-way, pair items
   items              conflicts / warnings: open, refresh, supersede, remember
                      an answer, auto-close
   resolutions        the items API: list items, resolve one (C4)

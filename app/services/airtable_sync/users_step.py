@@ -43,7 +43,8 @@ that differs is left out, so phase 6's three-way treats it as a first link
 
 Preview computes everything and writes only log rows; would-be users live
 in the step's in-memory index and are handed to the Program Roles step in
-`ctx.state[VIRTUAL_USERS]`, with `ctx.state[HELD_PEOPLE]`.
+`ctx.state[VIRTUAL_USERS]`, with `ctx.state[HELD_PEOPLE]` (and its M7
+subset, `ctx.state[DELETED_PEOPLE]`) in every run.
 """
 
 from __future__ import annotations
@@ -89,6 +90,7 @@ IDENTITY_FIELDS = ("name", "work_email", "alias_email")
 
 # ctx.state keys, for the Program Roles step (phase 5).
 HELD_PEOPLE = "users_held"  # Users Record IDs held (or skipped, M7) this run
+DELETED_PEOPLE = "users_deleted_in_hub"  # the M7 subset of HELD_PEOPLE
 VIRTUAL_USERS = "virtual_users"  # preview: Record ID → the would-be HubUser
 
 LogFn = Callable[..., Any]
@@ -503,6 +505,7 @@ class _UsersStep:
         self.writer = UserWriter(ctx.db, ctx.log, dry_run=ctx.dry_run, run_id=ctx.run_id)
         self.counts = self.writer.counts
         self.held: set[str] = set()
+        self.deleted_in_hub: set[str] = set()
         self._program_roles()
 
     # ── A5 inputs, from the snapshot (R2) ───────────────────────────────
@@ -557,6 +560,7 @@ class _UsersStep:
         if m.outcome == "deleted":  # M7: never matched, updated or reported
             self.counts["skipped_deleted_in_hub"] += 1
             self.held.add(rid)
+            self.deleted_in_hub.add(rid)
             writer.log("skipped_deleted_in_hub", airtable_record_id=rid, hub_id=m.user.id, subject=name, field=m.via)
             self.commit()
             return
@@ -701,6 +705,7 @@ class _UsersStep:
         self.detect_deleted(seen)
 
         ctx.state[HELD_PEOPLE] = set(self.held)
+        ctx.state[DELETED_PEOPLE] = set(self.deleted_in_hub)
         if ctx.dry_run:
             ctx.state[VIRTUAL_USERS] = {hu.record_id: replace(hu) for hu in self.writer.index.users if hu.virtual and hu.record_id}
         out = dict(self.counts)
