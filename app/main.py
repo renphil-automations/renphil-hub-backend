@@ -32,6 +32,7 @@ from app.routers import (
     forms,
     knowledge,
     locks_v2,
+    mcp_oauth,
     nav_tabs,
     product_analytics,
     hub_feedback,
@@ -109,6 +110,8 @@ def create_app() -> FastAPI:
     api_prefix = ""
 
     app.include_router(auth.router, prefix=api_prefix)
+    app.include_router(mcp_oauth.router, prefix=api_prefix)
+    app.include_router(mcp_oauth.metadata_router, prefix=api_prefix)
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
     app.include_router(bot_management.router, prefix=api_prefix)
