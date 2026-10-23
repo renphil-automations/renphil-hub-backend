@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import csv
 import asyncio
+import logging
 from collections import Counter
 from io import BytesIO, StringIO
 from datetime import date, timedelta
@@ -36,6 +37,9 @@ from app.models.auth import UserInfo
 from app.services.rbac_graph_service import effective_pairs, hub_admin_target_ids
 
 
+logger = logging.getLogger(__name__)
+
+
 DEFAULT_SETTINGS = {
     "active_model_key": "anthropic_claude_haiku_45",
     "bot_enabled": True,
@@ -44,6 +48,17 @@ DEFAULT_SETTINGS = {
     "answer_cache_enabled": True,
     "google_drive_knowledge_enabled": False,
 }
+
+
+def _runtime_status_unavailable(category: str) -> HTTPException:
+    """Return a safe operational category without leaking Agent internals."""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "message": "Agent runtime status is unavailable",
+            "category": category,
+        },
+    )
 
 # Feedback remains sourced from Airtable. A brief process-local cache prevents
 # every Analytics/Feedback tab switch from walking the same table again. The
@@ -667,7 +682,8 @@ def _drive_runtime_status(authorization: str | None) -> dict:
     """Read the safe Drive readiness state from the Agent."""
     agent_url = (os.getenv("AGENT_API_URL") or "").rstrip("/")
     if not agent_url:
-        raise HTTPException(status_code=503, detail="Agent runtime status is unavailable")
+        logger.warning("Bot Management runtime probe skipped: AGENT_API_URL is not configured")
+        raise _runtime_status_unavailable("agent_not_configured")
     headers: dict[str, str] = {"Accept": "application/json"}
     if authorization:
         headers["Authorization"] = authorization
@@ -675,12 +691,35 @@ def _drive_runtime_status(authorization: str | None) -> dict:
         response = httpx.get(f"{agent_url}/agent/runtime-status", headers=headers, timeout=10.0)
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="Agent runtime status is unavailable") from exc
+    except httpx.HTTPStatusError as exc:
+        # Keep details safe for administrators in deployment logs.  The browser
+        # receives the same generic response so it never learns Agent topology,
+        # credentials, or an upstream response body.
+        logger.warning(
+            "Bot Management runtime probe rejected by Agent: status_code=%s",
+            exc.response.status_code,
+        )
+        raise _runtime_status_unavailable("agent_response_rejected") from exc
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Bot Management runtime probe could not reach Agent: error_type=%s",
+            type(exc).__name__,
+        )
+        raise _runtime_status_unavailable("agent_unreachable") from exc
+    except ValueError as exc:
+        logger.warning("Bot Management runtime probe received invalid JSON from Agent")
+        raise _runtime_status_unavailable("agent_invalid_response") from exc
 
     drive = payload.get("drive_knowledge") if isinstance(payload, dict) else None
     if not isinstance(drive, dict) or not isinstance(drive.get("available"), bool) or not isinstance(drive.get("reason"), str):
-        raise HTTPException(status_code=502, detail="Agent returned an invalid runtime status")
+        logger.warning("Bot Management runtime probe received an invalid Agent status contract")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Agent returned an invalid runtime status",
+                "category": "agent_invalid_contract",
+            },
+        )
     return {"drive_knowledge": {"available": drive["available"], "reason": drive["reason"]}}
 
 
