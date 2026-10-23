@@ -9,7 +9,10 @@
 The lock is the `running` row itself (owner's choice, 2026-10-22; see
 AirtableSyncRunV2): at most one row may be `running`, enforced by the partial
 unique index `uq_airtable_sync_runs_running`. Every kind of run takes it —
-manual, scheduled and preview (v1 C1) — and phase 4/5 resolutions will too.
+manual, scheduled and preview (v1 C1). Item resolutions can't insert a run
+row, so they and `start` share a transaction-scoped advisory lock
+(`take_sync_lock`): a resolve refuses while a live run exists, and a start
+waits for a resolve in progress (`refuse_if_running`).
 A `running` row whose heartbeat is STALE_AFTER old is marked `interrupted` by
 the next start, so a restart that killed the thread never wedges the sync.
 
@@ -28,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import event, update
+from sqlalchemy import event, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -54,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL = 15.0  # seconds (v1 plan §5.1)
 STALE_AFTER = timedelta(minutes=5)
+# Transaction-scoped advisory lock serializing a run's START with item
+# resolutions (v1 C1): "ATSYNC". Held only for the start's / the resolve's
+# own transaction, so it works through the transaction-mode pooler.
+SYNC_LOCK_KEY = 0x4154_5359_4E43
 
 INTERRUPTED_ERROR = (
     "No heartbeat for 5 minutes: the run's process probably stopped (e.g. a restart). "
@@ -105,6 +112,27 @@ def is_stale(run: AirtableSyncRunV2, now: datetime | None = None) -> bool:
 
 def running_run(db: Session) -> AirtableSyncRunV2 | None:
     return db.query(AirtableSyncRunV2).filter(AirtableSyncRunV2.status == "running").first()
+
+
+def take_sync_lock(db: Session) -> None:
+    """Serialize run starts and item resolutions for the rest of `db`'s
+    transaction. A resolve takes it, then refuses if a live run exists; a
+    start takes it before looking for one. So a start arriving mid-resolve
+    waits for the resolve to commit, and a resolve arriving once a run's
+    row is committed sees it and answers 409. No-op on SQLite (the tests
+    are single-threaded)."""
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": SYNC_LOCK_KEY})
+
+
+def refuse_if_running(db: Session) -> None:
+    """Take the lock, then 409 (`SyncRunInProgress`) if a live run holds the
+    run lock. A stale `running` row (no heartbeat for 5 minutes) does not
+    block: its thread is gone, as `start` also assumes."""
+    take_sync_lock(db)
+    current = running_run(db)
+    if current is not None and not is_stale(current):
+        raise _in_progress(current)
 
 
 def _in_progress(run: AirtableSyncRunV2 | None) -> SyncRunInProgress:
@@ -308,6 +336,7 @@ class SyncRunner:
         trigger = trigger or ("preview" if preview else "manual")
         now = _utc_now()
 
+        take_sync_lock(db)  # waits for a resolution in progress
         current = running_run(db)
         if current is not None:
             if not is_stale(current, now):

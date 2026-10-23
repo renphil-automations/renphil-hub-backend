@@ -13,8 +13,9 @@ A step is `fn(ctx: RunContext) -> dict`:
   - it returns its summary counts, stored under `summary.steps[<step>]`.
 A step whose prerequisite is missing waits and logs; it never fails (R3).
 
-Phase 3: Clusters and Programs (scopes_step.py). Users and Program Roles are
-still stubs that only report what they read (phases 4 and 5).
+Phase 3: Clusters and Programs (scopes_step.py). Phase 4: Users without HR
+fields (users_step.py). Program Roles is still a stub that only reports what
+it read (phase 5).
 """
 
 from __future__ import annotations
@@ -22,13 +23,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from app.services.airtable_sync.scopes_step import clusters_step, programs_step
+from app.services.airtable_sync.users_step import users_step
 
 if TYPE_CHECKING:
     from app.services.airtable_sync.runner import RunContext
-
-
-def users_step(ctx: RunContext) -> dict:
-    return {"records": len(ctx.snapshot.users), "stub": True}
 
 
 def program_roles_step(ctx: RunContext) -> dict:

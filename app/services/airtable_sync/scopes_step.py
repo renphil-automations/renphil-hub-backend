@@ -416,7 +416,9 @@ class _ScopeStep:
                 payload={
                     "airtable_name": name,
                     "candidates": [_describe(c) for c in candidates],
-                    "choices": ["link", "create_new", "skip"],
+                    # No create_new (owner, 2026-10-22): the candidates own
+                    # the name case-insensitively, so it would be taken.
+                    "choices": ["link", "skip"],
                 },
             )
             self.save_record(rid, rec, hub_id=None)

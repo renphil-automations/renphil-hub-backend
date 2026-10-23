@@ -179,6 +179,68 @@ class SyncLogAPIResponse(BaseModel):
     data: SyncLogPage
 
 
+# ---------------------------------------------------------
+# Items (plan v2 §6; v1 plan §5.4, §7)
+# ---------------------------------------------------------
+
+ItemStatusFilter = Literal["open", "resolved", "superseded", "all"]
+
+
+class SyncItemResponse(BaseModel):
+    id: int
+    entity: str
+    airtable_record_id: str
+    hub_id: int | None = None
+    subject: str | None = None
+    kind: str
+    # Per-field / per-edge kinds only (e.g. the cluster of a removed edge).
+    field: str | None = None
+    # Base / Airtable / Hub values, candidates, usage… per kind.
+    payload: dict[str, Any] | None = None
+    # What resolve accepts for this item now; empty for "—" items and for
+    # items that are not open.
+    choices: list[str] = Field(default_factory=list)
+    status: Literal["open", "resolved", "superseded"]
+    resolution: str | None = None
+    resolution_data: dict[str, Any] | None = None
+    first_run_id: int | None = None
+    last_run_id: int | None = None
+    resolved_by_email: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime
+
+
+class SyncItemPage(BaseModel):
+    items: list[SyncItemResponse] = Field(default_factory=list)
+    next_cursor: int | None = None
+
+
+class SyncItemsAPIResponse(BaseModel):
+    data: SyncItemPage
+
+
+class ResolveItemRequest(StrictRequestModel):
+    """`choice` is one of the item's `choices`. `data` carries the pick for
+    "Link to X": `{"user_id": n}` (ambiguous_match) or `{"scope_id": n}`
+    (scope_ambiguous_match)."""
+
+    choice: StrictStr = Field(min_length=1, max_length=48)
+    data: dict[str, Any] | None = None
+
+
+class ResolveItemData(BaseModel):
+    item: SyncItemResponse
+    # What the resolution did: {"applied": bool, ...}; a person-level
+    # answer that must wait says `waiting_on` (the open or skipped kinds).
+    outcome: dict[str, Any]
+    # The same record's items still open afterwards.
+    open_items: list[SyncItemResponse] = Field(default_factory=list)
+
+
+class ResolveItemAPIResponse(BaseModel):
+    data: ResolveItemData
+
+
 class SyncStatusData(BaseModel):
     settings: SyncSettingsResponse
     # Names every missing sync setting; null when the configuration is

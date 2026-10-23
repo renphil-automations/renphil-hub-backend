@@ -8,7 +8,10 @@
   steps              the four steps a run executes, in their fixed order
   scopes_step        the Clusters and Programs steps: scopes, C2 aliases,
                      sync edges
+  users_step         the Users step: K2 matching, M7, person-level items,
+                     user creation, user_deleted (no HR fields yet)
   items              conflicts / warnings: open, refresh, supersede, remember
-                     a Skip, auto-close
+                     an answer, auto-close
+  resolutions        the items API: list items, resolve one (C4)
   runs_service       run history, a run's log, the tab's status payload
 """

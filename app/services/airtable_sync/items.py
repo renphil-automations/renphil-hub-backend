@@ -20,8 +20,11 @@ by another item, or the step did not run) are left exactly as they are.
 
 The FINGERPRINT is a hash of the Airtable inputs that produced the item (v1
 §3.2), never of Hub-side values: a Hub-side change refreshes the payload but
-neither supersedes the item nor forgets a Skip. An `auto_closed` item is not
-a remembered answer — the same problem coming back reopens.
+neither supersedes the item nor forgets a Skip. An `auto_closed` (or
+`delete_user`) item is not a remembered answer — the same problem coming
+back reopens. A remembered answer's item gets `last_run_id` bumped, and
+`answer()` hands the answer to a step whose pipeline it drives (Users: a
+remembered Link / Create new / Assign default is applied, a Skip holds).
 
 In a preview nothing is written: each found item becomes a
 `would_raise_<kind>` log row (`old_value` = what a real run would do with it:
@@ -46,9 +49,16 @@ if TYPE_CHECKING:
     from app.services.airtable_sync.runner import RunContext
 
 AUTO_CLOSED = "auto_closed"
+# Resolutions that are NOT a remembered answer: the same problem coming back
+# reopens. `auto_closed` (nobody answered) and `delete_user` (the person was
+# soft-deleted; if an admin Restores them and they are still gone from
+# Airtable, they must be asked about again).
+NOT_REMEMBERED = (AUTO_CLOSED, "delete_user")
 
 # Item key within one entity: (airtable_record_id, kind, field).
 _Key = tuple[str, str, str]
+# A remembered answer: (item id, resolution, resolution_data).
+Answer = tuple[int, str, Any]
 
 
 def fingerprint(kind: str, inputs: Any) -> str:
@@ -73,20 +83,28 @@ class ItemBook:
                 AirtableSyncItemV2.entity == entity, AirtableSyncItemV2.status == "open"
             )
         }
-        # Answers an admin gave (Skip, Keep…), by fingerprint (G1).
-        self._answered: set[tuple[str, str, str, str]] = {
-            (rid, kind, fld, fp)
-            for rid, kind, fld, fp in db.query(
+        # Answers an admin gave (Skip, Keep, Link…), by fingerprint (G1). The
+        # latest answer wins when the same fingerprint was answered twice.
+        self._answered: dict[tuple[str, str, str, str], Answer] = {
+            (rid, kind, fld, fp): (item_id, resolution, data)
+            for item_id, rid, kind, fld, fp, resolution, data in db.query(
+                AirtableSyncItemV2.id,
                 AirtableSyncItemV2.airtable_record_id,
                 AirtableSyncItemV2.kind,
                 AirtableSyncItemV2.field,
                 AirtableSyncItemV2.fingerprint,
-            ).filter(
+                AirtableSyncItemV2.resolution,
+                AirtableSyncItemV2.resolution_data,
+            )
+            .filter(
                 AirtableSyncItemV2.entity == entity,
                 AirtableSyncItemV2.status == "resolved",
-                AirtableSyncItemV2.resolution != AUTO_CLOSED,
+                AirtableSyncItemV2.resolution.notin_(NOT_REMEMBERED),
             )
+            .order_by(AirtableSyncItemV2.id)
         }
+        # Remembered answers met by `raise_item` this run, by item key.
+        self._remembered: dict[_Key, Answer] = {}
         # (rid, kind) pairs checked this run; a kind checked for a record
         # covers every `field` of that kind (e.g. one item per cluster edge).
         self._checked: set[tuple[str, str]] = set()
@@ -119,6 +137,13 @@ class ItemBook:
     def open_record_ids(self) -> set[str]:
         return {rid for (rid, _k, _f) in self._open}
 
+    def answer(self, airtable_record_id: str, kind: str, field: str = "") -> tuple[str, Any] | None:
+        """(resolution, resolution_data) of the remembered answer the last
+        `raise_item` for this key met, or None if it wasn't remembered. A
+        step that lets answers drive its pipeline (the Users step) reads it."""
+        found = self._remembered.get((airtable_record_id, kind, field))
+        return (found[1], found[2]) if found else None
+
     def evaluate(self, airtable_record_id: str, kinds: Iterable[str]) -> None:
         """Declare that these kinds were checked for this record this run."""
         for kind in kinds:
@@ -144,10 +169,13 @@ class ItemBook:
         self._raised.add(key)
         fp = fingerprint(kind, inputs)
         current = self._open.get(key)
+        answered = self._answered.get((airtable_record_id, kind, field, fp))
+        self._remembered.pop(key, None)
         if current is not None:
             outcome = "refreshed" if current.fingerprint == fp else "superseded"
-        elif (airtable_record_id, kind, field, fp) in self._answered:
+        elif answered is not None:
             outcome = "remembered"
+            self._remembered[key] = answered
         else:
             outcome = "opened"
         self._count(f"items_{outcome}")
@@ -172,6 +200,11 @@ class ItemBook:
             current.last_run_id = ctx.run_id
             return outcome
         if outcome == "remembered":
+            # The answer still applied in this run: a resolution can tell an
+            # answer that is still in force from a stale one (`last_run_id`).
+            ctx.db.query(AirtableSyncItemV2).filter(AirtableSyncItemV2.id == answered[0]).update(
+                {"last_run_id": ctx.run_id}, synchronize_session=False
+            )
             return outcome
         if outcome == "superseded":
             current.status = "superseded"

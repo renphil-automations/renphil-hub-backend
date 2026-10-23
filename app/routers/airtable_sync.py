@@ -13,8 +13,10 @@ Hub Admins only, for every endpoint.
   GET  /v2/airtable-sync/runs/{id}  one run (the tab polls it)
   GET  /v2/airtable-sync/runs/{id}/log   a run's log, paginated
   GET  /v2/airtable-sync/status     schedule, current/last run, open items
+  GET  /v2/airtable-sync/items      conflicts / warnings, paginated
+  POST /v2/airtable-sync/items/{id}/resolve   answer one (409 during a run)
 
-Items, resolutions and the scheduler tick come in later phases.
+Bulk resolve and the scheduler tick come in later phases.
 """
 
 from __future__ import annotations
@@ -29,8 +31,12 @@ from app.db_v2.database import get_db_v2
 from app.dependencies import CurrentHubUser, get_current_hub_user, get_current_user, require_hub_admin
 from app.schemas.airtable_sync import (
     DesignationMappingsAPIResponse,
+    ItemStatusFilter,
     LogEntity,
     ReplaceDesignationMappingsRequest,
+    ResolveItemAPIResponse,
+    ResolveItemRequest,
+    SyncItemsAPIResponse,
     StartRunAPIResponse,
     StartRunRequest,
     SyncLogAPIResponse,
@@ -40,7 +46,7 @@ from app.schemas.airtable_sync import (
     SyncStatusAPIResponse,
     UpdateSyncSettingsRequest,
 )
-from app.services.airtable_sync import airtable_reader, runs_service, settings_service
+from app.services.airtable_sync import airtable_reader, resolutions, runs_service, settings_service
 from app.services.airtable_sync.runner import SyncRunner, get_sync_runner
 from app.services.airtable_sync.settings_service import AirtableSyncError, MappingEntry
 
@@ -261,4 +267,69 @@ def get_run_log(
 def get_sync_status(db: Session = Depends(get_db_v2), runner: SyncRunner = Depends(get_sync_runner)):
     data = runs_service.status_payload(db, runner.settings_provider())
     db.commit()  # persists the settings row if this read created it
+    return {"data": data}
+
+
+# ---------------------------------------------------------
+# Items: conflicts and warnings (plan v2 §6; v1 plan §5.4)
+# ---------------------------------------------------------
+
+ITEM_NOT_FOUND_RESPONSE = {404: {"description": "No such item"}}
+
+
+@router.get(
+    "/items",
+    response_model=SyncItemsAPIResponse,
+    summary="Conflicts and warnings, oldest first, paginated",
+    responses=FORBIDDEN_RESPONSE,
+)
+def list_items(
+    status: ItemStatusFilter = "open",
+    kind: str | None = Query(None, max_length=48),
+    entity: LogEntity | None = None,
+    q: str | None = Query(None, max_length=200),
+    cursor: int | None = Query(None, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db_v2),
+):
+    return {
+        "data": resolutions.list_items(
+            db,
+            status=None if status == "all" else status,
+            kind=kind,
+            entity=entity,
+            q=q,
+            cursor=cursor,
+            limit=limit,
+        )
+    }
+
+
+@router.post(
+    "/items/{item_id}/resolve",
+    response_model=ResolveItemAPIResponse,
+    summary="Answer one conflict or warning",
+    responses={
+        **FORBIDDEN_RESPONSE,
+        **ITEM_NOT_FOUND_RESPONSE,
+        409: {"description": "A run is in progress, or the choice can't be applied"},
+    },
+)
+def resolve_item(
+    item_id: int,
+    request: ResolveItemRequest,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+):
+    """Applies the choice at once (from the Airtable values of the latest
+    run) and logs it. Refused with 409 while a run is going."""
+    try:
+        data = resolutions.resolve_item(db, item_id, choice=request.choice, data=request.data, current=current)
+    except AirtableSyncError as e:
+        db.rollback()
+        raise _conflict(e)
+    if data is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Item not found")
+    db.commit()
     return {"data": data}
