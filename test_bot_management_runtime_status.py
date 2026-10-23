@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,8 +15,12 @@ def _response(status_code: int, payload: object) -> httpx.Response:
     return httpx.Response(status_code, json=payload, request=request)
 
 
+def _agent_settings(*, url: str | None = "https://agent.example", token: str | None = "server-only-token"):
+    return SimpleNamespace(AGENT_API_URL=url, AGENT_SYNC_TOKEN=token)
+
+
 def test_runtime_status_proxies_the_safe_agent_contract(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("AGENT_API_URL", "https://agent.example")
+    monkeypatch.setattr(bot_management, "get_app_settings", lambda: _agent_settings())
     observed: dict[str, object] = {}
 
     def fake_get(url: str, *, headers: dict[str, str], timeout: float):
@@ -24,12 +29,12 @@ def test_runtime_status_proxies_the_safe_agent_contract(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(bot_management.httpx, "get", fake_get)
 
-    assert bot_management._drive_runtime_status("Bearer verified-admin") == {
+    assert bot_management._drive_runtime_status("Bearer browser-jwt") == {
         "drive_knowledge": {"available": True, "reason": "Ready"}
     }
     assert observed == {
         "url": "https://agent.example/agent/runtime-status",
-        "headers": {"Accept": "application/json", "Authorization": "Bearer verified-admin"},
+        "headers": {"Accept": "application/json", "X-Sync-Token": "server-only-token"},
         "timeout": 10.0,
     }
 
@@ -37,7 +42,7 @@ def test_runtime_status_proxies_the_safe_agent_contract(monkeypatch: pytest.Monk
 def test_runtime_status_logs_the_upstream_status_without_exposing_it_to_browser(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
-    monkeypatch.setenv("AGENT_API_URL", "https://agent.example")
+    monkeypatch.setattr(bot_management, "get_app_settings", lambda: _agent_settings())
     monkeypatch.setattr(bot_management.httpx, "get", lambda *args, **kwargs: _response(404, {"detail": "not found"}))
 
     with caplog.at_level(logging.WARNING), pytest.raises(HTTPException) as exc_info:
@@ -53,7 +58,7 @@ def test_runtime_status_logs_the_upstream_status_without_exposing_it_to_browser(
 
 
 def test_runtime_status_reports_missing_agent_configuration_as_a_safe_category(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("AGENT_API_URL", raising=False)
+    monkeypatch.setattr(bot_management, "get_app_settings", lambda: _agent_settings(token=None))
 
     with pytest.raises(HTTPException) as exc_info:
         bot_management._drive_runtime_status(None)
@@ -63,7 +68,7 @@ def test_runtime_status_reports_missing_agent_configuration_as_a_safe_category(m
 
 
 def test_runtime_status_reports_an_unreachable_agent_as_a_safe_category(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("AGENT_API_URL", "https://agent.example")
+    monkeypatch.setattr(bot_management, "get_app_settings", lambda: _agent_settings())
 
     def fail_get(*args, **kwargs):
         raise httpx.ConnectTimeout("connect timed out")
@@ -86,7 +91,7 @@ def test_runtime_status_reports_an_unreachable_agent_as_a_safe_category(monkeypa
     ],
 )
 def test_runtime_status_rejects_an_invalid_agent_contract(monkeypatch: pytest.MonkeyPatch, payload: object):
-    monkeypatch.setenv("AGENT_API_URL", "https://agent.example")
+    monkeypatch.setattr(bot_management, "get_app_settings", lambda: _agent_settings())
     monkeypatch.setattr(bot_management.httpx, "get", lambda *args, **kwargs: _response(200, payload))
 
     with pytest.raises(HTTPException) as exc_info:

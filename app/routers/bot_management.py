@@ -32,6 +32,7 @@ from app.dependencies import (
     get_airtable_service,
     get_current_hub_user,
 )
+from app.config import get_settings as get_app_settings
 from app.services.airtable_service import AirtableService
 from app.models.auth import UserInfo
 from app.services.rbac_graph_service import effective_pairs, hub_admin_target_ids
@@ -678,15 +679,18 @@ def list_models_for_bot_management(http_request: Request):
     return payload
 
 
-def _drive_runtime_status(authorization: str | None) -> dict:
+def _drive_runtime_status(_authorization: str | None = None) -> dict:
     """Read the safe Drive readiness state from the Agent."""
-    agent_url = (os.getenv("AGENT_API_URL") or "").rstrip("/")
-    if not agent_url:
-        logger.warning("Bot Management runtime probe skipped: AGENT_API_URL is not configured")
+    settings = get_app_settings()
+    agent_url = (settings.AGENT_API_URL or "").strip().rstrip("/")
+    sync_token = (settings.AGENT_SYNC_TOKEN or "").strip()
+    if not agent_url or not sync_token:
+        logger.warning("Bot Management runtime probe skipped: Agent service configuration is incomplete")
         raise _runtime_status_unavailable("agent_not_configured")
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if authorization:
-        headers["Authorization"] = authorization
+    # Bot Management authorizes the browser request through its live
+    # All-Scopes administrator dependency. The Agent receives only the
+    # server-to-server credential; a user JWT must never be forwarded here.
+    headers = {"Accept": "application/json", "X-Sync-Token": sync_token}
     try:
         response = httpx.get(f"{agent_url}/agent/runtime-status", headers=headers, timeout=10.0)
         response.raise_for_status()
