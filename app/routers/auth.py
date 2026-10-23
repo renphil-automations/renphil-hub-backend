@@ -32,6 +32,7 @@ from app.helpers.exceptions import UserRemovedError
 from app.models.auth import MeResponse, TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
+from app.services.mcp_oauth_service import McpOAuthError
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -100,6 +101,33 @@ async def callback(
             email=normalized_email,
         )
         admin = is_hub_admin(db, current)
+
+    # MCP OAuth reuses the already verified Google callback. The normal Hub
+    # session JWT never travels through the external MCP client redirect.
+    settings = get_settings()
+    if settings.MCP_OAUTH_ENABLED and hub_user is not None:
+        from app.routers.mcp_oauth import complete_hub_login
+
+        try:
+            oauth_redirect = complete_hub_login(
+                db=db,
+                continuation_uri=frontend_redirect_uri,
+                email=hub_user.email,
+                subject=str(hub_user.id),
+            )
+        except McpOAuthError as exc:
+            detail = str(exc).strip().lower()
+            if "invalid or expired" in detail:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="OAuth authorization request expired or is invalid.",
+                ) from exc
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="MCP authorization is temporarily unavailable. Please try again.",
+            ) from exc
+        if oauth_redirect is not None:
+            return RedirectResponse(oauth_redirect)
 
     params = urlencode(
         {

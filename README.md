@@ -74,6 +74,61 @@ uvicorn app.main:app --reload
    all subsequent requests.
 5. Protected endpoints use the `get_current_user` dependency to validate the token.
 
+## MCP OAuth (standalone RenPhil MCP)
+
+Hub is the OAuth issuer for the standalone RenPhil MCP. Only four callers are
+ever admitted: the Hub Agent (`MCP_OAUTH_AGENT_CLIENT_ID`, delegated tokens via
+the service-authenticated `/mcp/oauth/agent-token`) and exactly one approved
+client each for Claude, ChatGPT and Gemini (`MCP_OAUTH_CLIENTS_JSON` +
+`MCP_OAUTH_CLIENT_PROVIDERS_JSON`). External clients must present a DPoP proof
+at `/mcp/oauth/token`; dynamic client registration is disabled. Bot Management
+(All Scopes admins) controls the master external toggle, each provider toggle
+and its verification state, and the Hub Agent tool mode; admission is
+re-checked on every MCP capability call. See `app/services/mcp_access_policy.py`.
+`PUT /v2/bot-management/settings` requires `expected_version_id` (the active
+version the form was loaded from). Saves are serialized with a row lock, and a
+save based on an older version returns `409`, so a stale page can never
+silently re-enable access another administrator switched off.
+
+Schema: run the V2 Alembic chain before enabling MCP OAuth:
+
+```bash
+alembic upgrade head   # single root revision 0001_mcp_oauth
+```
+
+### Abuse protection for the public MCP OAuth endpoints
+
+`/mcp/oauth/authorize`, `/mcp/oauth/token`, the discovery documents,
+`/mcp/oauth/jwks.json` and the disabled registration routes
+(`/mcp/oauth/register`, `/register`) are rate limited by
+`app/services/mcp_oauth_rate_limit.py` through a route class used only by the
+MCP OAuth routers. Hub Google login (`/auth/*`), session creation, access
+checks, `/mcp/oauth/agent-token` (server-to-server, sync-token authenticated)
+and every other Hub route are not limited.
+
+- Shared, atomic fixed-window counters in the existing Upstash Redis (one
+  `EVAL` per check; buckets are evaluated in order and a throttled caller
+  does not consume the shared per-client/global buckets).
+- Limits per 60 s unless noted: authorize 60/network, 600/approved client
+  (60 shared for all unknown/malformed client IDs), 3000 global; token
+  30/network, 300/approved client (30 unknown), 1500 global, plus at most 20
+  failed exchanges per network per 10 minutes; registration 5/network, 60
+  global; discovery and JWKS 120/network, 6000 global each.
+- Over the limit: `429` with `Retry-After`, `Cache-Control: no-store` and
+  `{"error": "temporarily_unavailable", ...}`. Store unavailable (or not
+  configured) outside local development: `503` with `Retry-After: 5`. No
+  in-memory fallback except for a loopback issuer without Upstash.
+- Networks (IPv4 address or IPv6 /64, from the right-most
+  `X-Forwarded-For` entry added by the hosting proxy) are stored only as an
+  HMAC keyed from `JWT_SECRET_KEY`; client buckets are the approved provider
+  name or `unknown`. No IP, email, code, token, PKCE verifier, redirect URI,
+  client ID or body is written to Redis, logs or responses.
+- No new environment variables.
+
+Tests for this feature (`tests/test_mcp_oauth_*.py`,
+`tests/test_mcp_access_policy.py`, `tests/test_bot_management_mcp.py`) are
+tracked; run them with `python -m pytest tests/ -q`.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full list with descriptions.

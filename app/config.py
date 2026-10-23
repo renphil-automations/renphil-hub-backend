@@ -62,6 +62,21 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # ── MCP OAuth authorization server ────────────────────────────────
+    # Hub is the issuer. The private RS256 key is held only by Hub; MCP
+    # receives the matching public JWKS document.
+    MCP_OAUTH_ENABLED: bool = False
+    MCP_OAUTH_ISSUER: str | None = None
+    MCP_OAUTH_AUDIENCE: str = "renphil-data-mcp"
+    # Exact clients and exact callbacks only; wildcard redirects are rejected.
+    MCP_OAUTH_CLIENTS_JSON: str = "{}"
+    MCP_OAUTH_CLIENT_PROVIDERS_JSON: str = "{}"
+    MCP_OAUTH_CODE_TTL_SECONDS: int = 120
+    MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: int = 300
+    MCP_OAUTH_AGENT_CLIENT_ID: str = "renphil-agent"
+    MCP_OAUTH_SIGNING_PRIVATE_KEY: str | None = None
+    MCP_OAUTH_SIGNING_KEY_ID: str | None = None
+
     # ── Google Drive ───────────────────────────────────────────────────
     GOOGLE_DRIVE_FOLDER_ID: str
     # Production: store the entire service-account JSON as a string in this var.

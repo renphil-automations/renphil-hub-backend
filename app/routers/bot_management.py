@@ -155,6 +155,16 @@ router = APIRouter(
 )
 
 
+# MCP settings persist in the same versioned Bot Management configuration.
+# External providers default to disabled/unverified and the Hub Agent defaults
+# to its existing local tool path (see app/services/mcp_access_policy.py).
+from app.services.mcp_access_policy import DEFAULT_MCP_SETTINGS as _DEFAULT_MCP_SETTINGS  # noqa: E402
+
+DEFAULT_SETTINGS.update(_DEFAULT_MCP_SETTINGS)
+
+_VerificationState = Literal["unverified", "dpop_staging_verified", "deployment_verified"]
+
+
 class UpdateBotSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -164,10 +174,44 @@ class UpdateBotSettingsRequest(BaseModel):
     general_assistant_mode_enabled: bool | None = None
     answer_cache_enabled: bool | None = None
     google_drive_knowledge_enabled: bool | None = None
+    hub_ai_tool_mode: Literal["mcp", "local"] | None = None
+    mcp_external_connections_enabled: bool | None = None
+    mcp_claude_enabled: bool | None = None
+    mcp_chatgpt_enabled: bool | None = None
+    mcp_gemini_enabled: bool | None = None
+    mcp_claude_verification: _VerificationState | None = None
+    mcp_chatgpt_verification: _VerificationState | None = None
+    mcp_gemini_verification: _VerificationState | None = None
+    # Optimistic concurrency: the id of the active configuration version the
+    # administrator's form was loaded from. A save based on an older version
+    # is rejected with 409 rather than silently overwriting a newer change,
+    # such as re-enabling external MCP access another administrator disabled.
+    expected_version_id: int = Field(ge=1)
+
+
+STALE_SETTINGS_DETAIL = (
+    "Bot settings were changed by another administrator. "
+    "Reload to see the latest settings, then make your change again."
+)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# MCP runs (kind = 'mcp') carry the approved caller category in actor_kind.
+_MCP_PROVIDER_ACTOR_KINDS = {
+    "hub_agent": "mcp_hub_agent",
+    "claude": "mcp_claude",
+    "chatgpt": "mcp_chatgpt",
+    "gemini": "mcp_gemini",
+}
+_NOT_MCP = "COALESCE(runs.kind, '') <> 'mcp'"
+
+
+def _mcp_scope(kind: str | None, provider: str | None) -> bool:
+    """True when the viewer explicitly asked for MCP activity."""
+    return (kind or "").strip().lower() == "mcp" or bool((provider or "").strip())
 
 
 def _analytics_filters(
@@ -180,9 +224,16 @@ def _analytics_filters(
     kind: str | None,
     tool_name: str | None,
     search: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     clauses = ["1 = 1"]
     params: dict[str, object] = {}
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider:
+        if normalized_provider not in _MCP_PROVIDER_ACTOR_KINDS:
+            raise HTTPException(status_code=422, detail="Unsupported MCP provider filter.")
+        clauses.append("runs.kind = 'mcp' AND runs.actor_kind = :mcp_actor_kind")
+        params["mcp_actor_kind"] = _MCP_PROVIDER_ACTOR_KINDS[normalized_provider]
     if date_from is not None:
         clauses.append("runs.started_at >= :date_from")
         params["date_from"] = datetime.combine(date_from, datetime.min.time(), tzinfo=timezone.utc)
@@ -197,7 +248,13 @@ def _analytics_filters(
     ):
         normalized = (value or "").strip().lower()
         if normalized:
-            clauses.append(f"{column} = :{key}")
+            if column == "runs.model_key":
+                # A certified model also labels the Hub Agent's MCP calls made
+                # while answering with it.
+                clauses.append("(runs.model_key = :model_key OR runs.model_key = :model_key_mcp)")
+                params["model_key_mcp"] = f"mcp:renphil-agent:{normalized}"
+            else:
+                clauses.append(f"{column} = :{key}")
             params[key] = normalized
     normalized_tool = (tool_name or "").strip().lower()
     if normalized_tool:
@@ -239,12 +296,13 @@ def _analytics_rows(
     limit: int,
     offset: int,
     search: str | None = None,
+    provider: str | None = None,
     sort_by: Literal["when", "user", "model", "duration", "outcome"] = "when",
     sort_direction: Literal["asc", "desc"] = "desc",
 ) -> tuple[list[dict], int]:
     where_sql, params = _analytics_filters(
         date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
     )
     order_columns = {
         "when": "runs.started_at",
@@ -257,14 +315,15 @@ def _analytics_rows(
     try:
         total = int(db.execute(text(f"SELECT COUNT(*) FROM bot_telemetry_runs AS runs WHERE {where_sql}"), params).scalar_one())
         rows = db.execute(text(f"""
-            SELECT runs.id, runs.actor_email, runs.kind, runs.job_name, runs.model_key,
+            SELECT runs.id, runs.actor_email, runs.actor_kind, runs.kind, runs.job_name, runs.model_key,
                    runs.configuration_version_id, runs.started_at, runs.finished_at,
                    runs.elapsed_ms, runs.status, runs.error_code,
-                   COUNT(spans.id) AS span_count
+                   COUNT(spans.id) AS span_count,
+                   MAX(CASE WHEN runs.kind = 'mcp' THEN spans.tool_name END) AS mcp_tool_name
             FROM bot_telemetry_runs AS runs
             LEFT JOIN bot_telemetry_spans AS spans ON spans.run_id = runs.id
             WHERE {where_sql}
-            GROUP BY runs.id, runs.actor_email, runs.kind, runs.job_name, runs.model_key,
+            GROUP BY runs.id, runs.actor_email, runs.actor_kind, runs.kind, runs.job_name, runs.model_key,
                      runs.configuration_version_id, runs.started_at, runs.finished_at,
                      runs.elapsed_ms, runs.status, runs.error_code
             ORDER BY {order_sql}
@@ -280,9 +339,18 @@ def _analytics_rows(
             "started_at": row["started_at"], "finished_at": row["finished_at"],
             "elapsed_ms": row["elapsed_ms"], "status": row["status"],
             "error_code": row["error_code"], "span_count": int(row["span_count"] or 0),
+            "mcp_provider": _mcp_provider_label(row["actor_kind"]) if row["kind"] == "mcp" else None,
+            "mcp_tool_name": row["mcp_tool_name"],
         }
         for row in rows
     ], total
+
+
+def _mcp_provider_label(actor_kind: str | None) -> str:
+    for provider, value in _MCP_PROVIDER_ACTOR_KINDS.items():
+        if actor_kind == value:
+            return provider
+    return "unknown"
 
 
 def _analytics_chart_rows(
@@ -296,12 +364,20 @@ def _analytics_chart_rows(
     kind: str | None,
     tool_name: str | None,
     search: str | None = None,
+    provider: str | None = None,
 ) -> list[dict]:
-    """Return bounded, non-content telemetry points for browser-local charts."""
+    """Return bounded, non-content telemetry points for browser-local charts.
+
+    Answer/job charts never include MCP tool calls unless the viewer filtered
+    for MCP (type = MCP or a provider), so MCP activity cannot inflate answer
+    counts, durations, or usage-by-user.
+    """
     where_sql, params = _analytics_filters(
         date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
     )
+    if not _mcp_scope(kind, provider):
+        where_sql = f"{where_sql} AND {_NOT_MCP}"
     try:
         rows = db.execute(text(f"""
             SELECT runs.actor_email, runs.kind, runs.started_at, runs.elapsed_ms
@@ -467,6 +543,7 @@ def _build_bot_analytics_workbook(
     runs: list[dict],
     feedback_records: list[object],
     viewer_time_zone: str | None,
+    include_mcp: bool = False,
 ) -> bytes:
     output = BytesIO()
     workbook = xlsxwriter.Workbook(output, {"in_memory": True})
@@ -474,6 +551,9 @@ def _build_bot_analytics_workbook(
     viewer_timezone, timezone_label = _analytics_export_timezone(viewer_time_zone)
     subtitle = f"RenPhil Hub bot analytics. Times are shown in {timezone_label}."
     requested_points = [point for point in points if point.get("kind") == "request"]
+    # Answer/job sheets never count MCP tool calls unless MCP was requested.
+    chart_runs = runs if include_mcp else [run for run in runs if run.get("kind") != "mcp"]
+    mcp_runs = [run for run in runs if run.get("kind") == "mcp"]
     user_series = _analytics_distribution([point.get("actor_email") for point in requested_points], "Unknown user")
     hours = [0] * 24
     for point in points:
@@ -498,7 +578,7 @@ def _build_bot_analytics_workbook(
             workbook, sheet_name="Time of day", title="Usage by time of day", subtitle=subtitle,
             series_headers=(f"Hour ({timezone_label})", "Runs"), series_rows=hour_series,
             detail_headers=["Started at", "User", "Run type", "Duration (ms)", "Outcome", "Model", "Job name"],
-            detail_rows=[[_analytics_timestamp(run.get("started_at"), viewer_timezone), run.get("actor_email") or "", run.get("kind") or "", run.get("elapsed_ms") if run.get("elapsed_ms") is not None else "", run.get("status") or "", run.get("model_key") or "", run.get("job_name") or ""] for run in runs],
+            detail_rows=[[_analytics_timestamp(run.get("started_at"), viewer_timezone), run.get("actor_email") or "", run.get("kind") or "", run.get("elapsed_ms") if run.get("elapsed_ms") is not None else "", run.get("status") or "", run.get("model_key") or "", run.get("job_name") or ""] for run in chart_runs],
             chart_kind="column",
         )
     if report in ("all", "response_time"):
@@ -506,7 +586,7 @@ def _build_bot_analytics_workbook(
             workbook, sheet_name="Response time", title="Response-time distribution", subtitle=subtitle,
             series_headers=("Duration range", "Runs"), series_rows=response_series,
             detail_headers=["Started at", "User", "Run type", "Duration (ms)", "Outcome", "Model", "Job name"],
-            detail_rows=[[_analytics_timestamp(run.get("started_at"), viewer_timezone), run.get("actor_email") or "", run.get("kind") or "", run.get("elapsed_ms") if run.get("elapsed_ms") is not None else "", run.get("status") or "", run.get("model_key") or "", run.get("job_name") or ""] for run in runs if run.get("elapsed_ms") is not None],
+            detail_rows=[[_analytics_timestamp(run.get("started_at"), viewer_timezone), run.get("actor_email") or "", run.get("kind") or "", run.get("elapsed_ms") if run.get("elapsed_ms") is not None else "", run.get("status") or "", run.get("model_key") or "", run.get("job_name") or ""] for run in chart_runs if run.get("elapsed_ms") is not None],
             chart_kind="line",
         )
     if report in ("all", "negative_feedback"):
@@ -521,6 +601,22 @@ def _build_bot_analytics_workbook(
             ] for record in negative_feedback],
             chart_kind="bar",
         )
+    if report == "all" and mcp_runs:
+        mcp_sheet = workbook.add_worksheet("MCP calls")
+        mcp_sheet.hide_gridlines(2)
+        mcp_header = workbook.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": "#FF7F50"})
+        mcp_sheet.write(0, 0, "MCP tool calls", workbook.add_format({"bold": True, "font_size": 18}))
+        mcp_sheet.write(1, 0, subtitle, workbook.add_format({"font_size": 9, "font_color": "#6E6E73"}))
+        mcp_headers = ["Started at", "User", "Caller", "Tool", "Model / client", "Duration (ms)", "Outcome", "Error category"]
+        mcp_sheet.write_row(3, 0, mcp_headers, mcp_header)
+        for row_index, run in enumerate(mcp_runs, start=4):
+            mcp_sheet.write_row(row_index, 0, [
+                _analytics_timestamp(run.get("started_at"), viewer_timezone), run.get("actor_email") or "",
+                run.get("mcp_provider") or "", run.get("mcp_tool_name") or "", run.get("model_key") or "",
+                run.get("elapsed_ms") if run.get("elapsed_ms") is not None else "", run.get("status") or "", run.get("error_code") or "",
+            ])
+        mcp_sheet.autofilter(3, 0, 3 + len(mcp_runs), len(mcp_headers) - 1)
+        mcp_sheet.set_column(0, len(mcp_headers) - 1, 22)
     if report == "all":
         worksheet = workbook.add_worksheet("Runs")
         worksheet.hide_gridlines(2)
@@ -622,12 +718,30 @@ def _next_version_number(db: Session) -> int:
     return 1 if latest is None else latest.version + 1
 
 
+def _lock_configuration_state(db: Session) -> BotConfigurationStateV2:
+    """Serialize configuration writes on the singleton state row.
+
+    ``SELECT ... FOR UPDATE`` makes concurrent saves on any Hub instance run
+    one at a time, so the expected-version check and the next version number
+    are always computed against the latest committed configuration.
+    """
+    _active_version(db)  # provisions the default version on first use
+    return (
+        db.query(BotConfigurationStateV2)
+        .filter(BotConfigurationStateV2.id == 1)
+        .populate_existing()
+        .with_for_update()
+        .one()
+    )
+
+
 def _save_version(
     db: Session,
     actor: UserInfo,
     settings: dict,
     action: str,
 ) -> BotConfigurationVersionV2:
+    _lock_configuration_state(db)
     previous = _active_version(db)
     now = _now()
     version = BotConfigurationVersionV2(
@@ -732,6 +846,118 @@ def get_runtime_status_for_bot_management(http_request: Request):
     """Expose safe runtime readiness information through Bot Management only."""
     return _drive_runtime_status(http_request.headers.get("authorization"))
 
+def _mcp_runtime_probe() -> dict:
+    """Bounded, safe MCP readiness from the Agent (server-to-server only).
+
+    Uses the Agent service credential, never the administrator's browser JWT.
+    Returns only fixed fields; URLs, tokens and upstream text are never
+    forwarded to the browser.
+    """
+    from app.config import get_settings as get_app_settings
+
+    settings = get_app_settings()
+    agent_url = (settings.AGENT_API_URL or os.getenv("AGENT_API_URL") or "").strip().rstrip("/")
+    sync_token = (settings.AGENT_SYNC_TOKEN or "").strip()
+    if not agent_url or not sync_token:
+        return {"health": "unavailable", "configured": False, "reason": "The Agent service connection is not configured."}
+    try:
+        response = httpx.get(
+            f"{agent_url}/agent/mcp-runtime-status",
+            headers={"Accept": "application/json", "X-Sync-Token": sync_token},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return {"health": "unavailable", "configured": False, "reason": "The Agent could not report MCP status."}
+    mcp = payload.get("mcp") if isinstance(payload, dict) else None
+    if not (
+        isinstance(mcp, dict)
+        and isinstance(mcp.get("available"), bool)
+        and isinstance(mcp.get("configured"), bool)
+        and isinstance(mcp.get("reason"), str)
+    ):
+        return {"health": "unavailable", "configured": False, "reason": "The Agent returned an invalid MCP status."}
+    health = "operational" if mcp["available"] else ("degraded" if mcp["configured"] else "unavailable")
+    return {"health": health, "configured": mcp["configured"], "reason": mcp["reason"][:200]}
+
+
+def _last_successful_mcp_call(db: Session) -> datetime | None:
+    try:
+        return db.execute(text(
+            "SELECT MAX(finished_at) FROM bot_telemetry_runs WHERE kind = 'mcp' AND status = 'succeeded'"
+        )).scalar_one_or_none()
+    except Exception:
+        db.rollback()
+        return None
+
+
+def _mcp_status_payload(db: Session, active_settings: dict) -> dict:
+    from app.config import get_settings as get_app_settings
+    from app.services.mcp_access_policy import load_approved_clients, normalized_mcp_settings, provider_readiness
+
+    approved = load_approved_clients(get_app_settings())
+    values = normalized_mcp_settings(active_settings)
+    return {
+        "runtime": _mcp_runtime_probe(),
+        "checked_at": _now(),
+        "last_successful_call_at": _last_successful_mcp_call(db),
+        "hub_ai_tool_mode": values["hub_ai_tool_mode"],
+        "external_connections_enabled": values["mcp_external_connections_enabled"],
+        "oauth_enabled": approved.oauth_enabled,
+        "client_configuration_valid": approved.problem is None,
+        "providers": provider_readiness(active_settings=active_settings, approved=approved),
+    }
+
+
+def _apply_mcp_settings(request: "UpdateBotSettingsRequest", settings: dict) -> None:
+    """Validate and apply MCP fields. Toggles never weaken authentication."""
+    from app.config import get_settings as get_app_settings
+    from app.services.mcp_access_policy import EXTERNAL_PROVIDERS, PROVIDER_LABELS, load_approved_clients
+
+    approved = None
+    if request.mcp_external_connections_enabled is not None:
+        settings["mcp_external_connections_enabled"] = request.mcp_external_connections_enabled
+    for provider in EXTERNAL_PROVIDERS:
+        enabled = getattr(request, f"mcp_{provider}_enabled")
+        verification = getattr(request, f"mcp_{provider}_verification")
+        needs_mapping = bool(enabled) and settings.get(f"mcp_{provider}_enabled") is not True
+        needs_mapping = needs_mapping or (verification not in (None, "unverified") and verification != settings.get(f"mcp_{provider}_verification"))
+        if needs_mapping:
+            approved = approved or load_approved_clients(get_app_settings())
+            if not approved.mapped(provider):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{PROVIDER_LABELS[provider]} needs an approved client mapping before it can be enabled or verified.",
+                )
+        if verification == "deployment_verified" and settings.get(f"mcp_{provider}_verification") not in ("dpop_staging_verified", "deployment_verified"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{PROVIDER_LABELS[provider]} must pass DPoP-compatible staging verification before it can be marked operational.",
+            )
+        if enabled is not None:
+            settings[f"mcp_{provider}_enabled"] = enabled
+        if verification is not None:
+            settings[f"mcp_{provider}_verification"] = verification
+    if request.hub_ai_tool_mode is not None:
+        if (
+            request.hub_ai_tool_mode == "mcp"
+            and settings.get("hub_ai_tool_mode") != "mcp"
+            and not _mcp_runtime_probe()["configured"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Hub AI cannot use MCP until the Agent reports a configured MCP connection. Keep the local Agent mode.",
+            )
+        settings["hub_ai_tool_mode"] = request.hub_ai_tool_mode
+
+
+@router.get("/mcp-status")
+def get_mcp_status(db: Session = Depends(get_db_v2)):
+    """Safe MCP runtime and per-provider readiness for All Scopes admins."""
+    return _mcp_status_payload(db, _normalized_settings(_active_version(db).settings))
+
+
 @router.get("/settings")
 def get_settings(db: Session = Depends(get_db_v2)):
     return {
@@ -755,7 +981,18 @@ def update_settings(
         active_model_key,
         http_request.headers.get("Authorization"),
     )
+    if request.google_drive_knowledge_enabled and not _drive_runtime_status(
+        http_request.headers.get("authorization")
+    )["drive_knowledge"]["available"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Google Drive Knowledge cannot be enabled until its approved folder and service account are ready.",
+        )
 
+    # Remote checks run before the row lock; the merge and save run under it.
+    state = _lock_configuration_state(db)
+    if state.active_version_id != request.expected_version_id:
+        raise HTTPException(status_code=409, detail=STALE_SETTINGS_DETAIL)
     settings = _normalized_settings(_active_version(db).settings)
     settings["active_model_key"] = active_model_key
     if request.bot_enabled is not None:
@@ -767,14 +1004,8 @@ def update_settings(
     if request.answer_cache_enabled is not None:
         settings["answer_cache_enabled"] = request.answer_cache_enabled
     if request.google_drive_knowledge_enabled is not None:
-        if request.google_drive_knowledge_enabled and not _drive_runtime_status(
-            http_request.headers.get("authorization")
-        )["drive_knowledge"]["available"]:
-            raise HTTPException(
-                status_code=409,
-                detail="Google Drive Knowledge cannot be enabled until its approved folder and service account are ready.",
-            )
         settings["google_drive_knowledge_enabled"] = request.google_drive_knowledge_enabled
+    _apply_mcp_settings(request, settings)
 
     version = _save_version(
         db,
@@ -852,22 +1083,27 @@ def get_bot_analytics_summary(
     kind: str | None = None,
     tool_name: str | None = None,
     search: str | None = None,
+    provider: str | None = None,
     db: Session = Depends(get_db_v2),
 ):
     where_sql, params = _analytics_filters(
         date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
     )
     try:
         totals = db.execute(text(f"""
-            SELECT COUNT(*) AS run_count,
+            SELECT SUM(CASE WHEN {_NOT_MCP} THEN 1 ELSE 0 END) AS run_count,
                    SUM(CASE WHEN runs.kind = 'request' THEN 1 ELSE 0 END) AS request_count,
                    SUM(CASE WHEN runs.kind = 'job' THEN 1 ELSE 0 END) AS background_job_count,
-                   SUM(CASE WHEN runs.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded_count,
-                   SUM(CASE WHEN runs.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-                   SUM(CASE WHEN runs.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
-                   COALESCE(SUM(runs.elapsed_ms), 0) AS total_elapsed_ms,
-                   AVG(runs.elapsed_ms) AS average_elapsed_ms
+                   SUM(CASE WHEN {_NOT_MCP} AND runs.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded_count,
+                   SUM(CASE WHEN {_NOT_MCP} AND runs.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                   SUM(CASE WHEN {_NOT_MCP} AND runs.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+                   COALESCE(SUM(CASE WHEN {_NOT_MCP} THEN runs.elapsed_ms END), 0) AS total_elapsed_ms,
+                   AVG(CASE WHEN {_NOT_MCP} THEN runs.elapsed_ms END) AS average_elapsed_ms,
+                   SUM(CASE WHEN runs.kind = 'mcp' THEN 1 ELSE 0 END) AS mcp_call_count,
+                   SUM(CASE WHEN runs.kind = 'mcp' AND runs.status = 'succeeded' THEN 1 ELSE 0 END) AS mcp_succeeded_count,
+                   SUM(CASE WHEN runs.kind = 'mcp' AND runs.status = 'failed' THEN 1 ELSE 0 END) AS mcp_failed_count,
+                   AVG(CASE WHEN runs.kind = 'mcp' THEN runs.elapsed_ms END) AS mcp_average_elapsed_ms
             FROM bot_telemetry_runs AS runs
             WHERE {where_sql}
         """), params).mappings().one()
@@ -885,9 +1121,21 @@ def get_bot_analytics_summary(
         """), params).mappings().one()
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Bot analytics is temporarily unavailable.") from exc
+    mcp_keys = {"mcp_call_count", "mcp_succeeded_count", "mcp_failed_count", "mcp_average_elapsed_ms"}
+    # Answer/job totals exclude MCP tool calls; MCP calls are reported only in
+    # their own block so they can never inflate answer counts or durations.
     return {
-        "totals": {key: int(value or 0) for key, value in totals.items() if key != "average_elapsed_ms"} | {
+        "totals": {
+            key: int(value or 0) for key, value in totals.items()
+            if key not in mcp_keys and key != "average_elapsed_ms"
+        } | {
             "average_elapsed_ms": round(float(totals["average_elapsed_ms"] or 0), 2),
+        },
+        "mcp": {
+            "call_count": int(totals["mcp_call_count"] or 0),
+            "succeeded_count": int(totals["mcp_succeeded_count"] or 0),
+            "failed_count": int(totals["mcp_failed_count"] or 0),
+            "average_elapsed_ms": round(float(totals["mcp_average_elapsed_ms"] or 0), 2),
         },
         "tokens": {key: int(value or 0) for key, value in token_totals.items()},
     }
@@ -905,6 +1153,7 @@ def list_bot_analytics_runs(
     kind: str | None = None,
     tool_name: str | None = None,
     search: str | None = None,
+    provider: str | None = None,
     sort_by: Literal["when", "user", "model", "duration", "outcome"] = "when",
     sort_direction: Literal["asc", "desc"] = "desc",
     db: Session = Depends(get_db_v2),
@@ -913,7 +1162,7 @@ def list_bot_analytics_runs(
     bounded_page = max(page, 1)
     data, total = _analytics_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
         sort_by=sort_by, sort_direction=sort_direction,
         limit=bounded_page_size, offset=(bounded_page - 1) * bounded_page_size,
     )
@@ -930,12 +1179,13 @@ def get_bot_analytics_chart_data(
     kind: str | None = None,
     tool_name: str | None = None,
     search: str | None = None,
+    provider: str | None = None,
     db: Session = Depends(get_db_v2),
 ):
     """Chart points only; no prompts, answers, provider payloads, or trace data."""
     return {"data": _analytics_chart_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
     )}
 
 
@@ -949,15 +1199,16 @@ def export_bot_analytics_csv(
     kind: str | None = None,
     tool_name: str | None = None,
     search: str | None = None,
+    provider: str | None = None,
     db: Session = Depends(get_db_v2),
 ):
     data, _ = _analytics_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
         limit=10_000, offset=0,
     )
     output = StringIO()
-    columns = ["id", "actor_email", "kind", "job_name", "model_key", "configuration_version_id", "started_at", "finished_at", "elapsed_ms", "status", "error_code", "span_count"]
+    columns = ["id", "actor_email", "kind", "job_name", "model_key", "configuration_version_id", "started_at", "finished_at", "elapsed_ms", "status", "error_code", "span_count", "mcp_provider", "mcp_tool_name"]
     writer = csv.DictWriter(output, fieldnames=columns)
     writer.writeheader()
     writer.writerows(data)
@@ -979,6 +1230,7 @@ async def export_bot_analytics_workbook(
     kind: str | None = None,
     tool_name: str | None = None,
     search: str | None = None,
+    provider: str | None = None,
     time_zone: str | None = None,
     db: Session = Depends(get_db_v2),
     airtable_service: AirtableService = Depends(get_airtable_service),
@@ -986,17 +1238,17 @@ async def export_bot_analytics_workbook(
     """Export native Excel charts with the non-content rows that support them."""
     runs, _ = _analytics_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
         limit=10_000, offset=0,
     )
     points = _analytics_chart_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
-        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
+        model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
     )
     feedback_records = await airtable_service.list_feedbacks(limit=500) if report in ("all", "negative_feedback") else []
     workbook = _build_bot_analytics_workbook(
         report=report, points=points, runs=runs, feedback_records=feedback_records,
-        viewer_time_zone=time_zone,
+        viewer_time_zone=time_zone, include_mcp=_mcp_scope(kind, provider),
     )
     filename = "bot-analytics.xlsx" if report == "all" else f"bot-analytics-{report.replace('_', '-')}.xlsx"
     return Response(

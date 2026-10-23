@@ -24,7 +24,11 @@ Thumbs.db
 
 NOTES!!.txt
 generate_jwt_key.py
-tests/
+# Tests stay local by default; the MCP release suites below are tracked.
+tests/*
+!tests/test_mcp_oauth_*.py
+!tests/test_mcp_access_policy.py
+!tests/test_bot_management_mcp.py
 
 # Logs
 logs/
