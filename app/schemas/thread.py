@@ -520,16 +520,23 @@ class NotificationEntry(BaseModel):
     problem; a live join is simply the current, correct title, and it
     costs nothing extra since the notification can only exist while its
     thread does (`ON DELETE CASCADE`, plan §3.4 — "no orphan state and no
-    tombstone")."""
+    tombstone").
+
+    The Airtable sync's two types (`airtable_sync_started` /
+    `airtable_sync_finished`, v1 plan §9) have no thread: `thread_id`,
+    `thread_title` and `component_link` are None, and `link` is the in-app
+    path to open. Thread notifications always carry the three and a None
+    `link`."""
 
     id: int
     type: str
     actor_email: str | None
     actor_name: str | None
-    thread_id: int
-    thread_title: str
-    component_link: str
+    thread_id: int | None
+    thread_title: str | None
+    component_link: str | None
     excerpt: str | None
+    link: str | None = None
     read_at: datetime | None
     created_at: datetime
 

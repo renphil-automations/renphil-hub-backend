@@ -6,6 +6,10 @@
   execute read all four Airtable tables (fail fast on a missing field), run
           the ticked steps in the fixed order, record summary/status
 
+A real run notifies every Hub Admin when it starts (in `launch`, so only
+after the caller's commit: a 409 notifies nobody) and when its row is closed
+(`_finish`); previews notify nobody (notifications.py, v1 C3).
+
 The lock is the `running` row itself (owner's choice, 2026-10-22; see
 AirtableSyncRunV2): at most one row may be `running`, enforced by the partial
 unique index `uq_airtable_sync_runs_running`. Every kind of run takes it —
@@ -51,6 +55,7 @@ from app.services.airtable_sync.airtable_reader import (
     SyncConfig,
 )
 from app.services.airtable_sync.lock_sweep import ACCESS_REMOVED, release_unauthorized_locks
+from app.services.airtable_sync.notifications import SyncNotifier
 from app.services.airtable_sync.settings_service import AirtableSyncError
 from app.services.airtable_sync.steps import STEP_FUNCTIONS
 
@@ -302,6 +307,7 @@ class SyncRunner:
         settings_provider: Callable[[], Any] | None = None,
         step_functions: dict[str, Callable[[RunContext], dict]] | None = None,
         heartbeat_interval: float | None = HEARTBEAT_INTERVAL,
+        notifier: SyncNotifier | None = None,
     ) -> None:
         if session_factory is None:
             from app.db_v2.database import SessionLocalV2
@@ -313,6 +319,7 @@ class SyncRunner:
         self.settings_provider = settings_provider or get_settings
         self.step_functions = step_functions or STEP_FUNCTIONS
         self.heartbeat_interval = heartbeat_interval
+        self.notifier = notifier or SyncNotifier()
 
     # ── start: take the lock ────────────────────────────────────────────
 
@@ -368,6 +375,10 @@ class SyncRunner:
     # ── launch / execute ────────────────────────────────────────────────
 
     def launch(self, started: StartedRun) -> None:
+        """Call after the caller committed `start`'s row. Sends the start
+        notifications (advisory), then hands the run to the executor."""
+        if not started.dry_run:
+            self.notifier.started(self.session_factory, started.run_id)
         try:
             self.executor(lambda: self.execute(started))
         except Exception:
@@ -428,8 +439,11 @@ class SyncRunner:
     def _finish(self, run_id: int, status: str, summary: dict, error: str | None) -> None:
         """Close the run row from a fresh session (the run's own may be
         broken). Only a row still `running` is touched: one already marked
-        `interrupted` by a later start keeps that status."""
+        `interrupted` by a later start keeps that status, and sends no end
+        notification. A closed real run notifies every Hub Admin (advisory:
+        after the commit, from its own session)."""
         now = _utc_now()
+        closed = False
         db = self.session_factory()
         try:
             result = db.execute(
@@ -438,13 +452,16 @@ class SyncRunner:
                 .values(status=status, summary=summary, error=error, finished_at=now, heartbeat_at=now)
             )
             db.commit()
-            if result.rowcount == 0:
+            closed = result.rowcount > 0
+            if not closed:
                 logger.warning("Airtable sync run %s finished as %s, but its row was no longer running", run_id, status)
         except Exception:
             db.rollback()
             logger.exception("Airtable sync run %s: could not record its end (%s)", run_id, status)
         finally:
             db.close()
+        if closed and not summary.get("preview"):
+            self.notifier.finished(self.session_factory, run_id)
 
 
 _default_runner: SyncRunner | None = None

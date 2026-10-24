@@ -146,6 +146,11 @@ NOTIFICATION_TYPE_THREAD_APPROVED = "thread_approved"
 NOTIFICATION_TYPE_THREAD_REJECTED = "thread_rejected"
 NOTIFICATION_TYPE_THREAD_EDIT_APPROVED = "thread_edit_approved"
 NOTIFICATION_TYPE_THREAD_EDIT_REJECTED = "thread_edit_rejected"
+# The Airtable sync's two (plan_airtable_sync v1 §9, C3), written by
+# `airtable_sync/notifications.py`. They carry no thread or component:
+# `component_id` / `thread_id` are NULL and `link` says where to go.
+NOTIFICATION_TYPE_AIRTABLE_SYNC_STARTED = "airtable_sync_started"
+NOTIFICATION_TYPE_AIRTABLE_SYNC_FINISHED = "airtable_sync_finished"
 
 # Thread status values (D5, lifecycle in plan_thread_moderation_2026-09-18.md
 # §2). An editor's own post, or a decided pending one, is 'approved'; a
@@ -1050,8 +1055,17 @@ def _notify_newly_added_mentions(
         )
 
 
+def _notification_visible(notification_component_id: int | None, access: ViewerAccess | None) -> bool:
+    """The bell's access filter (plan_ac_enforcement_closeout §4.2). It
+    applies only to rows that point at a widget: a row with no
+    `component_id` (the Airtable sync's) has no widget to lose access to."""
+    if access is None or notification_component_id is None:
+        return True
+    return access.is_granted(("component", notification_component_id))
+
+
 def _to_notification_entry(
-    notification: NotificationV2, thread_title: str, component_link: str
+    notification: NotificationV2, thread_title: str | None, component_link: str | None
 ) -> NotificationEntry:
     return NotificationEntry(
         id=notification.id,
@@ -1062,6 +1076,7 @@ def _to_notification_entry(
         thread_title=thread_title,
         component_link=component_link,
         excerpt=notification.excerpt,
+        link=notification.link,
         read_at=notification.read_at,
         created_at=notification.created_at,
     )
@@ -1079,7 +1094,10 @@ def list_notifications_for_user(
     `NOTIFICATIONS_PAGE_SIZE`. `thread_title` / `component_link` are joined
     live rather than stored (see `NotificationEntry`'s own docstring for
     why) — safe unconditionally because a notification cannot outlive its
-    thread or component (`ON DELETE CASCADE`, plan §3.4).
+    thread or component (`ON DELETE CASCADE`, plan §3.4). The joins are
+    OUTER joins: the Airtable sync's notifications have neither (both ids
+    NULL; v1 plan §9.1), and come back with `thread_title` /
+    `component_link` None.
 
     plan_ac_enforcement_closeout_2026-09-09.md §4.2 — a third gap alongside
     the 9 `_check_view_access` sites: get mentioned in a thread, lose the
@@ -1096,8 +1114,8 @@ def list_notifications_for_user(
     email = _norm_email(user.email)
     query = (
         db.query(NotificationV2, ThreadV2.title, ComponentV2.link)
-        .join(ThreadV2, ThreadV2.id == NotificationV2.thread_id)
-        .join(ComponentV2, ComponentV2.id == NotificationV2.component_id)
+        .outerjoin(ThreadV2, ThreadV2.id == NotificationV2.thread_id)
+        .outerjoin(ComponentV2, ComponentV2.id == NotificationV2.component_id)
         .filter(NotificationV2.recipient_email == email)
     )
     if unread_only:
@@ -1125,9 +1143,7 @@ def list_notifications_for_user(
     )
 
     if access is not None:
-        page = [
-            row for row in page if access.is_granted(("component", row[0].component_id))
-        ]
+        page = [row for row in page if _notification_visible(row[0].component_id, access)]
 
     items = [
         _to_notification_entry(notification, title, link)
@@ -1171,7 +1187,7 @@ def get_unread_notification_count(
     granted_ids = [
         notification_id
         for notification_id, component_id in rows
-        if access.is_granted(("component", component_id))
+        if _notification_visible(component_id, access)
     ]
     count = len(granted_ids)
     max_id = max(granted_ids) if granted_ids else None
@@ -1204,7 +1220,7 @@ def mark_notification_read(
     )
     if notification is None:
         return
-    if access is not None and not access.is_granted(("component", notification.component_id)):
+    if not _notification_visible(notification.component_id, access):
         return
     notification.read_at = _utc_now()
     db.commit()
