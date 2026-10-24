@@ -4,7 +4,9 @@
           transaction; the caller commits, then calls `launch`
   launch  hand the run to the executor: a background thread in production
   execute read all four Airtable tables (fail fast on a missing field), run
-          the ticked steps in the fixed order, record summary/status
+          the ticked steps in the fixed order, record summary/status; the
+          row's summary is also published as each step starts
+          (`current_step`, `_progress`), for the tab's progress line
 
 A real run notifies every Hub Admin when it starts (in `launch`, so only
 after the caller's commit: a 409 notifies nobody) and when its row is closed
@@ -27,6 +29,7 @@ tests run a whole run synchronously against SQLite and a fake Airtable.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
@@ -413,6 +416,7 @@ class SyncRunner:
             )
             for step in started.steps:
                 summary["current_step"] = step
+                self._progress(started.run_id, summary)
                 summary["steps"][step] = self.step_functions[step](ctx) or {}
                 ctx.commit()
             summary.pop("current_step", None)
@@ -435,6 +439,27 @@ class SyncRunner:
             if error and secret:  # belt and braces: no message should carry it
                 error = error.replace(secret, "***")
             self._finish(started.run_id, status, summary, error)
+
+    def _progress(self, run_id: int, summary: dict) -> None:
+        """Publish the summary so far (`read`, the finished steps' counts,
+        `current_step`) on the run row, so `GET /runs/{id}` shows what a
+        running run is doing (the Airtable Sync tab; owner, 2026-10-24).
+        Same rules as `_finish`: a fresh session (a preview's own is
+        guarded), and only a row still `running`. Advisory: a failed write is
+        logged and the run carries on; `_finish` writes the final summary."""
+        db = self.session_factory()
+        try:
+            db.execute(
+                update(AirtableSyncRunV2)
+                .where(AirtableSyncRunV2.id == run_id, AirtableSyncRunV2.status == "running")
+                .values(summary=copy.deepcopy(summary))
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.warning("Airtable sync run %s: could not record its progress", run_id, exc_info=True)
+        finally:
+            db.close()
 
     def _finish(self, run_id: int, status: str, summary: dict, error: str | None) -> None:
         """Close the run row from a fresh session (the run's own may be
