@@ -20,16 +20,22 @@ the Program Roles step applies the remembered answer next run. Keep current
 only moves the base, so it always applies. Skip / Keep are remembered by
 fingerprint (G1).
 
+A person's HR answers (`field_conflict` Accept Airtable / Keep current, E1's
+Apply + …) are person-level answers too: the person's fields, link or
+creation all apply together once their last open item is answered (C4).
+
 Items with no buttons ("—") and kinds a later phase answers → 409.
 Every refusal is an `AirtableSyncError` (409); the router rolls back.
-Bulk resolve (v1 §5.4 "Accept all / Keep all") is deferred to phase 6,
-where field conflicts first appear.
+After the commit, `PostCommit` deletes replaced headshot objects (A-5) and
+sweeps the edit locks (lock_sweep.py). Bulk resolve (v1 §5.4 "Accept all /
+Keep all") is `resolve_item` in a loop, stopping at the first error.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import or_
@@ -41,18 +47,27 @@ from app.db_v2.models.role import RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
 from app.db_v2.models.user import UserV2
+from app.config import get_settings
 from app.services import rbac_assignment_service, rbac_service, user_admin_service
-from app.services.airtable_sync.items import NOT_REMEMBERED
+from app.services.airtable_sync.hr_fields import Plan
+from app.services.airtable_sync.items import NOT_REMEMBERED, ItemBook
+from app.services.airtable_sync.lock_sweep import release_unauthorized_locks
 from app.services.airtable_sync.program_roles_step import PairWriter, Target, retire_person_pairs, split_key
 from app.services.airtable_sync.runner import _as_text, as_utc, refuse_if_running
 from app.services.airtable_sync.runs_service import _like_pattern
 from app.services.airtable_sync.scopes_step import SYNC_EDGE, name_key
 from app.services.airtable_sync.settings_service import AirtableSyncError
+from app.services.airtable_sync.r2 import R2Config
 from app.services.airtable_sync.users_step import (
+    APPLY_EMAIL,
+    EMAIL_CHANGE,
+    EMAIL_TAKEN,
+    FIELD_CONFLICT,
     PERSON_KINDS,
     SYNC_SOURCE,
     UserWriter,
     answered_match,
+    field_item_specs,
     match_person,
 )
 from app.services.rbac_graph_service import RbacGraphError, delete_scope_edge
@@ -75,6 +90,10 @@ CHOICES: dict[str, tuple[str, ...]] = {
     "assignment_conflict": ("accept_airtable", "keep_current"),
     "assignment_removed": ("remove", "keep"),
     "unmapped_designation": ("skip",),
+    "field_conflict": ("accept_airtable", "keep_current"),
+    # "Apply + keep the old address as Alias Email" is offered only when the
+    # Hub has no alias (the payload's choices say so).
+    "work_email_change_signed_in": ("apply_keep_alias", "apply_drop_old", "skip"),
 }
 # "—" items: they close by themselves once the data is fixed.
 NO_CHOICES = frozenset(
@@ -206,6 +225,8 @@ class _Res:
     data: dict
     log: _ResolutionLog
     current: CurrentHubUser
+    # Writers whose old headshots are deleted once the router has committed.
+    after_commit: list[UserWriter] = field(default_factory=list)
 
     @property
     def rid(self) -> str:
@@ -367,9 +388,10 @@ def _cluster_edge_removed(res: _Res) -> dict:
 # ── users ───────────────────────────────────────────────────────────────
 
 
-def _answers_in_force(res: _Res, record: AirtableSyncRecordV2) -> dict[str, tuple[str, Any, dict]]:
+def _answers_in_force(res: _Res, record: AirtableSyncRecordV2) -> dict[tuple[str, str], tuple[str, Any, dict]]:
     """The person's answered items that still applied in their last run
-    (the one being resolved included): kind → (resolution, data, payload)."""
+    (the one being resolved included): (kind, field) → (resolution, data,
+    payload)."""
     rows = (
         res.db.query(AirtableSyncItemV2)
         .filter(
@@ -381,19 +403,51 @@ def _answers_in_force(res: _Res, record: AirtableSyncRecordV2) -> dict[str, tupl
         )
         .order_by(AirtableSyncItemV2.id)
     )
-    out: dict[str, tuple[str, Any, dict]] = {}
+    out: dict[tuple[str, str], tuple[str, Any, dict]] = {}
     for it in rows:
         if it.id == res.item.id:  # its data is stored after the applier ran
-            out[it.kind] = (res.choice, res.data, it.payload or {})
+            out[(it.kind, it.field or "")] = (res.choice, res.data, it.payload or {})
         elif record.last_seen_run_id is not None and it.last_run_id == record.last_seen_run_id:
-            out[it.kind] = (it.resolution, it.resolution_data, it.payload or {})
+            out[(it.kind, it.field or "")] = (it.resolution, it.resolution_data, it.payload or {})
     return out
 
 
+def _unanswered(plan: Plan, answers: dict[tuple[str, str], tuple[str, Any, dict]]) -> list[str]:
+    """What the HR merge now finds that no answer in force covers: the Hub
+    changed since the run (the next run raises it)."""
+    out: list[str] = []
+    for c in plan.conflicts:
+        if answers.get((FIELD_CONFLICT, c.field), ("",))[0] not in ("accept_airtable", "keep_current"):
+            out.append(FIELD_CONFLICT)
+    if plan.email_change is not None:
+        choice = answers.get((EMAIL_CHANGE, ""), ("",))[0]
+        if choice not in APPLY_EMAIL or (choice == "apply_keep_alias" and not plan.alias_offer):
+            out.append(EMAIL_CHANGE)
+    if plan.taken:
+        out.append(EMAIL_TAKEN)
+    return sorted(set(out))
+
+
+def _raise_now(res: _Res, record: AirtableSyncRecordV2, plan: Plan, m: Any, answers: dict) -> None:
+    """Open the merge's unanswered items exactly as the step would (same
+    inputs, so the next run refreshes them), dated to the person's last run
+    so an answer to them counts as in force (`_answers_in_force`)."""
+    ctx = SimpleNamespace(db=res.db, dry_run=False, run_id=record.last_seen_run_id, log=res.log)
+    book = ItemBook(ctx, "user")
+    for spec in field_item_specs(plan, m.user):
+        if (spec.kind, spec.field) in answers:
+            continue
+        book.raise_item(
+            res.rid, spec.kind, inputs=spec.inputs, payload=spec.payload, subject=res.item.subject, hub_id=spec.hub_id, field=spec.field
+        )
+    res.db.flush()
+
+
 def _apply_person(res: _Res) -> dict:
-    """C4: with the person's last open item answered, link or create them
-    (and give the default pair if answered) now, from `latest_airtable`.
-    Otherwise the answer waits for the next run."""
+    """C4: with the person's last open item answered, link or create them,
+    apply their HR fields (with every answer in force) and give the default
+    pair if answered, now, from `latest_airtable`. Otherwise the answer waits
+    for the next run."""
     db, rid = res.db, res.rid
     waiting = sorted(
         k
@@ -410,21 +464,31 @@ def _apply_person(res: _Res) -> dict:
     if record is None or not record.latest_airtable:
         return {"applied": False, "waiting_on": ["next_run"]}
     answers = _answers_in_force(res, record)
-    skipped = sorted(k for k, (resolution, _d, _p) in answers.items() if resolution == "skip")
+    skipped = sorted({k for (k, _f), (resolution, _d, _p) in answers.items() if resolution == "skip"})
     if skipped:
         return {"applied": False, "waiting_on": skipped}
 
     fields = dict(record.latest_airtable)
-    writer = UserWriter(db, res.log, dry_run=False, run_id=None)
+    writer = UserWriter(db, res.log, dry_run=False, run_id=None, r2=R2Config.from_settings(get_settings()))
     m = match_person(writer.index, rid, fields)
-    if m.outcome == "item" and m.kind in answers:
-        resolution, data, payload = answers[m.kind]
+    if m.outcome == "item" and (m.kind, "") in answers:
+        resolution, data, payload = answers[(m.kind, "")]
         m = answered_match(writer.index, rid, m.kind, resolution, data, payload) or m
     if m.outcome in ("item", "deleted"):
         # The Hub changed since the run: the next run re-checks the person.
         return {"applied": False, "waiting_on": [m.kind or "skipped_deleted_in_hub"]}
-    want_default = answers.get("no_program_roles", ("",))[0] == "assign_default"
-    hu = writer.apply(rid, fields, m, want_default=want_default)
+    plan = writer.plan_for(rid, m, fields)
+    unanswered = _unanswered(plan, answers) if plan is not None else []
+    if unanswered:
+        # The merge found items no run has raised yet (the person was only
+        # just matched, by this answer): open them now, so they can be
+        # answered without waiting for a run.
+        _raise_now(res, record, plan, m, answers)
+        return {"applied": False, "waiting_on": unanswered}
+    want_default = answers.get(("no_program_roles", ""), ("",))[0] == "assign_default"
+    step_answers = {key: (resolution, data) for key, (resolution, data, _p) in answers.items()}
+    hu = writer.apply(rid, fields, m, want_default=want_default, plan=plan, answers=step_answers)
+    res.after_commit.append(writer)  # its old headshots, once the Hub has switched
     return {"applied": True, "user_id": hu.id}
 
 
@@ -450,6 +514,18 @@ def _match_item(res: _Res) -> dict:
 
 def _no_program_roles(res: _Res) -> dict:
     if res.choice == "skip":
+        return {"applied": True}
+    return _apply_person(res)
+
+
+def _field_conflict(res: _Res) -> dict:
+    # Accept Airtable and Keep current both move the base (M3); the person's
+    # writes wait for their last open item (C4), like every person answer.
+    return _apply_person(res)
+
+
+def _work_email_change(res: _Res) -> dict:
+    if res.choice == "skip":  # remembered: the person stays held (v1 §5.4)
         return {"applied": True}
     return _apply_person(res)
 
@@ -584,6 +660,8 @@ APPLIERS = {
     "assignment_conflict": _assignment_conflict,
     "assignment_removed": _assignment_removed,
     "unmapped_designation": _unmapped_designation,
+    "field_conflict": _field_conflict,
+    "work_email_change_signed_in": _work_email_change,
 }
 
 
@@ -609,11 +687,36 @@ def _check_choice(item: AirtableSyncItemV2, choice: str) -> None:
     raise AirtableSyncError("invalid_choice", f"{choice!r} is not a choice for this item.", choices=allowed_choices(item))
 
 
+class PostCommit:
+    """What a resolution leaves for after its commit (A-5, owner
+    2026-10-23): delete the old headshot objects it switched away from, then
+    sweep the edit locks (lock_sweep.py). The router calls `run` after it
+    has committed; a rollback simply drops this object."""
+
+    def __init__(self) -> None:
+        self.writers: list[UserWriter] = []
+
+    def run(self, db: Session, *, sweep: bool = True) -> None:
+        for writer in self.writers:
+            if writer.pending_deletes:
+                writer.delete_old_headshots()
+        self.writers.clear()
+        db.commit()  # the delete log rows
+        if sweep:
+            release_unauthorized_locks(db)
+
+
 def resolve_item(
-    db: Session, item_id: int, *, choice: str, data: dict | None, current: CurrentHubUser
+    db: Session,
+    item_id: int,
+    *,
+    choice: str,
+    data: dict | None,
+    current: CurrentHubUser,
+    post_commit: PostCommit | None = None,
 ) -> dict | None:
     """None when there is no such item (404). Flushes; the router commits,
-    or rolls back on an `AirtableSyncError`."""
+    or rolls back on an `AirtableSyncError`, then runs `post_commit`."""
     refuse_if_running(db)
     item = db.query(AirtableSyncItemV2).filter(AirtableSyncItemV2.id == item_id).with_for_update().one_or_none()
     if item is None:
@@ -622,6 +725,8 @@ def resolve_item(
 
     actor = (current.email or "").strip().lower() or None
     res = _Res(db=db, item=item, choice=choice, data=dict(data or {}), log=_ResolutionLog(db, item, actor), current=current)
+    if post_commit is not None:
+        res.after_commit = post_commit.writers
     # Resolved first: a person-level answer looks at what is still open.
     item.status = "resolved"
     item.resolution = choice
@@ -645,3 +750,55 @@ def resolve_item(
         .all()
     )
     return {"item": serialize_item(item), "outcome": outcome, "open_items": [serialize_item(i) for i in open_items]}
+
+
+def bulk_targets(db: Session, *, item_ids: list[int] | None, run_id: int | None, kind: str | None, choice: str) -> list[int]:
+    """The items a bulk resolve works through, in id order. `item_ids` are
+    taken as given (each must offer the choice, or the loop stops there);
+    `run_id` picks the items still open from that run that offer it."""
+    if item_ids is not None:
+        return sorted(set(item_ids))
+    query = db.query(AirtableSyncItemV2).filter(AirtableSyncItemV2.status == "open", AirtableSyncItemV2.last_run_id == run_id)
+    if kind:
+        query = query.filter(AirtableSyncItemV2.kind == kind)
+    return [i.id for i in query.order_by(AirtableSyncItemV2.id) if i.kind in APPLIERS and choice in allowed_choices(i)]
+
+
+def bulk_resolve(
+    db: Session,
+    *,
+    item_ids: list[int] | None,
+    run_id: int | None,
+    kind: str | None,
+    choice: str,
+    current: CurrentHubUser,
+) -> dict:
+    """v1 §5.4's bulk actions ("Accept all from Airtable" / "Keep all"):
+    `resolve_item` in a loop, one transaction per item, stopping at the first
+    error (that item rolled back, the earlier ones kept). Items are taken in
+    id order, so a person's last item is the one whose answer applies all of
+    theirs (C4). Owns its commits; sweeps the locks once at the end. A live
+    run → `SyncRunInProgress` before anything is touched (409)."""
+    refuse_if_running(db)
+    ids = bulk_targets(db, item_ids=item_ids, run_id=run_id, kind=kind, choice=choice)
+    db.rollback()  # the targets' read is not part of any item's transaction
+    resolved: list[dict] = []
+    failed: dict | None = None
+    not_attempted: list[int] = []
+    for n, item_id in enumerate(ids):
+        post = PostCommit()
+        try:
+            out = resolve_item(db, item_id, choice=choice, data=None, current=current, post_commit=post)
+            if out is None:
+                raise AirtableSyncError("item_not_found", "No such item.", item_id=item_id)
+        except AirtableSyncError as exc:
+            db.rollback()
+            failed = {"item_id": item_id, "code": exc.code, "message": exc.message, **exc.details}
+            not_attempted = ids[n + 1 :]
+            break
+        db.commit()
+        post.run(db, sweep=False)
+        resolved.append({"item_id": item_id, "outcome": out["outcome"]})
+    if resolved:
+        release_unauthorized_locks(db)
+    return {"resolved": resolved, "failed": failed, "not_attempted": not_attempted}

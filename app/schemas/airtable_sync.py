@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from app.schemas.tab import StrictRequestModel
 
@@ -239,6 +239,48 @@ class ResolveItemData(BaseModel):
 
 class ResolveItemAPIResponse(BaseModel):
     data: ResolveItemData
+
+
+class BulkResolveRequest(StrictRequestModel):
+    """v1 plan §5.4 "Accept all from Airtable" / "Keep all": the same choice
+    for several items, in id order, stopping at the first error.
+      item_ids  these items (e.g. one person's conflicts); each must offer
+                the choice
+      run_id    every item still open from that run (its `last_run_id`)
+                that offers the choice, optionally of one `kind` (e.g. the
+                first run's `field_conflict`s)
+    Exactly one of `item_ids` and `run_id`."""
+
+    item_ids: list[StrictInt] | None = Field(default=None, min_length=1, max_length=1000)
+    run_id: StrictInt | None = None
+    kind: StrictStr | None = Field(default=None, min_length=1, max_length=48)
+    choice: StrictStr = Field(min_length=1, max_length=48)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> BulkResolveRequest:
+        if (self.item_ids is None) == (self.run_id is None):
+            raise ValueError("Give exactly one of item_ids and run_id.")
+        if self.kind is not None and self.item_ids is not None:
+            raise ValueError("kind only narrows a run_id request.")
+        return self
+
+
+class BulkResolvedItem(BaseModel):
+    item_id: int
+    outcome: dict[str, Any]
+
+
+class BulkResolveData(BaseModel):
+    resolved: list[BulkResolvedItem] = Field(default_factory=list)
+    # The item that stopped the loop, with the 409's {code, message, ...};
+    # null when every item was resolved.
+    failed: dict[str, Any] | None = None
+    # Items after the failed one, left as they were.
+    not_attempted: list[int] = Field(default_factory=list)
+
+
+class BulkResolveAPIResponse(BaseModel):
+    data: BulkResolveData
 
 
 class SyncStatusData(BaseModel):

@@ -40,3 +40,6 @@ upstash-redis>=1.4.0,<2.0.0
 
 # ── Certification ─────────────────────────────────────────
 certifi>=2026.10.19
+
+# ── Cloudflare R2 (S3 API): headshots copied by the Airtable sync ─────
+boto3>=1.34,<2.0

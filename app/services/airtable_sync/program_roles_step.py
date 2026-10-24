@@ -71,6 +71,7 @@ from app.db_v2.models.scope import ScopeV2
 from app.db_v2.models.user import UserV2
 from app.services import rbac_assignment_service
 from app.services.airtable_sync.items import ItemBook
+from app.services.airtable_sync.lock_sweep import ACCESS_REMOVED
 from app.services.airtable_sync.scopes_step import PROGRAM_ALIASES, VIRTUAL_SCOPES
 from app.services.airtable_sync.settings_service import normalize_designation
 from app.services.airtable_sync.users_step import DELETED_PEOPLE, HELD_PEOPLE, SYNC_SOURCE, VIRTUAL_USERS
@@ -724,6 +725,8 @@ class _ProgramRolesStep:
         for key, rows in pairs.items():
             self.sync_pair(key, rows)
         self.detect_removed(set(pairs))
+        if not self.ctx.dry_run and (self.counts["replaced"] or self.counts["removed"]):
+            self.ctx.state[ACCESS_REMOVED] = True  # the runner sweeps the locks once
         out = dict(self.counts)
         out.update(self.book.finish())
         self.commit()

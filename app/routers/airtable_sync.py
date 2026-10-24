@@ -15,8 +15,9 @@ Hub Admins only, for every endpoint.
   GET  /v2/airtable-sync/status     schedule, current/last run, open items
   GET  /v2/airtable-sync/items      conflicts / warnings, paginated
   POST /v2/airtable-sync/items/{id}/resolve   answer one (409 during a run)
+  POST /v2/airtable-sync/items/bulk-resolve   one choice for several items
 
-Bulk resolve and the scheduler tick come in later phases.
+The scheduler tick comes in a later phase.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ from sqlalchemy.orm import Session
 from app.db_v2.database import get_db_v2
 from app.dependencies import CurrentHubUser, get_current_hub_user, get_current_user, require_hub_admin
 from app.schemas.airtable_sync import (
+    BulkResolveAPIResponse,
+    BulkResolveRequest,
     DesignationMappingsAPIResponse,
     ItemStatusFilter,
     LogEntity,
@@ -323,8 +326,9 @@ def resolve_item(
 ):
     """Applies the choice at once (from the Airtable values of the latest
     run) and logs it. Refused with 409 while a run is going."""
+    post = resolutions.PostCommit()
     try:
-        data = resolutions.resolve_item(db, item_id, choice=request.choice, data=request.data, current=current)
+        data = resolutions.resolve_item(db, item_id, choice=request.choice, data=request.data, current=current, post_commit=post)
     except AirtableSyncError as e:
         db.rollback()
         raise _conflict(e)
@@ -332,4 +336,30 @@ def resolve_item(
         db.rollback()
         raise HTTPException(status_code=404, detail="Item not found")
     db.commit()
+    post.run(db)  # old headshot objects, then the lock sweep: after the commit
+    return {"data": data}
+
+
+@router.post(
+    "/items/bulk-resolve",
+    response_model=BulkResolveAPIResponse,
+    summary="Answer several items with one choice (Accept all / Keep all)",
+    responses={**FORBIDDEN_RESPONSE, 409: {"description": "A run is in progress"}},
+)
+def bulk_resolve_items(
+    request: BulkResolveRequest,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+):
+    """One transaction per item, in id order, stopping at the first error:
+    `failed` names it (with the 409 it would have answered) and
+    `not_attempted` lists the rest. 409 if a run is in progress at the start;
+    one starting midway stops the loop like any other error."""
+    try:
+        data = resolutions.bulk_resolve(
+            db, item_ids=request.item_ids, run_id=request.run_id, kind=request.kind, choice=request.choice, current=current
+        )
+    except AirtableSyncError as e:
+        db.rollback()
+        raise _conflict(e)
     return {"data": data}

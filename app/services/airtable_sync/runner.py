@@ -50,6 +50,7 @@ from app.services.airtable_sync.airtable_reader import (
     Snapshot,
     SyncConfig,
 )
+from app.services.airtable_sync.lock_sweep import ACCESS_REMOVED, release_unauthorized_locks
 from app.services.airtable_sync.settings_service import AirtableSyncError
 from app.services.airtable_sync.steps import STEP_FUNCTIONS
 
@@ -404,6 +405,9 @@ class SyncRunner:
                 summary["steps"][step] = self.step_functions[step](ctx) or {}
                 ctx.commit()
             summary.pop("current_step", None)
+            if ctx.state.get(ACCESS_REMOVED) and not started.dry_run:
+                # Once per run: whoever lost edit() keeps no lock (lock_sweep.py).
+                summary["locks_released"] = release_unauthorized_locks(db)
             status, error = "succeeded", None
         except (AirtableSyncConfigError, AirtableReadError, PreviewWriteError) as exc:
             _quiet_rollback(db)

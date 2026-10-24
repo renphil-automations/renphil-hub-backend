@@ -442,6 +442,25 @@ class Settings(BaseSettings):
     AIRTABLE_SYNC_USERS_POST_ON_WEBSITE_FIELD: str | None = None
     AIRTABLE_SYNC_USERS_NEW_HEADSHOT_BIO_FIELD: str | None = None
     AIRTABLE_SYNC_USERS_ADD_TO_WEBSITE_DATE_FIELD: str | None = None
+    # The sync's own names for four fields whose shared USERS_* setting
+    # names a field Airtable doesn't have (owner, 2026-10-23). Blank → the
+    # shared setting is used.
+    AIRTABLE_SYNC_USERS_START_DATE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_END_DATE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_OFFICE_LOCATION_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_TECH_STACK_FIELD: str | None = None
+
+    # ══════════════════════════════════════════════════════════════════
+    # Cloudflare R2: headshots copied by the Airtable sync (plan v2 §7)
+    # ══════════════════════════════════════════════════════════════════
+    # Optional: without them the sync skips the Headshot field (one warning
+    # per run). The two keys are secrets: never log or print them.
+    R2_ACCESS_KEY_ID: str | None = None
+    R2_SECRET_ACCESS_KEY: str | None = None
+    R2_BUCKET: str | None = None
+    R2_ENDPOINT_URL: str | None = None
+    R2_KEY_PREFIX: str | None = None  # e.g. "headshots/" (trailing slash)
+    R2_PUBLIC_BASE_URL: str | None = None  # e.g. "https://pub-….r2.dev"
 
     # ══════════════════════════════════════════════════════════════════
     # Gemini (Google Generative AI)

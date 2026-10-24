@@ -25,6 +25,7 @@ from pyairtable import retry_strategy as _pyairtable_retry_strategy
 
 from app.config import get_settings
 from app.services.airtable_sync import normalize
+from app.services.airtable_sync import r2 as r2_store
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +88,14 @@ def designation_choices() -> list[str]:
 class FieldSpec:
     """One Airtable field the sync reads. `name` is the logical name the
     steps use; `setting` the config key holding the Airtable field name;
-    `kind` picks the normalizer (normalize.NORMALIZERS)."""
+    `kind` picks the normalizer (normalize.NORMALIZERS). `fallback` is a
+    second setting read when `setting` is blank (a shared USERS_* setting
+    the sync has its own name for)."""
 
     name: str
     setting: str
     kind: str = "text"
+    fallback: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,8 +147,11 @@ USERS = TableSpec(
         FieldSpec("work_email", "USERS_WORK_EMAIL_FIELD", "email"),
         FieldSpec("alias_email", "USERS_ALIAS_EMAIL_FIELD", "email"),
     ),
-    # v1 plan §6.1 (a DRAFT until E-1). Department and Program are HR fields
-    # only since plan v2 §3.2.
+    # v1 plan §6.1 (the draft, confirmed by the owner 2026-10-23, E-1).
+    # Department and Program are HR fields only since plan v2 §3.2. Which of
+    # these the sync merges, and how, is hr_fields.HR_FIELDS; `is_fellow` is
+    # derived from Employment Type there (owner, 2026-10-23), so its own
+    # setting stays blank.
     optional=(
         FieldSpec("first_name", "USERS_FIRST_NAME_FIELD"),
         FieldSpec("last_name", "USERS_LAST_NAME_FIELD"),
@@ -154,20 +161,25 @@ USERS = TableSpec(
         FieldSpec("is_fellow", "AIRTABLE_SYNC_USERS_IS_FELLOW_FIELD", "checkbox"),
         FieldSpec("department", "USERS_DEPARTMENT_FIELD"),
         FieldSpec("program", "USERS_PROGRAM_FIELD"),
-        FieldSpec("start_date", "USERS_START_DATE_FIELD", "date"),
+        FieldSpec("start_date", "AIRTABLE_SYNC_USERS_START_DATE_FIELD", "date", fallback="USERS_START_DATE_FIELD"),
         FieldSpec("personal_email", "USERS_PERSONAL_EMAIL_FIELD", "email"),
         FieldSpec("position", "USERS_POSITION_FIELD"),
         FieldSpec("dob", "USERS_DOB_FIELD", "date"),
         FieldSpec("birthday_shoutout_opt_out", "AIRTABLE_SYNC_USERS_BIRTHDAY_OPT_OUT_FIELD", "checkbox"),
         FieldSpec("post_on_website", "AIRTABLE_SYNC_USERS_POST_ON_WEBSITE_FIELD", "checkbox"),
         FieldSpec("headshot", "USERS_HEADSHOT_FIELD", "attachments"),
-        FieldSpec("office_location", "USERS_OFFICE_LOCATION_FIELD"),
+        FieldSpec("office_location", "AIRTABLE_SYNC_USERS_OFFICE_LOCATION_FIELD", fallback="USERS_OFFICE_LOCATION_FIELD"),
         FieldSpec("home_address", "USERS_HOME_ADDRESS_FIELD"),
         FieldSpec("bio", "USERS_BIO_FIELD"),
         FieldSpec("scope_of_work", "USERS_SCOPE_OF_WORK_FIELD"),
         FieldSpec("new_headshot_bio_to_website", "AIRTABLE_SYNC_USERS_NEW_HEADSHOT_BIO_FIELD"),
-        FieldSpec("end_date", "USERS_END_DATE_FIELD", "date"),
-        FieldSpec("manager_tech_stack_selections", "USERS_TECH_STACK_SELECTIONS_FIELD", "multi"),
+        FieldSpec("end_date", "AIRTABLE_SYNC_USERS_END_DATE_FIELD", "date", fallback="USERS_END_DATE_FIELD"),
+        FieldSpec(
+            "manager_tech_stack_selections",
+            "AIRTABLE_SYNC_USERS_TECH_STACK_FIELD",
+            "multi",
+            fallback="USERS_TECH_STACK_SELECTIONS_FIELD",
+        ),
         FieldSpec("add_to_website_date", "AIRTABLE_SYNC_USERS_ADD_TO_WEBSITE_DATE_FIELD", "datetime"),
     ),
 )
@@ -198,6 +210,9 @@ class ResolvedTable:
     required: dict[str, str]  # logical name -> Airtable field name
     optional: dict[str, str]
     unconfigured: tuple[str, ...]  # optional fields whose setting is blank
+    # optional logical name -> the setting that supplied it (its `fallback`
+    # when its own setting is blank), for messages
+    optional_settings: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -208,6 +223,9 @@ class SyncConfig:
     base_id: str
     api_key: str = field(repr=False)
     tables: tuple[ResolvedTable, ...]
+    # Headshots (plan v2 §7): None when any R2 setting is blank, and then the
+    # Users step skips the Headshot field with one warning per run.
+    r2: r2_store.R2Config | None = None
 
     def table(self, entity: str) -> ResolvedTable:
         return next(t for t in self.tables if t.spec.entity == entity)
@@ -237,12 +255,18 @@ def build_config(settings: Any) -> SyncConfig:
     for spec in TABLE_SPECS:
         table_id = need(spec.table_setting)
         required = {f.name: need(f.setting) for f in spec.required}
-        optional = {f.name: v for f in spec.optional if (v := _setting(settings, f.setting))}
+        optional: dict[str, str] = {}
+        optional_settings: dict[str, str] = {}
+        for f in spec.optional:
+            for setting in (f.setting, f.fallback):
+                if setting and (value := _setting(settings, setting)):
+                    optional[f.name], optional_settings[f.name] = value, setting
+                    break
         unconfigured = tuple(f.setting for f in spec.optional if f.name not in optional)
-        tables.append(ResolvedTable(spec, table_id, required, optional, unconfigured))
+        tables.append(ResolvedTable(spec, table_id, required, optional, unconfigured, optional_settings))
     if missing:
         raise AirtableSyncConfigError(f"Missing setting(s): {', '.join(missing)}")
-    return SyncConfig(base_id=base_id, api_key=api_key, tables=tuple(tables))
+    return SyncConfig(base_id=base_id, api_key=api_key, tables=tuple(tables), r2=r2_store.R2Config.from_settings(settings))
 
 
 class AirtableSource(Protocol):
@@ -383,7 +407,8 @@ def read_snapshot(source: AirtableSource, config: SyncConfig) -> Snapshot:
             if airtable_name in names:
                 readable_optional[spec.name] = airtable_name
             else:
-                optional_missing.append(f"{spec.setting} ({airtable_name!r} not in {table.spec.label})")
+                setting = table.optional_settings.get(spec.name, spec.setting)
+                optional_missing.append(f"{setting} ({airtable_name!r} not in {table.spec.label})")
         columns = {**table.required, **readable_optional}
         kinds = {f.name: f.kind for f in (*table.spec.required, *table.spec.optional)}
         raw = _call(config, table, "records", lambda t=table, c=columns: source.records(t.table_id, list(c.values())))
