@@ -1037,7 +1037,7 @@ def _require_airtable_index_sync_token(
 
     provided = (x_sync_token or "").strip()
 
-    if not provided or not hmac.compare_digest(provided, expected):
+    if not provided or not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid sync token.",
@@ -1090,7 +1090,7 @@ def _verify_airtable_personal_identity(
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(supplied_signature, expected):
+    if not hmac.compare_digest(supplied_signature.encode("utf-8"), expected.encode("ascii")):
         raise _invalid_airtable_personal_identity()
 
     try:

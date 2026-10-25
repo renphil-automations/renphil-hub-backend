@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 import unittest
@@ -88,11 +87,11 @@ class BotManagementMcpSettingsTests(_Base):
         with patch.object(bot_management, "hub_admin_target_ids", return_value=(1, [10])), \
                 patch.object(bot_management, "effective_pairs", return_value={(1, 22)}):
             with self.assertRaises(HTTPException) as caught:
-                asyncio.run(bot_management.require_bot_management_admin(current=current, db=self.db))
+                bot_management.require_bot_management_admin(current=current, db=self.db)
             self.assertEqual(caught.exception.status_code, 403)
         with patch.object(bot_management, "hub_admin_target_ids", return_value=(1, [10])), \
                 patch.object(bot_management, "effective_pairs", return_value={(1, 10)}):
-            self.assertEqual(asyncio.run(bot_management.require_bot_management_admin(current=current, db=self.db)), ADMIN)
+            self.assertEqual(bot_management.require_bot_management_admin(current=current, db=self.db), ADMIN)
 
     def test_a_save_based_on_an_older_version_is_rejected_with_409(self):
         with patch("app.config.get_settings", return_value=_app_settings()):
@@ -269,6 +268,27 @@ class BotManagementMcpAnalyticsTests(_Base):
         self.assertEqual(totals["total_elapsed_ms"], 11000)
         self.assertAlmostEqual(totals["average_elapsed_ms"], 11000 / 3, places=1)
         self.assertEqual(summary["mcp"], {"call_count": 3, "succeeded_count": 2, "failed_count": 1, "average_elapsed_ms": round((900 + 700 + 50000) / 3, 2)})
+
+    def test_summary_breaks_runs_down_by_type(self):
+        # Ported Analytics view (QA 2026-10-25): breakdown under "Tracked runs".
+        summary = bot_management.get_bot_analytics_summary(**self._filters(), db=self.db)
+        self.assertEqual(summary["type_breakdown"], {"request_count": 2, "background_job_count": 1, "mcp_call_count": 3})
+        self.assertEqual(summary["totals"]["run_count"], 3)  # MCP still never counts as answers
+
+    def test_breakdown_follows_the_active_filters(self):
+        summary = bot_management.get_bot_analytics_summary(**self._filters(actor_email="ben@renphil.org"), db=self.db)
+        self.assertEqual(summary["type_breakdown"], {"request_count": 0, "background_job_count": 0, "mcp_call_count": 2})
+
+    def test_chart_points_carry_the_job_name(self):
+        # Ported "Usage by job" chart groups background jobs by name.
+        with self.engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO bot_telemetry_runs (id, actor_email, actor_kind, kind, job_name, started_at, finished_at, elapsed_ms, status)
+                VALUES (:id, NULL, 'system', 'job', 'nightly-index', :t, :t, 1200, 'succeeded')
+            """), {"id": str(uuid.uuid4()), "t": datetime(2026, 10, 20, 13, 0, tzinfo=timezone.utc)})
+        points = bot_management.get_bot_analytics_chart_data(**self._filters(), db=self.db)["data"]
+        self.assertIn("job_name", points[0])
+        self.assertIn("nightly-index", {point["job_name"] for point in points if point["kind"] == "job"})
 
     def test_charts_exclude_mcp_unless_mcp_is_selected(self):
         points = bot_management.get_bot_analytics_chart_data(**self._filters(), db=self.db)["data"]

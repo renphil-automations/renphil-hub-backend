@@ -104,9 +104,10 @@ def verify_token_request_proof(
     jti = claims.get("jti")
     if not isinstance(jti, str) or not jti.strip() or len(jti) > 256:
         raise McpDPoPError("DPoP proof identifier is invalid.")
-    if not hmac.compare_digest(str(claims.get("htm") or "").upper(), "POST"):
+    # Claims are client-controlled; compare bytes so non-ASCII is a 400, not a TypeError 500.
+    if not hmac.compare_digest(str(claims.get("htm") or "").upper().encode("utf-8"), b"POST"):
         raise McpDPoPError("DPoP proof method binding is invalid.")
-    if not hmac.compare_digest(canonical_htu(str(claims.get("htu") or "")), canonical_htu(token_endpoint)):
+    if not hmac.compare_digest(canonical_htu(str(claims.get("htu") or "")).encode("utf-8"), canonical_htu(token_endpoint).encode("utf-8")):
         raise McpDPoPError("DPoP proof URL binding is invalid.")
     issued_raw = claims.get("iat")
     if isinstance(issued_raw, bool) or not isinstance(issued_raw, (int, float)):

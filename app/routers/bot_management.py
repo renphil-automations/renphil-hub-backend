@@ -35,6 +35,7 @@ from app.config import get_settings as get_app_settings
 from app.services.bot_feedback_service import as_record, find_bot_feedback, list_bot_feedback
 from app.services.feedback_status_service import FeedbackStatusUnavailable, set_status, status_ready
 from app.models.auth import UserInfo
+from app.services import bot_settings_edit_lock as edit_lock
 from app.services.rbac_graph_service import effective_pairs, hub_admin_target_ids
 
 
@@ -110,7 +111,9 @@ def _validate_active_model_key(
             detail="The selected model is not currently certified and configured.",
         )
 
-async def require_bot_management_admin(
+# Sync on purpose: FastAPI runs it in the threadpool, so its blocking Postgres
+# queries never stall the event loop (and the Agent's live-ACL callbacks).
+def require_bot_management_admin(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> UserInfo:
@@ -366,7 +369,7 @@ def _analytics_chart_rows(
         where_sql = f"{where_sql} AND {_NOT_MCP}"
     try:
         rows = db.execute(text(f"""
-            SELECT runs.actor_email, runs.kind, runs.started_at, runs.elapsed_ms
+            SELECT runs.actor_email, runs.kind, runs.job_name, runs.started_at, runs.elapsed_ms
             FROM bot_telemetry_runs AS runs
             WHERE {where_sql}
             ORDER BY runs.started_at DESC, runs.id DESC
@@ -378,6 +381,7 @@ def _analytics_chart_rows(
         {
             "actor_email": row["actor_email"],
             "kind": row["kind"],
+            "job_name": row["job_name"],
             "started_at": row["started_at"],
             "elapsed_ms": row["elapsed_ms"],
         }
@@ -966,12 +970,20 @@ def update_settings(
     active_model_key = request.active_model_key.strip().lower()
     if not active_model_key:
         raise HTTPException(status_code=422, detail="active_model_key is required")
+    _refuse_if_edited_by_another_admin(current_user)
 
-    _validate_active_model_key(
-        active_model_key,
-        http_request.headers.get("Authorization"),
-    )
-    if request.google_drive_knowledge_enabled and not _drive_runtime_status(
+    # Remote Agent checks guard only changes that need them, so turning things
+    # off (External AI, a provider, RenPhil AI, Drive) never depends on the
+    # Agent being reachable. The expected-version check under the row lock
+    # below rejects any save whose comparison base was concurrently replaced.
+    saved = _normalized_settings(_active_version(db).settings)
+    if active_model_key != str(saved.get("active_model_key") or "").strip().lower():
+        _validate_active_model_key(
+            active_model_key,
+            http_request.headers.get("Authorization"),
+        )
+    turning_drive_on = bool(request.google_drive_knowledge_enabled) and not saved.get("google_drive_knowledge_enabled")
+    if turning_drive_on and not _drive_runtime_status(
         http_request.headers.get("authorization")
     )["drive_knowledge"]["available"]:
         raise HTTPException(
@@ -1003,6 +1015,7 @@ def update_settings(
         settings,
         "settings_updated",
     )
+    edit_lock.release(current_user)
     return {"active": _version_payload(version)}
 
 
@@ -1011,13 +1024,48 @@ def reset_settings(
     current_user: UserInfo = Depends(require_bot_management_admin),
     db: Session = Depends(get_db_v2),
 ):
+    _refuse_if_edited_by_another_admin(current_user)
     version = _save_version(
         db,
         current_user,
         _normalized_settings(_default_version(db).settings),
         "settings_reset_to_default",
     )
+    edit_lock.release(current_user)
     return {"active": _version_payload(version)}
+
+
+def _refuse_if_edited_by_another_admin(current_user: UserInfo) -> None:
+    holder = edit_lock.held_by_other(current_user)
+    if holder is not None:
+        raise HTTPException(
+            status_code=423,
+            detail=f"Bot Management is being edited by {holder.name}. Try again after they save or discard their changes.",
+        )
+
+
+@router.get("/settings/lock")
+def get_settings_lock(current_user: UserInfo = Depends(require_bot_management_admin)):
+    holder = edit_lock.current()
+    return {"edit_lock": holder.payload(current_user) if holder else None, "ttl_seconds": edit_lock.LOCK_TTL_SECONDS}
+
+
+@router.post("/settings/lock")
+def acquire_settings_lock(current_user: UserInfo = Depends(require_bot_management_admin)):
+    """Take (or refresh while editing) the settings edit lock."""
+    granted, holder = edit_lock.acquire(current_user)
+    if not granted and holder is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Bot Management is being edited by {holder.name}. Your changes were not started.",
+        )
+    return {"edit_lock": holder.payload(current_user) if holder else None, "ttl_seconds": edit_lock.LOCK_TTL_SECONDS}
+
+
+@router.delete("/settings/lock")
+def release_settings_lock(current_user: UserInfo = Depends(require_bot_management_admin)):
+    edit_lock.release(current_user)
+    return {"edit_lock": None}
 
 
 @router.get("/settings/audit")
@@ -1167,6 +1215,12 @@ def get_bot_analytics_summary(
             "average_elapsed_ms": round(float(totals["mcp_average_elapsed_ms"] or 0), 2),
         },
         "tokens": {key: int(value or 0) for key, value in token_totals.items()},
+        # Per-type counts for the current filters, shown under "Tracked runs".
+        "type_breakdown": {
+            "request_count": int(totals["request_count"] or 0),
+            "background_job_count": int(totals["background_job_count"] or 0),
+            "mcp_call_count": int(totals["mcp_call_count"] or 0),
+        },
     }
 
 
