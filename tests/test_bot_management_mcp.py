@@ -279,6 +279,19 @@ class BotManagementMcpAnalyticsTests(_Base):
         summary = bot_management.get_bot_analytics_summary(**self._filters(actor_email="ben@renphil.org"), db=self.db)
         self.assertEqual(summary["type_breakdown"], {"request_count": 0, "background_job_count": 0, "mcp_call_count": 2})
 
+    def test_mcp_view_primary_cards_use_mcp_counts_not_answer_counts(self):
+        summary = bot_management.get_bot_analytics_summary(**self._filters(kind="mcp"), db=self.db)
+        self.assertEqual(summary["totals"]["run_count"], 3)
+        self.assertEqual((summary["totals"]["succeeded_count"], summary["totals"]["failed_count"]), (2, 1))
+        self.assertEqual(summary["totals"]["total_elapsed_ms"], 51600)
+        self.assertAlmostEqual(summary["totals"]["average_elapsed_ms"], 51600 / 3, places=1)
+
+    def test_provider_view_primary_cards_use_only_that_provider_mcp_calls(self):
+        summary = bot_management.get_bot_analytics_summary(**self._filters(provider="claude"), db=self.db)
+        self.assertEqual(summary["totals"]["run_count"], 1)
+        self.assertEqual(summary["totals"]["succeeded_count"], 1)
+        self.assertEqual(summary["totals"]["total_elapsed_ms"], 700)
+
     def test_chart_points_carry_the_job_name(self):
         # Ported "Usage by job" chart groups background jobs by name.
         with self.engine.begin() as connection:

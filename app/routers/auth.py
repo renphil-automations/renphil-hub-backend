@@ -44,6 +44,8 @@ async def login(
     auth_service: AuthService = Depends(get_auth_service),
 ):
     """Redirect the caller to the Google consent screen."""
+    if not auth_service.is_allowed_login_redirect_uri(redirect_uri):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid login redirect URI.")
     url = auth_service.get_authorization_url(redirect_uri)
     return RedirectResponse(url)
 

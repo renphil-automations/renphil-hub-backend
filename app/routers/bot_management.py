@@ -1167,16 +1167,21 @@ def get_bot_analytics_summary(
         date_from=date_from, date_to=date_to, actor_email=actor_email,
         model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search, provider=provider,
     )
+    # The primary cards describe the view the administrator selected. The
+    # unfiltered/dashboard view deliberately excludes MCP tool calls so they
+    # cannot inflate answer usage, but an explicit MCP or provider filter must
+    # show real MCP counts, durations, and outcomes rather than zeros.
+    primary_kind_sql = "runs.kind = 'mcp'" if _mcp_scope(kind, provider) else _NOT_MCP
     try:
         totals = db.execute(text(f"""
-            SELECT SUM(CASE WHEN {_NOT_MCP} THEN 1 ELSE 0 END) AS run_count,
+            SELECT SUM(CASE WHEN {primary_kind_sql} THEN 1 ELSE 0 END) AS run_count,
                    SUM(CASE WHEN runs.kind = 'request' THEN 1 ELSE 0 END) AS request_count,
                    SUM(CASE WHEN runs.kind = 'job' THEN 1 ELSE 0 END) AS background_job_count,
-                   SUM(CASE WHEN {_NOT_MCP} AND runs.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded_count,
-                   SUM(CASE WHEN {_NOT_MCP} AND runs.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-                   SUM(CASE WHEN {_NOT_MCP} AND runs.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
-                   COALESCE(SUM(CASE WHEN {_NOT_MCP} THEN runs.elapsed_ms END), 0) AS total_elapsed_ms,
-                   AVG(CASE WHEN {_NOT_MCP} THEN runs.elapsed_ms END) AS average_elapsed_ms,
+                   SUM(CASE WHEN {primary_kind_sql} AND runs.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded_count,
+                   SUM(CASE WHEN {primary_kind_sql} AND runs.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                   SUM(CASE WHEN {primary_kind_sql} AND runs.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+                   COALESCE(SUM(CASE WHEN {primary_kind_sql} THEN runs.elapsed_ms END), 0) AS total_elapsed_ms,
+                   AVG(CASE WHEN {primary_kind_sql} THEN runs.elapsed_ms END) AS average_elapsed_ms,
                    SUM(CASE WHEN runs.kind = 'mcp' THEN 1 ELSE 0 END) AS mcp_call_count,
                    SUM(CASE WHEN runs.kind = 'mcp' AND runs.status = 'succeeded' THEN 1 ELSE 0 END) AS mcp_succeeded_count,
                    SUM(CASE WHEN runs.kind = 'mcp' AND runs.status = 'failed' THEN 1 ELSE 0 END) AS mcp_failed_count,

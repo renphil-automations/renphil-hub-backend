@@ -36,6 +36,7 @@ from sqlalchemy.pool import StaticPool
 
 import app.routers.auth as auth_router
 import app.routers.mcp_oauth as mcp_oauth_router
+from app.config import get_settings
 from app.db_v2.database import BaseV2, get_db_v2
 from app.db_v2.models.bot_management import BotConfigurationStateV2, BotConfigurationVersionV2
 from app.db_v2.models.mcp_oauth import McpOAuthAuthorizationCodeV2, McpOAuthAuthorizationRequestV2
@@ -529,7 +530,8 @@ class CompatibilityBoundaryTests(_Base):
     def test_hub_google_login_is_unchanged_and_never_throttled_even_when_mcp_limiter_is_down_or_exhausted(self):
         app = self._full_app()
         http = TestClient(app, follow_redirects=False)
-        before = http.get("/auth/login", params={"redirect_uri": "https://hub-frontend.example/auth/callback"})
+        frontend_uri = f"{get_settings().ALLOWED_ORIGINS[0].rstrip('/')}/auth/callback"
+        before = http.get("/auth/login", params={"redirect_uri": frontend_uri})
         self.assertEqual(before.status_code, 307)
         location = urlsplit(before.headers["location"])
         self.assertEqual(location.netloc, "accounts.google.com")
@@ -539,7 +541,7 @@ class CompatibilityBoundaryTests(_Base):
         # Exhaust and then break the MCP limiter: Hub login is unaffected.
         self.redis.down = True
         for _ in range(200):
-            response = http.get("/auth/login", params={"redirect_uri": "https://hub-frontend.example/auth/callback"}, headers={"x-forwarded-for": CLIENT_IP})
+            response = http.get("/auth/login", params={"redirect_uri": frontend_uri}, headers={"x-forwarded-for": CLIENT_IP})
             self.assertEqual(response.status_code, 307)
             self.assertEqual(urlsplit(response.headers["location"]).netloc, "accounts.google.com")
         self.assertEqual(self.redis.calls, [])
