@@ -1610,11 +1610,12 @@ async def get_airtable_personal_context(
     """
 
     email = str(identity.get("email") or "").strip().lower()
-    roles = [
-        str(role).strip()
-        for role in (identity.get("roles") or [])
-        if str(role).strip()
-    ]
+    # The signed context binds the user email to the trusted Agent, but roles
+    # inside it are a login-time JWT snapshot. Reload current Hub roles before
+    # any component visibility decision so revocations and All Scopes changes
+    # take effect immediately.
+    live_roles = await airtable_service.get_user_roles(email)
+    roles = [str(role).strip() for role in live_roles if str(role).strip()]
 
     links = await asyncio.to_thread(list_airtable_component_links, db)
     total_links = len(links)
