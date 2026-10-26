@@ -440,6 +440,10 @@ class ThreadRevisionModerationSummary(BaseModel):
     can_moderate: bool
     moderated_component_count: int
     pending_count: int
+    view_as: bool = Field(
+        default=False,
+        description="True when computed for the role/scope given in view_as_role/view_as_scope.",
+    )
 
 
 class ThreadModerationListResponse(BaseModel):
@@ -455,6 +459,10 @@ class ThreadModerationSummary(BaseModel):
     can_moderate: bool
     moderated_component_count: int
     pending_count: int
+    view_as: bool = Field(
+        default=False,
+        description="True when computed for the role/scope given in view_as_role/view_as_scope.",
+    )
 
 
 class ThreadWidgetCounts(BaseModel):

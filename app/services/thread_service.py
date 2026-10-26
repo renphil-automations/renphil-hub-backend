@@ -1623,6 +1623,7 @@ def list_threads_for_link(
     user: UserInfo,
     *,
     access: ViewerAccess | None = None,
+    anonymous: bool = False,
 ) -> ThreadListResponse:
     component = _get_thread_widget_component(db, link)
     if component is None:
@@ -1632,17 +1633,18 @@ def list_threads_for_link(
     # plan §5.5 — every approved thread, plus the CALLER'S OWN pending/
     # rejected ones (M3: an author sees their own non-approved threads with
     # a status badge; nobody else's pending/rejected rows appear in the
-    # widget's list at all).
-    query = db.query(ThreadV2).filter(
-        ThreadV2.component_id == component.id,
-        or_(
-            ThreadV2.status == THREAD_STATUS_APPROVED,
+    # widget's list at all). `anonymous=True` drops that second arm, so the
+    # list is exactly what any other viewer would get: approved only.
+    visible_status = ThreadV2.status == THREAD_STATUS_APPROVED
+    if not anonymous:
+        visible_status = or_(
+            visible_status,
             and_(
                 ThreadV2.author_email == _norm_email(user.email),
                 ThreadV2.status.in_((THREAD_STATUS_PENDING, THREAD_STATUS_REJECTED)),
             ),
-        ),
-    )
+        )
+    query = db.query(ThreadV2).filter(ThreadV2.component_id == component.id, visible_status)
     if cursor:
         after_created_at, after_id = _decode_cursor(cursor)
         # A row comparison, not two ANDed predicates (plan §4.3, finding
@@ -2588,7 +2590,7 @@ def thread_history_facets(
 
 
 def moderation_summary(
-    db: Session, *, access: ViewerAccess | None = None
+    db: Session, *, access: ViewerAccess | None = None, view_as: bool = False
 ) -> tuple[ThreadModerationSummary, str]:
     """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
     top of the `ViewerAccess` the dependency already built; polled like the
@@ -2599,17 +2601,23 @@ def moderation_summary(
     browser's own HTTP cache revalidate one user's request against
     another's cached body). A Hub Admin with zero thread widgets still gets
     `can_moderate=True` — the section is part of their admin surface
-    regardless of whether any widget currently has a thread on it."""
+    regardless of whether any widget currently has a thread on it.
+
+    `view_as=True` means `access` was built for an adopted role/scope
+    (`dependencies.get_view_as_access`) — so direct-to-user grants are
+    already absent from it. The flag is echoed in the body and suffixes the
+    ETag (`-va`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
+    etag_suffix = "-va" if view_as else ""
 
     if not component_ids:
         return (
             ThreadModerationSummary(
-                can_moderate=can_moderate, moderated_component_count=0, pending_count=0
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0, view_as=view_as
             ),
-            f'"{can_moderate_flag}-0-0-0"',
+            f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
 
     count, max_id = (
@@ -2620,13 +2628,14 @@ def moderation_summary(
     count = int(count or 0)
     etag = (
         f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
-        f'{int(max_id) if max_id is not None else 0}"'
+        f'{int(max_id) if max_id is not None else 0}{etag_suffix}"'
     )
     return (
         ThreadModerationSummary(
             can_moderate=can_moderate,
             moderated_component_count=len(component_ids),
             pending_count=count,
+            view_as=view_as,
         ),
         etag,
     )
@@ -2879,7 +2888,7 @@ def revision_history_facets(
 
 
 def revision_moderation_summary(
-    db: Session, *, access: ViewerAccess | None = None
+    db: Session, *, access: ViewerAccess | None = None, view_as: bool = False
 ) -> tuple[ThreadRevisionModerationSummary, str]:
     """`GET /threads/revision-moderation/summary` — Revision Management's
     own sidebar badge (amendment A4), the same shape and ETag discipline as
@@ -2887,17 +2896,18 @@ def revision_moderation_summary(
     `"{1 if can_moderate else 0}-{n_components}-{pending}-{max_pending_id}"`
     — so two callers with different bodies never share a tag (followups
     §1). Counts pending REVISIONS only; new threads are Threads
-    Management's."""
+    Management's. `view_as` behaves exactly as in `moderation_summary`."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
+    etag_suffix = "-va" if view_as else ""
 
     if not component_ids:
         return (
             ThreadRevisionModerationSummary(
-                can_moderate=can_moderate, moderated_component_count=0, pending_count=0
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0, view_as=view_as
             ),
-            f'"{can_moderate_flag}-0-0-0"',
+            f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
 
     count, max_id = (
@@ -2912,13 +2922,14 @@ def revision_moderation_summary(
     count = int(count or 0)
     etag = (
         f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
-        f'{int(max_id) if max_id is not None else 0}"'
+        f'{int(max_id) if max_id is not None else 0}{etag_suffix}"'
     )
     return (
         ThreadRevisionModerationSummary(
             can_moderate=can_moderate,
             moderated_component_count=len(component_ids),
             pending_count=count,
+            view_as=view_as,
         ),
         etag,
     )

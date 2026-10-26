@@ -69,8 +69,10 @@ from sqlalchemy.orm import Session
 from app.db_v2.database import get_db_v2
 from app.dependencies import (
     CurrentHubUser,
+    ViewAsAccess,
     get_current_hub_user,
     get_current_user,
+    get_view_as_access,
     get_viewer_access,
     is_hub_admin,
 )
@@ -109,6 +111,11 @@ from app.services.rbac_graph_service import RbacClosures
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["Threads"])
+
+VIEW_AS_ERROR_RESPONSES = {
+    400: {"description": "View As: only one of view_as_role/view_as_scope given, or an unknown key"},
+    403: {"description": "View As refused: the caller may not adopt the given role/scope"},
+}
 
 
 # ---------------------------------------------------------
@@ -202,12 +209,16 @@ async def get_thread_widget_counts(
 async def list_threads(
     link: str = Path(..., description="The thread widget component's stable `link`."),
     cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    anonymous: bool = Query(
+        default=False,
+        description="When true, leave out the caller's own pending and rejected threads (approved threads only).",
+    ),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.list_threads_for_link, db, link, cursor, user, access=access
+        thread_service.list_threads_for_link, db, link, cursor, user, access=access, anonymous=anonymous
     )
 
 
@@ -310,14 +321,20 @@ async def get_thread_history_facets(
     "/threads/moderation/summary",
     response_model=ThreadModerationSummary,
     summary="Whether the caller moderates anything, and how many threads are pending",
+    responses=VIEW_AS_ERROR_RESPONSES,
 )
 async def get_moderation_summary(
     request: Request,
     response: Response,
     db: Session = Depends(get_db_v2),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    summary, etag = await asyncio.to_thread(thread_service.moderation_summary, db, access=access)
+    summary, etag = await asyncio.to_thread(
+        thread_service.moderation_summary,
+        db,
+        access=view_as_access.access,
+        view_as=view_as_access.view_as,
+    )
     # Same 304-on-unchanged shape as `/notifications/unread-count` above.
     # `Cache-Control: no-store` on both the 200 and the 304 (followups plan
     # §1) so the browser's own HTTP cache never stores this body — that
@@ -420,15 +437,19 @@ async def get_revision_history_facets(
     "/threads/revision-moderation/summary",
     response_model=ThreadRevisionModerationSummary,
     summary="Whether the caller moderates anything, and how many revisions are pending",
+    responses=VIEW_AS_ERROR_RESPONSES,
 )
 async def get_revision_moderation_summary(
     request: Request,
     response: Response,
     db: Session = Depends(get_db_v2),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
     summary, etag = await asyncio.to_thread(
-        thread_service.revision_moderation_summary, db, access=access
+        thread_service.revision_moderation_summary,
+        db,
+        access=view_as_access.access,
+        view_as=view_as_access.view_as,
     )
     # Identical discipline to `/threads/moderation/summary` above: no-store
     # on both the 200 and the 304, 304 only for JS's own If-None-Match.

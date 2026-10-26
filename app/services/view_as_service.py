@@ -31,7 +31,7 @@ from app.db_v2.models.role import RoleV2
 from app.db_v2.models.scope import ScopeV2
 from app.db_v2.models.user import UserV2
 from app.services.access_visibility_service import ViewerAccess, build_node_tree, fold
-from app.services.rbac_graph_service import RbacClosures, held_assignments, hub_admin_target_ids
+from app.services.rbac_graph_service import HeldClosure, RbacClosures, held_assignments, hub_admin_target_ids
 from app.services.resource_grant_service import seeds_for_principal
 
 logger = logging.getLogger(__name__)
@@ -51,8 +51,10 @@ class ViewAsError(Exception):
 @dataclass(frozen=True)
 class ViewAsTarget:
     role_id: int
+    role_key: str
     role_name: str
     scope_id: int
+    scope_key: str
     scope_name: str
 
 
@@ -92,8 +94,12 @@ def _public_scope_ids(db: Session) -> set[int]:
     return {row[0] for row in db.query(ScopeV2.id).filter(ScopeV2.is_public.is_(True)).all()}
 
 
-def _sorted_id_names(rows) -> list[dict]:
-    return [{"id": row_id, "name": name} for row_id, name in sorted(rows, key=lambda r: (r[1].lower(), r[0]))]
+def _sorted_options(rows) -> list[dict]:
+    """``(id, key, name)`` rows → ``[{"id", "key", "name"}]`` sorted by name."""
+    return [
+        {"id": row_id, "key": key, "name": name}
+        for row_id, key, name in sorted(rows, key=lambda r: (r[2].lower(), r[0]))
+    ]
 
 
 def viewable_scope_ids(db: Session, user_id: int, *, closures: RbacClosures | None = None) -> set[int]:
@@ -122,16 +128,24 @@ def viewable_role_ids(
 
 
 def list_viewable_scopes(db: Session, user_id: int) -> list[dict]:
-    """``[{"id", "name"}]`` for every scope ``viewable_scope_ids`` allows,
-    unique and sorted by name."""
+    """``[{"id", "key", "name", "is_universal"}]`` for every scope
+    ``viewable_scope_ids`` allows, unique and sorted by name."""
     scope_ids = viewable_scope_ids(db, user_id)
     if not scope_ids:
         return []
-    return _sorted_id_names(db.query(ScopeV2.id, ScopeV2.name).filter(ScopeV2.id.in_(scope_ids)).all())
+    rows = (
+        db.query(ScopeV2.id, ScopeV2.key, ScopeV2.name, ScopeV2.is_universal)
+        .filter(ScopeV2.id.in_(scope_ids))
+        .all()
+    )
+    return [
+        {"id": scope_id, "key": key, "name": name, "is_universal": bool(is_universal)}
+        for scope_id, key, name, is_universal in sorted(rows, key=lambda r: (r[2].lower(), r[0]))
+    ]
 
 
 def list_viewable_roles(db: Session, user_id: int, scope_id: int) -> list[dict]:
-    """``[{"id", "name"}]`` for every role the user may adopt on
+    """``[{"id", "key", "name"}]`` for every role the user may adopt on
     ``scope_id``, unique and sorted by name.
 
     Raises ``ViewAsError`` 404 for an unknown scope and 403 for a scope the
@@ -147,7 +161,7 @@ def list_viewable_roles(db: Session, user_id: int, scope_id: int) -> list[dict]:
     role_ids = viewable_role_ids(db, user_id, scope_id, closures=closures)
     if not role_ids:
         return []
-    return _sorted_id_names(db.query(RoleV2.id, RoleV2.name).filter(RoleV2.id.in_(role_ids)).all())
+    return _sorted_options(db.query(RoleV2.id, RoleV2.key, RoleV2.name).filter(RoleV2.id.in_(role_ids)).all())
 
 
 # ---------------------------------------------------------
@@ -167,33 +181,63 @@ def verify_view_as(
     db: Session,
     user_id: int,
     *,
-    role_name: str,
-    scope_name: str,
+    role_key: str,
+    scope_key: str,
     closures: RbacClosures | None = None,
 ) -> ViewAsTarget:
-    """Resolve the two names and check the caller may adopt them — scope
-    first, then role on that scope. Raises ``ViewAsError`` on any failure."""
+    """Resolve the two KEYS (``roles.key`` / ``scopes.key``, exact match) and
+    check the caller may adopt them — scope first, then role on that scope.
+    Raises ``ViewAsError`` on any failure."""
     graph = closures if closures is not None else RbacClosures(db)
 
-    scope = db.query(ScopeV2.id, ScopeV2.name).filter(ScopeV2.name == scope_name).first()
+    scope = db.query(ScopeV2.id, ScopeV2.key, ScopeV2.name).filter(ScopeV2.key == scope_key).first()
     if scope is None:
-        raise ViewAsError(400, "view_as_scope_not_found", f"Scope '{scope_name}' does not exist.")
+        raise ViewAsError(400, "view_as_scope_not_found", f"Scope '{scope_key}' does not exist.")
     if scope[0] not in viewable_scope_ids(db, user_id, closures=graph):
         raise ViewAsError(
-            403, "view_as_scope_not_allowed", f"You are not allowed to view the hub as scope '{scope_name}'."
+            403, "view_as_scope_not_allowed", f"You are not allowed to view the hub as scope '{scope_key}'."
         )
 
-    role = db.query(RoleV2.id, RoleV2.name).filter(RoleV2.name == role_name).first()
+    role = db.query(RoleV2.id, RoleV2.key, RoleV2.name).filter(RoleV2.key == role_key).first()
     if role is None:
-        raise ViewAsError(400, "view_as_role_not_found", f"Role '{role_name}' does not exist.")
+        raise ViewAsError(400, "view_as_role_not_found", f"Role '{role_key}' does not exist.")
     if role[0] not in viewable_role_ids(db, user_id, scope[0], closures=graph):
         raise ViewAsError(
             403,
             "view_as_role_not_allowed",
-            f"You are not allowed to view the hub as role '{role_name}' in scope '{scope_name}'.",
+            f"You are not allowed to view the hub as role '{role_key}' in scope '{scope_key}'.",
         )
 
-    return ViewAsTarget(role_id=role[0], role_name=role[1], scope_id=scope[0], scope_name=scope[1])
+    return ViewAsTarget(
+        role_id=role[0], role_key=role[1], role_name=role[2],
+        scope_id=scope[0], scope_key=scope[1], scope_name=scope[2],
+    )
+
+
+def pair_is_hub_admin(db: Session, target: ViewAsTarget, *, closures: RbacClosures | None = None) -> bool:
+    """``dependencies.is_hub_admin``'s closure rule applied to the adopted
+    pair alone: true only when it reaches ``(hub_admin, universal scope)``."""
+    graph = closures if closures is not None else RbacClosures(db)
+    hub_admin_role_id, universal_scope_ids = hub_admin_target_ids(db, closures=graph)
+    return bool(
+        hub_admin_role_id is not None
+        and hub_admin_role_id in graph.role_descendants(target.role_id)
+        and universal_scope_ids & graph.scope_descendants(target.scope_id)
+    )
+
+
+def held_closures_for(target: ViewAsTarget, *, closures: RbacClosures) -> list[HeldClosure]:
+    """The adopted pair as the ONE assignment row a View As caller holds —
+    the shape ``rbac_delegation_service.can_delegate`` reads, so the
+    delegation rule itself is reused unchanged."""
+    return [
+        HeldClosure(
+            role_id=target.role_id,
+            scope_id=target.scope_id,
+            role_ids=closures.role_descendants(target.role_id),
+            scope_ids=closures.scope_descendants(target.scope_id),
+        )
+    ]
 
 
 def resolve_view_as_access(
@@ -204,18 +248,11 @@ def resolve_view_as_access(
     Grants naming the CALLER directly are deliberately not included — the
     point is to see what the role/scope sees, not the caller's own extras.
 
-    ``full_access`` follows ``dependencies.is_hub_admin``'s closure rule
-    applied to the adopted pair: true only when it reaches
-    ``(hub_admin, universal scope)``.
+    ``full_access`` follows ``pair_is_hub_admin``.
     """
     graph = closures if closures is not None else RbacClosures(db)
 
-    hub_admin_role_id, universal_scope_ids = hub_admin_target_ids(db, closures=graph)
-    if (
-        hub_admin_role_id is not None
-        and hub_admin_role_id in graph.role_descendants(target.role_id)
-        and universal_scope_ids & graph.scope_descendants(target.scope_id)
-    ):
+    if pair_is_hub_admin(db, target, closures=graph):
         return ViewerAccess(visibility=None, full_access=True)
 
     seeds = seeds_for_principal(db, role_id=target.role_id, scope_id=target.scope_id, user_id=None, closures=graph)

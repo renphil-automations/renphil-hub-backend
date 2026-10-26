@@ -132,6 +132,7 @@ def assert_can_delegate(
     role_id: int,
     scope_id: int,
     closures: RbacClosures | None = None,
+    held: list[HeldClosure] | None = None,
 ) -> None:
     """The full write-gate for an assignment create/revoke (session handoff
     2026-08-24 §3.1, §4): Hub Admin bypasses unconditionally; everyone else
@@ -155,10 +156,14 @@ def assert_can_delegate(
     this shares it rather than building a second one. Purely a cost
     optimization — omitted, ``can_delegate`` builds its own exactly as
     before.
+
+    ``held`` replaces the granter's own assignment rows — View As passes the
+    adopted pair (``view_as_service.held_closures_for``), together with the
+    matching ``is_hub_admin`` (``view_as_service.pair_is_hub_admin``).
     """
     if is_hub_admin:
         return
-    if can_delegate(db, granter_hub_user_id, role_id, scope_id, closures=closures):
+    if can_delegate(db, granter_hub_user_id, role_id, scope_id, closures=closures, held=held):
         return
     raise RbacGraphError(
         "not_delegable",

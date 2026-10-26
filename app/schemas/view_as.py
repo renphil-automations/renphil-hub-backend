@@ -15,11 +15,16 @@ VIEW_AS_FLAG_DESCRIPTION = (
 
 class ViewAsOption(BaseModel):
     id: int
+    key: str = Field(description="Send this as view_as_role / view_as_scope.")
     name: str
 
 
+class ViewAsScopeOption(ViewAsOption):
+    is_universal: bool = Field(description="True for the universal scope, which covers every scope.")
+
+
 class ViewAsScopeListAPIResponse(BaseModel):
-    data: list[ViewAsOption] = Field(default_factory=list)
+    data: list[ViewAsScopeOption] = Field(default_factory=list)
 
 
 class ViewAsRoleListAPIResponse(BaseModel):
