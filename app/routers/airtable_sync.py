@@ -17,7 +17,8 @@ Hub Admins only, for every endpoint.
   POST /v2/airtable-sync/items/{id}/resolve   answer one (409 during a run)
   POST /v2/airtable-sync/items/bulk-resolve   one choice for several items
 
-The scheduler tick comes in a later phase.
+The scheduler tick (`POST /v2/airtable-sync/tick`) is token-only, so it lives
+in routers/airtable_sync_tick.py, outside this router's Hub Admin gate.
 """
 
 from __future__ import annotations

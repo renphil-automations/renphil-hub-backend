@@ -297,3 +297,25 @@ class SyncStatusData(BaseModel):
 
 class SyncStatusAPIResponse(BaseModel):
     data: SyncStatusData
+
+
+# ---------------------------------------------------------
+# Scheduler tick (token-only; routers/airtable_sync_tick.py)
+# ---------------------------------------------------------
+
+
+class SyncTickData(BaseModel):
+    """What one tick did (services/airtable_sync/scheduler.py)."""
+
+    result: Literal["started", "skipped", "not_due"]
+    # skipped: "run_in_progress". not_due: "schedule_disabled",
+    # "slot_already_used", "slot_too_old" or "invalid_schedule".
+    reason: str | None = None
+    # The slot the tick looked at (null when the schedule is off or invalid).
+    slot: datetime | None = None
+    run_id: int | None = None  # started
+    blocking_run_id: int | None = None  # skipped: the run holding the lock
+
+
+class SyncTickAPIResponse(BaseModel):
+    data: SyncTickData

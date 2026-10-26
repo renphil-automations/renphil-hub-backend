@@ -34,6 +34,9 @@ xlsxwriter>=3.2.0,<4.0.0
 # ── Calendar iCal parsing (Calendar widget proxy) ──────────────────
 icalendar>=5.0,<6.0
 recurring-ical-events>=3.0,<4.0
+# IANA time zones for zoneinfo (the Airtable sync schedule); Windows and slim
+# images have no system database. Was already installed via the line above.
+tzdata>=2024.1
 
 # ── Cache (Upstash Redis over REST) ───────────────
 upstash-redis>=1.4.0,<2.0.0

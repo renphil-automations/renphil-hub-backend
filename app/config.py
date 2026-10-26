@@ -507,6 +507,10 @@ class Settings(BaseSettings):
     # Shared secret for POST /data/airtable/cache/refresh — same shape as
     # AGENT_SYNC_TOKEN below, sent as X-Sync-Token. Unset ⇒ 503.
     CACHE_REFRESH_TOKEN: str | None = None
+    # Shared secret for POST /v2/airtable-sync/tick (the Airtable → Hub
+    # sync's scheduler, called by the same cron), sent as X-Sync-Token.
+    # Unset ⇒ 503: no scheduled runs.
+    AIRTABLE_SYNC_TOKEN: str | None = None
     # A scheduled refresh will NOT re-walk a widget whose cached entry is
     # younger than this (plan_airtable_cache_scaling_2026-08-08.md §4.4).
     #
