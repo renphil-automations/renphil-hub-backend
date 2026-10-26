@@ -452,14 +452,14 @@ def get_children(
 
 @router.get(
     "/{document_id}/variants",
-    response_model=TabSummaryListAPIResponse,
+    response_model=TabSummaryListViewAsAPIResponse,
     summary="Get tab variants (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_VIEW_AS_RESPONSE},
 )
 def get_variants(
     document_id: str,
     db: Session = Depends(get_db_v2),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
     lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     """A tab variant (TabV2.parent_tab_id) is a distinct, one-level nesting
@@ -467,11 +467,11 @@ def get_variants(
     nesting) — see gridstack_service.py's TabV2 docstring."""
     validate_document_id(document_id)
 
-    variants = get_tab_variants_v2(db, document_id, access=access, lock_view=lock_view)
+    variants = get_tab_variants_v2(db, document_id, access=view_as_access.access, lock_view=lock_view)
     if variants is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
-    return {"data": variants}
+    return {"data": variants, "view_as": view_as_access.view_as}
 
 
 @router.post(

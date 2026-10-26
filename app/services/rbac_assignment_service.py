@@ -27,7 +27,7 @@ from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeV2
 from app.db_v2.models.user import UserV2
 from app.services.rbac_delegation_service import can_delegate
-from app.services.rbac_graph_service import RbacGraphError, held_closures
+from app.services.rbac_graph_service import HeldClosure, RbacGraphError, held_closures
 from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
@@ -122,11 +122,22 @@ def list_granted_by_me(db: Session, hub_user_id: int) -> list[dict]:
     return _serialize_many(db, rows)
 
 
-def list_revocable(db: Session, hub_user_id: int, *, is_hub_admin: bool) -> list[dict]:
+def list_revocable(
+    db: Session,
+    hub_user_id: int,
+    *,
+    is_hub_admin: bool,
+    held: list[HeldClosure] | None = None,
+) -> list[dict]:
     """Every assignment, ORG-WIDE, the caller is currently eligible to
     revoke under §6.1's symmetric rule (design doc §6.3) — not just the ones
     they granted. A Hub Admin is eligible for all of them, unconditionally,
     same bypass as everywhere else in this phase.
+
+    ``held`` replaces the caller's own assignment rows — View As passes the
+    adopted pair (``view_as_service.held_closures_for``) so the answer is
+    what a holder of exactly that pair could revoke. The rule is still
+    ``can_delegate``, unchanged.
 
     A plain per-row `can_delegate` call, not a bulk query: both graphs are
     tens of rows (rbac_graph_service's own docstring), so doing this in
@@ -170,7 +181,7 @@ def list_revocable(db: Session, hub_user_id: int, *, is_hub_admin: bool) -> list
         # ONE snapshot, ONE expansion of the caller's own assignments, reused
         # for every candidate. Built here rather than inside the comprehension
         # so it cannot accidentally become per-row again.
-        held = held_closures(db, hub_user_id)
+        held = held if held is not None else held_closures(db, hub_user_id)
         rows = [
             r
             for r in rows
