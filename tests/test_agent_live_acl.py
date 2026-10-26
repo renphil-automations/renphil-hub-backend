@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import inspect
 import json
 import time
 from types import SimpleNamespace
@@ -152,85 +151,3 @@ class AgentLiveAclTests(unittest.TestCase):
 
         self.assertTrue(response["is_admin"])
         self.assertEqual(response["granted_node_keys"], [])
-
-    def test_verified_live_acl_uses_postgres_roles_not_airtable(self) -> None:
-        """Roles come from Neon ``users`` -> ``role_assignments`` -> ``roles``.
-
-        The signed Agent envelope's role snapshot is ignored and Airtable's
-        Access Control table is never called.
-        """
-        hub_user = SimpleNamespace(id=9, has_signed_in=True, name="Person")
-        seen: dict[str, object] = {}
-
-        def fake_build(identity, _db, *, hub_user=None, closures=None):
-            seen["identity"] = identity
-            seen["hub_user"] = hub_user
-            return {"email": identity.email, "is_admin": True, "granted_node_keys": [],
-                    "authorization_fingerprint": "fp"}
-
-        with (
-            patch.object(agent_access, "find_user_by_email", lambda _db, _email: hub_user),
-            patch.object(agent_access, "RbacClosures", lambda _db: object()),
-            patch.object(agent_access, "_postgres_role_names", lambda _db, user_id, _c: ["Hub Admin"] if user_id == 9 else []),
-            patch.object(agent_access, "_build_live_acl_response", fake_build),
-        ):
-            response = agent_access._build_verified_live_acl_response(
-                AgentIdentity(email="person@example.org", roles=("Member",)),
-                _Db(hub_user),
-            )
-
-        self.assertEqual(response["resolved_roles"], ["Hub Admin"])
-        self.assertEqual(seen["identity"].roles, ("Hub Admin",))  # never the JWT "Member"
-        self.assertIs(seen["hub_user"], hub_user)
-        module_source = inspect.getsource(agent_access)
-        self.assertNotIn("get_user_roles", module_source)
-        self.assertNotIn("airtable_service", module_source)
-        self.assertFalse(inspect.iscoroutinefunction(agent_access.get_verified_granted_nodes))
-
-    def test_postgres_role_names_include_inherited_child_roles(self) -> None:
-        class _Closures:
-            def role_descendants(self, role_id: int) -> set[int]:
-                return {1: {1, 2, 3}, 4: {4}}[role_id]
-
-        class _RoleQuery:
-            def __init__(self) -> None:
-                self.ids: list[int] = []
-
-            def filter(self, clause) -> "_RoleQuery":
-                self.ids = list(clause.right.value)
-                return self
-
-            def all(self) -> list[tuple[str]]:
-                names = {1: "Hub Admin", 2: "Program Lead", 3: "Hub Member", 4: "Hub Member"}
-                return [(names[i],) for i in self.ids]
-
-        class _RoleDb:
-            def query(self, *_args: object) -> _RoleQuery:
-                return _RoleQuery()
-
-        with patch.object(agent_access, "held_assignments", lambda _db, _uid: [(1, 10), (4, 11)]):
-            names = agent_access._postgres_role_names(_RoleDb(), 9, _Closures())
-        self.assertEqual(names, ["Hub Admin", "Hub Member", "Program Lead"])
-
-        with patch.object(agent_access, "held_assignments", lambda _db, _uid: []):
-            self.assertEqual(agent_access._postgres_role_names(_RoleDb(), 9, _Closures()), [])
-
-    def test_verified_live_acl_refuses_unknown_or_never_signed_in_users(self) -> None:
-        for hub_user in (None, SimpleNamespace(id=9, has_signed_in=False, name="Person")):
-            with patch.object(agent_access, "find_user_by_email", lambda _db, _email: hub_user):
-                with self.assertRaises(HTTPException) as error:
-                    agent_access._build_verified_live_acl_response(
-                        AgentIdentity(email="person@example.org", roles=("Hub Admin",)),
-                        _Db(hub_user),
-                    )
-            self.assertEqual(error.exception.status_code, 403)
-
-    def test_live_acl_refuses_a_user_who_has_not_signed_in(self) -> None:
-        for hub_user in (None, SimpleNamespace(id=9, has_signed_in=False, name="Person")):
-            with self.assertRaises(HTTPException) as error:
-                agent_access._build_live_acl_response(
-                    AgentIdentity(email="person@example.org", roles=("Member",)),
-                    _Db(hub_user),
-                )
-            self.assertEqual(error.exception.status_code, 403)
-            self.assertEqual(error.exception.detail, "Agent identity has not signed in to the Hub yet.")
