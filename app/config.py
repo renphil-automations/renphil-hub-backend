@@ -607,6 +607,25 @@ class Settings(BaseSettings):
     BOOKMARKS_TYPE_FIELD: str = "type"
     BOOKMARKS_TITLE_FIELD: str = "bookmark_title"
 
+    # ══════════════════════════════════════════════════════════════════
+    # Hub product-usage analytics (`hub_product_events`)
+    # ══════════════════════════════════════════════════════════════════
+    # Which deployment this API is: `local`, `sandbox` or `production`. Stamped
+    # server-side on every product-usage event so Sandbox clicks can never be
+    # counted as Production ones; the browser never supplies it. Unset (or any
+    # other value) is recorded as `unconfigured` rather than guessed.
+    HUB_ENVIRONMENT: str = ""
+    # Days of `hub_product_events` to keep (default 396 ≈ 13 months). `0`/`off`
+    # disables purging; anything outside 30–3650 makes the purge refuse to run.
+    # Kept as text so a bad value can never stop the API from starting; it is
+    # parsed by `product_analytics_service.parse_retention_days`.
+    PRODUCT_ANALYTICS_RETENTION_DAYS: str = "396"
+
+    @property
+    def hub_environment(self) -> str:
+        value = self.HUB_ENVIRONMENT.strip().lower()
+        return value if value in {"local", "sandbox", "production"} else "unconfigured"
+
 
 def get_settings() -> Settings:
     """Return a cached singleton of the application settings."""
