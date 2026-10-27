@@ -27,7 +27,7 @@ from app.dependencies import CurrentHubUser, RbacClosures, get_current_hub_user,
 from app.routers.bot_management import require_bot_management_admin
 from app.services import product_analytics_service as service
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
-from app.services.product_analytics_refs import resolve_names
+from app.services.product_analytics_refs import resolve_names, summarize_locations
 from app.services.rate_limit_service import get_rate_limit_service
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,12 @@ def get_product_analytics_summary(
     db: Session = Depends(get_db_v2),
 ):
     try:
-        return service.summarize_events(db, filters)
+        summary = service.summarize_events(db, filters)
+        # The safe route templates in `by_page` are useful for exports and
+        # diagnostics but not for a human investigation. Resolve a separate
+        # protected, current-location view without persisting names/URLs.
+        summary["by_location"] = summarize_locations(db, service.location_groups(db, filters))
+        return summary
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc
 

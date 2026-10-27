@@ -840,8 +840,10 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertNotIn("Jane", export)
         header = export.splitlines()[0].split(",")
         self.assertFalse({"component_name", "target_name"} & set(header))
-        summary = self.client.get("/v2/product-analytics/summary").text
-        self.assertNotIn("Jane", summary)
+        # The protected admin summary now has a separate current-location
+        # view. Names are still absent from persistence and exports above.
+        summary = self.client.get("/v2/product-analytics/summary").json()
+        self.assertIn("Jane Doe Review Hub", {item["label"] for item in summary["by_location"]})
 
     def test_admin_view_derives_safe_open_destinations_without_storing_them(self) -> None:
         """Admins can inspect current Hub context, including a mirror's source.
@@ -1011,6 +1013,25 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(body["totals"], {"events": 4, "users": 1})
         self.assertEqual({item["key"]: item["count"] for item in body["by_trigger"]}, {"click": 3, "default": 1})
         self.assertEqual(sum(item["count"] for item in body["by_day"]), 4)
+
+    def test_pages_summary_uses_current_readable_destinations_not_route_templates(self) -> None:
+        self.current = MEMBER
+        self._ingest(
+            _event("root_tab.selected", target_id="root-doc-1", page_route="/secret/title", properties={}),
+            _event("link.clicked", component_id="cmp-links", page_route="/secret/title", properties={}),
+            _event("detail_card.details_opened", component_id="cmp-mirror", target_id="card-a", page_route="/secret/title", properties={}),
+        )
+        self.current = ADMIN
+        locations = self.client.get("/v2/product-analytics/summary").json()["by_location"]
+        self.assertEqual(
+            {(item["label"], item["href"], item["count"], item["mirror"]) for item in locations},
+            {
+                ("Jane Doe Salary", "/jane-doe-review-hub/jane-doe-salary", 1, False),
+                ("Jane Doe cards", "/dashboard?component=cmp-cards", 1, True),
+                ("Jane Doe links", "/dashboard?component=cmp-links", 1, False),
+            },
+        )
+        self.assertNotIn("secret/title", repr(locations))
 
     def test_events_pagination_is_bounded(self) -> None:
         self._seed()

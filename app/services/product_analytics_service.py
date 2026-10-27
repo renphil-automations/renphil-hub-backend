@@ -431,6 +431,38 @@ def summarize_events(db: Session, filters: EventFilters) -> dict[str, Any]:
     }
 
 
+def location_groups(db: Session, filters: EventFilters) -> list[dict[str, Any]]:
+    """Exact, privacy-safe event groups used to build the admin-only Pages view.
+
+    The database stores only a route template plus verified opaque ids. This
+    query deliberately returns the latter to the protected read path, where
+    current names and internal destinations are resolved. It does not return
+    event properties, titles, URLs, or any browser-supplied destination.
+    """
+    model = HubProductEventV2
+    statement = _apply_filters(
+        select(
+            model.event_name,
+            model.component_id,
+            model.target_id,
+            model.page_route,
+            func.count().label("count"),
+        ).select_from(model),
+        filters,
+    ).group_by(model.event_name, model.component_id, model.target_id, model.page_route)
+    return [
+        {
+            "event_name": event_name,
+            "component_id": component_id,
+            "target_id": target_id,
+            "page_route": page_route,
+            "properties": {},
+            "count": int(count),
+        }
+        for event_name, component_id, target_id, page_route, count in db.execute(statement).all()
+    ]
+
+
 EXPORT_COLUMNS = [
     "occurred_at", "received_at", "environment", "actor_email", "event_name",
     "component_type", "action", "trigger", "page_route", "component_id",

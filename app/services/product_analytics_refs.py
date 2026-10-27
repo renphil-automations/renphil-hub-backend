@@ -41,6 +41,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+from urllib.parse import quote
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -391,6 +392,7 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
         target_name = None
         open_path = None
         open_component_link = None
+        open_component_name = None
         mirror_component_link = None
         if target:
             if rule.target == "nav_tab":
@@ -417,6 +419,7 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
                 target_name = details["title"] if details else None
                 if details and details["type"] != "mirror":
                     open_component_link = target
+                    open_component_name = details["title"]
             elif rule.target == "thread" and _THREAD_ID_RE.match(target):
                 target_name = thread_names.get(int(target))
         component_link = event.get("component_id")
@@ -428,15 +431,52 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
                 target_component = mirror_targets.get(candidate) if isinstance(candidate, str) else None
                 if target_component and target_component["type"] != "mirror":
                     open_component_link = candidate
+                    open_component_name = target_component["title"]
                     mirror_component_link = component_link
             else:
                 open_component_link = component_link
+                open_component_name = component_name
         out.append({
             **event,
             "component_name": component_name or None,
             "target_name": target_name or None,
             "open_path": open_path,
             "open_component_link": open_component_link,
+            "open_component_name": open_component_name or None,
             "mirror_component_link": mirror_component_link,
         })
     return out
+
+
+def summarize_locations(db: Session, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Combine exact event groups into readable, clickable admin destinations.
+
+    This is intentionally a read-time view, after the database has grouped by
+    safe stored ids. ``href`` is either a server-derived internal path or the
+    existing component deep-link form. Unresolved/deleted records retain the
+    route template solely as an explicit technical fallback and cannot be
+    clicked.
+    """
+    combined: dict[str, dict[str, Any]] = {}
+    for event in resolve_names(db, groups):
+        path = event.get("open_path")
+        component_link = event.get("open_component_link")
+        if path:
+            key, href = f"path:{path}", path
+            label = event.get("target_name") or path
+        elif component_link:
+            key, href = f"component:{component_link}", f"/dashboard?component={quote(component_link, safe='')}"
+            label = event.get("target_name") or event.get("open_component_name") or event.get("component_name") or component_link
+        else:
+            route = event.get("page_route") or "/"
+            key, href, label = f"unresolved:{route}", None, f"Unavailable current destination ({route})"
+        item = combined.setdefault(key, {
+            "key": key,
+            "label": label,
+            "href": href,
+            "count": 0,
+            "mirror": bool(event.get("mirror_component_link")),
+        })
+        item["count"] += int(event.get("count") or 0)
+        item["mirror"] = item["mirror"] or bool(event.get("mirror_component_link"))
+    return sorted(combined.values(), key=lambda item: (-item["count"], item["label"].casefold()))[:25]
