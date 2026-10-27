@@ -43,8 +43,22 @@ class AssignmentListAPIResponse(BaseModel):
     data: list[AssignmentResponse] = Field(default_factory=list)
 
 
+class RevocableAssignmentListAPIResponse(AssignmentListAPIResponse):
+    view_as: bool = Field(
+        default=False,
+        description="True when computed for the role/scope given in view_as_role/view_as_scope.",
+    )
+
+
 class AssignmentAPIResponse(BaseModel):
     data: AssignmentResponse
+
+
+class CreatedAssignmentAPIResponse(AssignmentAPIResponse):
+    view_as: bool = Field(
+        default=False,
+        description="True when the grant was authorised against the role/scope given in view_as_role/view_as_scope.",
+    )
 
 
 class CreateAssignmentRequest(StrictRequestModel):
