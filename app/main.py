@@ -52,6 +52,10 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         handlers=[logging.StreamHandler()],
     )
+    # At DEBUG these log the OAuth client secret (Basic auth header) and the
+    # Google access / refresh / id tokens on every sign-in. Never below WARNING.
+    for name in ("requests_oauthlib", "oauthlib"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     logger.info("Starting %s …", settings.APP_NAME)
     await init_http_client()
     yield
