@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import date
 from typing import Any
 
@@ -181,9 +182,27 @@ def _filters(
     )
 
 
+def _deployment_filters(filters: service.EventFilters) -> service.EventFilters:
+    """Constrain admin reads to this deployment outside local development.
+
+    A browser query parameter must never allow someone on Sandbox to inspect
+    Production usage (or the reverse). Local is deliberately the only
+    operator environment allowed to compare all stamped environments.
+    """
+    configured_environment = get_settings().hub_environment
+    if configured_environment == "local":
+        return filters
+    return replace(filters, environment=configured_environment)
+
+
 @router.get("/catalog", dependencies=[Depends(require_bot_management_admin)])
 def get_product_event_catalog():
-    return {"data": service.catalog_payload(), "environment": get_settings().hub_environment}
+    environment = get_settings().hub_environment
+    return {
+        "data": service.catalog_payload(),
+        "environment": environment,
+        "environment_filter_locked": environment != "local",
+    }
 
 
 @router.get("/summary", dependencies=[Depends(require_bot_management_admin)])
@@ -192,6 +211,7 @@ def get_product_analytics_summary(
     db: Session = Depends(get_db_v2),
 ):
     try:
+        filters = _deployment_filters(filters)
         summary = service.summarize_events(db, filters)
         # The safe route templates in `by_page` are useful for exports and
         # diagnostics but not for a human investigation. Resolve a separate
@@ -212,6 +232,7 @@ def list_product_events(
     bounded_page_size = min(max(page_size, 1), 200)
     bounded_page = max(page, 1)
     try:
+        filters = _deployment_filters(filters)
         data, total = service.list_events(
             db, filters, limit=bounded_page_size, offset=(bounded_page - 1) * bounded_page_size,
         )
@@ -237,6 +258,7 @@ def export_product_usage_workbook(
     from app.routers.product_analytics_workbook import build_product_usage_workbook
 
     try:
+        filters = _deployment_filters(filters)
         summary = service.summarize_events(db, filters)
         events, total = service.list_events(db, filters, limit=service.MAX_EXPORT_ROWS, offset=0)
         if include_people:
@@ -264,6 +286,7 @@ def export_product_events_csv(
     db: Session = Depends(get_db_v2),
 ):
     try:
+        filters = _deployment_filters(filters)
         data, _ = service.list_events(db, filters, limit=service.MAX_EXPORT_ROWS, offset=0)
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc

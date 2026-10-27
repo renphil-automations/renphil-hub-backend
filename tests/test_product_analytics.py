@@ -158,6 +158,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             seed_hub(session)
         self.current = MEMBER
         self.limiter = FakeLimiter()
+        self.environment = "sandbox"
         # Live access: the real node tree and fold run over the seeded Hub;
         # only the per-user grant lookup and the Hub Admin answer are faked.
         # By default the member holds a view grant on the hub root (sees
@@ -198,7 +199,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
                 "effective_pairs",
                 lambda _db, user_id: {(HUB_ADMIN_ROLE_ID, ALL_SCOPES_ID)} if user_id == ADMIN.hub_user_id else set(),
             ),
-            patch.object(product_analytics, "get_settings", lambda: SimpleNamespace(hub_environment="sandbox")),
+            patch.object(product_analytics, "get_settings", lambda: SimpleNamespace(hub_environment=self.environment)),
             patch.object(product_analytics, "get_rate_limit_service", lambda: self.limiter),
             patch.object(product_analytics, "RbacClosures", self._closures),
             patch.object(product_analytics, "SessionLocalV2", self._worker_session),
@@ -995,9 +996,44 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(total(action="select"), 2)
         self.assertEqual(total(trigger="default"), 1)
         self.assertEqual(total(environment="sandbox"), 5)
-        self.assertEqual(total(environment="production"), 0)
+        # This Sandbox deployment ignores a cross-environment query.
+        self.assertEqual(total(environment="production"), 5)
         self.assertEqual(total(date_from="2000-01-01", date_to="2000-01-02"), 0)
         self.assertGreaterEqual(total(date_from=today, date_to=today), 1)
+
+    def test_nonlocal_deployments_are_server_locked_to_their_configured_environment(self) -> None:
+        """A forged query parameter cannot cross the Sandbox/Production wall.
+
+        Local is intentionally the sole operator environment allowed to
+        compare the separately stamped datasets.
+        """
+        self._seed()
+        now = datetime.now(timezone.utc)
+        with self.Session() as db:
+            db.add(HubProductEventV2(
+                event_id=str(uuid.uuid4()), event_name="button.clicked",
+                component_type="button", action="click", trigger="click",
+                cascade_id=None, hub_user_id=1, actor_email="admin@renphil.org",
+                environment="production", page_route="/dashboard", component_id=None,
+                target_id=None, properties={}, occurred_at=now, received_at=now,
+            ))
+            db.commit()
+
+        self.current = ADMIN
+        self.environment = "production"
+        # Supplying sandbox is ignored for every admin read/export surface.
+        self.assertEqual(self.client.get("/v2/product-analytics/summary", params={"environment": "sandbox"}).json()["totals"]["events"], 1)
+        self.assertEqual(self.client.get("/v2/product-analytics/events", params={"environment": "sandbox"}).json()["total"], 1)
+        self.assertIn("production", self.client.get("/v2/product-analytics/export", params={"environment": "sandbox"}).text)
+        self.assertNotIn("sandbox", self.client.get("/v2/product-analytics/export", params={"environment": "sandbox"}).text)
+        catalog = self.client.get("/v2/product-analytics/catalog").json()
+        self.assertEqual(catalog["environment"], "production")
+        self.assertTrue(catalog["environment_filter_locked"])
+
+        self.environment = "local"
+        self.assertEqual(self.client.get("/v2/product-analytics/events", params={"environment": "sandbox"}).json()["total"], 5)
+        self.assertEqual(self.client.get("/v2/product-analytics/events", params={"environment": "production"}).json()["total"], 1)
+        self.assertFalse(self.client.get("/v2/product-analytics/catalog").json()["environment_filter_locked"])
 
     def test_page_route_filter_treats_wildcards_literally(self) -> None:
         self._seed()
