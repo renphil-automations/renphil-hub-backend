@@ -843,6 +843,35 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         summary = self.client.get("/v2/product-analytics/summary").text
         self.assertNotIn("Jane", summary)
 
+    def test_admin_view_derives_safe_open_destinations_without_storing_them(self) -> None:
+        """Admins can inspect current Hub context, including a mirror's source.
+
+        Destinations are calculated only for this protected response. They
+        must never become analytics rows, CSV data, or a way for a browser to
+        supply a redirect URL.
+        """
+        self._ingest(
+            _event("navigation_tab.selected", target_id="nav-doc-1"),
+            _event("root_tab.selected", target_id="root-doc-1"),
+            _event("view_tab.selected", target_id="child-doc-1"),
+            _event("link.clicked", component_id="cmp-links", properties={}),
+            _event("detail_card.details_opened", component_id="cmp-mirror", target_id="card-a", properties={}),
+        )
+        self.current = ADMIN
+        events = {event["event_name"]: event for event in self.client.get("/v2/product-analytics/events").json()["data"]}
+        self.assertEqual(events["navigation_tab.selected"]["open_path"], "/jane-doe-review-hub")
+        self.assertEqual(events["root_tab.selected"]["open_path"], "/jane-doe-review-hub/jane-doe-salary")
+        self.assertEqual(events["view_tab.selected"]["open_path"], "/jane-doe-review-hub/jane-doe-salary/jane-doe-medical-leave")
+        self.assertEqual(events["link.clicked"]["open_component_link"], "cmp-links")
+        mirror = events["detail_card.details_opened"]
+        self.assertEqual(mirror["open_component_link"], "cmp-cards")
+        self.assertEqual(mirror["mirror_component_link"], "cmp-mirror")
+        with self.engine.connect() as conn:
+            stored = json.dumps([list(r) for r in conn.execute(text("SELECT * FROM hub_product_events")).all()], default=str)
+        self.assertNotIn("open_component_link", stored)
+        self.assertNotIn("open_path", stored)
+        self.assertNotIn("mirror_component_link", self.client.get("/v2/product-analytics/export").text)
+
     def test_deleted_records_stay_opaque(self) -> None:
         self._ingest(_event("root_tab.selected", target_id="root-doc-1"))
         with self.Session() as session:

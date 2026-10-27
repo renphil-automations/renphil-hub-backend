@@ -51,6 +51,7 @@ from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.tab import TabV2
 from app.db_v2.models.thread import ThreadV2
 from app.services.access_visibility_service import ViewerAccess
+from app.services.gridstack_service import _slugify_title
 
 # What each event's ids are allowed to refer to.
 #   target: None | "nav_tab" | "root_tab" | "tab" | "sbn_tab" | "thread" | "detail_card" | "view_code"
@@ -315,10 +316,15 @@ def verify_identifiers(
 
 
 def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return copies of `events` with `component_name` / `target_name` added.
+    """Return admin-view-only names and safe, live destinations for events.
 
     Read-time only, for the All-Scopes admin view. Unknown or deleted ids get
-    None and stay opaque. Nothing here is persisted, exported, logged or cached.
+    None and stay opaque. ``open_path`` is generated from current Hub records
+    rather than the stored route template, so it is both readable and safe to
+    follow. ``open_component_link`` feeds the existing component deep-link
+    navigator; a mirror deliberately resolves to its original component while
+    retaining ``mirror_component_link`` for audit context. None of these
+    derived values are persisted, exported, logged or cached.
     """
     nav_ids, tab_ids, links, thread_ids = set(), set(), set(), set()
     for event in events:
@@ -336,9 +342,46 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
             links.add(target)
         elif rule.target == "thread" and _THREAD_ID_RE.match(target):
             thread_ids.add(int(target))
-    nav_names = dict(db.execute(select(NavTabV2.document_id, NavTabV2.title).where(NavTabV2.document_id.in_(nav_ids))).all()) if nav_ids else {}
-    tab_names = dict(db.execute(select(TabV2.document_id, TabV2.title).where(TabV2.document_id.in_(tab_ids))).all()) if tab_ids else {}
-    component_names = dict(db.execute(select(ComponentV2.link, ComponentV2.title).where(ComponentV2.link.in_(links))).all()) if links else {}
+    component_rows = db.execute(
+        select(ComponentV2.link, ComponentV2.title, ComponentV2.type, ComponentV2.props)
+        .where(ComponentV2.link.in_(links))
+    ).all() if links else []
+    components = {link: {"title": title, "type": ctype, "props": props or {}}
+                  for link, title, ctype, props in component_rows}
+    mirror_target_links = {
+        info["props"].get("target_link")
+        for info in components.values()
+        if info["type"] == "mirror" and isinstance(info["props"].get("target_link"), str)
+    }
+    mirror_target_rows = db.execute(
+        select(ComponentV2.link, ComponentV2.title, ComponentV2.type)
+        .where(ComponentV2.link.in_(mirror_target_links))
+    ).all() if mirror_target_links else []
+    mirror_targets = {link: {"title": title, "type": ctype} for link, title, ctype in mirror_target_rows}
+
+    nav_rows = db.execute(
+        select(NavTabV2.document_id, NavTabV2.title, NavTabV2.slug).where(NavTabV2.document_id.in_(nav_ids))
+    ).all() if nav_ids else []
+    nav_details = {document_id: {"title": title, "slug": slug} for document_id, title, slug in nav_rows}
+    tab_rows = db.execute(
+        select(TabV2.document_id, TabV2.title, TabV2.parent_tab_id, TabV2.nav_tab_id)
+        .where(TabV2.document_id.in_(tab_ids))
+    ).all() if tab_ids else []
+    tab_details = {document_id: {"title": title, "parent_id": parent_id, "nav_id": nav_id}
+                   for document_id, title, parent_id, nav_id in tab_rows}
+    parent_ids = {info["parent_id"] for info in tab_details.values() if info["parent_id"] is not None}
+    parent_rows = db.execute(
+        select(TabV2.id, TabV2.title, TabV2.nav_tab_id)
+        .where(TabV2.id.in_(parent_ids))
+    ).all() if parent_ids else []
+    parent_details = {tab_id: {"title": title, "nav_id": nav_id} for tab_id, title, nav_id in parent_rows}
+    nav_ids_for_tabs = {
+        nav_id for nav_id in [
+            *(info["nav_id"] for info in tab_details.values()),
+            *(info["nav_id"] for info in parent_details.values()),
+        ] if nav_id is not None
+    }
+    nav_by_id = dict(db.execute(select(NavTabV2.id, NavTabV2.slug).where(NavTabV2.id.in_(nav_ids_for_tabs))).all()) if nav_ids_for_tabs else {}
     thread_names = dict(db.execute(select(ThreadV2.id, ThreadV2.title).where(ThreadV2.id.in_(thread_ids))).all()) if thread_ids else {}
 
     out = []
@@ -346,15 +389,54 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
         rule = ID_RULES.get(event.get("event_name"), IdRule())
         target = event.get("target_id")
         target_name = None
+        open_path = None
+        open_component_link = None
+        mirror_component_link = None
         if target:
             if rule.target == "nav_tab":
-                target_name = nav_names.get(target)
+                details = nav_details.get(target)
+                target_name = details["title"] if details else None
+                if details and details["slug"]:
+                    open_path = f"/{details['slug']}"
             elif rule.target in ("root_tab", "tab"):
-                target_name = tab_names.get(target)
+                details = tab_details.get(target)
+                target_name = details["title"] if details else None
+                if details:
+                    parent = parent_details.get(details["parent_id"])
+                    nav_slug = nav_by_id.get(details["nav_id"] or (parent or {}).get("nav_id"))
+                    slug = _slugify_title(details["title"] or "")
+                    if nav_slug and slug:
+                        if details["parent_id"] is None:
+                            open_path = f"/{nav_slug}/{slug}"
+                        else:
+                            parent_slug = _slugify_title((parent or {}).get("title") or "")
+                            if parent_slug:
+                                open_path = f"/{nav_slug}/{parent_slug}/{slug}"
             elif rule.target == "sbn_tab":
-                target_name = component_names.get(target)
+                details = components.get(target)
+                target_name = details["title"] if details else None
+                if details and details["type"] != "mirror":
+                    open_component_link = target
             elif rule.target == "thread" and _THREAD_ID_RE.match(target):
                 target_name = thread_names.get(int(target))
-        component_name = component_names.get(event["component_id"]) if event.get("component_id") else None
-        out.append({**event, "component_name": component_name or None, "target_name": target_name or None})
+        component_link = event.get("component_id")
+        component = components.get(component_link) if component_link else None
+        component_name = component["title"] if component else None
+        if open_component_link is None and component_link and component:
+            if component["type"] == "mirror":
+                candidate = component["props"].get("target_link")
+                target_component = mirror_targets.get(candidate) if isinstance(candidate, str) else None
+                if target_component and target_component["type"] != "mirror":
+                    open_component_link = candidate
+                    mirror_component_link = component_link
+            else:
+                open_component_link = component_link
+        out.append({
+            **event,
+            "component_name": component_name or None,
+            "target_name": target_name or None,
+            "open_path": open_path,
+            "open_component_link": open_component_link,
+            "mirror_component_link": mirror_component_link,
+        })
     return out
