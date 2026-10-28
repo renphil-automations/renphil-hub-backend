@@ -15,7 +15,12 @@ Hub Admins only, for every endpoint.
   GET  /v2/airtable-sync/status     schedule, current/last run, open items
   GET  /v2/airtable-sync/items      conflicts / warnings, paginated
   POST /v2/airtable-sync/items/{id}/resolve   answer one (409 during a run)
-  POST /v2/airtable-sync/items/bulk-resolve   one choice for several items
+  POST /v2/airtable-sync/items/bulk-resolve   one choice for several items,
+                                     in this request
+  POST /v2/airtable-sync/bulk-jobs  the same in the background (202); the
+                                     tab follows it through /status
+  GET  /v2/airtable-sync/bulk-jobs/{id}        one job's progress
+  POST /v2/airtable-sync/bulk-jobs/{id}/stop   stop before its next item
 
 The scheduler tick (`POST /v2/airtable-sync/tick`) is token-only, so it lives
 in routers/airtable_sync_tick.py, outside this router's Hub Admin gate.
@@ -32,8 +37,10 @@ from sqlalchemy.orm import Session
 from app.db_v2.database import get_db_v2
 from app.dependencies import CurrentHubUser, get_current_hub_user, get_current_user, require_hub_admin
 from app.schemas.airtable_sync import (
+    BulkJobAPIResponse,
     BulkResolveAPIResponse,
     BulkResolveRequest,
+    StartBulkJobRequest,
     DesignationMappingsAPIResponse,
     ItemStatusFilter,
     LogEntity,
@@ -50,7 +57,8 @@ from app.schemas.airtable_sync import (
     SyncStatusAPIResponse,
     UpdateSyncSettingsRequest,
 )
-from app.services.airtable_sync import airtable_reader, resolutions, runs_service, settings_service
+from app.services.airtable_sync import airtable_reader, bulk_jobs, resolutions, runs_service, settings_service
+from app.services.airtable_sync.bulk_jobs import BulkJobRunner, get_bulk_job_runner
 from app.services.airtable_sync.runner import SyncRunner, get_sync_runner
 from app.services.airtable_sync.settings_service import AirtableSyncError, MappingEntry
 
@@ -364,3 +372,84 @@ def bulk_resolve_items(
         db.rollback()
         raise _conflict(e)
     return {"data": data}
+
+
+# ---------------------------------------------------------
+# Background bulk answers (owner, 2026-10-27)
+# ---------------------------------------------------------
+
+JOB_NOT_FOUND_RESPONSE = {404: {"description": "No such bulk job"}}
+
+
+@router.post(
+    "/bulk-jobs",
+    status_code=202,
+    response_model=BulkJobAPIResponse,
+    summary="Answer several items with one choice, in the background",
+    responses={**FORBIDDEN_RESPONSE, 409: {"description": "A run or another bulk answer is in progress"}},
+)
+def start_bulk_job(
+    request: StartBulkJobRequest,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    job_runner: BulkJobRunner = Depends(get_bulk_job_runner),
+):
+    """Fixes the items (as bulk-resolve picks them) and returns at once; the
+    job answers them one by one in the background, stopping at the first
+    error. Every other answer is refused (409 `bulk_in_progress`) until it
+    ends. Follow it through `GET /status` or `GET /bulk-jobs/{id}`."""
+    try:
+        started = bulk_jobs.start_job(
+            db,
+            item_ids=request.item_ids,
+            run_id=request.run_id,
+            kind=request.kind,
+            choice=request.choice,
+            label=request.label,
+            current=current,
+        )
+    except AirtableSyncError as e:
+        db.rollback()
+        raise _conflict(e)
+    # Commit BEFORE launching: the job's thread reads with its own session.
+    db.commit()
+    job_runner.launch(started)
+    db.expire_all()
+    return {"data": bulk_jobs.serialize_job(bulk_jobs.get_job(db, started.job_id))}
+
+
+@router.get(
+    "/bulk-jobs/{job_id}",
+    response_model=BulkJobAPIResponse,
+    summary="One bulk job's progress",
+    responses={**FORBIDDEN_RESPONSE, **JOB_NOT_FOUND_RESPONSE},
+)
+def get_bulk_job(job_id: int, db: Session = Depends(get_db_v2)):
+    job = bulk_jobs.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Bulk job not found")
+    return {"data": bulk_jobs.serialize_job(job)}
+
+
+@router.post(
+    "/bulk-jobs/{job_id}/stop",
+    response_model=BulkJobAPIResponse,
+    summary="Stop a bulk job before its next item",
+    responses={**FORBIDDEN_RESPONSE, **JOB_NOT_FOUND_RESPONSE, 409: {"description": "The job has already ended"}},
+)
+def stop_bulk_job(
+    job_id: int,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+):
+    """Items already answered stay answered; the rest stay open."""
+    try:
+        job = bulk_jobs.request_stop(db, job_id, actor_email=current.email)
+    except AirtableSyncError as e:
+        db.rollback()
+        raise _conflict(e)
+    if job is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Bulk job not found")
+    db.commit()
+    return {"data": bulk_jobs.serialize_job(job)}

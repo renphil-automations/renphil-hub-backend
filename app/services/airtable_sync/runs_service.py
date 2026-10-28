@@ -11,7 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.airtable_sync import AirtableSyncItemV2, AirtableSyncLogV2, AirtableSyncRunV2
-from app.services.airtable_sync import airtable_reader, settings_service
+from app.services.airtable_sync import airtable_reader, bulk_jobs, settings_service
 from app.services.airtable_sync.runner import as_utc, is_stale, running_run
 
 
@@ -143,8 +143,9 @@ def _config_error(settings: Any) -> str | None:
 
 def status_payload(db: Session, settings: Any) -> dict:
     """What the tab polls: the schedule, the running run (if any), the last
-    finished run, open items by kind, and whether the sync's settings are
-    complete (checked locally; Airtable is not called)."""
+    finished run, open items by kind, the current and last background bulk
+    answer, and whether the sync's settings are complete (checked locally;
+    Airtable is not called)."""
     now = _utc_now()
     current = running_run(db)
     last = (
@@ -154,7 +155,11 @@ def status_payload(db: Session, settings: Any) -> dict:
         .first()
     )
     counts = open_item_counts(db)
+    job = bulk_jobs.running_job(db)
+    last_job = bulk_jobs.last_finished_job(db)
     return {
+        "current_bulk_job": bulk_jobs.serialize_job(job, now) if job else None,
+        "last_bulk_job": bulk_jobs.serialize_job(last_job, now) if last_job else None,
         "settings": settings_service.serialize_settings(settings_service.get_settings_row(db)),
         "config_error": _config_error(settings),
         "current_run": serialize_run(current, now) if current else None,

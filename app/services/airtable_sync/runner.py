@@ -260,12 +260,21 @@ def _thread_executor(fn: Callable[[], None]) -> None:
 class _Heartbeat:
     """Bumps the run's `heartbeat_at` every `interval` seconds from its own
     thread and its own short sessions, so a long Airtable read or step keeps
-    the run alive. Only touches a row that is still `running`."""
+    the run alive. Only touches a row that is still `running`. `model` is the
+    row's table: runs, or a bulk job (bulk_jobs.py), which has the same
+    `id` / `status` / `heartbeat_at` columns."""
 
-    def __init__(self, session_factory: Callable[[], Session], run_id: int, interval: float | None) -> None:
+    def __init__(
+        self,
+        session_factory: Callable[[], Session],
+        run_id: int,
+        interval: float | None,
+        model: type = AirtableSyncRunV2,
+    ) -> None:
         self._session_factory = session_factory
         self._run_id = run_id
         self._interval = interval
+        self._model = model
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -286,8 +295,8 @@ class _Heartbeat:
         db = self._session_factory()
         try:
             db.execute(
-                update(AirtableSyncRunV2)
-                .where(AirtableSyncRunV2.id == self._run_id, AirtableSyncRunV2.status == "running")
+                update(self._model)
+                .where(self._model.id == self._run_id, self._model.status == "running")
                 .values(heartbeat_at=_utc_now())
             )
             db.commit()

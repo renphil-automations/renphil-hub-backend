@@ -14,6 +14,8 @@ Users, Program Roles) and writes `scopes`, `parent_child_scopes`, `users` and
   airtable_sync_log               one row per change made (or, in a preview,
                                   that would be made)
   airtable_sync_items             open and closed conflicts / warnings
+  airtable_sync_bulk_jobs         one row per background "Accept all" /
+                                  "Keep all" (its progress, for the tab)
 
 The sync is one-way (Airtable → Hub) and never writes to Airtable.
 
@@ -65,6 +67,10 @@ RUN_STATUSES = ("running", "succeeded", "failed", "interrupted")
 # The steps a run may tick, in the only order they ever run (plan v2 R1).
 RUN_STEPS = ("clusters", "programs", "users", "program_roles")
 ITEM_STATUSES = ("open", "resolved", "superseded")
+# succeeded: every item answered; failed: stopped at an item's error;
+# stopped: an admin pressed Stop, or a run started midway (`stop_reason`);
+# interrupted: no heartbeat for 5 minutes (its thread died).
+BULK_JOB_STATUSES = ("running", "succeeded", "failed", "stopped", "interrupted")
 
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_RUN_TIME = time(6, 0)
@@ -300,6 +306,60 @@ class AirtableSyncLogV2(BaseV2):
     )
 
 
+class AirtableSyncBulkJobV2(BaseV2):
+    """One background bulk resolve ("Accept all from Airtable" / "Keep all";
+    owner, 2026-10-27): the same loop as `resolutions.bulk_resolve`, run in a
+    thread so the tab can follow it after the admin navigates away, a reload,
+    or from another admin's screen.
+
+    Like the run row, the `running` row is a lock: at most one job runs
+    (`uq_airtable_sync_bulk_jobs_running`), and while it does every other
+    answer is refused (409 `bulk_in_progress`). `item_ids` is the exact list
+    the job works through, fixed at its start. `heartbeat_at` moves after
+    every item; a row 5 minutes without one is taken as dead and marked
+    `interrupted` by the next job start (or ignored by a resolve)."""
+
+    __tablename__ = "airtable_sync_bulk_jobs"
+
+    id = Column(Integer, primary_key=True)
+    choice = Column(String(48), nullable=False)
+    # What the admin asked for: {"run_id", "kind"} or {"item_ids": true}.
+    target = Column(JSONB, nullable=True)
+    # The button's wording, for the tracker ("Accept all from Airtable (run 9, Field conflict)").
+    label = Column(String(255), nullable=True)
+    item_ids = Column(JSONB, nullable=False, default=list)
+    total = Column(Integer, nullable=False, default=0, server_default="0")
+    done = Column(Integer, nullable=False, default=0, server_default="0")
+    last_item_id = Column(Integer, nullable=True)
+    last_subject = Column(String(512), nullable=True)
+    status = Column(String(16), nullable=False, default="running")
+    # The item that stopped the loop, with its 409's {code, message, ...}.
+    failed = Column(JSONB, nullable=True)
+    not_attempted = Column(Integer, nullable=False, default=0, server_default="0")
+    stop_requested_by_email = Column(String(320), nullable=True)
+    # stopped: "stop_requested" or "run_started".
+    stop_reason = Column(String(32), nullable=True)
+    error = Column(Text, nullable=True)
+    started_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    started_by_email = Column(String(320), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(_in("status", BULK_JOB_STATUSES), name="ck_airtable_sync_bulk_jobs_status"),
+        Index("ix_airtable_sync_bulk_jobs_started_at", "started_at"),
+        Index(
+            "uq_airtable_sync_bulk_jobs_running",
+            "status",
+            unique=True,
+            # Both dialect predicates, as on uq_airtable_sync_runs_running.
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
+    )
+
+
 # Every table this module defines, in FK-dependency order. The migration
 # script creates them in this order.
 SYNC_TABLES = (
@@ -309,4 +369,5 @@ SYNC_TABLES = (
     AirtableSyncRecordV2.__table__,
     AirtableSyncItemV2.__table__,
     AirtableSyncLogV2.__table__,
+    AirtableSyncBulkJobV2.__table__,
 )

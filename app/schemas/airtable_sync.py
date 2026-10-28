@@ -283,6 +283,44 @@ class BulkResolveAPIResponse(BaseModel):
     data: BulkResolveData
 
 
+class StartBulkJobRequest(BulkResolveRequest):
+    """`BulkResolveRequest` run in the background (services/airtable_sync/
+    bulk_jobs.py), plus the button's wording for the tracker."""
+
+    label: StrictStr | None = Field(default=None, max_length=255)
+
+
+class BulkJobResponse(BaseModel):
+    id: int
+    choice: str
+    label: str | None = None
+    # {"run_id", "kind"} or {"item_ids": true}
+    target: dict[str, Any] | None = None
+    status: Literal["running", "succeeded", "failed", "stopped", "interrupted"]
+    total: int
+    done: int
+    last_item_id: int | None = None
+    last_subject: str | None = None
+    # The item that stopped the loop, with the 409's {code, message, ...}.
+    failed: dict[str, Any] | None = None
+    not_attempted: int = 0
+    stop_requested: bool = False
+    stop_requested_by_email: str | None = None
+    # stopped: "stop_requested" (an admin's Stop) or "run_started".
+    stop_reason: str | None = None
+    error: str | None = None
+    started_by_email: str | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    # True for a `running` job with no heartbeat for 5 minutes.
+    stale: bool = False
+
+
+class BulkJobAPIResponse(BaseModel):
+    data: BulkJobResponse
+
+
 class SyncStatusData(BaseModel):
     settings: SyncSettingsResponse
     # Names every missing sync setting; null when the configuration is
@@ -293,6 +331,9 @@ class SyncStatusData(BaseModel):
     # Open conflicts/warnings by kind; the tab's badge is the total.
     open_items: dict[str, int] = Field(default_factory=dict)
     open_items_total: int = 0
+    # The background bulk answer going now (any admin's), and the last ended one.
+    current_bulk_job: BulkJobResponse | None = None
+    last_bulk_job: BulkJobResponse | None = None
 
 
 class SyncStatusAPIResponse(BaseModel):

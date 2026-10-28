@@ -3,7 +3,8 @@
 
 A resolution
   - takes the sync lock and refuses (409 `run_in_progress`) while a live run
-    holds the run lock (`runner.refuse_if_running`);
+    holds the run lock, and (409 `bulk_in_progress`) while a live background
+    bulk job other than its caller does (`bulk_jobs.refuse_if_busy`);
   - checks the choice against the kind's choices AND the ones the item's
     payload offered (e.g. `delete_scope` only when the scope was unused);
   - marks the item `resolved` (resolution, resolution_data, who, when);
@@ -28,7 +29,9 @@ Items with no buttons ("—") and kinds a later phase answers → 409.
 Every refusal is an `AirtableSyncError` (409); the router rolls back.
 After the commit, `PostCommit` deletes replaced headshot objects (A-5) and
 sweeps the edit locks (lock_sweep.py). Bulk resolve (v1 §5.4 "Accept all /
-Keep all") is `resolve_item` in a loop, stopping at the first error.
+Keep all") is `resolve_item` in a loop, stopping at the first error: here
+in one request (`bulk_resolve`), or in the background with tracked progress
+(bulk_jobs.py, what the tab uses).
 """
 
 from __future__ import annotations
@@ -53,7 +56,8 @@ from app.services.airtable_sync.hr_fields import Plan
 from app.services.airtable_sync.items import NOT_REMEMBERED, ItemBook
 from app.services.airtable_sync.lock_sweep import release_unauthorized_locks
 from app.services.airtable_sync.program_roles_step import PairWriter, Target, retire_person_pairs, split_key
-from app.services.airtable_sync.runner import _as_text, as_utc, refuse_if_running
+from app.services.airtable_sync.bulk_jobs import refuse_if_busy
+from app.services.airtable_sync.runner import _as_text, as_utc
 from app.services.airtable_sync.runs_service import _like_pattern
 from app.services.airtable_sync.scopes_step import SYNC_EDGE, name_key
 from app.services.airtable_sync.settings_service import AirtableSyncError
@@ -714,10 +718,13 @@ def resolve_item(
     data: dict | None,
     current: CurrentHubUser,
     post_commit: PostCommit | None = None,
+    bulk_job_id: int | None = None,
 ) -> dict | None:
     """None when there is no such item (404). Flushes; the router commits,
-    or rolls back on an `AirtableSyncError`, then runs `post_commit`."""
-    refuse_if_running(db)
+    or rolls back on an `AirtableSyncError`, then runs `post_commit`.
+    `bulk_job_id`: the background job making this call, which its own
+    `bulk_in_progress` check lets through."""
+    refuse_if_busy(db, own_job_id=bulk_job_id)
     item = db.query(AirtableSyncItemV2).filter(AirtableSyncItemV2.id == item_id).with_for_update().one_or_none()
     if item is None:
         return None
@@ -778,8 +785,9 @@ def bulk_resolve(
     error (that item rolled back, the earlier ones kept). Items are taken in
     id order, so a person's last item is the one whose answer applies all of
     theirs (C4). Owns its commits; sweeps the locks once at the end. A live
-    run → `SyncRunInProgress` before anything is touched (409)."""
-    refuse_if_running(db)
+    run → `SyncRunInProgress` before anything is touched (409), as is a
+    live background job (`bulk_in_progress`)."""
+    refuse_if_busy(db)
     ids = bulk_targets(db, item_ids=item_ids, run_id=run_id, kind=kind, choice=choice)
     db.rollback()  # the targets' read is not part of any item's transaction
     resolved: list[dict] = []
