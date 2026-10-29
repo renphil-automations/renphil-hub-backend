@@ -357,6 +357,11 @@ class ThreadUpdateResult(BaseModel):
 class ThreadListResponse(BaseModel):
     items: list[ThreadSummary] = Field(default_factory=list)
     next_cursor: str | None = None
+    view_as: bool = Field(
+        default=False,
+        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+    )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class ThreadModerationRow(ThreadSummary):
@@ -442,8 +447,20 @@ class ThreadRevisionModerationSummary(BaseModel):
     pending_count: int
     view_as: bool = Field(
         default=False,
-        description="True when computed for the role/scope given in view_as_role/view_as_scope.",
+        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
     )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+
+
+class ThreadDetailViewAsResponse(ThreadDetail):
+    """`GET /threads/{id}` — `ThreadDetail` plus the View As echo fields
+    (kept off `ThreadDetail` itself, which create/update also return)."""
+
+    view_as: bool = Field(
+        default=False,
+        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+    )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class ThreadModerationListResponse(BaseModel):
@@ -461,8 +478,9 @@ class ThreadModerationSummary(BaseModel):
     pending_count: int
     view_as: bool = Field(
         default=False,
-        description="True when computed for the role/scope given in view_as_role/view_as_scope.",
+        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
     )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class ThreadWidgetCounts(BaseModel):
@@ -497,6 +515,11 @@ class CommentSummary(BaseModel):
 class CommentListResponse(BaseModel):
     items: list[CommentSummary] = Field(default_factory=list)
     next_cursor: str | None = None
+    view_as: bool = Field(
+        default=False,
+        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+    )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class VoteResponse(BaseModel):
@@ -545,6 +568,8 @@ class NotificationEntry(BaseModel):
 class NotificationListResponse(BaseModel):
     items: list[NotificationEntry] = Field(default_factory=list)
     next_cursor: str | None = None
+    view_as: bool = Field(default=False, description="True when listed for the user given in `view_as_user`.")
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class UnreadCountResponse(BaseModel):
@@ -554,3 +579,5 @@ class UnreadCountResponse(BaseModel):
     `thread_service.get_unread_notification_count`."""
 
     count: int
+    view_as: bool = Field(default=False, description="True when listed for the user given in `view_as_user`.")
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")

@@ -36,7 +36,8 @@ from app.db_v2.database import get_db_v2
 from app.dependencies import (
     CurrentHubUser,
     get_current_hub_user,
-    get_view_as_target,
+    get_view_as_selection,
+    get_view_as_user_selection,
     is_hub_admin,
     require_hub_admin,
 )
@@ -47,6 +48,7 @@ from app.schemas.rbac_assignments import (
     CreatedAssignmentAPIResponse,
     CreateHubUserRequest,
     DeleteUserPreviewAPIResponse,
+    GrantedAssignmentListAPIResponse,
     HubUserAdminAPIResponse,
     HubUserAdminListAPIResponse,
     HubUserListAPIResponse,
@@ -77,27 +79,34 @@ async def _release_now_unauthorized_locks(db: Session) -> None:
 ADMIN_ONLY = [Depends(require_hub_admin)]
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: only one of view_as_role/view_as_scope given, or an unknown key"},
-    403: {"description": "View As refused: the caller may not adopt the given role/scope"},
+    400: {"description": "View As: `anonymous=true` with `view_as_user`, a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
 
 def _delegation_identity(
     db: Session,
     current: CurrentHubUser,
-    target: view_as_service.ViewAsTarget | None,
+    selection: view_as_service.ViewAsSelection | None,
     closures: RbacClosures,
 ) -> tuple[bool, list | None]:
     """``(is_hub_admin, held)`` for ``assert_can_delegate`` /
     ``list_revocable``: the caller's own assignments normally (``held=None``
     lets the delegation service load them), or exactly the verified View As
-    pair."""
-    if target is None:
+    selection — the given pairs plus the selected user's rows, one held row
+    per pair. Direct-to-user grants play no part in delegation, so
+    ``anonymous`` changes nothing here beyond its 400 with
+    ``view_as_user``."""
+    if selection is None:
         return is_hub_admin(db, current, closures=closures), None
     return (
-        view_as_service.pair_is_hub_admin(db, target, closures=closures),
-        view_as_service.held_closures_for(target, closures=closures),
+        view_as_service.any_pair_is_hub_admin(db, selection.targets, closures=closures),
+        view_as_service.held_closures_for(selection.targets, closures=closures),
     )
+
+
+def _view_as_user(selection: view_as_service.ViewAsSelection | None) -> str | None:
+    return selection.user_email if selection is not None else None
 
 
 CONFLICT_RESPONSE = {
@@ -228,14 +237,24 @@ def get_my_assignments(
 
 @router.get(
     "/me/granted",
-    response_model=AssignmentListAPIResponse,
+    response_model=GrantedAssignmentListAPIResponse,
     summary="Assignments I personally granted (audit trail — may include ones I can no longer revoke)",
+    responses=VIEW_AS_ERROR_RESPONSES,
 )
 def get_my_granted(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_user_selection),
 ):
-    return {"data": rbac_assignment_service.list_granted_by_me(db, current.hub_user_id)}
+    """With `view_as_user` (verified like everywhere else), the assignments
+    the SELECTED user granted. `view_as` pairs are not accepted: a role and
+    scope pair never grants anything itself."""
+    granter_id = selection.user.id if selection is not None else current.hub_user_id
+    return {
+        "data": rbac_assignment_service.list_granted_by_me(db, granter_id),
+        "view_as": selection is not None,
+        "view_as_user": _view_as_user(selection),
+    }
 
 
 @router.get(
@@ -247,17 +266,18 @@ def get_my_granted(
 def get_my_revocable(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
-    target: view_as_service.ViewAsTarget | None = Depends(get_view_as_target),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
 ):
     """Deliberately broader than `/me/granted` (design doc §6.3): revocation
     is symmetric, not ownership-based, so this can include assignments some
     other admin granted. A Hub Admin gets everything, unconditionally.
 
-    With `view_as_role`/`view_as_scope`, the answer is for a holder of
-    exactly that pair instead of the caller's own assignments."""
-    admin, held = _delegation_identity(db, current, target, RbacClosures(db))
+    With View As parameters, the answer is for a holder of exactly the
+    given pairs plus the selected user's assignments, instead of the
+    caller's own."""
+    admin, held = _delegation_identity(db, current, selection, RbacClosures(db))
     data = rbac_assignment_service.list_revocable(db, current.hub_user_id, is_hub_admin=admin, held=held)
-    return {"data": data, "view_as": target is not None}
+    return {"data": data, "view_as": selection is not None, "view_as_user": _view_as_user(selection)}
 
 
 @router.get(
@@ -296,7 +316,7 @@ def create_assignment(
     request: CreateAssignmentRequest,
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
-    target: view_as_service.ViewAsTarget | None = Depends(get_view_as_target),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
 ):
     """`role_id`/`scope_id` not found stays a plain 404, matching every
     other `/v2/rbac` endpoint — checked BEFORE the delegation gate so a bad
@@ -305,8 +325,8 @@ def create_assignment(
     The ⊥ refusal below sits between the two, and its position is not
     cosmetic — see `_assert_not_public`.
 
-    With `view_as_role`/`view_as_scope`, the delegation gate checks the
-    verified pair instead of the caller's own assignments. The row is still
+    With View As parameters, the delegation gate checks the verified
+    pairs (given and the selected user's) instead of the caller's own assignments. The row is still
     recorded as granted by the real caller."""
     role = rbac_service.get_role(db, request.role_id)
     if role is None:
@@ -320,7 +340,7 @@ def create_assignment(
         # ONE SNAPSHOT (§8.2, §6.8): shared between the Hub Admin bypass and
         # the delegation check below rather than each building its own.
         closures = RbacClosures(db)
-        admin, held = _delegation_identity(db, current, target, closures)
+        admin, held = _delegation_identity(db, current, selection, closures)
         assert_can_delegate(
             db,
             granter_hub_user_id=current.hub_user_id,
@@ -341,7 +361,7 @@ def create_assignment(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
-    return {"data": assignment, "view_as": target is not None}
+    return {"data": assignment, "view_as": selection is not None, "view_as_user": _view_as_user(selection)}
 
 
 @router.delete(
@@ -358,7 +378,7 @@ async def delete_assignment(
     assignment_id: int,
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
-    target: view_as_service.ViewAsTarget | None = Depends(get_view_as_target),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
 ):
     """Symmetric with create, not ownership-based (design doc §6.3,
     restated as a landmine in handoff §7): the check re-runs §6.1 against
@@ -373,8 +393,8 @@ async def delete_assignment(
     `_assert_not_the_last_hub_admin`'s docstring, which explains at length
     why the bypass every other gate applies first is inverted there.
 
-    With `view_as_role`/`view_as_scope`, the delegation gate checks the
-    verified pair instead of the caller's own assignments. The admin floor
+    With View As parameters, the delegation gate checks the verified
+    pairs (given and the selected user's) instead of the caller's own assignments. The admin floor
     is unaffected."""
     assignment = rbac_assignment_service.get_assignment(db, assignment_id)
     if assignment is None:
@@ -382,7 +402,7 @@ async def delete_assignment(
 
     try:
         closures = RbacClosures(db)
-        admin, held = _delegation_identity(db, current, target, closures)
+        admin, held = _delegation_identity(db, current, selection, closures)
         assert_can_delegate(
             db,
             granter_hub_user_id=current.hub_user_id,

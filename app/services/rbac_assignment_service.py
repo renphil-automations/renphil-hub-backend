@@ -135,8 +135,8 @@ def list_revocable(
     same bypass as everywhere else in this phase.
 
     ``held`` replaces the caller's own assignment rows — View As passes the
-    adopted pair (``view_as_service.held_closures_for``) so the answer is
-    what a holder of exactly that pair could revoke. The rule is still
+    adopted pairs (``view_as_service.held_closures_for``) so the answer is
+    what a holder of exactly those pairs could revoke. The rule is still
     ``can_delegate``, unchanged.
 
     A plain per-row `can_delegate` call, not a bulk query: both graphs are
