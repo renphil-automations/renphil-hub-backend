@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import CurrentHubUser, get_current_hub_user, get_view_as_user_selection
+from app.dependencies import CurrentHubUser, get_current_hub_user
 from app.schemas.bookmark import (
     AddBookmarkRequest,
     AddBookmarkResponse,
@@ -19,37 +19,25 @@ from app.schemas.bookmark import (
     BookmarkListResponse,
     DeleteBookmarkResponse,
 )
-from app.services import bookmark_service, view_as_service
+from app.services import bookmark_service
 
 router = APIRouter(prefix="/bookmarks", tags=["Bookmarks"])
 
 
-@router.get(
-    "/get_bookmarks",
-    response_model=BookmarkListResponse,
-    responses={
-        400: {"description": "View As: unknown or removed `view_as_user`"},
-        403: {"description": "View As refused: the selected user holds a role/scope the caller may not adopt"},
-    },
-)
+@router.get("/get_bookmarks", response_model=BookmarkListResponse)
 def get_bookmarks(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_user_selection),
 ) -> BookmarkListResponse:
     """Return every bookmark saved by the authenticated caller.
 
     The owner is resolved from the JWT email to the caller's ``hub_users``
-    row, never taken as input — except under ``view_as_user``, verified like
-    on every other View As endpoint, where it is the selected user. ``view_as``
-    pairs and ``anonymous`` are not accepted: bookmarks belong to a person.
+    row, never taken as input.
     """
-    user_id = selection.user.id if selection is not None else current.hub_user_id
+    user_id = current.hub_user_id
     rows = bookmark_service.list_bookmarks(db, user_id=user_id)
     return BookmarkListResponse(
         user_id=user_id,
-        view_as=selection is not None,
-        view_as_user=selection.user_email if selection is not None else None,
         bookmarks=[
             BookmarkEntry(
                 bookmark_link=row.bookmark_link,

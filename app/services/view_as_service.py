@@ -267,24 +267,19 @@ SOURCE_USER = "view_as_user"
 
 @dataclass(frozen=True)
 class ViewAsUser:
-    """The user picked through ``view_as_user``. ``email`` is the one given;
-    ``emails`` is every address the person is known by (work and alias),
-    normalized — what person-keyed rows such as notifications are matched
-    against."""
+    """The user picked through ``view_as_user``."""
 
     id: int
     email: str
     name: str | None
-    emails: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ViewAsSelection:
     """A verified View As request. ``targets`` is the union of the given
     ``view_as`` pairs and the selected user's assignment rows, one per
-    ``(role, scope)``. ``user`` is the selected user, when one was given —
-    their DIRECT grants count too (``resolve_view_as_access``); with pairs
-    only, the caller's own direct grants count instead."""
+    ``(role, scope)``. ``user`` is the selected user, when one was given:
+    access uses only their assignments, never their direct grants."""
 
     targets: list[ViewAsTarget]
     user: ViewAsUser | None = None
@@ -427,8 +422,7 @@ def _check_user(
                 "_status": 403,
             }
         )
-    emails = tuple(sorted({e for e in (normalize_email(user.work_email), normalize_email(user.alias_email)) if e}))
-    return ViewAsUser(id=user.id, email=email, name=user.name, emails=emails), targets, failures
+    return ViewAsUser(id=user.id, email=email, name=user.name), targets, failures
 
 
 # Top-level error code by (who blocked, status): only the selected user,
@@ -607,9 +601,8 @@ def resolve_view_as_access(
     closures: RbacClosures | None = None,
 ) -> ViewerAccess:
     """The ``ViewerAccess`` a holder of exactly these pairs would get, plus
-    the grants shared DIRECTLY with ``user_id`` when given — the selected
-    View As user, or the caller themselves when only pairs were given
-    without ``anonymous``.
+    the grants shared DIRECTLY with ``user_id`` when given — only ever the
+    caller themselves, when only pairs were given without ``anonymous``.
 
     Pairs are expanded ONE AT A TIME and unioned afterwards — the same
     per-row rule ``effective_pairs`` applies to real assignments, so a role

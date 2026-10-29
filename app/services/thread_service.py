@@ -72,7 +72,6 @@ import json
 import logging
 import re
 import unicodedata
-from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1068,12 +1067,6 @@ def _to_notification_entry(
     )
 
 
-def _recipient_emails(user: UserInfo, recipient_emails: Iterable[str] | None) -> list[str]:
-    if recipient_emails is not None:
-        return sorted({_norm_email(e) for e in recipient_emails if e})
-    return [_norm_email(user.email)]
-
-
 def list_notifications_for_user(
     db: Session,
     user: UserInfo,
@@ -1081,7 +1074,6 @@ def list_notifications_for_user(
     unread_only: bool,
     *,
     access: ViewerAccess | None = None,
-    recipient_emails: Iterable[str] | None = None,
 ) -> NotificationListResponse:
     """`GET /notifications` (plan §4.1) — self only, newest first, pages of
     `NOTIFICATIONS_PAGE_SIZE`. `thread_title` / `component_link` are joined
@@ -1100,17 +1092,13 @@ def list_notifications_for_user(
     dropdown; do not "fix" this into a subquery/join later. `next_cursor` is
     computed from the UNFILTERED page (before this filter runs), so
     pagination continuity tracks where the DB scan actually left off, not
-    what survives the filter.
-
-    `recipient_emails` (View As, `view_as_user`) replaces `user.email`: the
-    selected user's work AND alias emails, since rows can be keyed on
-    either."""
-    emails = _recipient_emails(user, recipient_emails)
+    what survives the filter."""
+    email = _norm_email(user.email)
     query = (
         db.query(NotificationV2, ThreadV2.title, ComponentV2.link)
         .join(ThreadV2, ThreadV2.id == NotificationV2.thread_id)
         .join(ComponentV2, ComponentV2.id == NotificationV2.component_id)
-        .filter(NotificationV2.recipient_email.in_(emails))
+        .filter(NotificationV2.recipient_email == email)
     )
     if unread_only:
         query = query.filter(NotificationV2.read_at.is_(None))
@@ -1149,12 +1137,7 @@ def list_notifications_for_user(
 
 
 def get_unread_notification_count(
-    db: Session,
-    user: UserInfo,
-    *,
-    access: ViewerAccess | None = None,
-    recipient_emails: Iterable[str] | None = None,
-    view_as_user: str | None = None,
+    db: Session, user: UserInfo, *, access: ViewerAccess | None = None
 ) -> tuple[int, str]:
     """`GET /notifications/unread-count` (plan §4.5) — "one query, both
     values", derived every time, never cached. Returns `(count, etag)`; the
@@ -1168,27 +1151,21 @@ def get_unread_notification_count(
     badge and the dropdown it opens visibly disagree — which costs the
     index-only-scan property: `component_id` has to be read per row to
     filter with, not just aggregated. Still bounded by how many
-    notifications one person has unread, not by the whole table.
-
-    `recipient_emails` as in `list_notifications_for_user`; `view_as_user`
-    (the selected user's email, echoed in the body) suffixes the ETag via
-    `_view_as_etag_suffix`, so two people's identical counts never share a
-    tag."""
-    emails = _recipient_emails(user, recipient_emails)
-    suffix = _view_as_etag_suffix(view_as_user is not None, view_as_user)
+    notifications one person has unread, not by the whole table."""
+    email = _norm_email(user.email)
     if access is None:
         count, max_id = (
             db.query(func.count(NotificationV2.id), func.max(NotificationV2.id))
-            .filter(NotificationV2.recipient_email.in_(emails), NotificationV2.read_at.is_(None))
+            .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
             .one()
         )
         count = int(count or 0)
-        etag = f'"{count}-{int(max_id) if max_id is not None else 0}{suffix}"'
+        etag = f'"{count}-{int(max_id) if max_id is not None else 0}"'
         return count, etag
 
     rows = (
         db.query(NotificationV2.id, NotificationV2.component_id)
-        .filter(NotificationV2.recipient_email.in_(emails), NotificationV2.read_at.is_(None))
+        .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
         .all()
     )
     granted_ids = [
@@ -1198,7 +1175,7 @@ def get_unread_notification_count(
     ]
     count = len(granted_ids)
     max_id = max(granted_ids) if granted_ids else None
-    etag = f'"{count}-{max_id if max_id is not None else 0}{suffix}"'
+    etag = f'"{count}-{max_id if max_id is not None else 0}"'
     return count, etag
 
 
@@ -1650,8 +1627,8 @@ def list_threads_for_link(
 ) -> ThreadListResponse:
     """`user` is whose own pending/rejected threads, votes and authored
     revisions show up — the caller normally, the selected user under
-    `view_as_user`, and nobody (`None`) for `anonymous`, which therefore
-    lists approved threads only with `my_vote` 0 (vote counts stay exact)."""
+    nobody (`None`) for `anonymous` or `view_as_user`, which therefore list
+    approved threads only with `my_vote` 0 (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
@@ -1797,8 +1774,8 @@ def get_thread_by_id(
     access to the widget at all keeps getting 403, never 404.
 
     `user` is whose authorship, vote and authored revisions count — the
-    caller normally (View As pairs included), the selected user under
-    `view_as_user`, and nobody (`None`) for `anonymous`."""
+    caller normally (View As pairs included), and nobody (`None`) for
+    `anonymous` or `view_as_user`."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
     # access to the widget at all must keep getting the existing 403, never
@@ -2650,8 +2627,8 @@ def moderation_summary(
     regardless of whether any widget currently has a thread on it.
 
     `view_as=True` means `access` was built from the View As parameters
-    (`dependencies.get_view_as_access`): its direct grants are the selected
-    user's (`view_as_user`), or else the caller's own. `view_as` and
+    (`dependencies.get_view_as_access`): its only direct grants are the
+    caller's own, with pairs only and without `anonymous`. `view_as` and
     `view_as_user` are echoed in the body and suffix the ETag
     (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)

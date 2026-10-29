@@ -75,8 +75,6 @@ from app.dependencies import (
     get_view_as_access,
     get_view_as_anonymous,
     get_view_as_selection,
-    get_view_as_user_access,
-    get_view_as_user_selection,
     get_viewer_access,
     is_hub_admin,
 )
@@ -122,11 +120,6 @@ VIEW_AS_ERROR_RESPONSES = {
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
-VIEW_AS_USER_ERROR_RESPONSES = {
-    400: {"description": "View As: unknown or removed `view_as_user`"},
-    403: {"description": "View As refused: the selected user holds a role/scope the caller may not adopt"},
-}
-
 THREAD_VIEW_AS_RESPONSES = {
     400: {
         "description": (
@@ -142,17 +135,13 @@ def _thread_subject(
     selection: view_as_service.ViewAsSelection | None,
     anonymous: bool,
 ) -> UserInfo | None:
-    """Whose authorship, votes and authored edits the thread read
-    endpoints report: the selected user under `view_as_user`, nobody
-    (`None`) under `anonymous`, and the caller otherwise — including a View
-    As of role/scope pairs only. (`anonymous` with `view_as_user` never
-    gets here: `get_view_as_selection` refuses it with a 400.)"""
-    if selection is not None and selection.user is not None:
-        # Validation skipped: the email comes from our own users table.
-        return UserInfo.model_construct(
-            email=selection.user.email, name=selection.user.name or selection.user.email, roles=[]
-        )
-    if anonymous:
+    """Whose authorship, votes and authored edits the thread read endpoints
+    report: the caller's, including a View As of role/scope pairs only, or
+    nobody's (`None`) under `anonymous` or `view_as_user` — a selected user
+    is seen through their roles only, exactly like `anonymous`.
+    (`anonymous` with `view_as_user` never gets here: `get_view_as_selection`
+    refuses it with a 400.)"""
+    if anonymous or (selection is not None and selection.user is not None):
         return None
     return user
 
@@ -255,10 +244,9 @@ async def list_threads(
     selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    """Own pending/rejected threads, votes and pending edits are the
-    selected user's with `view_as_user`, nobody's with `anonymous` (approved
-    threads only, `my_vote` 0), and the caller's otherwise — including with
-    `view_as` pairs only."""
+    """Own pending/rejected threads, votes and pending edits are nobody's
+    with `anonymous` or `view_as_user` (approved threads only, `my_vote` 0),
+    and the caller's otherwise — including with `view_as` pairs only."""
     subject = _thread_subject(user, selection, anonymous)
     result = await asyncio.to_thread(
         thread_service.list_threads_for_link,
@@ -865,29 +853,21 @@ async def vote_on_comment(
     "/notifications",
     response_model=NotificationListResponse,
     summary="One page of the caller's own notifications, newest first",
-    responses=VIEW_AS_USER_ERROR_RESPONSES,
 )
 async def list_notifications(
     cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
     unread_only: bool = Query(default=False),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_user_selection),
-    view_as_access: ViewAsAccess = Depends(get_view_as_user_access),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
-    """With `view_as_user`, the selected user's notifications (addressed to
-    their work or alias email), filtered by THEIR access."""
-    result = await asyncio.to_thread(
+    return await asyncio.to_thread(
         thread_service.list_notifications_for_user,
         db,
         user,
         cursor,
         unread_only,
-        access=view_as_access.access,
-        recipient_emails=selection.user.emails if selection is not None else None,
-    )
-    return result.model_copy(
-        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+        access=access,
     )
 
 
@@ -895,23 +875,16 @@ async def list_notifications(
     "/notifications/unread-count",
     response_model=UnreadCountResponse,
     summary="The caller's unread notification count — derived every time, never cached (plan §4.5)",
-    responses=VIEW_AS_USER_ERROR_RESPONSES,
 )
 async def get_unread_notification_count(
     request: Request,
     response: Response,
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_user_selection),
-    view_as_access: ViewAsAccess = Depends(get_view_as_user_access),
+    access: ViewerAccess = Depends(get_viewer_access),
 ):
     count, etag = await asyncio.to_thread(
-        thread_service.get_unread_notification_count,
-        db,
-        user,
-        access=view_as_access.access,
-        recipient_emails=selection.user.emails if selection is not None else None,
-        view_as_user=view_as_access.view_as_user,
+        thread_service.get_unread_notification_count, db, user, access=access
     )
     # plan §4.5 — "does not save a request, but it drops the body in the
     # overwhelmingly common unchanged case." A 304 carries no body by HTTP
@@ -926,9 +899,7 @@ async def get_unread_notification_count(
         )
     response.headers["ETag"] = etag
     response.headers["Cache-Control"] = "no-store"
-    return UnreadCountResponse(
-        count=count, view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
-    )
+    return UnreadCountResponse(count=count)
 
 
 @router.post(
