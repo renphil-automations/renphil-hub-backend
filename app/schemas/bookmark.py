@@ -21,6 +21,10 @@ class BookmarkListResponse(BaseModel):
 
     user_id: int
     bookmarks: list[BookmarkEntry] = Field(default_factory=list)
+    view_as: bool = Field(default=False, description="True when listed for the user given in `view_as_user`.")
+    view_as_user: str | None = Field(
+        default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none."
+    )
 
 
 class AddBookmarkRequest(BaseModel):
