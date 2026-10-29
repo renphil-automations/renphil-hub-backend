@@ -11,7 +11,8 @@ the same loop, run in a thread, with its progress on a row the tab polls:
   execute      `resolve_item` per item, one transaction each, in id order,
                stopping at the first error (v1 §5.4, unchanged); `done`,
                the last item and the heartbeat move after every item
-  request_stop the admin's Stop: honoured before the next item
+  request_stop the admin's Stop: honoured before the next item; a stale
+               job is closed (`interrupted`) at once
 
 While a job is live every other answer is refused with 409
 `bulk_in_progress` (`refuse_if_busy`, used by `resolve_item` and the
@@ -59,6 +60,10 @@ logger = logging.getLogger(__name__)
 INTERRUPTED_ERROR = (
     "No heartbeat for 5 minutes: the job's process probably stopped (e.g. a restart). "
     "Marked interrupted when the next job started."
+)
+STOPPED_STALE_ERROR = (
+    "No heartbeat for 5 minutes: the job's process probably stopped (e.g. a restart). "
+    "Marked interrupted when an admin pressed Stop."
 )
 
 
@@ -185,11 +190,7 @@ def start_job(
     if current_job is not None:
         if not is_stale(current_job, now):
             raise _in_progress(current_job)
-        logger.warning("Airtable sync bulk job %s: no heartbeat since %s, marking it interrupted", current_job.id, liveness(current_job))
-        current_job.status = "interrupted"
-        current_job.finished_at = now
-        current_job.error = INTERRUPTED_ERROR
-        current_job.not_attempted = max(current_job.total - current_job.done, 0)
+        _mark_interrupted(current_job, now, INTERRUPTED_ERROR)
         db.flush()  # free the index before the insert below
 
     ids = bulk_targets(db, item_ids=item_ids, run_id=run_id, kind=kind, choice=choice)
@@ -215,17 +216,33 @@ def start_job(
     return StartedJob(job_id=job.id, item_ids=tuple(ids), choice=choice, current=current)
 
 
+def _mark_interrupted(job: AirtableSyncBulkJobV2, now: datetime, error: str) -> None:
+    logger.warning("Airtable sync bulk job %s: no heartbeat since %s, marking it interrupted", job.id, liveness(job))
+    job.status = "interrupted"
+    job.finished_at = now
+    job.error = error
+    job.not_attempted = max(job.total - job.done, 0)
+
+
 def request_stop(db: Session, job_id: int, *, actor_email: str | None) -> AirtableSyncBulkJobV2 | None:
     """Mark a live job to stop before its next item (flush; the caller
-    commits). None when there is no such job; 409 when it isn't running."""
+    commits). None when there is no such job; 409 when it isn't running.
+
+    A stale job is closed (`interrupted`) on the spot instead: its thread is
+    gone, so nothing would ever honour the flag (owner, 2026-10-29). Should
+    the thread be alive after all, its next item sees the row is no longer
+    `running` and it stops there, as after a later start."""
     job = db.query(AirtableSyncBulkJobV2).filter(AirtableSyncBulkJobV2.id == job_id).with_for_update().one_or_none()
     if job is None:
         return None
     if job.status != "running":
         raise AirtableSyncError("bulk_job_not_running", "This bulk answer has already ended.", status=job.status)
+    now = _utc_now()
     if job.stop_requested_by_email is None:
         job.stop_requested_by_email = (actor_email or "").strip().lower() or "an admin"
-        db.flush()
+    if is_stale(job, now):
+        _mark_interrupted(job, now, STOPPED_STALE_ERROR)
+    db.flush()
     return job
 
 
