@@ -526,8 +526,9 @@ class ViewAsAccess:
 
 
 VIEW_AS_USER_DESCRIPTION = (
-    "View As: email of a user to see the hub as (their assignments AND the content "
-    "shared directly with them). Combines with `view_as` pairs where those are accepted. "
+    "View As: email of a user to see the hub as, through their role/scope assignments only "
+    "(content shared directly with them is not included, and their own threads, votes and "
+    "pending edits are not marked as theirs). Combines with `view_as` pairs. "
     "Pick from `GET /v2/view-as/users`."
 )
 
@@ -643,21 +644,6 @@ async def get_view_as_selection(
     return _verify_view_as(db, current, values, user_email, anonymous=anonymous)
 
 
-async def get_view_as_user_selection(
-    view_as_user: str | None = Query(default=None, description=VIEW_AS_USER_DESCRIPTION),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-) -> view_as_service.ViewAsSelection | None:
-    """``get_view_as_selection`` for endpoints where only a selected USER
-    means anything (``/v2/rbac/me/granted``: a role/scope pair never grants
-    anything itself), so ``view_as`` pairs and ``anonymous`` are not
-    accepted. Same verification, logging and errors."""
-    user_email = view_as_service.normalize_email(view_as_user)
-    if user_email is None:
-        return None
-    return _verify_view_as(db, current, [], user_email)
-
-
 async def get_view_as_access(
     selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     anonymous: bool = Depends(get_view_as_anonymous),
@@ -668,11 +654,11 @@ async def get_view_as_access(
     exactly ``get_viewer_access`` without View As parameters, the selection's
     combined access with them (see ``get_view_as_selection``).
 
-    Content shared DIRECTLY with a person is the selected user's under
-    ``view_as_user``, the caller's own otherwise — unless ``anonymous``,
-    which drops the caller's direct shares, with or without pairs. A Hub
-    Admin keeps full access under ``anonymous`` (direct shares add nothing
-    to it)."""
+    Content shared DIRECTLY with a person counts only for the caller, and
+    only without ``anonymous`` or ``view_as_user``: a selected user is seen
+    through their role/scope assignments alone, never their direct shares.
+    A Hub Admin keeps full access under ``anonymous`` (direct shares add
+    nothing to it)."""
     if selection is None:
         if not anonymous:
             return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
@@ -683,26 +669,11 @@ async def get_view_as_access(
             access = view_as_service.resolve_access_without_direct_grants(db, current.hub_user_id, closures=closures)
         return ViewAsAccess(access=access, view_as=False)
 
-    if selection.user is not None:
-        direct_grants_user_id = selection.user.id
+    if selection.user is not None or anonymous:
+        direct_grants_user_id = None
     else:
-        direct_grants_user_id = None if anonymous else current.hub_user_id
+        direct_grants_user_id = current.hub_user_id
     access = view_as_service.resolve_view_as_access(db, selection.targets, user_id=direct_grants_user_id)
-    return ViewAsAccess(access=access, view_as=True, view_as_user=selection.user_email)
-
-
-async def get_view_as_user_access(
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_user_selection),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-) -> ViewAsAccess:
-    """``get_view_as_access`` for the endpoints that accept ``view_as_user``
-    only (no pairs, no ``anonymous``): the caller's own access without it,
-    the selected user's full access — assignments and direct shares — with
-    it."""
-    if selection is None:
-        return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
-    access = view_as_service.resolve_view_as_access(db, selection.targets, user_id=selection.user.id)
     return ViewAsAccess(access=access, view_as=True, view_as_user=selection.user_email)
 
 

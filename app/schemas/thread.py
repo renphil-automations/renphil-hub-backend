@@ -568,8 +568,6 @@ class NotificationEntry(BaseModel):
 class NotificationListResponse(BaseModel):
     items: list[NotificationEntry] = Field(default_factory=list)
     next_cursor: str | None = None
-    view_as: bool = Field(default=False, description="True when listed for the user given in `view_as_user`.")
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class UnreadCountResponse(BaseModel):
@@ -579,5 +577,3 @@ class UnreadCountResponse(BaseModel):
     `thread_service.get_unread_notification_count`."""
 
     count: int
-    view_as: bool = Field(default=False, description="True when listed for the user given in `view_as_user`.")
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")

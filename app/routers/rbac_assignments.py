@@ -37,7 +37,6 @@ from app.dependencies import (
     CurrentHubUser,
     get_current_hub_user,
     get_view_as_selection,
-    get_view_as_user_selection,
     is_hub_admin,
     require_hub_admin,
 )
@@ -48,7 +47,6 @@ from app.schemas.rbac_assignments import (
     CreatedAssignmentAPIResponse,
     CreateHubUserRequest,
     DeleteUserPreviewAPIResponse,
-    GrantedAssignmentListAPIResponse,
     HubUserAdminAPIResponse,
     HubUserAdminListAPIResponse,
     HubUserListAPIResponse,
@@ -237,24 +235,14 @@ def get_my_assignments(
 
 @router.get(
     "/me/granted",
-    response_model=GrantedAssignmentListAPIResponse,
+    response_model=AssignmentListAPIResponse,
     summary="Assignments I personally granted (audit trail — may include ones I can no longer revoke)",
-    responses=VIEW_AS_ERROR_RESPONSES,
 )
 def get_my_granted(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_user_selection),
 ):
-    """With `view_as_user` (verified like everywhere else), the assignments
-    the SELECTED user granted. `view_as` pairs are not accepted: a role and
-    scope pair never grants anything itself."""
-    granter_id = selection.user.id if selection is not None else current.hub_user_id
-    return {
-        "data": rbac_assignment_service.list_granted_by_me(db, granter_id),
-        "view_as": selection is not None,
-        "view_as_user": _view_as_user(selection),
-    }
+    return {"data": rbac_assignment_service.list_granted_by_me(db, current.hub_user_id)}
 
 
 @router.get(
