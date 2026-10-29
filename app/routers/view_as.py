@@ -1,6 +1,7 @@
 """View As pickers — the scopes, then the roles on a scope, that the caller
-may adopt through the ``view_as_role`` / ``view_as_scope`` parameters of the
-hub's read endpoints. Rules: ``app/services/view_as_service.py``."""
+may adopt through the repeatable ``view_as=role_key:scope_key`` parameter of the
+hub's read endpoints, and the users they may pick through ``view_as_user``.
+Rules: ``app/services/view_as_service.py``."""
 
 from __future__ import annotations
 
@@ -11,7 +12,11 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
 from app.dependencies import CurrentHubUser, get_current_hub_user
-from app.schemas.view_as import ViewAsRoleListAPIResponse, ViewAsScopeListAPIResponse
+from app.schemas.view_as import (
+    ViewAsRoleListAPIResponse,
+    ViewAsScopeListAPIResponse,
+    ViewAsUserListAPIResponse,
+)
 from app.services import view_as_service
 
 logger = logging.getLogger(__name__)
@@ -62,3 +67,21 @@ def list_view_as_roles(
         logger.warning("View As roles refused for %s (user %s) on scope %s: %s", current.email, user_id, scope_id, e.code)
         raise HTTPException(status_code=e.status_code, detail={"code": e.code, "message": e.message})
     return {"scope_id": scope_id, "data": roles}
+
+
+@router.get(
+    "/users",
+    response_model=ViewAsUserListAPIResponse,
+    summary="Users the caller may pick through view_as_user",
+)
+def list_view_as_users(
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Every active user whose EVERY role/scope assignment the caller could
+    adopt themselves (same or weaker role, on a scope the caller holds, a
+    child of one, or the public scope). A single assignment beyond the
+    caller's reach excludes the user. Users with no assignment are
+    included; the caller and users with no email are not. Sorted by name.
+    Each user carries their assignments as `role_key`/`scope_key`."""
+    return {"data": view_as_service.list_viewable_users(db, _user_id(db, current))}
