@@ -67,10 +67,12 @@ exception.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
 import unicodedata
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -405,7 +407,7 @@ def _moderated_component_ids(db: Session, access: ViewerAccess | None) -> list[i
 
 
 def _can_see_thread_revisions(
-    thread: ThreadV2, component: ComponentV2, user: UserInfo, access: ViewerAccess | None
+    thread: ThreadV2, component: ComponentV2, user: UserInfo | None, access: ViewerAccess | None
 ) -> bool:
     """plan_thread_edit_versioning_2026-09-22.md §4.4 / landmine 3 — "may
     this caller know about this thread's staged edits": the thread's author
@@ -418,9 +420,8 @@ def _can_see_thread_revisions(
     `ThreadDetail.pending_revisions` and `GET .../revisions/{id}`, so the
     three can't drift apart. `access=None` → author only (the editor arm is
     `_is_component_editor`, which is False without a real `ViewerAccess`)."""
-    return _norm_email(thread.author_email) == _norm_email(user.email) or _is_component_editor(
-        component, access
-    )
+    is_author = user is not None and _norm_email(thread.author_email) == _norm_email(user.email)
+    return is_author or _is_component_editor(component, access)
 
 
 # ---------------------------------------------------------
@@ -1067,6 +1068,12 @@ def _to_notification_entry(
     )
 
 
+def _recipient_emails(user: UserInfo, recipient_emails: Iterable[str] | None) -> list[str]:
+    if recipient_emails is not None:
+        return sorted({_norm_email(e) for e in recipient_emails if e})
+    return [_norm_email(user.email)]
+
+
 def list_notifications_for_user(
     db: Session,
     user: UserInfo,
@@ -1074,6 +1081,7 @@ def list_notifications_for_user(
     unread_only: bool,
     *,
     access: ViewerAccess | None = None,
+    recipient_emails: Iterable[str] | None = None,
 ) -> NotificationListResponse:
     """`GET /notifications` (plan §4.1) — self only, newest first, pages of
     `NOTIFICATIONS_PAGE_SIZE`. `thread_title` / `component_link` are joined
@@ -1092,13 +1100,17 @@ def list_notifications_for_user(
     dropdown; do not "fix" this into a subquery/join later. `next_cursor` is
     computed from the UNFILTERED page (before this filter runs), so
     pagination continuity tracks where the DB scan actually left off, not
-    what survives the filter."""
-    email = _norm_email(user.email)
+    what survives the filter.
+
+    `recipient_emails` (View As, `view_as_user`) replaces `user.email`: the
+    selected user's work AND alias emails, since rows can be keyed on
+    either."""
+    emails = _recipient_emails(user, recipient_emails)
     query = (
         db.query(NotificationV2, ThreadV2.title, ComponentV2.link)
         .join(ThreadV2, ThreadV2.id == NotificationV2.thread_id)
         .join(ComponentV2, ComponentV2.id == NotificationV2.component_id)
-        .filter(NotificationV2.recipient_email == email)
+        .filter(NotificationV2.recipient_email.in_(emails))
     )
     if unread_only:
         query = query.filter(NotificationV2.read_at.is_(None))
@@ -1137,7 +1149,12 @@ def list_notifications_for_user(
 
 
 def get_unread_notification_count(
-    db: Session, user: UserInfo, *, access: ViewerAccess | None = None
+    db: Session,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None = None,
+    recipient_emails: Iterable[str] | None = None,
+    view_as_user: str | None = None,
 ) -> tuple[int, str]:
     """`GET /notifications/unread-count` (plan §4.5) — "one query, both
     values", derived every time, never cached. Returns `(count, etag)`; the
@@ -1151,21 +1168,27 @@ def get_unread_notification_count(
     badge and the dropdown it opens visibly disagree — which costs the
     index-only-scan property: `component_id` has to be read per row to
     filter with, not just aggregated. Still bounded by how many
-    notifications one person has unread, not by the whole table."""
-    email = _norm_email(user.email)
+    notifications one person has unread, not by the whole table.
+
+    `recipient_emails` as in `list_notifications_for_user`; `view_as_user`
+    (the selected user's email, echoed in the body) suffixes the ETag via
+    `_view_as_etag_suffix`, so two people's identical counts never share a
+    tag."""
+    emails = _recipient_emails(user, recipient_emails)
+    suffix = _view_as_etag_suffix(view_as_user is not None, view_as_user)
     if access is None:
         count, max_id = (
             db.query(func.count(NotificationV2.id), func.max(NotificationV2.id))
-            .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
+            .filter(NotificationV2.recipient_email.in_(emails), NotificationV2.read_at.is_(None))
             .one()
         )
         count = int(count or 0)
-        etag = f'"{count}-{int(max_id) if max_id is not None else 0}"'
+        etag = f'"{count}-{int(max_id) if max_id is not None else 0}{suffix}"'
         return count, etag
 
     rows = (
         db.query(NotificationV2.id, NotificationV2.component_id)
-        .filter(NotificationV2.recipient_email == email, NotificationV2.read_at.is_(None))
+        .filter(NotificationV2.recipient_email.in_(emails), NotificationV2.read_at.is_(None))
         .all()
     )
     granted_ids = [
@@ -1175,7 +1198,7 @@ def get_unread_notification_count(
     ]
     count = len(granted_ids)
     max_id = max(granted_ids) if granted_ids else None
-    etag = f'"{count}-{max_id if max_id is not None else 0}"'
+    etag = f'"{count}-{max_id if max_id is not None else 0}{suffix}"'
     return count, etag
 
 
@@ -1406,7 +1429,7 @@ def _pending_revision_counts(
     db: Session,
     threads: list[ThreadV2],
     component: ComponentV2,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None,
 ) -> dict[int, int]:
@@ -1435,7 +1458,7 @@ def _pending_revision_summaries(
     db: Session,
     thread: ThreadV2,
     component: ComponentV2,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None,
 ) -> list[ThreadRevisionSummary]:
@@ -1620,11 +1643,15 @@ def list_threads_for_link(
     db: Session,
     link: str,
     cursor: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None = None,
     anonymous: bool = False,
 ) -> ThreadListResponse:
+    """`user` is whose own pending/rejected threads, votes and authored
+    revisions show up — the caller normally, the selected user under
+    `view_as_user`, and nobody (`None`) for `anonymous`, which therefore
+    lists approved threads only with `my_vote` 0 (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
@@ -1636,7 +1663,7 @@ def list_threads_for_link(
     # widget's list at all). `anonymous=True` drops that second arm, so the
     # list is exactly what any other viewer would get: approved only.
     visible_status = ThreadV2.status == THREAD_STATUS_APPROVED
-    if not anonymous:
+    if not anonymous and user is not None:
         visible_status = or_(
             visible_status,
             and_(
@@ -1664,7 +1691,7 @@ def list_threads_for_link(
     has_more = len(rows) > THREADS_PAGE_SIZE
     page = rows[:THREADS_PAGE_SIZE]
 
-    my_votes = _my_votes_for_threads(db, [t.id for t in page], user.email)
+    my_votes = _my_votes_for_threads(db, [t.id for t in page], user.email) if user is not None else {}
     # Scoped (plan_thread_edit_versioning §4.4, landmine 3) — 0 for any row
     # this caller neither authored nor edits.
     revision_counts = _pending_revision_counts(db, page, component, user, access=access)
@@ -1753,7 +1780,7 @@ def create_thread_for_link(
 
 
 def get_thread_by_id(
-    db: Session, thread_id: int, user: UserInfo, *, access: ViewerAccess | None = None
+    db: Session, thread_id: int, user: UserInfo | None, *, access: ViewerAccess | None = None
 ) -> ThreadDetail:
     """Fetch one thread's full content — any viewer with the widget's own
     view access, NOT author-only (session handoff 2026-08-20 §0/addendum:
@@ -1767,17 +1794,21 @@ def get_thread_by_id(
     not just the queue row); anyone else gets the SAME 404 a nonexistent id
     would — "this id exists but isn't yours" is never leaked. The `_check_
     view_access` 403 still runs FIRST (landmine 2): a caller with no view
-    access to the widget at all keeps getting 403, never 404."""
+    access to the widget at all keeps getting 403, never 404.
+
+    `user` is whose authorship, vote and authored revisions count — the
+    caller normally (View As pairs included), the selected user under
+    `view_as_user`, and nobody (`None`) for `anonymous`."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
     # access to the widget at all must keep getting the existing 403, never
     # a 404 that would leak "this id exists but isn't approved/yours".
     _check_view_access(component, access)
     if thread.status != THREAD_STATUS_APPROVED:
-        is_author = _norm_email(thread.author_email) == _norm_email(user.email)
+        is_author = user is not None and _norm_email(thread.author_email) == _norm_email(user.email)
         if not (is_author or _is_component_editor(component, access)):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
-    my_vote = _my_vote_for_thread(db, thread.id, user.email)
+    my_vote = _my_vote_for_thread(db, thread.id, user.email) if user is not None else 0
     return _to_thread_detail(
         thread,
         my_vote,
@@ -2589,8 +2620,23 @@ def thread_history_facets(
     )
 
 
+def _view_as_etag_suffix(view_as: bool, view_as_user: str | None) -> str:
+    """`-va` for a View As body, plus a short hash of the selected user's
+    email so two View As bodies that differ only by `view_as_user` never
+    share a tag (the email itself stays out of the header)."""
+    if not view_as:
+        return ""
+    if not view_as_user:
+        return "-va"
+    return "-va-" + hashlib.sha256(view_as_user.encode()).hexdigest()[:12]
+
+
 def moderation_summary(
-    db: Session, *, access: ViewerAccess | None = None, view_as: bool = False
+    db: Session,
+    *,
+    access: ViewerAccess | None = None,
+    view_as: bool = False,
+    view_as_user: str | None = None,
 ) -> tuple[ThreadModerationSummary, str]:
     """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
     top of the `ViewerAccess` the dependency already built; polled like the
@@ -2603,19 +2649,21 @@ def moderation_summary(
     `can_moderate=True` — the section is part of their admin surface
     regardless of whether any widget currently has a thread on it.
 
-    `view_as=True` means `access` was built for an adopted role/scope
-    (`dependencies.get_view_as_access`) — so direct-to-user grants are
-    already absent from it. The flag is echoed in the body and suffixes the
-    ETag (`-va`), keeping the tag covering every body field."""
+    `view_as=True` means `access` was built from the View As parameters
+    (`dependencies.get_view_as_access`): its direct grants are the selected
+    user's (`view_as_user`), or else the caller's own. `view_as` and
+    `view_as_user` are echoed in the body and suffix the ETag
+    (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
-    etag_suffix = "-va" if view_as else ""
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
 
     if not component_ids:
         return (
             ThreadModerationSummary(
-                can_moderate=can_moderate, moderated_component_count=0, pending_count=0, view_as=view_as
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
+                view_as=view_as, view_as_user=view_as_user,
             ),
             f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
@@ -2636,6 +2684,7 @@ def moderation_summary(
             moderated_component_count=len(component_ids),
             pending_count=count,
             view_as=view_as,
+            view_as_user=view_as_user,
         ),
         etag,
     )
@@ -2888,7 +2937,11 @@ def revision_history_facets(
 
 
 def revision_moderation_summary(
-    db: Session, *, access: ViewerAccess | None = None, view_as: bool = False
+    db: Session,
+    *,
+    access: ViewerAccess | None = None,
+    view_as: bool = False,
+    view_as_user: str | None = None,
 ) -> tuple[ThreadRevisionModerationSummary, str]:
     """`GET /threads/revision-moderation/summary` — Revision Management's
     own sidebar badge (amendment A4), the same shape and ETag discipline as
@@ -2900,12 +2953,13 @@ def revision_moderation_summary(
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
-    etag_suffix = "-va" if view_as else ""
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
 
     if not component_ids:
         return (
             ThreadRevisionModerationSummary(
-                can_moderate=can_moderate, moderated_component_count=0, pending_count=0, view_as=view_as
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
+                view_as=view_as, view_as_user=view_as_user,
             ),
             f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
@@ -2930,6 +2984,7 @@ def revision_moderation_summary(
             moderated_component_count=len(component_ids),
             pending_count=count,
             view_as=view_as,
+            view_as_user=view_as_user,
         ),
         etag,
     )
@@ -2986,10 +3041,12 @@ def list_comments_for_thread(
     db: Session,
     thread_id: int,
     cursor: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None = None,
 ) -> CommentListResponse:
+    """`user` is whose `my_vote` is reported — see `get_thread_by_id`;
+    `None` reports 0 on every comment while the counts stay exact."""
     thread, component = _require_thread_and_component(db, thread_id)
     _check_view_access(component, access)
     _require_approved(thread)
@@ -3012,7 +3069,7 @@ def list_comments_for_thread(
     has_more = len(rows) > COMMENTS_PAGE_SIZE
     page = rows[:COMMENTS_PAGE_SIZE]
 
-    my_votes = _my_votes_for_comments(db, [c.id for c in page], user.email)
+    my_votes = _my_votes_for_comments(db, [c.id for c in page], user.email) if user is not None else {}
     items = [_to_comment_summary(c, my_votes.get(c.id, 0)) for c in page]
     next_cursor = _encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
 

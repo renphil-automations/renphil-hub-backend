@@ -86,7 +86,7 @@ COMMON_NOT_FOUND_RESPONSE = {404: {"description": "Requested tab or resource was
 COMMON_CONFLICT_RESPONSE = {409: {"description": "Conflict"}}
 COMMON_FORBIDDEN_RESPONSE = {403: {"description": "You do not have edit access to this item"}}
 COMMON_FORBIDDEN_VIEW_AS_RESPONSE = {
-    403: {"description": "View As refused: the caller may not adopt the given role/scope"}
+    403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"}
 }
 
 
@@ -426,7 +426,7 @@ def get_workspace(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
 
-    return {"data": workspace, "view_as": view_as_access.view_as}
+    return {"data": workspace, "view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
 
 
 @router.get(
@@ -447,7 +447,7 @@ def get_children(
     if children is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
-    return {"data": children, "view_as": view_as_access.view_as}
+    return {"data": children, "view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
 
 
 @router.get(
@@ -471,7 +471,7 @@ def get_variants(
     if variants is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
-    return {"data": variants, "view_as": view_as_access.view_as}
+    return {"data": variants, "view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
 
 
 @router.post(
