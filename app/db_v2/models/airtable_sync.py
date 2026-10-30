@@ -61,7 +61,12 @@ def _utc_now() -> datetime:
 # and the migration script import one definition.
 ENTITIES = ("cluster", "program", "user", "program_role")
 DESIGNATION_ACTIONS = ("role", "dont_sync")
-FREQUENCIES = ("daily", "weekly")
+FREQUENCIES = ("daily", "weekly", "interval")
+# "Every N hours" (frequency 'interval'), in minutes from local midnight: what
+# the settings API accepts (owner, 2026-10-29; plan_airtable_sync_retries_interval
+# §5.1). The DB CHECK is looser on purpose (≥ 15 and a divisor of 24 h), so a
+# shorter choice later needs no migration.
+INTERVAL_MINUTES = (60, 120, 180, 240, 360, 480, 720)
 RUN_TRIGGERS = ("manual", "scheduled", "preview")
 RUN_STATUSES = ("running", "succeeded", "failed", "interrupted")
 # The steps a run may tick, in the only order they ever run (plan v2 R1).
@@ -93,6 +98,9 @@ class AirtableSyncSettingsV2(BaseV2):
     run_time = Column(Time, nullable=False, default=DEFAULT_RUN_TIME, server_default=text("'06:00:00'"))
     # 0 = Monday … 6 = Sunday (Python's `weekday()`). NULL when daily.
     run_weekday = Column(Integer, nullable=True)
+    # Minutes between slots when frequency = 'interval'; NULL otherwise
+    # (ck_airtable_sync_settings_interval).
+    interval_minutes = Column(Integer, nullable=True)
     timezone = Column(String(64), nullable=False, default=DEFAULT_TIMEZONE, server_default=DEFAULT_TIMEZONE)
     # The scheduled slot already used, so a tick never runs one slot twice
     # (v1 plan §8). Written only by the scheduler.
@@ -106,6 +114,15 @@ class AirtableSyncSettingsV2(BaseV2):
         CheckConstraint(
             "run_weekday IS NULL OR (run_weekday >= 0 AND run_weekday <= 6)",
             name="ck_airtable_sync_settings_weekday",
+        ),
+        CheckConstraint(
+            "interval_minutes IS NULL OR (interval_minutes >= 15 AND 1440 % interval_minutes = 0)",
+            name="ck_airtable_sync_settings_interval_minutes",
+        ),
+        CheckConstraint(
+            "(frequency = 'interval' AND interval_minutes IS NOT NULL) "
+            "OR (frequency <> 'interval' AND interval_minutes IS NULL)",
+            name="ck_airtable_sync_settings_interval",
         ),
     )
 
@@ -170,10 +187,26 @@ class AirtableSyncRunV2(BaseV2):
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     summary = Column(JSONB, nullable=True)
     error = Column(Text, nullable=True)
+    # The slot a scheduled attempt is for (plan_airtable_sync_retries_interval
+    # §3.1): the attempts at a slot = the runs carrying it. NULL on manual
+    # runs and previews, and on scheduled runs from before the column (no
+    # backfill), which are therefore never retried.
+    scheduled_slot = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in("trigger", RUN_TRIGGERS), name="ck_airtable_sync_runs_trigger"),
         CheckConstraint(_in("status", RUN_STATUSES), name="ck_airtable_sync_runs_status"),
+        CheckConstraint(
+            "trigger = 'scheduled' OR scheduled_slot IS NULL",
+            name="ck_airtable_sync_runs_scheduled_slot",
+        ),
+        Index(
+            "ix_airtable_sync_runs_scheduled_slot",
+            "scheduled_slot",
+            # Both dialect predicates, as on uq_airtable_sync_runs_running.
+            postgresql_where=text("scheduled_slot IS NOT NULL"),
+            sqlite_where=text("scheduled_slot IS NOT NULL"),
+        ),
         Index("ix_airtable_sync_runs_started_at", "started_at"),
         Index(
             "uq_airtable_sync_runs_running",

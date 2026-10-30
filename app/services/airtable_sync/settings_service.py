@@ -27,6 +27,10 @@ from app.services.rbac_assignment_service import HUB_ADMIN_ROLE_KEY
 
 SETTINGS_ROW_ID = 1
 
+# What `update_settings` accepts. 'interval' is in FREQUENCIES with its schema
+# (RI-1) but is refused until RI-4 builds its slots and validation.
+_SETTABLE_FREQUENCIES = tuple(f for f in FREQUENCIES if f != "interval")
+
 
 class AirtableSyncError(Exception):
     """A request that collides with a sync rule. The router turns it into a
@@ -90,8 +94,10 @@ def update_settings(
     """Replace the schedule. A weekly schedule needs a weekday; a daily one
     must not carry one (it would be silently ignored, and then come back
     the day someone switches to weekly)."""
-    if frequency not in FREQUENCIES:
-        raise AirtableSyncError("invalid_frequency", f"Frequency must be one of {', '.join(FREQUENCIES)}.")
+    if frequency not in _SETTABLE_FREQUENCIES:
+        raise AirtableSyncError(
+            "invalid_frequency", f"Frequency must be one of {', '.join(_SETTABLE_FREQUENCIES)}."
+        )
     if frequency == "weekly" and run_weekday is None:
         raise AirtableSyncError("weekday_required", "A weekly schedule needs a weekday.")
     if frequency == "daily" and run_weekday is not None:

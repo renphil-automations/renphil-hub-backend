@@ -89,6 +89,10 @@ def decide(row: AirtableSyncSettingsV2, now: datetime) -> Decision:
     """Whether the latest slot should run now. Pure: reads `row` only."""
     if not row.schedule_enabled:
         return Decision(False, "schedule_disabled")
+    # 'interval' is in FREQUENCIES with its schema (RI-1), but its slots come
+    # in RI-4; until then it must not fall through to the daily branch.
+    if row.frequency == "interval":
+        return Decision(False, "invalid_schedule")
     # The settings API refuses all of these; a row edited by hand is the
     # only way here, and it must not crash every tick.
     weekly = row.frequency == "weekly"
