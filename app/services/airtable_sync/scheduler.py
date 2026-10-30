@@ -22,7 +22,8 @@ tick tries the same slot again.
 Retries and the bulk hold (plan_airtable_sync_retries_interval §3, §6):
 
   - every tick first reaps a stale `running` row of any kind, in its own
-    short transaction (`runner.reap_stale`), even with the schedule off;
+    short transaction (`runner.reap_stale`), even with the schedule off; a
+    reaped scheduled attempt (slot set) then gets its end note (§7);
   - a slot already used is retried (`decide_retry`) while its latest
     attempt failed or was interrupted: up to MAX_ATTEMPTS runs per slot, on
     the next tick (RETRY_WAIT 0, so the cron's cadence is the spacing),
@@ -61,6 +62,7 @@ from app.services.airtable_sync.runner import (
     liveness,
     real_success_after,
     reap_stale,
+    slot_utc,
     take_sync_lock,
 )
 from app.services.airtable_sync.settings_service import get_settings_row
@@ -230,6 +232,36 @@ def _retry(db: Session, row: AirtableSyncSettingsV2, slot: datetime, now: dateti
     )
 
 
+def retry_outlook(db: Session, run: AirtableSyncRunV2, now: datetime) -> bool:
+    """Whether a tick will retry `run`'s slot: the tick's own rules (`decide`,
+    then `_retry`) minus the lock and bulk facts, which only delay a retry.
+    `run` is the slot's latest attempt, already closed (the end note is
+    built after `_finish`'s or the reap's commit). Judged once RETRY_WAIT
+    has passed, so the wait never reads as "no retry" (plan §7)."""
+    if run.scheduled_slot is None or run.status == "succeeded":
+        return False
+    at = max(now, liveness(run) + RETRY_WAIT)
+    row = get_settings_row(db)
+    decision = decide(row, at)
+    slot = slot_utc(run.scheduled_slot)
+    # The tick's retry gate: the latest slot is this run's and is the one
+    # consumed (so `decide` said slot_already_used). Fails when the schedule
+    # is off or invalid, or another slot replaced this one.
+    if decision.slot != slot or slot != as_utc(row.last_scheduled_slot):
+        return False
+    return _retry(db, row, slot, at).due
+
+
+def _notify_reaped(runner: SyncRunner, run_id: int) -> None:
+    """The end note for a scheduled attempt the tick reaped (plan §3.4 step
+    1, §7): its thread's `_finish` will find the row closed and send none.
+    Advisory: an error is logged, never raised."""
+    try:
+        runner.notifier.finished(runner.session_factory, run_id)
+    except Exception:
+        logger.exception("Airtable sync run %s: could not notify its interruption", run_id)
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -252,10 +284,14 @@ def tick(db: Session, runner: SyncRunner, *, now: datetime | None = None) -> dic
     now = now or _utc_now()
 
     # 1. Reap, in its own short transaction: a dead run of any kind closes
-    # within a tick of going stale, even when nothing is due.
+    # within a tick of going stale, even when nothing is due. A scheduled
+    # attempt notifies like a failure, after the commit; nothing else does.
     take_sync_lock(db)
-    reap_stale(db, now, INTERRUPTED_BY_TICK)
+    reaped = reap_stale(db, now, INTERRUPTED_BY_TICK)
+    reaped_attempt = reaped.id if reaped is not None and reaped.scheduled_slot is not None else None
     db.commit()
+    if reaped_attempt is not None:
+        _notify_reaped(runner, reaped_attempt)
 
     # 2. Decide. Two overlapping ticks: the second waits here until the
     # first has committed, then sees the slot already used.

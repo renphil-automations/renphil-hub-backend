@@ -11,6 +11,16 @@
 Previews send none (C3), and neither do item resolutions. A start that 409s
 never reaches `launch`, so it notifies nobody.
 
+Retries (plan_airtable_sync_retries_interval §7): a scheduled attempt is a
+run with `scheduled_slot` set, numbered by its rank among that slot's runs.
+Attempts 2–3 send no start note. A failed attempt says "… failed (attempt n
+of 3), retrying: …" when `scheduler.retry_outlook` plans a retry, "… failed
+after n attempts: …" when it doesn't and n > 1, today's text when n = 1; a
+success on attempt n > 1 says "finished on attempt n of 3". A scheduled
+attempt reaped by the tick gets the same end note (`scheduler.tick`); one
+reaped by a manual start still notifies nobody. Runs without a slot (manual,
+previews, scheduled runs from before RI-1) read as before.
+
 Recipients come from `rbac_graph_service.hub_admin_user_ids`, the one seam
 for "who is an admin" (it already skips soft-deleted users, v1 §11), not v1
 §9.1's `edit_lock_service._admin_holder_emails`, which answers a different
@@ -121,14 +131,39 @@ def _open_items(db: Session, run_id: int) -> tuple[int, int]:
     return conflicts, len(kinds) - conflicts
 
 
+def attempt_number(db: Session, run: AirtableSyncRunV2) -> int | None:
+    """The run's attempt number (1-based, by id among the runs with its
+    slot); None for a run without a slot."""
+    if run.scheduled_slot is None:
+        return None
+    from app.services.airtable_sync.runner import attempts_for_slot  # runner imports this module
+
+    ids = [a.id for a in attempts_for_slot(db, run.scheduled_slot)]
+    return ids.index(run.id) + 1 if run.id in ids else None
+
+
 def finished_line(db: Session, run: AirtableSyncRunV2) -> str:
     """v1 §5.1 step 4. A failure (or an interruption) is a `finished` with
-    the failure text; the run's `error` is already short and secret-free."""
+    the failure text; the run's `error` is already short and secret-free.
+    A scheduled attempt gets §7's retry wording."""
+    from app.services.airtable_sync import scheduler  # scheduler → runner → notifications
+    from app.services.airtable_sync.runner import as_utc
+
+    n = attempt_number(db, run)
     if run.status != "succeeded":
-        return _clip(f"Airtable sync failed: {run.error or run.status}")
+        error = run.error or run.status
+        # Judged as of the run's end: the notifier's own clock plays no part.
+        if n is not None and scheduler.retry_outlook(db, run, as_utc(run.finished_at) or _utc_now()):
+            return _clip(f"Scheduled Airtable sync failed (attempt {n} of {scheduler.MAX_ATTEMPTS}), retrying: {error}")
+        if n is not None and n > 1:
+            return _clip(f"Scheduled Airtable sync failed after {n} attempts: {error}")
+        return _clip(f"Airtable sync failed: {error}")
     conflicts, warnings = _open_items(db, run.id)
+    head = "Airtable sync finished"
+    if n is not None and n > 1:
+        head = f"Airtable sync finished on attempt {n} of {scheduler.MAX_ATTEMPTS}"
     return _clip(
-        f"Airtable sync finished: {_step_total(run.summary, UPDATED_COUNTS)} updated, "
+        f"{head}: {_step_total(run.summary, UPDATED_COUNTS)} updated, "
         f"{_step_total(run.summary, CREATED_COUNTS)} created, {conflicts} conflicts, {warnings} warnings"
     )
 
@@ -178,6 +213,9 @@ def _advisory(what: str, session_factory: Callable[[], Session], run_id: int, bo
 
 def run_started(session_factory: Callable[[], Session], run_id: int) -> int | None:
     def body(db: Session, run: AirtableSyncRunV2) -> int:
+        n = attempt_number(db, run)
+        if n is not None and n > 1:
+            return 0  # a retry: the first attempt's start note stands (§7)
         actor = _starter(db, run)
         exclude = run.started_by_user_id if run.trigger == "manual" else None
         return _write(
