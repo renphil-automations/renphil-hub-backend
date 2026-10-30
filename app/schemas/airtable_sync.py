@@ -143,6 +143,13 @@ class SyncRunResponse(BaseModel):
     #  "steps": {step: counts}, "failed_step"?}
     summary: dict[str, Any] | None = None
     error: str | None = None
+    # A scheduled attempt's slot, its number among the runs with that slot
+    # (1-based, by id), the runs so far for it, and the most there will be.
+    # All null on manual runs, previews and runs from before the column.
+    scheduled_slot: datetime | None = None
+    attempt: int | None = None
+    attempts: int | None = None
+    max_attempts: int | None = None
 
 
 class SyncRunAPIResponse(BaseModel):
@@ -350,12 +357,19 @@ class SyncTickData(BaseModel):
 
     result: Literal["started", "skipped", "not_due"]
     # skipped: "run_in_progress". not_due: "schedule_disabled",
-    # "slot_already_used", "slot_too_old" or "invalid_schedule".
+    # "slot_already_used", "slot_too_old", "invalid_schedule" or
+    # "bulk_job_in_progress".
     reason: str | None = None
     # The slot the tick looked at (null when the schedule is off or invalid).
     slot: datetime | None = None
     run_id: int | None = None  # started
     blocking_run_id: int | None = None  # skipped: the run holding the lock
+    attempt: int | None = None  # started / skipped: a retry's attempt number
+    # not_due slot_already_used: why the slot isn't retried ("no_attempt",
+    # "attempt_running", "attempts_exhausted", "succeeded_since",
+    # "slot_too_old", "retry_wait", "next_slot_soon"); null after a success.
+    retry_reason: str | None = None
+    bulk_job_id: int | None = None  # not_due bulk_job_in_progress: the live job
 
 
 class SyncTickAPIResponse(BaseModel):

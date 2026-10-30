@@ -245,7 +245,7 @@ def get_run(run_id: int, db: Session = Depends(get_db_v2)):
     run = runs_service.get_run(db, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    return {"data": runs_service.serialize_run(run)}
+    return {"data": runs_service.serialize_one_run(db, run)}
 
 
 @router.get(

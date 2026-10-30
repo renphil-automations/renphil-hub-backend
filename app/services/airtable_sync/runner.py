@@ -20,7 +20,8 @@ row, so they and `start` share a transaction-scoped advisory lock
 (`take_sync_lock`): a resolve refuses while a live run exists, and a start
 waits for a resolve in progress (`refuse_if_running`).
 A `running` row whose heartbeat is STALE_AFTER old is marked `interrupted` by
-the next start, so a restart that killed the thread never wedges the sync.
+the next start or scheduler tick (`reap_stale`), so a restart that killed the
+thread never wedges the sync.
 
 Everything a run needs from outside (session factory, executor, Airtable
 source, settings, step functions, heartbeat interval) is injectable, so the
@@ -75,6 +76,11 @@ INTERRUPTED_ERROR = (
     "No heartbeat for 5 minutes: the run's process probably stopped (e.g. a restart). "
     "Marked interrupted when the next run started."
 )
+# The same, when the scheduler tick's reap closed the row (scheduler.tick).
+INTERRUPTED_BY_TICK = (
+    "No heartbeat for 5 minutes: the run's process probably stopped (e.g. a restart). "
+    "Marked interrupted by the scheduler tick."
+)
 
 
 def _utc_now() -> datetime:
@@ -121,6 +127,56 @@ def is_stale(run: AirtableSyncRunV2, now: datetime | None = None) -> bool:
 
 def running_run(db: Session) -> AirtableSyncRunV2 | None:
     return db.query(AirtableSyncRunV2).filter(AirtableSyncRunV2.status == "running").first()
+
+
+def slot_utc(value: datetime) -> datetime:
+    """A scheduled slot as stored and compared: aware UTC. SQLite keeps the
+    wall time only, so every write and every equality query must use this
+    one value."""
+    return as_utc(value).astimezone(timezone.utc)
+
+
+def attempts_for_slot(db: Session, slot: datetime) -> list[AirtableSyncRunV2]:
+    """The scheduled attempts at `slot`, oldest first
+    (plan_airtable_sync_retries_interval §3.1)."""
+    return (
+        db.query(AirtableSyncRunV2)
+        .filter(AirtableSyncRunV2.scheduled_slot == slot_utc(slot))
+        .order_by(AirtableSyncRunV2.id)
+        .all()
+    )
+
+
+def real_success_after(db: Session, run_id: int) -> bool:
+    """Whether a real run (manual or scheduled, any steps) newer than
+    `run_id` has succeeded: it calls a slot's retries off. A preview writes
+    nothing, so it doesn't count (owner, 2026-10-29, D4)."""
+    return (
+        db.query(AirtableSyncRunV2.id)
+        .filter(
+            AirtableSyncRunV2.id > run_id,
+            AirtableSyncRunV2.trigger.in_(("manual", "scheduled")),
+            AirtableSyncRunV2.status == "succeeded",
+        )
+        .first()
+        is not None
+    )
+
+
+def reap_stale(db: Session, now: datetime, error: str) -> AirtableSyncRunV2 | None:
+    """Mark a `running` row with a stale heartbeat `interrupted` (flush, no
+    commit) and return it; None when there is none. The caller holds
+    `take_sync_lock`. `start` calls it with INTERRUPTED_ERROR, the scheduler
+    tick with INTERRUPTED_BY_TICK."""
+    current = running_run(db)
+    if current is None or not is_stale(current, now):
+        return None
+    logger.warning("Airtable sync run %s: no heartbeat since %s, marking it interrupted", current.id, liveness(current))
+    current.status = "interrupted"
+    current.finished_at = now
+    current.error = error
+    db.flush()  # free the index before an insert
+    return current
 
 
 def take_sync_lock(db: Session) -> None:
@@ -344,11 +400,16 @@ class SyncRunner:
         trigger: str | None = None,
         started_by_user_id: int | None = None,
         started_by_email: str | None = None,
+        scheduled_slot: datetime | None = None,
     ) -> StartedRun:
         """Insert the `running` row in `db`'s transaction (flush, no commit).
         A stale `running` row is first marked `interrupted`; a live one →
         SyncRunInProgress. The caller commits, THEN calls `launch`: the run's
         thread uses its own session and must see the committed row.
+
+        `scheduled_slot`: only the scheduler tick passes it (the slot this
+        attempt is for); ck_airtable_sync_runs_scheduled_slot refuses it on a
+        manual run or a preview.
 
         On the losing side of a race the insert hits the unique index; this
         rolls `db` back (so call it before anything else in the transaction)."""
@@ -357,15 +418,10 @@ class SyncRunner:
         now = _utc_now()
 
         take_sync_lock(db)  # waits for a resolution in progress
+        reap_stale(db, now, INTERRUPTED_ERROR)
         current = running_run(db)
         if current is not None:
-            if not is_stale(current, now):
-                raise _in_progress(current)
-            logger.warning("Airtable sync run %s: no heartbeat since %s, marking it interrupted", current.id, liveness(current))
-            current.status = "interrupted"
-            current.finished_at = now
-            current.error = INTERRUPTED_ERROR
-            db.flush()  # free the index before the insert below
+            raise _in_progress(current)
 
         run = AirtableSyncRunV2(
             steps=list(ordered),
@@ -375,6 +431,7 @@ class SyncRunner:
             status="running",
             started_at=now,
             heartbeat_at=now,
+            scheduled_slot=slot_utc(scheduled_slot) if scheduled_slot is not None else None,
         )
         db.add(run)
         try:

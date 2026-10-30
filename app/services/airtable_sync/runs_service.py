@@ -12,14 +12,38 @@ from sqlalchemy.orm import Session
 
 from app.db_v2.models.airtable_sync import AirtableSyncItemV2, AirtableSyncLogV2, AirtableSyncRunV2
 from app.services.airtable_sync import airtable_reader, bulk_jobs, settings_service
-from app.services.airtable_sync.runner import as_utc, is_stale, running_run
+from app.services.airtable_sync.runner import as_utc, is_stale, running_run, slot_utc
+from app.services.airtable_sync.scheduler import MAX_ATTEMPTS
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def serialize_run(run: AirtableSyncRunV2, now: datetime | None = None) -> dict:
+def slot_attempts(db: Session, runs: list[AirtableSyncRunV2]) -> dict[datetime, list[int]]:
+    """The run ids at each slot among `runs`, oldest first: one query for a
+    whole page (plan_airtable_sync_retries_interval §3.6)."""
+    slots = {slot_utc(r.scheduled_slot) for r in runs if r.scheduled_slot is not None}
+    if not slots:
+        return {}
+    found: dict[datetime, list[int]] = {}
+    rows = (
+        db.query(AirtableSyncRunV2.id, AirtableSyncRunV2.scheduled_slot)
+        .filter(AirtableSyncRunV2.scheduled_slot.in_(sorted(slots)))
+        .order_by(AirtableSyncRunV2.id)
+        .all()
+    )
+    for run_id, slot in rows:
+        found.setdefault(slot_utc(slot), []).append(run_id)
+    return found
+
+
+def serialize_run(
+    run: AirtableSyncRunV2, now: datetime | None = None, attempts: dict[datetime, list[int]] | None = None
+) -> dict:
+    """`attempts`: `slot_attempts` over a page that includes `run`."""
+    slot = slot_utc(run.scheduled_slot) if run.scheduled_slot is not None else None
+    ids = (attempts or {}).get(slot, []) if slot is not None else []
     return {
         "id": run.id,
         "steps": list(run.steps or []),
@@ -36,7 +60,15 @@ def serialize_run(run: AirtableSyncRunV2, now: datetime | None = None) -> dict:
         "stale": is_stale(run, now),
         "summary": run.summary,
         "error": run.error,
+        "scheduled_slot": slot,
+        "attempt": ids.index(run.id) + 1 if run.id in ids else None,
+        "attempts": len(ids) if slot is not None else None,
+        "max_attempts": MAX_ATTEMPTS if slot is not None else None,
     }
+
+
+def serialize_one_run(db: Session, run: AirtableSyncRunV2, now: datetime | None = None) -> dict:
+    return serialize_run(run, now, slot_attempts(db, [run]))
 
 
 def list_runs(db: Session, limit: int) -> list[dict]:
@@ -47,7 +79,8 @@ def list_runs(db: Session, limit: int) -> list[dict]:
         .limit(limit)
         .all()
     )
-    return [serialize_run(r, now) for r in rows]
+    attempts = slot_attempts(db, rows)
+    return [serialize_run(r, now, attempts) for r in rows]
 
 
 def get_run(db: Session, run_id: int) -> AirtableSyncRunV2 | None:
@@ -154,6 +187,7 @@ def status_payload(db: Session, settings: Any) -> dict:
         .order_by(AirtableSyncRunV2.started_at.desc(), AirtableSyncRunV2.id.desc())
         .first()
     )
+    attempts = slot_attempts(db, [r for r in (current, last) if r is not None])
     counts = open_item_counts(db)
     job = bulk_jobs.running_job(db)
     last_job = bulk_jobs.last_finished_job(db)
@@ -162,8 +196,8 @@ def status_payload(db: Session, settings: Any) -> dict:
         "last_bulk_job": bulk_jobs.serialize_job(last_job, now) if last_job else None,
         "settings": settings_service.serialize_settings(settings_service.get_settings_row(db)),
         "config_error": _config_error(settings),
-        "current_run": serialize_run(current, now) if current else None,
-        "last_run": serialize_run(last, now) if last else None,
+        "current_run": serialize_run(current, now, attempts) if current else None,
+        "last_run": serialize_run(last, now, attempts) if last else None,
         "open_items": counts,
         "open_items_total": sum(counts.values()),
     }

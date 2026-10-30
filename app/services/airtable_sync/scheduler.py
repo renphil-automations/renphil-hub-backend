@@ -19,6 +19,20 @@ The cron calls `POST /v2/airtable-sync/tick` every few minutes
 A failure before that (e.g. the settings read) consumes nothing: the next
 tick tries the same slot again.
 
+Retries and the bulk hold (plan_airtable_sync_retries_interval §3, §6):
+
+  - every tick first reaps a stale `running` row of any kind, in its own
+    short transaction (`runner.reap_stale`), even with the schedule off;
+  - a slot already used is retried (`decide_retry`) while its latest
+    attempt failed or was interrupted: up to MAX_ATTEMPTS runs per slot, on
+    the next tick (RETRY_WAIT 0, so the cron's cadence is the spacing),
+    unless a real run has succeeded since, the slot is SLOT_MAX_AGE old, or
+    the next slot is within RETRY_ROOM. A retry never touches
+    `last_scheduled_slot`; one that finds the lock busy consumes and counts
+    nothing (no run row), so the next tick tries again;
+  - while a live bulk answer runs, a due first try or retry is held: nothing
+    is consumed, the first tick after the job starts it.
+
 DST (owner, 2026-10-24): a wall time that happens twice (fall-back) runs
 once, at its FIRST occurrence; one that doesn't exist (spring-forward gap)
 runs that same day, shifted forward by the gap (02:30 → 03:30 EDT). That is
@@ -35,13 +49,31 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.airtable_sync import FREQUENCIES, RUN_STEPS, AirtableSyncSettingsV2
-from app.services.airtable_sync.runner import SyncRunInProgress, SyncRunner, as_utc, take_sync_lock
+from app.db_v2.models.airtable_sync import FREQUENCIES, RUN_STEPS, AirtableSyncRunV2, AirtableSyncSettingsV2
+from app.services.airtable_sync import bulk_jobs
+from app.services.airtable_sync.runner import (
+    INTERRUPTED_BY_TICK,
+    SyncRunInProgress,
+    SyncRunner,
+    as_utc,
+    attempts_for_slot,
+    is_stale,
+    liveness,
+    real_success_after,
+    reap_stale,
+    take_sync_lock,
+)
 from app.services.airtable_sync.settings_service import get_settings_row
 
 logger = logging.getLogger(__name__)
 
 SLOT_MAX_AGE = timedelta(hours=6)
+# Retries (owner, 2026-10-29: D1, D9): attempts per slot, the wait after a
+# failed attempt (0 = the next tick), and the room a retry needs before the
+# next slot.
+MAX_ATTEMPTS = 3
+RETRY_WAIT = timedelta(0)
+RETRY_ROOM = timedelta(minutes=20)
 
 # Days to look back for the latest slot: a weekly slot is at most 7 days
 # old; one more covers a zone that skipped a calendar day.
@@ -76,6 +108,27 @@ def latest_slot(
         if slot <= now:
             return slot
     raise ValueError("No scheduled slot in the look-back window.")  # unreachable for a valid schedule
+
+
+def next_slot(
+    now: datetime,
+    *,
+    frequency: str,
+    run_time: time,
+    run_weekday: int | None,
+    zone: ZoneInfo,
+) -> datetime:
+    """The first scheduled instant strictly after `now` (aware, UTC). Daily
+    and weekly; the interval branch is RI-4."""
+    today = now.astimezone(zone).date()
+    for ahead in range(_LOOKBACK_DAYS + 1):
+        day = today + timedelta(days=ahead)
+        if frequency == "weekly" and day.weekday() != run_weekday:
+            continue
+        slot = resolve_local(day, run_time, zone)
+        if slot > now:
+            return slot
+    raise ValueError("No scheduled slot in the look-ahead window.")  # unreachable for a valid schedule
 
 
 @dataclass(frozen=True)
@@ -118,6 +171,65 @@ def decide(row: AirtableSyncSettingsV2, now: datetime) -> Decision:
     return Decision(True, None, slot)
 
 
+@dataclass(frozen=True)
+class RetryDecision:
+    due: bool
+    reason: str | None = None  # the `retry_reason`, when not due
+    attempt: int | None = None  # the attempt number, when due
+
+
+def decide_retry(
+    slot: datetime,
+    attempts: list[AirtableSyncRunV2],
+    *,
+    succeeded_since: bool,
+    next_slot: datetime,
+    now: datetime,
+) -> RetryDecision:
+    """Whether a used slot gets another attempt now (plan §3.2). Pure:
+    `attempts` are the slot's runs oldest first, `succeeded_since` whether a
+    real run newer than the latest one succeeded, `next_slot` the schedule's
+    next instant. The first reason that applies wins, in this order."""
+    if not attempts:
+        return RetryDecision(False, "no_attempt")  # the first try was a busy skip
+    latest = attempts[-1]
+    if latest.status == "running" and not is_stale(latest, now):
+        return RetryDecision(False, "attempt_running")
+    if latest.status == "succeeded":
+        return RetryDecision(False, "last_attempt_succeeded")
+    if len(attempts) >= MAX_ATTEMPTS:
+        return RetryDecision(False, "attempts_exhausted")
+    if succeeded_since:
+        return RetryDecision(False, "succeeded_since")
+    if now - slot >= SLOT_MAX_AGE:
+        return RetryDecision(False, "slot_too_old")
+    if now < liveness(latest) + RETRY_WAIT:
+        return RetryDecision(False, "retry_wait")
+    if next_slot - now <= RETRY_ROOM:
+        return RetryDecision(False, "next_slot_soon")
+    return RetryDecision(True, None, len(attempts) + 1)
+
+
+def _retry(db: Session, row: AirtableSyncSettingsV2, slot: datetime, now: datetime) -> RetryDecision:
+    """`decide_retry` with its facts read from `db`. Only called after
+    `decide`, so the schedule is valid (daily or weekly)."""
+    attempts = attempts_for_slot(db, slot)
+    weekly = row.frequency == "weekly"
+    return decide_retry(
+        slot,
+        attempts,
+        succeeded_since=bool(attempts) and real_success_after(db, attempts[-1].id),
+        next_slot=next_slot(
+            now,
+            frequency=row.frequency,
+            run_time=row.run_time,
+            run_weekday=row.run_weekday if weekly else None,
+            zone=ZoneInfo(row.timezone),
+        ),
+        now=now,
+    )
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -132,40 +244,78 @@ def _consume(db: Session, slot: datetime) -> None:
 
 def tick(db: Session, runner: SyncRunner, *, now: datetime | None = None) -> dict:
     """One scheduler tick. Returns what it did, for the cron's log:
-    `{"result": "started", "run_id", "slot"}`,
-    `{"result": "skipped", "reason": "run_in_progress", "slot", "blocking_run_id"}`, or
-    `{"result": "not_due", "reason", "slot"}`. Commits its own transaction."""
+    `{"result": "started", "run_id", "slot", "attempt"?}`,
+    `{"result": "skipped", "reason": "run_in_progress", "slot", "blocking_run_id", "attempt"?}`,
+    `{"result": "not_due", "reason", "slot", "retry_reason"?}`, or
+    `{"result": "not_due", "reason": "bulk_job_in_progress", "slot", "bulk_job_id"}`.
+    `attempt` only on a retry. Commits its own transactions."""
     now = now or _utc_now()
 
-    # Two overlapping ticks: the second waits here until the first has
-    # committed, then sees the slot already used.
+    # 1. Reap, in its own short transaction: a dead run of any kind closes
+    # within a tick of going stale, even when nothing is due.
     take_sync_lock(db)
-    decision = decide(get_settings_row(db), now)
-    if not decision.due:
-        db.commit()  # persists the settings row if this read created it
-        return {"result": "not_due", "reason": decision.reason, "slot": _iso(decision.slot)}
+    reap_stale(db, now, INTERRUPTED_BY_TICK)
+    db.commit()
 
+    # 2. Decide. Two overlapping ticks: the second waits here until the
+    # first has committed, then sees the slot already used.
+    take_sync_lock(db)
+    row = get_settings_row(db)
+    decision = decide(row, now)
+    slot = decision.slot
+
+    # 3. The candidate: the first try, or a retry of the slot just used.
+    attempt: int | None = None  # set on a retry
+    retry: RetryDecision | None = None
+    if not decision.due:
+        if decision.reason == "slot_already_used" and slot == as_utc(row.last_scheduled_slot):
+            retry = _retry(db, row, slot, now)
+        if retry is None or not retry.due:
+            db.commit()  # persists the settings row if this read created it
+            result = {"result": "not_due", "reason": decision.reason, "slot": _iso(slot)}
+            # Nothing to say after a success: the reply stays as phase 9's (owner, 2026-10-30).
+            if retry is not None and retry.reason != "last_attempt_succeeded":
+                result["retry_reason"] = retry.reason
+            return result
+        attempt = retry.attempt
+
+    # 4. The bulk hold (§6): nothing consumed, the next tick looks again.
+    job = bulk_jobs.running_job(db)
+    if job is not None and not bulk_jobs.is_stale(job, now):
+        db.commit()
+        logger.info("Airtable sync: scheduled slot %s held: bulk answer %s in progress", _iso(slot), job.id)
+        return {"result": "not_due", "reason": "bulk_job_in_progress", "slot": _iso(slot), "bulk_job_id": job.id}
+
+    # 5. Start.
     try:
-        started = runner.start(db, steps=RUN_STEPS, preview=False, trigger="scheduled")
+        started = runner.start(db, steps=RUN_STEPS, preview=False, trigger="scheduled", scheduled_slot=slot)
     except SyncRunInProgress as exc:
         # `start` may have rolled back (the insert race); either way begin
-        # clean, then consume the slot (v1 C1).
+        # clean. A first try consumes the slot (v1 C1); a retry consumes and
+        # counts nothing (no run row), so the next tick tries again.
         db.rollback()
-        _consume(db, decision.slot)
-        db.commit()
         blocking = exc.details.get("run_id")
+        result = {"result": "skipped", "reason": "run_in_progress", "slot": _iso(slot), "blocking_run_id": blocking}
+        if attempt is None:
+            _consume(db, slot)
+            db.commit()
+            logger.warning("Airtable sync: scheduled slot %s skipped: run in progress (run %s)", _iso(slot), blocking)
+            return result
+        db.commit()
         logger.warning(
-            "Airtable sync: scheduled slot %s skipped: run in progress (run %s)", _iso(decision.slot), blocking
+            "Airtable sync: scheduled slot %s retry (attempt %s) skipped: run in progress (run %s)",
+            _iso(slot),
+            attempt,
+            blocking,
         )
-        return {
-            "result": "skipped",
-            "reason": "run_in_progress",
-            "slot": _iso(decision.slot),
-            "blocking_run_id": blocking,
-        }
+        return {**result, "attempt": attempt}
 
-    _consume(db, decision.slot)  # same transaction as the run row
+    if attempt is None:
+        _consume(db, slot)  # same transaction as the run row
     db.commit()
     runner.launch(started)  # start notification, then the run in the background
-    logger.info("Airtable sync: scheduled slot %s started run %s", _iso(decision.slot), started.run_id)
-    return {"result": "started", "run_id": started.run_id, "slot": _iso(decision.slot)}
+    if attempt is None:
+        logger.info("Airtable sync: scheduled slot %s started run %s", _iso(slot), started.run_id)
+        return {"result": "started", "run_id": started.run_id, "slot": _iso(slot)}
+    logger.info("Airtable sync: scheduled slot %s started run %s (attempt %s)", _iso(slot), started.run_id, attempt)
+    return {"result": "started", "run_id": started.run_id, "slot": _iso(slot), "attempt": attempt}
