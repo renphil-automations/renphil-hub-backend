@@ -49,10 +49,10 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db_v2.models.hub_user import HubUserV2
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
+from app.db_v2.models.user import UserV2
 
 # Distinct constants so the two graphs never serialize against each other.
 # Arbitrary, but must stay stable — the lock is only meaningful if every
