@@ -10,14 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import (
-    ViewAsAccess,
-    get_current_user,
-    get_edit_session,
-    get_lock_view,
-    get_view_as_access,
-    get_viewer_access,
-)
+from app.dependencies import get_current_user, get_edit_session, get_lock_view, get_viewer_access
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
@@ -39,7 +32,6 @@ from app.schemas.tab import (
     UpdateTabContentRequest,
     UpdateTabRequest,
 )
-from app.schemas.view_as import TabSummaryListViewAsAPIResponse, TabWorkspaceViewAsAPIResponse
 from app.services import edit_lock_service
 from app.services.access_visibility_service import (
     AccessDeniedError,
@@ -85,9 +77,6 @@ COMMON_BAD_REQUEST_RESPONSE = {400: {"description": "Bad request"}}
 COMMON_NOT_FOUND_RESPONSE = {404: {"description": "Requested tab or resource was not found"}}
 COMMON_CONFLICT_RESPONSE = {409: {"description": "Conflict"}}
 COMMON_FORBIDDEN_RESPONSE = {403: {"description": "You do not have edit access to this item"}}
-COMMON_FORBIDDEN_VIEW_AS_RESPONSE = {
-    403: {"description": "View As refused: the caller may not adopt the given role/scope"}
-}
 
 
 def access_denied_to_http_exception(error: AccessDeniedError) -> HTTPException:
@@ -404,14 +393,14 @@ def unlock_component(
 
 @router.get(
     "/{document_id}/workspace",
-    response_model=TabWorkspaceViewAsAPIResponse,
+    response_model=TabWorkspaceAPIResponse,
     summary="Get tab workspace (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_VIEW_AS_RESPONSE},
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
 def get_workspace(
     document_id: str,
     db: Session = Depends(get_db_v2),
-    view_as_access: ViewAsAccess = Depends(get_view_as_access),
+    access: ViewerAccess = Depends(get_viewer_access),
     lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(document_id)
@@ -422,32 +411,32 @@ def get_workspace(
     # page_content via the new fold instead of the old
     # filter_widget_content_for_user(user.email, user.roles) call this
     # replaced.
-    workspace = get_tab_workspace_v2(db, document_id, access=view_as_access.access, lock_view=lock_view)
+    workspace = get_tab_workspace_v2(db, document_id, access=access, lock_view=lock_view)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
 
-    return {"data": workspace, "view_as": view_as_access.view_as}
+    return {"data": workspace}
 
 
 @router.get(
     "/{document_id}/children",
-    response_model=TabSummaryListViewAsAPIResponse,
+    response_model=TabSummaryListAPIResponse,
     summary="Get direct child tabs (v2)",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_VIEW_AS_RESPONSE},
+    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE},
 )
 def get_children(
     document_id: str,
     db: Session = Depends(get_db_v2),
-    view_as_access: ViewAsAccess = Depends(get_view_as_access),
+    access: ViewerAccess = Depends(get_viewer_access),
     lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
     validate_document_id(document_id)
 
-    children = get_tab_children_v2(db, document_id, access=view_as_access.access, lock_view=lock_view)
+    children = get_tab_children_v2(db, document_id, access=access, lock_view=lock_view)
     if children is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
-    return {"data": children, "view_as": view_as_access.view_as}
+    return {"data": children}
 
 
 @router.get(

@@ -26,14 +26,14 @@ from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueCons
 from app.db_v2.database import BaseV2
 
 # Importing the three FK targets is load-bearing, not tidiness. SQLAlchemy
-# resolves ``ForeignKey("users.id")`` by TABLE NAME against
+# resolves ``ForeignKey("hub_users.id")`` by TABLE NAME against
 # BaseV2.metadata at DDL time, so any caller that imports this module and
 # then runs ``create_all`` over the whole metadata -- which is what
 # tests/ does -- fails with NoReferencedTableError unless the target tables
 # were also imported. scripts/create_rbac_tables.py only avoids it by
 # naming every model explicitly. Same reason create_thread_tables.py
 # imports ComponentV2 with a noqa.
-from app.db_v2.models.user import UserV2  # noqa: F401
+from app.db_v2.models.hub_user import HubUserV2  # noqa: F401
 from app.db_v2.models.role import RoleV2  # noqa: F401
 from app.db_v2.models.scope import ScopeV2  # noqa: F401
 
@@ -52,7 +52,7 @@ class RoleAssignmentV2(BaseV2):
     # on a request) is exactly that leftmost prefix.
     user_id = Column(
         Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
+        ForeignKey("hub_users.id", ondelete="CASCADE"),
         nullable=False,
     )
 
@@ -83,7 +83,7 @@ class RoleAssignmentV2(BaseV2):
     # next to the identity, for the same reason.
     granted_by_user_id = Column(
         Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey("hub_users.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )

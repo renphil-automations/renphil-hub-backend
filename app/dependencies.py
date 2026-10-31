@@ -8,18 +8,17 @@ Provides:
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from fastapi import Depends, HTTPException, Query, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db_v2.database import get_db_v2
-from app.db_v2.models.user import UserV2
+from app.db_v2.models.hub_user import HubUserV2
 from app.models.auth import UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
@@ -27,7 +26,7 @@ from app.services.calendar_service import CalendarService
 from app.services.dify_service import DifyService
 from app.services.drive_service import DriveService
 from app.services.gemini_service import GeminiService
-from app.services import edit_lock_service, rbac_assignment_service, view_as_service
+from app.services import edit_lock_service, rbac_assignment_service
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_KEY is re-exported, see below
     HUB_ADMIN_ROLE_KEY,
@@ -36,9 +35,6 @@ from app.services.rbac_graph_service import (  # noqa: F401 — HUB_ADMIN_ROLE_K
     hub_admin_target_ids,
     is_bootstrap_admin_email,
 )
-from app.services.user_db_service import find_user_by_email
-
-logger = logging.getLogger(__name__)
 
 _bearer_scheme = HTTPBearer()
 
@@ -105,10 +101,6 @@ async def get_current_user(
 # ── hub_users auto-provisioning (session_handoff_2026-08-24-permission-
 # management-plan.md §5.1) ──────────────────────────────────────────────
 #
-# `hub_users` was folded into `users` in 2026-10: every "hub_users row" below
-# is now a `users` row, and `hub_user_id` is a `users.id`. The names stay so
-# the ~15 modules built on them did not have to move.
-#
 # Blocking prerequisite for the whole Permission Management phase: without
 # this, no signed-in person — including a would-be granter — resolves to a
 # hub_users row, so §6's delegation check has nothing to query.
@@ -135,63 +127,33 @@ class CurrentHubUser:
 
     info: UserInfo
     hub_user_id: int
-    email: str  # normalized: the JWT email the row was found by (work or alias email)
+    email: str  # normalized: the same value stored on the hub_users row
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def is_org_domain_email(email: str) -> bool:
-    """True for an email in one of `ALLOWED_EMAIL_DOMAIN`'s domains — the
-    people the login gate admits by domain alone."""
-    domain = (email or "").rsplit("@", 1)[-1].strip().lower()
-    return domain in get_settings().allowed_email_domains
-
-
-class HubUserRemoved(Exception):
-    """`_ensure_hub_user` found a soft-deleted row for the email
-    (plan_admin_soft_delete_user_2026-10-19.md §3.3). Deliberately NOT an
-    HTTPException: each caller maps it to its own refusal (401
-    `user_removed`, the sign-in 403, the Agent 403), and a caller that
-    forgets to fails closed with a 500 rather than admitting the person."""
-
-    def __init__(self, user: UserV2) -> None:
-        super().__init__(f"users row {user.id} is deleted")
-        self.user = user
-
-
-def _ensure_hub_user(
-    db: Session, *, email: str, name: str, allow_insert_external: bool = False
-) -> UserV2 | None:
-    """Look up or create the signed-in `users` row for `email` (already
-    normalized by the caller), and mark it signed in. Extracted from
-    `get_current_hub_user` below so the OAuth callback and the dev-only
-    `/auth/dev-login` route (session_handoff_2026-09-10-dev-login-tool.md)
-    can provision the same row synchronously, before minting a token,
-    instead of waiting for the next authenticated request.
-
-    Since `hub_users` was folded into `users` (2026-10), the lookup goes
-    through `work_email` then `alias_email`, so someone on the HR roster
-    claims their EXISTING row on first sign-in rather than getting a second
-    one. Only an email no row has gets a new login-only row (named from the
-    Google profile, else the email). `has_signed_in` (owner decision,
-    2026-10-09; renamed from `is_active` 2026-10-18): an HR row or an
-    admin-added person starts False and is flipped True here — the HR `name`
-    is never overwritten.
+def _ensure_hub_user(db: Session, *, email: str, name: str) -> HubUserV2 | None:
+    """Look up or create the `hub_users` row for `email` (already normalized
+    by the caller). Extracted from `get_current_hub_user` below so a second
+    caller — the dev-only `/auth/dev-login` route
+    (session_handoff_2026-09-10-dev-login-tool.md) — can provision the same
+    row synchronously, before minting a token, instead of waiting for the
+    next authenticated request to trigger the lazy upsert. Pure extraction:
+    no behavior change to the upsert itself.
 
     UNLIKE every other dependency in this module, this commits. A GET
     endpoint (e.g. "my assignments") never calls `db.commit()` itself, but
     provisioning has to survive past this request regardless of whether the
-    route that triggered it writes anything — so the write is committed
+    route that triggered it writes anything — so the insert is committed
     right here, in its own small transaction, rather than left for the
-    caller to remember. A signed-in row costs no write at all.
+    caller to remember.
 
     Handles the concurrent-first-login race explicitly: two simultaneous
     requests can both miss the SELECT and both attempt the INSERT, and only
-    one wins the unique index on `lower(work_email)`. The loser rolls back
-    and re-reads rather than 500ing. Two concurrent has_signed_in flips write the
-    same value, so that path needs no guard.
+    one wins the UNIQUE constraint on `email`. The loser rolls back and
+    re-reads rather than 500ing.
 
     A newly created row gets the default ⊥ assignment in the SAME commit
     (`rbac_assignment_service.add_default_assignment`, owner decision
@@ -199,53 +161,21 @@ def _ensure_hub_user(
     doing it for existing rows would both backfill (not wanted) and bring
     back a default someone revoked. The race loser's rollback discards its
     assignment along with its row; the winner's row already carries one.
-
-    A SOFT-DELETED ROW (plan_admin_soft_delete_user_2026-10-19.md §3.3, SD4)
-    raises `HubUserRemoved`, whatever the email's domain: never an insert
-    (the kept row still holds the email in the unique indexes) and never a
-    `has_signed_in` flip. The lookup therefore passes `include_deleted=True`;
-    with the default it would see "no row" and try to insert.
-
-    WHO MAY BE INSERTED (option B, owner 2026-10-18), for an email with NO
-    row at all. An org-domain email always may. A non-org-domain email only
-    when `allow_insert_external` is set, which only the OAuth callback (the
-    login gate has just admitted the email) and dev-login pass. The lazy
-    callers (`get_current_hub_user`, the Agent envelope path) never re-check
-    the gate, so for them an external email with no row returns None
-    instead: a live JWT must not provision an external person the gate
-    never admitted.
     """
-    user = find_user_by_email(db, email, include_deleted=True)
-    if user is not None and user.is_deleted:
-        raise HubUserRemoved(user)
-    if user is None:
-        if not allow_insert_external and not is_org_domain_email(email):
-            return None
-        now = _utc_now()
-        user = UserV2(
-            work_email=email,
-            name=(name or "").strip() or email,
-            has_signed_in=True,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(user)
+    hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
+    if hub_user is None:
+        hub_user = HubUserV2(email=email, name=name, is_active=True, created_at=_utc_now())
+        db.add(hub_user)
         try:
             db.flush()
             rbac_assignment_service.add_default_assignment(db, hub_user.id)
             db.commit()
         except IntegrityError:
             db.rollback()
-            user = find_user_by_email(db, email, include_deleted=True)
-            if user is not None and user.is_deleted:
-                raise HubUserRemoved(user)
+            hub_user = db.query(HubUserV2).filter(HubUserV2.email == email).first()
         else:
-            db.refresh(user)
-    elif not user.has_signed_in:
-        user.has_signed_in = True
-        db.commit()
-        db.refresh(user)
-    return user
+            db.refresh(hub_user)
+    return hub_user
 
 
 async def get_current_hub_user(
@@ -259,23 +189,8 @@ async def get_current_hub_user(
     """
     email = (user.email or "").strip().lower()
 
-    try:
-        hub_user = _ensure_hub_user(db, email=email, name=user.name)
-    except HubUserRemoved:
-        # Soft-deleted by an admin, any domain (plan_admin_soft_delete_user
-        # §3.3). 401 so the frontend's session-expired handling signs them out.
-        hub_user = None
-        removed = True
-    else:
-        # An external email with no `users` row at all: not provisioned from
-        # a bare JWT — see `_ensure_hub_user`.
-        removed = hub_user is None and not is_org_domain_email(email)
+    hub_user = _ensure_hub_user(db, email=email, name=user.name)
 
-    if removed:
-        raise HTTPException(
-            status_code=401,
-            detail={"code": "user_removed", "message": "Your account was removed."},
-        )
     if hub_user is None:
         # Only reachable if the concurrent INSERT that won the race was
         # itself rolled back by something else entirely — effectively
@@ -508,97 +423,6 @@ async def get_viewer_access(
     closures = RbacClosures(db)
     admin = is_hub_admin(db, current, closures=closures)
     return resolve_viewer_access(db, current.hub_user_id, is_admin=admin, closures=closures)
-
-
-# ── View As ─────────────────────────────────────────────────────────────
-
-
-@dataclass
-class ViewAsAccess:
-    """``access`` is what the read endpoint gates content on; ``view_as`` is
-    True when it was built from the ``view_as_role``/``view_as_scope``
-    parameters rather than from the caller's own assignments."""
-
-    access: ViewerAccess
-    view_as: bool
-
-
-async def get_view_as_access(
-    view_as_role: str | None = Query(
-        default=None,
-        description="View As: name of the role to adopt. Must be sent together with `view_as_scope`.",
-    ),
-    view_as_scope: str | None = Query(
-        default=None,
-        description="View As: name of the scope to adopt. Must be sent together with `view_as_role`.",
-    ),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-) -> ViewAsAccess:
-    """``get_viewer_access`` for the read endpoints that support View As.
-
-    Runs AFTER ``get_current_hub_user``, so authentication and first-login
-    provisioning are never skipped. With neither parameter it is exactly
-    ``get_viewer_access``. With both, the caller must be allowed to adopt
-    the pair (``view_as_service.verify_view_as``); the returned access is
-    then that pair's. With only one, 400.
-    """
-    role_name = view_as_service.normalize_param(view_as_role)
-    scope_name = view_as_service.normalize_param(view_as_scope)
-
-    if role_name is None and scope_name is None:
-        return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
-
-    logger.info(
-        "View As requested by %s: view_as_role=%r view_as_scope=%r", current.email, role_name, scope_name
-    )
-    if role_name is None or scope_name is None:
-        logger.warning(
-            "View As refused for %s: both view_as_role and view_as_scope are required (role=%r, scope=%r)",
-            current.email,
-            role_name,
-            scope_name,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "view_as_incomplete",
-                "message": "Both view_as_role and view_as_scope must be provided together.",
-            },
-        )
-
-    user_id = view_as_service.resolve_user_id(db, current.email)
-    if user_id is None:
-        user_id = current.hub_user_id
-    closures = RbacClosures(db)
-    try:
-        target = view_as_service.verify_view_as(
-            db, user_id, role_name=role_name, scope_name=scope_name, closures=closures
-        )
-    except view_as_service.ViewAsError as e:
-        logger.warning(
-            "View As verification failed for %s (user %s): role=%r scope=%r — %s (%s)",
-            current.email,
-            user_id,
-            role_name,
-            scope_name,
-            e.code,
-            e.message,
-        )
-        raise HTTPException(status_code=e.status_code, detail={"code": e.code, "message": e.message})
-
-    logger.info(
-        "View As verified for %s (user %s): adopting role %r (id %s) in scope %r (id %s)",
-        current.email,
-        user_id,
-        target.role_name,
-        target.role_id,
-        target.scope_name,
-        target.scope_id,
-    )
-    return ViewAsAccess(
-        access=view_as_service.resolve_view_as_access(db, target, closures=closures), view_as=True
-    )
 
 
 # ── Lock propagation (plan_lock_propagation_2026-09-08.md §4.3) ──────────

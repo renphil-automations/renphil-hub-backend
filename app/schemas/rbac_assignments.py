@@ -59,7 +59,7 @@ class CreateAssignmentRequest(StrictRequestModel):
 
 
 class HubUserResponse(BaseModel):
-    """Deliberately minimal — id, email, name only, never has_signed_in or
+    """Deliberately minimal — id, email, name only, never is_active or
     anything else. This is a people-directory search, a different kind of
     exposure than role/scope names (handoff §5.4)."""
 
@@ -77,7 +77,7 @@ class HubUserListAPIResponse(BaseModel):
 # row plus every role_assignments row it holds. Deliberately NOT the same
 # shape as HubUserResponse above: that one is the privacy-conscious search
 # picker (handoff §5.4); this is the Hub-Admin-only management surface, so
-# has_signed_in is included and there is no query-length gate at all — the
+# is_active is included and there is no query-length gate at all — the
 # privacy boundary here is `require_hub_admin` itself (see the router).
 # ---------------------------------------------------------
 
@@ -86,17 +86,11 @@ class HubUserAdminResponse(BaseModel):
     id: int
     email: str
     name: str | None = None
-    has_signed_in: bool
-    # Soft delete (plan_admin_soft_delete_user_2026-10-19.md §3.5). The list
-    # includes deleted users; the frontend shows them in their own tab.
-    # `deleted_by` is the deleting admin's email (a snapshot).
-    is_deleted: bool = False
-    deleted_at: datetime | None = None
-    deleted_by: str | None = None
+    is_active: bool
     # Every (role, scope) row this user holds directly, one row per grant —
     # never the expanded closure, same convention as AssignmentResponse
     # everywhere else on this router. Empty for the (currently: 181 of 182)
-    # users who hold none. A deleted user's rows are kept (inert until Restore).
+    # users who hold none.
     assignments: list[AssignmentResponse] = Field(default_factory=list)
 
 
@@ -106,82 +100,6 @@ class HubUserAdminListAPIResponse(BaseModel):
 
 class HubUserAdminAPIResponse(BaseModel):
     data: HubUserAdminResponse
-
-
-# ---------------------------------------------------------
-# Admin soft delete / restore previews
-# (plan_admin_soft_delete_user_2026-10-19.md §3.1, §3.2, §3.5)
-# ---------------------------------------------------------
-
-
-class DeleteUserGrantedCounts(BaseModel):
-    """Rows this user GRANTED to other people. Kept, attribution intact."""
-
-    assignments: int
-    resource_grants: int
-
-
-class DeleteUserCounts(BaseModel):
-    """What the user has. A soft delete KEEPS all of it (inert while they
-    are deleted, live again on Restore) except `locks_held`, which the
-    delete releases."""
-
-    assignments: int
-    resource_grants: int
-    bookmarks: int
-    locks_held: int
-    notifications: int
-    unread_notifications: int
-    granted_by_others: DeleteUserGrantedCounts
-
-
-class DeleteUserBlocker(BaseModel):
-    code: str
-    message: str
-
-
-class _UserLifecycleBase(BaseModel):
-    id: int
-    email: str
-    name: str | None = None
-    has_signed_in: bool
-    is_self: bool
-    is_deleted: bool
-    deleted_at: datetime | None = None
-    deleted_by: str | None = None
-
-
-class DeleteUserPreviewResponse(_UserLifecycleBase):
-    is_hub_admin: bool
-    counts: DeleteUserCounts
-    # Every guard that would refuse the delete; empty means it would go through.
-    blockers: list[DeleteUserBlocker] = Field(default_factory=list)
-
-
-class DeleteUserPreviewAPIResponse(BaseModel):
-    data: DeleteUserPreviewResponse
-
-
-class RestoreUserCounts(BaseModel):
-    """What comes back on Restore: every row was kept."""
-
-    assignments: int
-    resource_grants: int
-    bookmarks: int
-    notifications: int
-
-
-class RestoreUserPreviewResponse(_UserLifecycleBase):
-    # They hold the literal (Hub Admin, universal scope) pair, so a Restore
-    # makes them a Hub Admin again. The dialog warns prominently.
-    restores_hub_admin: bool
-    counts: RestoreUserCounts
-    # `not_deleted` when there is nothing to restore; empty otherwise.
-    blockers: list[DeleteUserBlocker] = Field(default_factory=list)
-
-
-class RestoreUserPreviewAPIResponse(BaseModel):
-    data: RestoreUserPreviewResponse
 
 
 class CreateHubUserRequest(StrictRequestModel):

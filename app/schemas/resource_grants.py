@@ -88,10 +88,6 @@ class ResourceGrantResponse(BaseModel):
     # in the impossible case the CASCADE has not yet caught up within one
     # transaction; a client should treat that identically to "unresolved".
     user_email: str | None = None
-    # The user-form grantee is soft-deleted (plan_admin_soft_delete_user
-    # §3.5): kept, shown greyed out as "(deleted user)", grants nothing until
-    # restored. Always False for a (role, scope)-form grant.
-    user_is_deleted: bool = False
 
     level: GrantLevel
 
