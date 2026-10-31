@@ -1979,67 +1979,6 @@ class Role(BaseModel):
     permissions: list[Permission] = Field(default_factory=list)
 
 
-class AccessControlRecord(BaseModel):
-    """An Access Control record as returned to clients.
-
-    Roles and permissions are resolved to objects carrying the record id,
-    name and (for permissions) description — sourced from the lookup
-    fields on the Access Control table.
-    """
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    id: str
-    user_email: str | None = None
-    roles: list[Role] = Field(default_factory=list)
-    permissions: list[Permission] = Field(default_factory=list)
-    fund_or_program_name: str | None = None
-
-
-class AccessControlAssign(BaseModel):
-    """Payload to upsert role(s) and/or permission(s) for a user email."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    user_email: str = Field(description="Email of the user.")
-    roles: list[str] | None = Field(
-        default=None, description="Role record IDs to add. Optional."
-    )
-    permissions: list[str] | None = Field(
-        default=None, description="Permission record IDs to add. Optional."
-    )
-
-    @model_validator(mode="after")
-    def _check_at_least_one(self) -> "AccessControlAssign":
-        if not self.roles and not self.permissions:
-            raise ValueError(
-                "At least one of 'roles' or 'permissions' must be provided."
-            )
-        return self
-
-
-class AccessControlRevoke(BaseModel):
-    """Payload to revoke role(s) and/or permission(s) for a user email."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    user_email: str = Field(description="Email of the user.")
-    roles: list[str] | None = Field(
-        default=None, description="Role record IDs to remove. Optional."
-    )
-    permissions: list[str] | None = Field(
-        default=None, description="Permission record IDs to remove. Optional."
-    )
-
-    @model_validator(mode="after")
-    def _check_at_least_one(self) -> "AccessControlRevoke":
-        if not self.roles and not self.permissions:
-            raise ValueError(
-                "At least one of 'roles' or 'permissions' must be provided."
-            )
-        return self
-
-
 class RoleCreate(BaseModel):
     """Payload to create a new Role."""
 

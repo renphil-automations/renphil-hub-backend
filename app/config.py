@@ -128,7 +128,6 @@ class Settings(BaseSettings):
     AWARDED_OPPORTUNITIES_TABLE: str
     DELIVERABLES_TABLE: str
     # RenPhil Hub base
-    ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
     FEEDBACKS_TABLE: str
@@ -136,7 +135,6 @@ class Settings(BaseSettings):
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
     OFFICE_SPACES_TABLE: str
-    ACCESS_CONTROL_TABLE: str
     TEAMS_TABLE: str
     USERS_TABLE: str
     ROLES_TABLE: str
@@ -161,15 +159,6 @@ class Settings(BaseSettings):
     ORGANIZATION_INFO_TABLE: str | None = None
 
     # ── Field names ───────────────────────────────────────────────────
-    # Admins / Access Control
-    ADMINS_EMAIL_FIELD: str
-    ACCESS_CONTROL_USER_EMAIL_FIELD: str
-    ACCESS_CONTROL_ROLES_FIELD: str
-    ACCESS_CONTROL_PERMISSIONS_FIELD: str
-    ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str
-    ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
     TEAMS_NAME_FIELD: str
@@ -202,9 +191,6 @@ class Settings(BaseSettings):
     ROLES_SCOPE_FIELD: str
     PERMISSIONS_NAME_FIELD: str
     PERMISSIONS_DESCRIPTION_FIELD: str
-
-    # Role auto-assigned to first-time authenticated users.
-    DEFAULT_MEMBER_ROLE: str = "Hub Member"
 
     # ── Fundraising (Total Moved & Deployed) fields ───────────────────
     AT_F_AMOUNT: str
