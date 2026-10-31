@@ -24,7 +24,6 @@ from app.db_v2.models.resource_grant import ResourceGrantV2
 from app.db_v2.models.role import RoleEdgeV2, RoleV2
 from app.db_v2.models.role_assignment import RoleAssignmentV2
 from app.db_v2.models.scope import ScopeEdgeV2, ScopeV2
-from app.db_v2.models.user import UserV2
 # `set_role_rank` was imported here to route rank edits through the validator.
 # That rule is disabled (see rbac_graph_service's "DISABLED: rank changes"
 # block); `depth` is now assigned directly in `update_role`.
@@ -270,29 +269,6 @@ def update_role(
     return serialize_role(role, parents, children)
 
 
-def _deleted_user_assignment_count(db: Session, criterion) -> int:
-    """How many of the assignments matching ``criterion`` belong to
-    soft-deleted users. Those rows are kept for Restore and still block a
-    role/scope delete (the FK is RESTRICT; owner, 2026-10-19, plan_admin_
-    soft_delete_user §6.2), so the refusal says how many there are."""
-    return (
-        db.query(RoleAssignmentV2)
-        .join(UserV2, UserV2.id == RoleAssignmentV2.user_id)
-        .filter(criterion, UserV2.is_deleted.is_(True))
-        .count()
-    )
-
-
-def _deleted_users_note(deleted_count: int) -> str:
-    if not deleted_count:
-        return ""
-    noun = "belongs to a deleted user" if deleted_count == 1 else "belong to deleted users"
-    return (
-        f" {deleted_count} of these {noun}: restore them, remove the "
-        f"assignment, then delete them again."
-    )
-
-
 def delete_role(db: Session, role_id: int) -> bool:
     """Refuses on a system role, one that still has assignments, or one still
     granted on a node.
@@ -322,17 +298,14 @@ def delete_role(db: Session, role_id: int) -> bool:
         db.query(RoleAssignmentV2).filter(RoleAssignmentV2.role_id == role_id).count()
     )
     if assignment_count:
-        deleted_count = _deleted_user_assignment_count(db, RoleAssignmentV2.role_id == role_id)
         raise RbacGraphError(
             "role_in_use",
             (
                 f"{role.name!r} is still assigned to {assignment_count} "
                 f"user/scope combination(s). Remove those assignments first."
-                f"{_deleted_users_note(deleted_count)}"
             ),
             role_id=role_id,
             assignment_count=assignment_count,
-            deleted_user_assignment_count=deleted_count,
         )
 
     # The second pre-count, and it is not optional: algorithm plan §7 gives
@@ -543,17 +516,14 @@ def delete_scope(db: Session, scope_id: int) -> bool:
         db.query(RoleAssignmentV2).filter(RoleAssignmentV2.scope_id == scope_id).count()
     )
     if assignment_count:
-        deleted_count = _deleted_user_assignment_count(db, RoleAssignmentV2.scope_id == scope_id)
         raise RbacGraphError(
             "scope_in_use",
             (
                 f"{scope.name!r} is still assigned to {assignment_count} "
                 f"user/role combination(s). Remove those assignments first."
-                f"{_deleted_users_note(deleted_count)}"
             ),
             scope_id=scope_id,
             assignment_count=assignment_count,
-            deleted_user_assignment_count=deleted_count,
         )
 
     # The grants pre-count, mirroring delete_role's — see the long note there

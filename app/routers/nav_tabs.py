@@ -23,14 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
-from app.dependencies import (
-    ViewAsAccess,
-    get_current_user,
-    get_edit_session,
-    get_lock_view,
-    get_view_as_access,
-    get_viewer_access,
-)
+from app.dependencies import get_current_user, get_edit_session, get_lock_view, get_viewer_access
 from app.models.auth import UserInfo
 from app.schemas.tab import (
     CreateNavTabRequest,
@@ -39,10 +32,10 @@ from app.schemas.tab import (
     NavTabResponse,
     RenewLockRequest,
     ReorderNavTabsRequest,
+    TabSummaryListAPIResponse,
     UnlockTabRequest,
     UpdateNavTabRequest,
 )
-from app.schemas.view_as import NavTabListViewAsAPIResponse, TabSummaryListViewAsAPIResponse
 from app.services import edit_lock_service
 from app.services.access_visibility_service import AccessDeniedError, ViewerAccess, resolve_hub_node
 from app.services.gridstack_service import get_root_tabs_v2
@@ -67,9 +60,6 @@ COMMON_BAD_REQUEST_RESPONSE = {400: {"description": "Bad request"}}
 COMMON_NOT_FOUND_RESPONSE = {404: {"description": "Requested nav tab was not found"}}
 COMMON_CONFLICT_RESPONSE = {409: {"description": "Conflict"}}
 COMMON_FORBIDDEN_RESPONSE = {403: {"description": "You do not have edit access to this item"}}
-COMMON_FORBIDDEN_VIEW_AS_RESPONSE = {
-    403: {"description": "View As refused: the caller may not adopt the given role/scope"}
-}
 
 
 # Declared before /{document_id} so "reorder" is never captured as a
@@ -86,18 +76,12 @@ def reorder_method_not_allowed():
     )
 
 
-@router.get(
-    "",
-    response_model=NavTabListViewAsAPIResponse,
-    summary="Get all nav tabs",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_FORBIDDEN_VIEW_AS_RESPONSE},
-)
+@router.get("", response_model=NavTabListAPIResponse, summary="Get all nav tabs")
 def get_nav_tabs(
     db: Session = Depends(get_db_v2),
-    view_as_access: ViewAsAccess = Depends(get_view_as_access),
+    access: ViewerAccess = Depends(get_viewer_access),
     lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
-    access = view_as_access.access
     # findings_dev_login_live_testing_2026-09-12.md #4: the frontend has no
     # other way to learn whether the caller holds edit(hub) — needed to gate
     # Delete/reorder correctly (§6.3: both are edit(parent(n)), not the
@@ -105,26 +89,21 @@ def get_nav_tabs(
     # `verdict()` lookup against the SAME `access` already computed for
     # this request — no extra query.
     hub_edit = access.verdict(resolve_hub_node(db)).edit
-    return {
-        "data": get_nav_tabs_v2(db, access=access, lock_view=lock_view),
-        "hub_edit": hub_edit,
-        "view_as": view_as_access.view_as,
-    }
+    return {"data": get_nav_tabs_v2(db, access=access, lock_view=lock_view), "hub_edit": hub_edit}
 
 
 @router.get(
     "/{document_id}/tabs",
-    response_model=TabSummaryListViewAsAPIResponse,
+    response_model=TabSummaryListAPIResponse,
     summary="Get root tabs scoped to one nav tab",
-    responses={**COMMON_BAD_REQUEST_RESPONSE, **COMMON_NOT_FOUND_RESPONSE, **COMMON_FORBIDDEN_VIEW_AS_RESPONSE},
+    responses={**COMMON_NOT_FOUND_RESPONSE},
 )
 def get_nav_tab_tabs(
     document_id: str,
     db: Session = Depends(get_db_v2),
-    view_as_access: ViewAsAccess = Depends(get_view_as_access),
+    access: ViewerAccess = Depends(get_viewer_access),
     lock_view: edit_lock_service.LockView = Depends(get_lock_view),
 ):
-    access = view_as_access.access
     validate_document_id(document_id)
 
     nav_tab = get_nav_tab_by_document_id(db, document_id)
@@ -136,10 +115,7 @@ def get_nav_tab_tabs(
     if not access.verdict(("nav_tab", nav_tab.id)).view:
         raise HTTPException(status_code=404, detail="Nav tab not found")
 
-    return {
-        "data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id, access=access, lock_view=lock_view),
-        "view_as": view_as_access.view_as,
-    }
+    return {"data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id, access=access, lock_view=lock_view)}
 
 
 @router.post(

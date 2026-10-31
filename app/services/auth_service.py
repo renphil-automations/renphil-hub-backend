@@ -24,11 +24,11 @@ from google.auth.transport import requests as google_requests
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.db_v2.models.hub_user import HubUserV2
 from app.helpers.exceptions import GoogleOAuthError, UserNotAuthorizedError
 from app.helpers.google_client import build_oauth_flow
 from app.models.auth import TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
-from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _pkce_store: dict[str, tuple[str, str]] = {}
 
 # Which rule in `_enforce_login_allowed` let an email through.
-LoginAdmission = Literal["domain", "users", "airtable"]
+LoginAdmission = Literal["domain", "hub_users", "airtable"]
 
 
 def _generate_code_verifier() -> str:
@@ -92,7 +92,7 @@ class AuthService:
         Complete the OAuth callback:
           - exchange auth code for tokens (with PKCE verifier)
           - verify & decode the id_token
-          - enforce the login allow-list (domain, users, Airtable)
+          - enforce the login allow-list (domain, hub_users, Airtable)
           - resolve the user's roles from the Airtable Access Control table
           - mint a local JWT
 
@@ -134,10 +134,10 @@ class AuthService:
         admitted_by = await self._enforce_login_allowed(email, airtable_service, db)
 
         # Auto-provision a Hub Member Access Control record for first-time
-        # users — except someone admitted through a `users` row (owner
+        # users — except someone admitted through `hub_users` (owner
         # decision, 2026-10-04): their sign-in must keep depending on
-        # `users` alone, not on an Airtable record this would create.
-        if admitted_by != "users":
+        # `hub_users` alone, not on an Airtable record this would create.
+        if admitted_by != "hub_users":
             await airtable_service.ensure_access_control_member(email)
 
         # Resolve roles from the Airtable Access Control table
@@ -201,23 +201,22 @@ class AuthService:
         """Gate login by email, returning which rule admitted it.
 
         Org-domain emails are always allowed. A non-org email is allowed only
-        when it is already known: first a `users` row signing in as it
-        (`work_email`, else `alias_email` — an HR row, or a person added from
+        when an admin pre-registered it: first a `hub_users` row (added from
         the Access Control page's Users tab), then — as a fallback until the
-        AC cutover, after which only `users` will count — a record in the
+        AC cutover, after which only `hub_users` will count — a record in the
         Airtable Access Control table. Otherwise login is refused. Runs
         BEFORE auto-provisioning so an unknown external email is never
         provisioned into existence.
 
-        `users.has_signed_in` is deliberately NOT checked (owner decision,
-        2026-10-04): an admin-added person
-        has not yet — that is the whole point of adding them.
+        `hub_users.is_active` is deliberately NOT checked (owner decision,
+        2026-10-04): any row admits.
         """
         domain = email.rsplit("@", 1)[-1].lower()
         if domain in self._settings.allowed_email_domains:
             return "domain"
-        if find_user_by_email(db, email) is not None:
-            return "users"
+        normalized = email.strip().lower()
+        if db.query(HubUserV2.id).filter(HubUserV2.email == normalized).first() is not None:
+            return "hub_users"
         if await airtable_service.access_control_email_exists(email):
             return "airtable"
         raise UserNotAuthorizedError(email)

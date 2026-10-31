@@ -6,7 +6,7 @@ source. The names are resolved once at import time, the same style
 ``app.db_v2.database`` already uses for its connection config.
 
 No ORM ``relationship()`` — every model in ``db_v2`` follows the same rule:
-traversal is a plain query. The FK to ``users`` and the
+traversal is a plain query. The FK to ``hub_users`` and the
 (user_id, bookmark_link) uniqueness are enforced by the database, declared
 here only so ``create_all`` in tests reproduces the real constraints.
 """
@@ -39,7 +39,7 @@ class BookmarkV2(BaseV2):
     user_id = Column(
         _settings.BOOKMARKS_USER_ID_FIELD,
         Integer,
-        ForeignKey("users.id"),
+        ForeignKey("hub_users.id"),
         nullable=False,
         index=True,
     )

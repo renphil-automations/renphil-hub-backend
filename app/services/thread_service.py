@@ -487,8 +487,6 @@ def _eligible_mentionable_users_query(db: Session):
         or_(UserV2.end_date.is_(None), UserV2.end_date > today),
         UserV2.work_email.isnot(None),
         UserV2.work_email != "",
-        # Soft-deleted people can't be mentioned (plan_admin_soft_delete_user §3.4).
-        UserV2.not_deleted(),
     )
 
 
@@ -855,19 +853,6 @@ def _notify_mentions(
     return notified
 
 
-def _recipient_is_deleted(db: Session, email: str) -> bool:
-    """A soft-deleted person gets no NEW notifications (plan_admin_soft_
-    delete_user §3.4); their existing ones are kept. Mentions never reach
-    here for them (the roster excludes deleted rows); this covers the
-    author/submitter notifications, which are addressed by stored email."""
-    return (
-        db.query(UserV2.id)
-        .filter(UserV2.matches_email(email), UserV2.is_deleted.is_(True))
-        .first()
-        is not None
-    )
-
-
 def _notify_new_thread_comment(
     db: Session,
     *,
@@ -888,8 +873,6 @@ def _notify_new_thread_comment(
     thread_author = _norm_email(thread_author_email)
     actor_email = _norm_email(actor.email)
     if thread_author == actor_email or thread_author in already_notified:
-        return
-    if _recipient_is_deleted(db, thread_author):
         return
     db.add(
         NotificationV2(
@@ -936,7 +919,7 @@ def _notify_thread_decision(
     same convention as every other write function in this module."""
     recipient = _norm_email(thread.author_email)
     reviewer_email = _norm_email(reviewer.email)
-    if recipient == reviewer_email or _recipient_is_deleted(db, recipient):
+    if recipient == reviewer_email:
         return
     db.add(
         NotificationV2(
@@ -984,7 +967,7 @@ def _notify_thread_edit_decision(
     transaction."""
     recipient = _norm_email(revision.submitted_by_email)
     reviewer_email = _norm_email(reviewer.email)
-    if recipient == reviewer_email or _recipient_is_deleted(db, recipient):
+    if recipient == reviewer_email:
         return
     db.add(
         NotificationV2(
