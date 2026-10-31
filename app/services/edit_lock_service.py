@@ -476,20 +476,26 @@ def _admin_holder_emails(db: Session, emails: set[str]) -> set[str]:
     if not emails:
         return set()
     # Local imports: same layering reason as `release_locks_now_unauthorized`.
-    from sqlalchemy import func
-
-    from app.db_v2.models.hub_user import HubUserV2
+    from app.db_v2.models.user import UserV2
     from app.services.rbac_graph_service import hub_admin_user_ids
 
     admin_ids = hub_admin_user_ids(db)
     if not admin_ids:
         return set()
+    emails = {e.strip().lower() for e in emails}
+    # A holder is whichever address they signed in with, so match both
+    # email columns and return the one that actually appears in `emails`.
     rows = (
-        db.query(HubUserV2.email)
-        .filter(HubUserV2.id.in_(admin_ids), func.lower(HubUserV2.email).in_(emails))
+        db.query(UserV2.work_email, UserV2.alias_email)
+        .filter(UserV2.id.in_(admin_ids), UserV2.matches_any_email(emails))
         .all()
     )
-    return {(email or "").strip().lower() for (email,) in rows}
+    return {
+        e
+        for row in rows
+        for e in ((row[0] or "").strip().lower(), (row[1] or "").strip().lower())
+        if e in emails
+    }
 
 
 def _admin_refusal_message(admins: list[BlockingHolder]) -> str:
@@ -783,10 +789,10 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
     # exact cycle `gridstack_service.py`'s own local import of this module
     # already has to dodge. See this file's own module docstring.
     from app.dependencies import CurrentHubUser, is_hub_admin
-    from app.db_v2.models.hub_user import HubUserV2
     from app.models.auth import UserInfo
     from app.services.access_visibility_service import resolve_gridstack_node, resolve_viewer_access
     from app.services.rbac_graph_service import RbacClosures
+    from app.services.user_db_service import find_user_by_email
 
     rows = _held_rows(db)
 
@@ -806,7 +812,7 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
             # reclaim path already covers it) — not this sweep's job.
             continue
 
-        hub_user = db.query(HubUserV2).filter(HubUserV2.email == holder).first()
+        hub_user = find_user_by_email(db, holder)
         if hub_user is None:
             _force_break_lock(row)
             released.append(node)

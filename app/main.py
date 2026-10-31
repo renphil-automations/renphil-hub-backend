@@ -35,6 +35,7 @@ from app.routers import (
     super_blocknote_v2,
     tabs_v2,
     threads,
+    view_as,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,8 @@ def create_app() -> FastAPI:
     app.include_router(rbac_assignments.router, prefix=api_prefix)
     app.include_router(resource_grants.router, prefix=api_prefix)
     app.include_router(bookmarks.router, prefix=api_prefix)
+    app.include_router(forms.router, prefix=api_prefix)
+    app.include_router(view_as.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────
     @app.get("/health", tags=["Health"])

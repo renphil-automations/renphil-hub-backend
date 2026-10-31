@@ -21,12 +21,14 @@ from app.config import Settings, get_settings
 from app.db_v2.database import get_db_v2
 from app.dependencies import (
     CurrentHubUser,
+    HubUserRemoved,
     _ensure_hub_user,
     get_airtable_service,
     get_auth_service,
     get_current_hub_user,
     is_hub_admin,
 )
+from app.helpers.exceptions import UserRemovedError
 from app.models.auth import MeResponse, TokenResponse, UserInfo
 from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
@@ -80,7 +82,12 @@ async def callback(
     # docstring) — falling back to `admin=False` there rather than raising,
     # so that edge case never breaks login itself over a nice-to-have flag.
     normalized_email = token_response.email.strip().lower()
-    hub_user = _ensure_hub_user(db, email=normalized_email, name=token_response.name)
+    try:
+        hub_user = _ensure_hub_user(db, email=normalized_email, name=token_response.name, allow_insert_external=True)
+    except HubUserRemoved:
+        # Soft-deleted, any domain (plan_admin_soft_delete_user §3.3): the
+        # token minted above is never handed over.
+        raise UserRemovedError(normalized_email)
     admin = False
     if hub_user is not None:
         current = CurrentHubUser(
@@ -235,7 +242,10 @@ async def dev_login(
     except ValidationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid email: {email}") from exc
 
-    hub_user = _ensure_hub_user(db, email=normalized_email, name=user.name)
+    try:
+        hub_user = _ensure_hub_user(db, email=normalized_email, name=user.name, allow_insert_external=True)
+    except HubUserRemoved:
+        raise UserRemovedError(normalized_email)
 
     access_token = auth_service._create_access_token(user)
 
