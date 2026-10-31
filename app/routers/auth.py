@@ -119,10 +119,9 @@ async def me(
 ):
     """Return the authenticated user's profile.
 
-    ``scoped_roles`` is always ``[]``: it used to be read from the Airtable
-    Access Control table, which auth no longer touches
-    (plan_login_airtable_removal_2026-10-31.md). Kept on the wire until the
-    frontend stops reading it (that plan's Step 4).
+    No Airtable call: the old ``scoped_roles`` field (read from the Airtable
+    Access Control table) was removed with the frontend role fallback
+    (plan_login_airtable_removal_2026-10-31.md, Step 4).
 
     Also includes the real ``is_hub_admin(db, current)`` answer
     (``BOOTSTRAP_ADMIN_EMAILS`` OR a live `role_assignments` row) — NOT whether "Hub
@@ -141,7 +140,6 @@ async def me(
         name=user.name,
         picture=user.picture,
         roles=user.roles,
-        scoped_roles=[],
         is_hub_admin=is_hub_admin(db, current),
     )
 
