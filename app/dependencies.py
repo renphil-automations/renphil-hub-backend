@@ -232,7 +232,7 @@ def _ensure_hub_user(
         db.add(user)
         try:
             db.flush()
-            rbac_assignment_service.add_default_assignment(db, hub_user.id)
+            rbac_assignment_service.add_default_assignment(db, user.id)
             db.commit()
         except IntegrityError:
             db.rollback()
