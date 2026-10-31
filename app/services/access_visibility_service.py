@@ -67,6 +67,7 @@ from app.db_v2.models.hub import HubV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.resource_grant import LEVEL_EDIT
 from app.db_v2.models.tab import TabV2
+from app.db_v2.models.user import UserV2
 from app.services.rbac_graph_service import (
     RbacClosures,
     audience_user_ids,
@@ -1537,6 +1538,14 @@ def users_granted_on_node(
 
     grants = grants_on_nodes(db, chain)
     granted: set[int] = {g.user_id for g in grants if g.user_id is not None}
+    # A soft-deleted user's user-form grant is kept for Restore but grants
+    # nothing (plan_admin_soft_delete_user §3.4); `audience_user_ids` already
+    # skips them on the pair side.
+    if granted:
+        granted -= {
+            row[0]
+            for row in db.query(UserV2.id).filter(UserV2.id.in_(granted), UserV2.is_deleted.is_(True)).all()
+        }
     pairs = {(g.role_id, g.scope_id) for g in grants if g.role_id is not None}
     # One assignments read for the bag's pairs and the admin pair together:
     # the union is the answer, and reading the table twice for two subsets

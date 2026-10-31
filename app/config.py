@@ -4,6 +4,7 @@ Uses pydantic-settings so every value is validated at startup.
 """
 
 from functools import lru_cache
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -568,6 +569,7 @@ class Settings(BaseSettings):
     # never shipped to browser JavaScript.
     AGENT_API_URL: str | None = None
     AGENT_SYNC_TOKEN: str | None = None
+    AGENT_MODELS_TIMEOUT_SECONDS: float = Field(default=45.0, ge=1.0, le=120.0)
 
     # ══════════════════════════════════════════════════════════════════
     # Tab / SBN-node locking (plan_access_control_algorithm_2026-08-27.md §6.6)
