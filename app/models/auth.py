@@ -55,9 +55,10 @@ class MeResponse(BaseModel):
     scoped_roles: list[ScopedRole] = Field(
         default_factory=list,
         description=(
-            "Per-assignment role info from the Access Control table. "
-            "Each entry carries the role name, its scope, and the "
-            "fund/program it is scoped to (null when scope is 'Hub')."
+            "Always empty: formerly per-assignment role info from the "
+            "Airtable Access Control table, which auth no longer reads "
+            "(plan_login_airtable_removal_2026-10-31.md). Kept until the "
+            "frontend stops reading it."
         ),
     )
     is_hub_admin: bool = Field(
