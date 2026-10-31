@@ -194,7 +194,7 @@ def status_payload(db: Session, settings: Any) -> dict:
     return {
         "current_bulk_job": bulk_jobs.serialize_job(job, now) if job else None,
         "last_bulk_job": bulk_jobs.serialize_job(last_job, now) if last_job else None,
-        "settings": settings_service.serialize_settings(settings_service.get_settings_row(db)),
+        "settings": settings_service.serialize_settings(settings_service.get_settings_row(db), now),
         "config_error": _config_error(settings),
         "current_run": serialize_run(current, now, attempts) if current else None,
         "last_run": serialize_run(last, now, attempts) if last else None,

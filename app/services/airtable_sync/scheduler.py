@@ -5,7 +5,9 @@ The cron calls `POST /v2/airtable-sync/tick` every few minutes
 
   1. work out the most recent scheduled slot ≤ now, in the schedule's zone
      (daily: `run_time` today or yesterday; weekly: the latest `run_weekday`
-     at `run_time`, today or up to 7 days ago), as an aware UTC instant;
+     at `run_time`, today or up to 7 days ago; interval: the latest
+     `00:00 + k × interval_minutes`, today or yesterday), as an aware UTC
+     instant;
   2. it is due only if the schedule is on, the slot is newer than
      `last_scheduled_slot`, and the slot is less than SLOT_MAX_AGE old (so a
      long outage never produces a surprise run at a random hour);
@@ -38,7 +40,10 @@ DST (owner, 2026-10-24): a wall time that happens twice (fall-back) runs
 once, at its FIRST occurrence; one that doesn't exist (spring-forward gap)
 runs that same day, shifted forward by the gap (02:30 → 03:30 EDT). That is
 what a `fold=0` aware datetime means (PEP 495), so `resolve_local` relies
-on it and the tests pin it.
+on it and the tests pin it. Interval slots use the same rule (owner,
+2026-10-29, D6): each grid time is resolved like a daily one, so two grid
+times can land on one instant (a missing 02:00 shifted onto 03:00) and
+merge, and at 2 h or more the jump-forward day has one run off the grid.
 """
 
 from __future__ import annotations
@@ -50,7 +55,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.airtable_sync import FREQUENCIES, RUN_STEPS, AirtableSyncRunV2, AirtableSyncSettingsV2
+from app.db_v2.models.airtable_sync import (
+    FREQUENCIES,
+    INTERVAL_MINUTES,
+    RUN_STEPS,
+    AirtableSyncRunV2,
+    AirtableSyncSettingsV2,
+)
 from app.services.airtable_sync import bulk_jobs
 from app.services.airtable_sync.runner import (
     INTERRUPTED_BY_TICK,
@@ -80,6 +91,11 @@ RETRY_ROOM = timedelta(minutes=20)
 # Days to look back for the latest slot: a weekly slot is at most 7 days
 # old; one more covers a zone that skipped a calendar day.
 _LOOKBACK_DAYS = 8
+# An interval grid starts every local day, so today or yesterday always has
+# a slot ≤ now (yesterday only for a zone whose jump swallows its midnight
+# and part of the next hour: none in tzdata 2000–2040, checked 2026-10-31);
+# likewise today or tomorrow has one > now.
+_INTERVAL_DAYS = 2
 
 
 def _utc_now() -> datetime:
@@ -92,6 +108,15 @@ def resolve_local(day: date, at: time, zone: ZoneInfo) -> datetime:
     return datetime.combine(day, at.replace(tzinfo=None), tzinfo=zone).astimezone(timezone.utc)
 
 
+def interval_slots(day: date, interval_minutes: int, zone: ZoneInfo) -> list[datetime]:
+    """`day`'s interval slots, oldest first (aware, UTC): the grid `00:00 +
+    k × interval_minutes`, each time resolved by `resolve_local`. A set, so
+    two grid times on one instant are one slot (plan §5.2)."""
+    return sorted(
+        {resolve_local(day, time(m // 60, m % 60), zone) for m in range(0, 1440, interval_minutes)}
+    )
+
+
 def latest_slot(
     now: datetime,
     *,
@@ -99,9 +124,18 @@ def latest_slot(
     run_time: time,
     run_weekday: int | None,
     zone: ZoneInfo,
+    interval_minutes: int | None = None,
 ) -> datetime:
-    """The most recent scheduled instant ≤ `now` (aware, UTC)."""
+    """The most recent scheduled instant ≤ `now` (aware, UTC).
+    `interval_minutes` is read for 'interval' only; `run_time` and
+    `run_weekday` for daily / weekly only."""
     today = now.astimezone(zone).date()
+    if frequency == "interval":
+        for back in range(_INTERVAL_DAYS):
+            for slot in reversed(interval_slots(today - timedelta(days=back), interval_minutes, zone)):
+                if slot <= now:
+                    return slot
+        raise ValueError("No interval slot in the look-back window.")  # unreachable
     for back in range(_LOOKBACK_DAYS + 1):
         day = today - timedelta(days=back)
         if frequency == "weekly" and day.weekday() != run_weekday:
@@ -119,10 +153,17 @@ def next_slot(
     run_time: time,
     run_weekday: int | None,
     zone: ZoneInfo,
+    interval_minutes: int | None = None,
 ) -> datetime:
-    """The first scheduled instant strictly after `now` (aware, UTC). Daily
-    and weekly; the interval branch is RI-4."""
+    """The first scheduled instant strictly after `now` (aware, UTC). Reads
+    the same fields as `latest_slot`."""
     today = now.astimezone(zone).date()
+    if frequency == "interval":
+        for ahead in range(_INTERVAL_DAYS):
+            for slot in interval_slots(today + timedelta(days=ahead), interval_minutes, zone):
+                if slot > now:
+                    return slot
+        raise ValueError("No interval slot in the look-ahead window.")  # unreachable
     for ahead in range(_LOOKBACK_DAYS + 1):
         day = today + timedelta(days=ahead)
         if frequency == "weekly" and day.weekday() != run_weekday:
@@ -140,31 +181,55 @@ class Decision:
     slot: datetime | None = None
 
 
+def _schedule_args(row: AirtableSyncSettingsV2) -> dict | None:
+    """`row`'s schedule as `latest_slot` / `next_slot` arguments, or None
+    when it is invalid. The settings API refuses all of these; a row edited
+    by hand is the only way here, and it must not crash every tick.
+    `interval_minutes` is read for an interval row only (a daily / weekly
+    row's is NULL, and the pure tests' rows have none)."""
+    weekly = row.frequency == "weekly"
+    interval = row.frequency == "interval"
+    if row.frequency not in FREQUENCIES or (weekly and row.run_weekday not in range(7)):
+        return None
+    if interval and row.interval_minutes not in INTERVAL_MINUTES:
+        return None
+    try:
+        zone = ZoneInfo(row.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    return {
+        "frequency": row.frequency,
+        "run_time": row.run_time,
+        "run_weekday": row.run_weekday if weekly else None,
+        "interval_minutes": row.interval_minutes if interval else None,
+        "zone": zone,
+    }
+
+
+def _next_slot(row: AirtableSyncSettingsV2, now: datetime) -> datetime:
+    """`next_slot` for a row `decide` has accepted: the one place a row's
+    fields become its call, so the retry room and the settings payload can't
+    read different schedules."""
+    return next_slot(now, **_schedule_args(row))
+
+
+def upcoming_slot(row: AirtableSyncSettingsV2, now: datetime) -> datetime | None:
+    """The schedule's next slot after `now`, for the settings payload; None
+    when the schedule is off or invalid."""
+    if not row.schedule_enabled or _schedule_args(row) is None:
+        return None
+    return _next_slot(row, now)
+
+
 def decide(row: AirtableSyncSettingsV2, now: datetime) -> Decision:
     """Whether the latest slot should run now. Pure: reads `row` only."""
     if not row.schedule_enabled:
         return Decision(False, "schedule_disabled")
-    # 'interval' is in FREQUENCIES with its schema (RI-1), but its slots come
-    # in RI-4; until then it must not fall through to the daily branch.
-    if row.frequency == "interval":
-        return Decision(False, "invalid_schedule")
-    # The settings API refuses all of these; a row edited by hand is the
-    # only way here, and it must not crash every tick.
-    weekly = row.frequency == "weekly"
-    if row.frequency not in FREQUENCIES or (weekly and row.run_weekday not in range(7)):
-        return Decision(False, "invalid_schedule")
-    try:
-        zone = ZoneInfo(row.timezone)
-    except (ZoneInfoNotFoundError, ValueError):
+    args = _schedule_args(row)
+    if args is None:
         return Decision(False, "invalid_schedule")
 
-    slot = latest_slot(
-        now,
-        frequency=row.frequency,
-        run_time=row.run_time,
-        run_weekday=row.run_weekday if weekly else None,
-        zone=zone,
-    )
+    slot = latest_slot(now, **args)
     last = as_utc(row.last_scheduled_slot)
     if last is not None and slot <= last:
         return Decision(False, "slot_already_used", slot)
@@ -214,20 +279,13 @@ def decide_retry(
 
 def _retry(db: Session, row: AirtableSyncSettingsV2, slot: datetime, now: datetime) -> RetryDecision:
     """`decide_retry` with its facts read from `db`. Only called after
-    `decide`, so the schedule is valid (daily or weekly)."""
+    `decide`, so the schedule is valid."""
     attempts = attempts_for_slot(db, slot)
-    weekly = row.frequency == "weekly"
     return decide_retry(
         slot,
         attempts,
         succeeded_since=bool(attempts) and real_success_after(db, attempts[-1].id),
-        next_slot=next_slot(
-            now,
-            frequency=row.frequency,
-            run_time=row.run_time,
-            run_weekday=row.run_weekday if weekly else None,
-            zone=ZoneInfo(row.timezone),
-        ),
+        next_slot=_next_slot(row, now),
         now=now,
     )
 

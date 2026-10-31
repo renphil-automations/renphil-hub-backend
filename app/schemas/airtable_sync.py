@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, model_validator
 
+from app.db_v2.models.airtable_sync import INTERVAL_MINUTES
 from app.schemas.tab import StrictRequestModel
 
 # "HH:MM", 24-hour.
@@ -27,11 +28,16 @@ MAX_MAPPINGS = 200
 
 class SyncSettingsResponse(BaseModel):
     schedule_enabled: bool
-    frequency: Literal["daily", "weekly"]
+    frequency: Literal["daily", "weekly", "interval"]
+    # Stored for every frequency; an interval schedule ignores it.
     run_time: str
-    # 0 = Monday … 6 = Sunday. Null when daily.
+    # 0 = Monday … 6 = Sunday. Null unless weekly.
     run_weekday: int | None = None
+    # Every N minutes from local midnight. Null unless interval.
+    interval_minutes: int | None = None
     timezone: str
+    # The next slot after now; null when the schedule is off or invalid.
+    next_slot: datetime | None = None
     last_scheduled_slot: datetime | None = None
     updated_by_email: str | None = None
     updated_at: datetime | None = None
@@ -46,9 +52,12 @@ class UpdateSyncSettingsRequest(StrictRequestModel):
     step (plan v2 R1), so there is no step choice here."""
 
     schedule_enabled: StrictBool
-    frequency: Literal["daily", "weekly"]
+    frequency: Literal["daily", "weekly", "interval"]
     run_time: StrictStr = Field(pattern=RUN_TIME_PATTERN)
     run_weekday: StrictInt | None = Field(default=None, ge=0, le=6)
+    # Interval only. Outside the offered range (60–720) is a 422; inside it,
+    # a value not offered is the service's 409 `invalid_interval`.
+    interval_minutes: StrictInt | None = Field(default=None, ge=INTERVAL_MINUTES[0], le=INTERVAL_MINUTES[-1])
     timezone: StrictStr = Field(min_length=1, max_length=64)
 
 

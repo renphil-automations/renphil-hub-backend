@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.db_v2.models.airtable_sync import (
     DESIGNATION_ACTIONS,
     FREQUENCIES,
+    INTERVAL_MINUTES,
     AirtableDesignationMappingV2,
     AirtableSyncSettingsV2,
 )
@@ -26,10 +27,6 @@ from app.db_v2.models.role import RoleV2
 from app.services.rbac_assignment_service import HUB_ADMIN_ROLE_KEY
 
 SETTINGS_ROW_ID = 1
-
-# What `update_settings` accepts. 'interval' is in FREQUENCIES with its schema
-# (RI-1) but is refused until RI-4 builds its slots and validation.
-_SETTABLE_FREQUENCIES = tuple(f for f in FREQUENCIES if f != "interval")
 
 
 class AirtableSyncError(Exception):
@@ -68,13 +65,20 @@ def get_settings_row(db: Session) -> AirtableSyncSettingsV2:
     return row
 
 
-def serialize_settings(row: AirtableSyncSettingsV2) -> dict:
+def serialize_settings(row: AirtableSyncSettingsV2, now: datetime | None = None) -> dict:
+    """`next_slot`: the schedule's next slot after `now`, any frequency; null
+    when it is off or invalid (the tab's "Next run")."""
+    # Local: the scheduler imports this module.
+    from app.services.airtable_sync.scheduler import upcoming_slot
+
     return {
         "schedule_enabled": bool(row.schedule_enabled),
         "frequency": row.frequency,
         "run_time": row.run_time.strftime("%H:%M"),
         "run_weekday": row.run_weekday,
+        "interval_minutes": row.interval_minutes,
         "timezone": row.timezone,
+        "next_slot": upcoming_slot(row, now or _utc_now()),
         "last_scheduled_slot": row.last_scheduled_slot,
         "updated_by_email": row.updated_by_email,
         "updated_at": row.updated_at,
@@ -90,18 +94,33 @@ def update_settings(
     run_weekday: int | None,
     timezone_name: str,
     actor_email: str,
+    interval_minutes: int | None = None,
 ) -> dict:
     """Replace the schedule. A weekly schedule needs a weekday; a daily one
     must not carry one (it would be silently ignored, and then come back
-    the day someone switches to weekly)."""
-    if frequency not in _SETTABLE_FREQUENCIES:
-        raise AirtableSyncError(
-            "invalid_frequency", f"Frequency must be one of {', '.join(_SETTABLE_FREQUENCIES)}."
-        )
+    the day someone switches to weekly). Likewise an interval schedule needs
+    `interval_minutes` and has no weekday, and only it may carry minutes
+    (plan §5.1). `run_time` is stored for every frequency (the UI sends the
+    stored one back); an interval schedule ignores it."""
+    if frequency not in FREQUENCIES:
+        raise AirtableSyncError("invalid_frequency", f"Frequency must be one of {', '.join(FREQUENCIES)}.")
     if frequency == "weekly" and run_weekday is None:
         raise AirtableSyncError("weekday_required", "A weekly schedule needs a weekday.")
     if frequency == "daily" and run_weekday is not None:
         raise AirtableSyncError("weekday_not_allowed", "A daily schedule has no weekday.")
+    if frequency == "interval":
+        if run_weekday is not None:
+            raise AirtableSyncError("weekday_not_allowed", "An interval schedule has no weekday.")
+        if interval_minutes is None:
+            raise AirtableSyncError("interval_required", "An interval schedule needs an interval.")
+        if interval_minutes not in INTERVAL_MINUTES:
+            raise AirtableSyncError(
+                "invalid_interval",
+                f"The interval must be one of {', '.join(map(str, INTERVAL_MINUTES))} minutes.",
+                interval_minutes=interval_minutes,
+            )
+    elif interval_minutes is not None:
+        raise AirtableSyncError("interval_not_allowed", f"A {frequency} schedule has no interval.")
     try:
         ZoneInfo(timezone_name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -114,6 +133,7 @@ def update_settings(
     row.frequency = frequency
     row.run_time = run_time.replace(second=0, microsecond=0)
     row.run_weekday = run_weekday
+    row.interval_minutes = interval_minutes
     row.timezone = timezone_name
     row.updated_by_email = actor_email
     row.updated_at = _utc_now()

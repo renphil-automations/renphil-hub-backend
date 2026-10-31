@@ -118,6 +118,7 @@ def update_sync_settings(
             frequency=request.frequency,
             run_time=time(hours, minutes),
             run_weekday=request.run_weekday,
+            interval_minutes=request.interval_minutes,
             timezone_name=request.timezone.strip(),
             actor_email=current.email,
         )
