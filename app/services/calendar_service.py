@@ -83,6 +83,21 @@ def _event_has_ended(
         return False
 
 
+def _start_key(event: dict[str, Any]) -> datetime:
+    """Sortable UTC start of an event; all-day dates count from midnight UTC."""
+    raw = _start_str(event.get("start")) or ""
+    try:
+        if "T" not in raw:
+            day = date.fromisoformat(raw)
+            return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
 def _meeting_from(event: dict[str, Any]) -> tuple[str | None, str | None]:
     """
     Return ``(join_url, provider_label)`` for the event's video conference.
@@ -188,25 +203,17 @@ class CalendarService:
 
         Series-level details (summary, location, links, attendees) come from
         the master; for a recurring event the start/end are taken from its
-        next instance. Raises 404 if the event is gone or the series has no
-        future occurrences left.
+        next instance. The returned ``id`` is the series actually shown, which
+        differs from *event_id* once a split series has been followed (see
+        ``_resolve``) — the widget RSVPs against it, so attendance lands on the
+        live series. Raises 404 if the event is gone, a one-off has ended, or
+        the series (and any continuation of it) has no future occurrences.
         """
-        master = self._get_raw(event_id)
+        series_id, master, instance = self._resolve(event_id)
 
-        recurring = bool(master.get("recurrence"))
-        start_node = master.get("start")
-        end_node = master.get("end")
-
-        if recurring:
-            instance = self._next_instance(event_id)
-            if instance is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="This event has no upcoming occurrences.",
-                )
-            # start/end come from the concrete next instance.
-            start_node = instance.get("start")
-            end_node = instance.get("end")
+        recurring = instance is not None
+        start_node = (instance or master).get("start")
+        end_node = (instance or master).get("end")
 
         attendees = master.get("attendees", []) or []
         attending = any(
@@ -216,7 +223,7 @@ class CalendarService:
         meeting_link, meeting_label = _meeting_from(master)
 
         return CalendarEvent(
-            id=event_id,
+            id=series_id,
             summary=master.get("summary", ""),
             start=_start_str(start_node),
             end=_start_str(end_node),
@@ -238,34 +245,16 @@ class CalendarService:
         series with no future instance returns 404 so the Agent can remove stale
         vectors instead of indexing cached widget metadata.
         """
-        master = self._get_raw(event_id)
-        if str(master.get("status") or "").lower() == "cancelled":
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="This event is no longer available.",
-            )
+        _series_id, master, instance = self._resolve(event_id)
 
-        recurring = bool(master.get("recurrence"))
-        start_node = master.get("start")
-        end_node = master.get("end")
-
-        if recurring:
-            instance = self._next_instance(event_id)
-            if instance is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="This event has no upcoming occurrences.",
-                )
-            start_node = instance.get("start")
-            end_node = instance.get("end")
-        elif _event_has_ended(start_node, end_node):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="This event has expired.",
-            )
+        recurring = instance is not None
+        start_node = (instance or master).get("start")
+        end_node = (instance or master).get("end")
 
         meeting_link, meeting_label = _meeting_from(master)
         return CalendarIndexEvent(
+            # Keyed by the stored id, not the followed series, so the Agent's
+            # vectors stay attached to the widget that references them.
             id=event_id,
             summary=master.get("summary", ""),
             start=_start_str(start_node),
@@ -291,6 +280,9 @@ class CalendarService:
         state, so re-clicking is harmless.
         """
         email_lower = email.lower()
+        # Patch the series the widget is actually showing: a stale client may
+        # still hold an occurrence id or the ended half of a split series.
+        event_id, _master, _instance = self._resolve(event_id)
 
         for attempt in range(_ATTENDANCE_MAX_ATTEMPTS):
             event = self._get_raw(event_id)
@@ -354,23 +346,173 @@ class CalendarService:
                 ) from exc
             raise GoogleCalendarError(f"Could not read event: {exc}") from exc
 
-    def _next_instance(self, master_id: str) -> dict[str, Any] | None:
-        """Return the next upcoming instance of a recurring series, or None."""
-        try:
-            resp = (
-                self._service.events()
-                .instances(
-                    calendarId=self._calendar_id,
-                    eventId=master_id,
-                    timeMin=_now_rfc3339(),
-                    maxResults=1,
-                    fields="items(id,start,end)",
+    def _resolve(
+        self, event_id: str
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+        """
+        Map a stored event id to what the widget should show right now.
+
+        Returns ``(series_id, master, next_instance)`` — ``next_instance`` is
+        None for a one-off event. Handles three ways a stored id goes stale:
+
+        * an occurrence id (``<series>_<timestamp>``) is swapped for its
+          series, so it advances instead of pinning one date forever;
+        * a one-off that is cancelled or over raises 404;
+        * a series with no future occurrences — typically the ended half of a
+          "This and following events" edit — is replaced by its continuation
+          (``_find_continuation``), else raises 404.
+        """
+        master = self._get_raw(event_id)
+        parent_id = master.get("recurringEventId")
+        if parent_id:
+            event_id, master = parent_id, self._get_raw(parent_id)
+
+        if not master.get("recurrence"):
+            if str(master.get("status") or "").lower() == "cancelled":
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="This event is no longer available.",
                 )
-                .execute()
+            if _event_has_ended(master.get("start"), master.get("end")):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="This event has expired.",
+                )
+            return event_id, master, None
+
+        instance = (
+            None
+            if str(master.get("status") or "").lower() == "cancelled"
+            else self._next_instance(master)
+        )
+        if instance is not None:
+            return event_id, master, instance
+
+        continuation = self._find_continuation(master)
+        if continuation is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This event has no upcoming occurrences.",
             )
-        except HttpError as exc:
-            raise GoogleCalendarError(
-                f"Could not read event occurrences: {exc}"
-            ) from exc
-        items = resp.get("items", [])
-        return items[0] if items else None
+        successor, instance = continuation
+        logger.info(
+            "Calendar series %s has ended; following continuation %s.",
+            event_id, successor["id"],
+        )
+        return successor["id"], self._get_raw(successor["id"]), instance
+
+    def _find_continuation(
+        self, ended: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """
+        Find the live series that continues *ended* after a split, with its
+        next instance, or None.
+
+        Google records no link between the two halves of a "This and following
+        events" edit, but leaves two fingerprints, checked against every
+        upcoming recurring series:
+
+        * events with guests get the id ``<original>_R<start>`` — a later split
+          of that half reuses the same ``<original>`` prefix;
+        * the continuation copies the original's ``created`` timestamp and
+          organizer (this is the only trace for guest-less events, which get an
+          unrelated id; Google strips ``created`` from a cancelled original, so
+          the prefix test still matters).
+
+        Several halves can match after repeated splits; the one whose next
+        occurrence comes soonest is the one currently running.
+        """
+        base = ended["id"].split("_R", 1)[0]
+        created = ended.get("created")
+        organizer = (ended.get("organizer") or {}).get("email")
+
+        best: tuple[dict[str, Any], dict[str, Any]] | None = None
+        for series in self._upcoming_series():
+            if series["id"] == ended["id"]:
+                continue
+            same_lineage = series["id"].startswith(f"{base}_R") or (
+                created is not None
+                and series.get("created") == created
+                and (series.get("organizer") or {}).get("email") == organizer
+            )
+            if not same_lineage:
+                continue
+            instance = self._next_instance(series)
+            if instance is None:
+                continue
+            if best is None or _start_key(instance) < _start_key(best[1]):
+                best = (series, instance)
+        return best
+
+    def _upcoming_series(self) -> list[dict[str, Any]]:
+        """Every live recurring series on the calendar with a future occurrence."""
+        series: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            try:
+                resp = (
+                    self._service.events()
+                    .list(
+                        calendarId=self._calendar_id,
+                        singleEvents=False,
+                        timeMin=_now_rfc3339(),
+                        maxResults=250,
+                        pageToken=page_token,
+                        fields=(
+                            "nextPageToken,"
+                            "items(id,iCalUID,status,recurrence,created,organizer)"
+                        ),
+                    )
+                    .execute()
+                )
+            except HttpError as exc:
+                raise GoogleCalendarError(
+                    f"Could not list calendar series: {exc}"
+                ) from exc
+            series.extend(
+                item
+                for item in resp.get("items", [])
+                if item.get("recurrence")
+                and str(item.get("status") or "").lower() != "cancelled"
+            )
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return series
+
+    def _next_instance(self, master: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the next upcoming instance of a recurring series, or None.
+
+        Uses ``events.list`` by iCalUID with ``orderBy=startTime`` rather than
+        ``events.instances``: the latter's order is undocumented and in practice
+        scrambled for some series, so its first item can be weeks away. Pages
+        are followed because Google may return an empty page with a
+        ``nextPageToken``. ``timeMin`` filters on *end* time, so a meeting in
+        progress is still "next" until it finishes.
+        """
+        page_token: str | None = None
+        while True:
+            try:
+                resp = (
+                    self._service.events()
+                    .list(
+                        calendarId=self._calendar_id,
+                        iCalUID=master["iCalUID"],
+                        singleEvents=True,
+                        orderBy="startTime",
+                        timeMin=_now_rfc3339(),
+                        maxResults=5,
+                        pageToken=page_token,
+                        fields="nextPageToken,items(id,start,end)",
+                    )
+                    .execute()
+                )
+            except HttpError as exc:
+                raise GoogleCalendarError(
+                    f"Could not read event occurrences: {exc}"
+                ) from exc
+            items = resp.get("items", [])
+            if items:
+                return items[0]
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return None
