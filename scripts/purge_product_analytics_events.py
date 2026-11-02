@@ -1,4 +1,4 @@
-"""Delete expired Hub product-usage events and active-time intervals.
+"""Delete expired analytics and reliably identified deleted-page records.
 
 Run once a day in every deployment that records events (see
 PRODUCT_ANALYTICS_EVENTS.md, "Retention"):
@@ -6,8 +6,8 @@ PRODUCT_ANALYTICS_EVENTS.md, "Retention"):
     python -m scripts.purge_product_analytics_events            # delete
     python -m scripts.purge_product_analytics_events --dry-run  # count only
 
-* Deletes only `hub_product_events` rows whose `occurred_at` is older than the
-  retention period, `--batch-size` rows per transaction (default 5,000).
+* Deletes analytics with reliable bindings to deleted resources, in batches.
+* Age-expired records are retained until archive-before-delete is available.
 * Prints counts and the cutoff date only, never row contents.
 * `PRODUCT_ANALYTICS_RETENTION_DAYS`: unset = 365 days; `0`/`off` = purging
   disabled (exit 0, nothing deleted); anything else outside 30–3650 days is
@@ -68,15 +68,16 @@ def run(
             intervals = service.count_expired_engagements(db, cutoff=cutoff)
             out(f"dry run: {count} event(s) older than {cutoff.date().isoformat()} (retention {days} days) would be deleted.")
             out(f"dry run: {intervals} active-time interval(s) would be deleted.")
+            for table in ("events", "engagements"):
+                count = service.count_deleted_page_records(db, table=table)
+                out(f"dry run: {count} {table} row(s) reference deleted pages or tabs (may overlap expired rows).")
             return EXIT_OK
-        deleted = service.purge_expired_events(
-            db, cutoff=cutoff, batch_size=args.batch_size, max_batches=args.max_batches,
-        )
-        intervals = service.purge_expired_engagements(
-            db, cutoff=cutoff, batch_size=args.batch_size, max_batches=args.max_batches,
-        )
-    out(f"deleted {deleted} event(s) older than {cutoff.date().isoformat()} (retention {days} days).")
-    out(f"deleted {intervals} active-time interval(s).")
+        # Deleted-resource records are removed without archiving. Age-expired
+        # records remain untouched until archive-before-delete is implemented.
+        deleted_events = service.purge_deleted_page_records(db, table="events", batch_size=args.batch_size, max_batches=args.max_batches)
+        deleted_intervals = service.purge_deleted_page_records(db, table="engagements", batch_size=args.batch_size, max_batches=args.max_batches)
+    out(f"deleted {deleted_events} event(s) and {deleted_intervals} active-time interval(s) referencing deleted pages or tabs.")
+    out("Age-expired records were retained: verified analytics archiving is not configured.")
     return EXIT_OK
 
 

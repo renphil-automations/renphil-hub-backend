@@ -154,12 +154,18 @@ Privacy rules:
 
 ## Retention
 
+Archive integration is pending. The cleanup command does not delete records solely because they are old until verified archive-before-delete is implemented. It can delete records with verified references to deleted resources. Do not schedule age-based retention until the archive follow-up is deployed and reviewed.
+
 `PRODUCT_ANALYTICS_RETENTION_DAYS` defaults to **365 days**.
 
 - `0`, `off`, `disabled` or `none` disables purging (for a local or sandbox database you reset anyway).
 - Any other value must be a whole number from 30 to 3650. Otherwise the purge refuses to run (exit code 2) and deletes nothing. The API still starts, because the setting is only parsed by the purge.
 
-`python -m scripts.purge_product_analytics_events` deletes click events whose `occurred_at` and active-time intervals whose `ended_at` are older than the cutoff. It processes 5,000 rows per transaction (`--batch-size`, 100–50,000); `--max-batches` limits batches separately for each table. `--dry-run` only counts. It prints counts and the cutoff date, never row contents. Run the table setup before scheduling this job so both analytics tables exist.
+`python -m scripts.purge_product_analytics_events --dry-run` counts click events whose `occurred_at` and active-time intervals whose `ended_at` are older than the cutoff; age-expired records are retained until archival is available. The deleted-resource cleanup processes 5,000 rows per transaction (`--batch-size`, 100–50,000); `--max-batches` limits batches separately for each table. `--dry-run` only counts. It prints counts and the cutoff date, never row contents. Run the table setup before scheduling this job so both analytics tables exist.
+
+The job deletes navigation/tab selection events and active-time intervals with a non-null verified binding to a nav tab, tab or sub-tab that no longer exists, plus component events whose verified component no longer exists. Dry-run reports these separately; they can overlap age-expired rows. Unbound historical records and component clicks without a reliable original page binding remain: a missing binding or moved widget does not prove which page originally generated the event. This cleanup requires current navigation, tabs, gridstacks and components in the same database. `0`/`off` disables the job. Deletes are permanent and are not an archive.
+
+New events also receive a nullable `page_id` derived on the server from an authorized selected tab or verified component placement. It records the page at ingestion, not an untrusted browser field. If a component later moves, its existing event keeps its original page reference while new events use the current placement. Existing unbound rows cannot be safely backfilled just from a component's current location.
 
 **Required in Production: run it once a day** (for example 03:15 UTC) from the deployment's scheduler: Render cron job, GitHub Actions `schedule`, or the host's cron, with the backend's normal environment. A missed day only delays deletion by a day.
 
@@ -168,7 +174,7 @@ Privacy rules:
 1. Create the table: `python -m scripts.create_product_analytics_tables` (idempotent `CREATE TABLE … IF NOT EXISTS` via `create_all(checkfirst=True)`; this branch has no Alembic). When the planned shared Alembic baseline lands, its `create_all` covers this model, so no extra revision or head is needed.
 2. Set `HUB_ENVIRONMENT` (`sandbox` / `production`) on each backend.
 3. Make sure Upstash is configured, or the ingest rate limit is off.
-4. Schedule the daily purge (above) in Production; set `PRODUCT_ANALYTICS_RETENTION_DAYS` only to change the 365-day default.
+4. Coordinate the archive follow-up before scheduling age-based retention; `PRODUCT_ANALYTICS_RETENTION_DAYS` defaults to 365 days.
 5. Optional frontend kill switch: `VITE_PRODUCT_ANALYTICS_ENABLED=false`.
 
 ## Known View As boundary

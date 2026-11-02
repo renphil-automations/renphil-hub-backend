@@ -794,18 +794,49 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.grants[MEMBER.hub_user_id].append(grant("tab", other_id, "edit"))
         self.assertEqual(self._insights("root-doc-1").json()["clicks"]["total"], 1)
 
-    def test_scoped_editor_cannot_receive_other_people_emails(self) -> None:
+    def test_scoped_editor_receives_openers_only_for_editable_pages(self) -> None:
         self.current = ADMIN
-        self._ingest(_event(target_id="root-doc-1", actor_email="ignored@client.test"))
+        self._ingest(_event(target_id="root-doc-1", actor_email="ignored@client.test"), _event(target_id="root-doc-2"))
         with self.Session() as db:
             editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+            other = db.query(TabV2).filter(TabV2.document_id == "root-doc-2").one()
         self.current = MEMBER
         self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
         summary = self.client.get("/v2/product-analytics/summary").json()
         self.assertEqual(summary["by_user"], [])
+        self.assertEqual(len(summary["page_openers"]), 1)
+        self.assertEqual(summary["page_openers"][0]["person"], ADMIN.email)
+        self.assertEqual(summary["page_openers"][0]["count"], 1)
+        self.grants = {MEMBER.hub_user_id: [grant("tab", other.id, "edit")]}
+        after_revoke = self.client.get("/v2/product-analytics/summary").json()
+        self.assertEqual(len(after_revoke["page_openers"]), 1)
+        self.assertNotEqual(after_revoke["page_openers"][0]["page_id"], "root-doc-1")
+        self.grants = {MEMBER.hub_user_id: []}
+        self.assertNotEqual(self.client.get("/v2/product-analytics/summary").status_code, 200)
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
         event = self.client.get("/v2/product-analytics/events").json()["data"][0]
         self.assertIsNone(event["actor_email"])
         self.assertEqual(self.client.get("/v2/product-analytics/export").status_code, 403)
+
+    def test_event_page_binding_is_derived_from_verified_placement_not_client(self) -> None:
+        self.current = ADMIN
+        first = _event("link.clicked", component_id="cmp-links", target_id=None, page_id="root-doc-2", properties={})
+        self.assertEqual(self._ingest(first).json()["accepted"], 1)
+        with self.Session() as db:
+            row = db.query(HubProductEventV2).filter_by(event_id=first["event_id"]).one()
+            self.assertEqual(row.page_id, "root-doc-1")
+            other = db.query(TabV2).filter_by(document_id="root-doc-2").one()
+            grid = GridstackV2(document_id="root-doc-2", parent_tab_id=other.id)
+            db.add(grid)
+            db.flush()
+            component = db.query(ComponentV2).filter_by(link="cmp-links").one()
+            component.gridstack_id = grid.id
+            db.commit()
+        second = _event("link.clicked", component_id="cmp-links", target_id=None, page_id="root-doc-1", properties={})
+        self.assertEqual(self._ingest(second).json()["accepted"], 1)
+        with self.Session() as db:
+            self.assertEqual(db.query(HubProductEventV2).filter_by(event_id=first["event_id"]).one().page_id, "root-doc-1")
+            self.assertEqual(db.query(HubProductEventV2).filter_by(event_id=second["event_id"]).one().page_id, "root-doc-2")
 
     def _add_sub_tab(self, document_id: str) -> int:
         """A sub-tab as the Hub stores it: a sub-gridstack (what

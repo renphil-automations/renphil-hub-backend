@@ -42,6 +42,9 @@ class HubProductEventV2(BaseV2):
     # The route TEMPLATE (`/:nav_tab/:tab`, `/admin/bot-management`), never
     # the path itself: Hub URLs carry slugs derived from tab titles.
     page_route = Column(String(256), nullable=False)
+    # Assigned by the server from a verified component placement or tab target.
+    # Historical rows and interactions with no reliable page remain NULL.
+    page_id = Column(String(128), nullable=True)
     component_id = Column(String(128), nullable=True)
     # An opaque stable id (tab/card/thread id) or a catalog code such as
     # `pending`/`history`. Never a title or label: those are admin- or

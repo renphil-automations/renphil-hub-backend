@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from dataclasses import replace
 from datetime import date
 from typing import Any, NamedTuple
@@ -707,6 +708,19 @@ def get_product_analytics_summary(
             summary = service.summarize_event_rows(rows)
             locations_source = _location_groups(rows)
             _redact_people_for_scoped_editor(summary)
+            # Page editors may see who opened pages they currently edit. The
+            # rows are already filtered against live edit access above; do not
+            # expose actor identities from other interactions or unbound IDs.
+            openings = [row for row in rows if row.get("event_name") in _PAGE_SELECTION_EVENTS and row.get("target_id") and row.get("actor_email")]
+            resolved = resolve_names(db, openings, access=reader.access)
+            counts: Counter[tuple[str, str, str]] = Counter()
+            for row in resolved:
+                if row.get("target_name"):
+                    counts[(row["actor_email"], row["target_id"], row["target_name"])] += 1
+            summary["page_openers"] = [
+                {"person": person, "page_id": page_id, "page": page, "count": count}
+                for (person, page_id, page), count in counts.most_common()
+            ]
         summary["engagement"] = _engagement_summary(db, filters, reader)
         # The safe route templates in `by_page` are useful for exports and
         # diagnostics but not for a human investigation. Resolve a separate

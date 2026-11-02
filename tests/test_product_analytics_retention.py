@@ -7,7 +7,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -49,6 +49,10 @@ class PurgeTests(unittest.TestCase):
         self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
         HubProductEventV2.__table__.create(bind=self.engine)
         HubProductEngagementV2.__table__.create(bind=self.engine)
+        with self.engine.begin() as connection:
+            for table in ("nav_tabs", "tabs", "gridstacks"):
+                connection.execute(text(f"CREATE TABLE {table} (document_id VARCHAR(255))"))
+            connection.execute(text("CREATE TABLE components (link VARCHAR(255))"))
         self.Session = sessionmaker(bind=self.engine)
 
     def _add(self, *ages: timedelta) -> None:
@@ -103,12 +107,12 @@ class PurgeTests(unittest.TestCase):
         code = purge_script.run(list(argv), session_factory=self.Session, raw_retention=raw, now=NOW, out=lines.append)
         return code, lines
 
-    def test_script_deletes_and_reports_only_counts(self) -> None:
+    def test_script_retains_expired_records_without_verified_archive(self) -> None:
         self._add(timedelta(days=500), timedelta(days=400), timedelta(days=5))
         code, lines = self._run("396", "--batch-size", "100")
         self.assertEqual(code, 0)
-        self.assertEqual(lines, ["deleted 2 event(s) older than 2025-09-25 (retention 396 days).", "deleted 0 active-time interval(s)."])
-        self.assertEqual(self._count(), 1)
+        self.assertIn("verified analytics archiving", lines[1])
+        self.assertEqual(self._count(), 3)
         self.assertNotIn("a@renphil.org", " ".join(lines))
 
     def test_script_dry_run_deletes_nothing(self) -> None:
@@ -131,9 +135,64 @@ class PurgeTests(unittest.TestCase):
         self.assertIn("1 active-time interval(s)", lines[1])
         code, lines = self._run("396")
         self.assertEqual(code, 0)
-        self.assertEqual(lines[1], "deleted 1 active-time interval(s).")
+        self.assertIn("verified analytics archiving", lines[1])
         with self.Session() as db:
-            self.assertEqual(db.query(HubProductEngagementV2).count(), 1)
+            self.assertEqual(db.query(HubProductEngagementV2).count(), 2)
+
+    def test_deleted_pages_are_purged_but_live_and_unbound_history_stays(self) -> None:
+        with self.Session() as db:
+            db.execute(text("INSERT INTO nav_tabs (document_id) VALUES ('nav-live')"))
+            db.execute(text("INSERT INTO tabs (document_id) VALUES ('tab-live')"))
+            db.execute(text("INSERT INTO gridstacks (document_id) VALUES ('sub-live')"))
+            for kind, target in [("root_tab.selected", "tab-live"), ("root_tab.selected", "tab-deleted"),
+                                 ("sub_tab.selected", "sub-live"), ("navigation_tab.selected", "nav-deleted"),
+                                 ("root_tab.selected", None), ("link.clicked", "tab-deleted")]:
+                db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name=kind, component_type="test",
+                    action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                    page_route="/:nav_tab", target_id=target, properties={}, occurred_at=NOW, received_at=NOW))
+            for nav, tab in [("nav-live", "tab-live"), ("nav-live", "sub-live"), ("nav-live", "tab-deleted"),
+                             ("nav-deleted", None), (None, None)]:
+                db.add(HubProductEngagementV2(engagement_id=str(uuid.uuid4()), hub_user_id=1,
+                    actor_email="a@renphil.org", environment="local", page_route="/:nav_tab", nav_tab_id=nav,
+                    tab_id=tab, active_seconds=5, started_at=NOW, ended_at=NOW, received_at=NOW))
+            db.commit()
+        code, lines = self._run("365", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("2 events row(s)", lines[2])
+        self.assertIn("2 engagements row(s)", lines[3])
+        self.assertEqual(self._count(), 6)
+        with self.Session() as db:
+            self.assertEqual(service.purge_deleted_page_records(db, table="events"), 2)
+            self.assertEqual(service.purge_deleted_page_records(db, table="engagements"), 2)
+        self.assertEqual(self._count(), 4)
+        with self.Session() as db:
+            self.assertEqual(db.query(HubProductEngagementV2).count(), 3)
+
+    def test_deleted_component_events_are_removed_but_existing_and_unbound_events_are_kept(self) -> None:
+        with self.Session() as db:
+            db.execute(text("INSERT INTO components (link) VALUES ('component-live')"))
+            for link in ("component-live", "component-deleted", None):
+                db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="link.clicked", component_type="links",
+                    action="click", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                    page_route="/:nav_tab", component_id=link, properties={}, occurred_at=NOW, received_at=NOW))
+            db.commit()
+        with self.Session() as db:
+            self.assertEqual(service.count_deleted_page_records(db, table="events"), 1)
+            self.assertEqual(service.purge_deleted_page_records(db, table="events"), 1)
+        self.assertEqual(self._count(), 2)
+
+    def test_deleted_original_page_removes_bound_event_even_if_component_moved(self) -> None:
+        with self.Session() as db:
+            db.execute(text("INSERT INTO components (link) VALUES ('component-live')"))
+            db.execute(text("INSERT INTO tabs (document_id) VALUES ('tab-live')"))
+            for page_id in ("tab-live", "tab-deleted", None):
+                db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="link.clicked", component_type="links",
+                    action="click", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                    page_route="/:nav_tab", component_id="component-live", page_id=page_id, properties={}, occurred_at=NOW, received_at=NOW))
+            db.commit()
+        with self.Session() as db:
+            self.assertEqual(service.purge_deleted_page_records(db, table="events"), 1)
+        self.assertEqual(self._count(), 2)
 
     def test_script_disabled_deletes_nothing(self) -> None:
         self._add(timedelta(days=5000))

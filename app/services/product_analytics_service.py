@@ -28,13 +28,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from typing import Any, Callable, Iterable
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.product_analytics import HubProductEngagementV2, HubProductEventV2
 from app.services.access_visibility_service import ViewerAccess
-from app.services.product_analytics_refs import verify_engagement_identifiers, verify_identifiers
+from app.services.product_analytics_refs import component_root_tab_ids, verify_engagement_identifiers, verify_identifiers
+from app.db_v2.models.tab import TabV2
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,18 @@ def ingest_events(
     # unverified and inaccessible ids are dropped the same way, silently.
     if rows:
         verify_identifiers(db, rows, access_for=access_for, actor_email=actor_email)
+        # The page is determined by the server after identifier/ACL checks;
+        # browser-supplied page IDs are never used. A component's current
+        # placement is captured now, rather than inferred after it moves.
+        links = {row["component_id"] for row in rows if row.get("component_id")}
+        owners = component_root_tab_ids(db, links) if links else {}
+        root_ids = set(owners.values())
+        root_docs = dict(db.execute(select(TabV2.id, TabV2.document_id).where(TabV2.id.in_(root_ids))).all()) if root_ids else {}
+        for row in rows:
+            if row["event_name"] in {"root_tab.selected", "view_tab.selected", "sub_tab.selected"}:
+                row["page_id"] = row.get("target_id")
+            else:
+                row["page_id"] = root_docs.get(owners.get(row.get("component_id")))
     inserted = _insert_ignoring_duplicates(db, rows)
     return {
         "accepted": inserted,
@@ -936,4 +949,47 @@ def purge_expired_engagements(
         batches += 1
         if len(ids) < batch_size:
             break
+    return deleted
+
+
+def _deleted_page_predicate(table: str):
+    # NULL identifiers are deliberately retained: they are legacy/unbound
+    # rows and absence of a binding does not prove a resource was deleted.
+    if table == "events":
+        return text("""(page_id IS NOT NULL AND NOT EXISTS
+            (SELECT 1 FROM tabs t WHERE t.document_id = hub_product_events.page_id) AND NOT EXISTS
+            (SELECT 1 FROM gridstacks g WHERE g.document_id = hub_product_events.page_id)) OR (component_id IS NOT NULL AND NOT EXISTS
+            (SELECT 1 FROM components c WHERE c.link = hub_product_events.component_id)) OR (target_id IS NOT NULL AND (
+            (event_name = 'navigation_tab.selected' AND NOT EXISTS
+                (SELECT 1 FROM nav_tabs n WHERE n.document_id = hub_product_events.target_id)) OR
+            (event_name IN ('root_tab.selected', 'view_tab.selected', 'sub_tab.selected') AND NOT EXISTS
+                (SELECT 1 FROM tabs t WHERE t.document_id = hub_product_events.target_id) AND NOT EXISTS
+                (SELECT 1 FROM gridstacks g WHERE g.document_id = hub_product_events.target_id))))""")
+    if table == "engagements":
+        return text("""(nav_tab_id IS NOT NULL AND NOT EXISTS
+            (SELECT 1 FROM nav_tabs n WHERE n.document_id = hub_product_engagements.nav_tab_id)) OR
+            (tab_id IS NOT NULL AND NOT EXISTS
+                (SELECT 1 FROM tabs t WHERE t.document_id = hub_product_engagements.tab_id) AND NOT EXISTS
+                (SELECT 1 FROM gridstacks g WHERE g.document_id = hub_product_engagements.tab_id))""")
+    raise ValueError("unknown analytics table")
+
+
+def count_deleted_page_records(db: Session, *, table: str) -> int:
+    model = {"events": HubProductEventV2, "engagements": HubProductEngagementV2}[table]
+    return int(db.execute(select(func.count()).select_from(model).where(_deleted_page_predicate(table))).scalar_one())
+
+
+def purge_deleted_page_records(db: Session, *, table: str, batch_size: int = 5_000, max_batches: int | None = None) -> int:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    model = {"events": HubProductEventV2, "engagements": HubProductEngagementV2}[table]
+    deleted = batches = 0
+    while max_batches is None or batches < max_batches:
+        ids = db.execute(select(model.id).where(_deleted_page_predicate(table)).order_by(model.id).limit(batch_size)).scalars().all()
+        if not ids:
+            break
+        result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(_deleted_page_predicate(table)))
+        db.commit()
+        deleted += int(result.rowcount or 0)
+        batches += 1
     return deleted

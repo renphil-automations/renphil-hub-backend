@@ -20,6 +20,7 @@ def _add_additive_columns() -> None:
     with engine_v2.begin() as connection:
         requirements = {
             "hub_product_events": {
+                "page_id": "VARCHAR(128)",
                 "view_as_role_key": "VARCHAR(128)",
                 "view_as_scope_key": "VARCHAR(128)",
                 "view_as_context": "JSON",

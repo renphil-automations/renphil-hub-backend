@@ -117,6 +117,27 @@ class ProductAnalyticsPostgresTests(unittest.TestCase):
         for p in self._patches:
             p.start()
 
+    def test_deleted_page_cleanup_against_postgres(self) -> None:
+        from app.services import product_analytics_service as service
+        # Temporary tables shadow real names only within this connection.
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                for table in ("nav_tabs", "tabs", "gridstacks"):
+                    conn.execute(text(f"CREATE TEMP TABLE {table} (document_id VARCHAR(255)) ON COMMIT DROP"))
+                conn.execute(text("CREATE TEMP TABLE components (link VARCHAR(255)) ON COMMIT DROP"))
+                for table in ("hub_product_events", "hub_product_engagements"):
+                    conn.execute(text(f"CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS) ON COMMIT DROP"))
+                conn.execute(text("INSERT INTO tabs (document_id) VALUES ('live-tab')"))
+                conn.execute(text("INSERT INTO hub_product_engagements (engagement_id, hub_user_id, actor_email, environment, page_route, tab_id, active_seconds, started_at, ended_at, received_at) VALUES (:id, 1, 'qa@example.test', 'local', '/test', 'deleted-tab', 5, now(), now(), now())"), {"id": str(uuid.uuid4())})
+                with sessionmaker(bind=conn)() as db:
+                    self.assertEqual(service.count_deleted_page_records(db, table="engagements"), 1)
+                    self.assertEqual(service.purge_deleted_page_records(db, table="engagements"), 1)
+                    self.assertEqual(service.count_deleted_page_records(db, table="engagements"), 0)
+            finally:
+                if transaction.is_active:
+                    transaction.rollback()
+
     def _worker_session(self):
         db = self.Session()
         record = {"session": db, "thread": threading.get_ident(), "closed_in": None, "access_db": None}
