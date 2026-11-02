@@ -23,16 +23,18 @@ from __future__ import annotations
 import csv
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from typing import Any, Callable, Iterable
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.product_analytics import HubProductEventV2
+from app.db_v2.models.product_analytics import HubProductEngagementV2, HubProductEventV2
 from app.services.access_visibility_service import ViewerAccess
-from app.services.product_analytics_refs import verify_identifiers
+from app.services.product_analytics_refs import verify_engagement_identifiers, verify_identifiers
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,18 @@ TRIGGERS = ("click", "default")
 # A browser batch flushes every ~5 s; 25 clicks/defaults in one batch is
 # already far beyond a person's pace.
 MAX_BATCH = 25
+MAX_ENGAGEMENT_BATCH = 10
+# The browser cuts an active interval every 30 seconds and when a page is
+# hidden or navigated away from. Keeping a strict server maximum prevents a
+# stale tab or crafted request from reporting a whole day as active usage.
+MAX_ENGAGEMENT_SECONDS = 60
+
+
+def is_missing_engagement_table(exc: ProgrammingError) -> bool:
+    """True only while the additive active-time table has not been deployed."""
+    return "hub_product_engagements" in str(exc).lower()
+
+
 MAX_EXPORT_ROWS = 50_000
 # Client clocks drift; anything further out than this is stamped with the
 # server's receive time instead of trusted.
@@ -250,6 +264,61 @@ def validate_event(
     }
 
 
+def validate_engagement(
+    raw: Any,
+    *,
+    hub_user_id: int,
+    actor_email: str,
+    environment: str,
+    received_at: datetime,
+) -> dict[str, Any]:
+    """Validate one active page-time interval without accepting free text.
+
+    The duration is derived from the bounded client timestamps, not trusted as
+    an arbitrary counter.  This is analytics rather than billing, but this
+    check makes accidental duplicate/stale intervals visible and prevents a
+    malformed browser from distorting totals by orders of magnitude.
+    """
+    if not isinstance(raw, dict):
+        raise EventRejected("engagement must be an object")
+    engagement_id = raw.get("engagement_id")
+    if not isinstance(engagement_id, str) or not _UUID_RE.match(engagement_id):
+        raise EventRejected("engagement_id must be a UUID")
+    page_route = route_template(raw.get("page_route"))
+    if page_route is None:
+        raise EventRejected("page_route must be an internal path")
+    started_at = _parse_occurred_at(raw.get("started_at"), received_at)
+    ended_at = _parse_occurred_at(raw.get("ended_at"), received_at)
+    seconds = int((ended_at - started_at).total_seconds())
+    if not 1 <= seconds <= MAX_ENGAGEMENT_SECONDS:
+        raise EventRejected("active interval must be between 1 and 60 seconds")
+    supplied_seconds = raw.get("active_seconds")
+    if not isinstance(supplied_seconds, int) or isinstance(supplied_seconds, bool):
+        raise EventRejected("active_seconds must be an integer")
+    # Browsers round at slightly different moments. Permit one second either
+    # way, but retain the server-derived value as the authority.
+    if abs(supplied_seconds - seconds) > 1:
+        raise EventRejected("active_seconds does not match the interval")
+    return {
+        "engagement_id": engagement_id.lower(),
+        "hub_user_id": hub_user_id,
+        "actor_email": actor_email,
+        "environment": environment,
+        "page_route": page_route,
+        # These remain opaque, client-supplied candidates until
+        # `verify_engagement_identifiers` resolves them against the live Hub
+        # tree and current access.  Keeping them here is essential: dropping
+        # them before that verification makes every scoped editor's interval
+        # indistinguishable from a legacy route-only row.
+        "nav_tab_id": raw.get("nav_tab_id"),
+        "tab_id": raw.get("tab_id"),
+        "active_seconds": seconds,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "received_at": received_at,
+    }
+
+
 def _insert_ignoring_duplicates(db: Session, rows: list[dict[str, Any]]) -> int:
     """Insert rows, skipping any whose event_id already exists. Returns inserted count."""
     if not rows:
@@ -279,6 +348,9 @@ def ingest_events(
     hub_user_id: int,
     actor_email: str,
     environment: str,
+    view_as_role_key: str | None = None,
+    view_as_scope_key: str | None = None,
+    view_as_context: dict | None = None,
     access_for: Callable[[], ViewerAccess],
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -300,6 +372,11 @@ def ingest_events(
             in_batch_duplicates += 1
             continue
         seen.add(row["event_id"])
+        # Never read a simulation value from the browser event body. The
+        # router supplies these only after Hub validates the adopted pair.
+        row["view_as_role_key"] = view_as_role_key
+        row["view_as_scope_key"] = view_as_scope_key
+        row["view_as_context"] = view_as_context
         rows.append(row)
     # Client ids are only kept when the Hub records confirm them AND the
     # reporter can currently view them (see product_analytics_refs);
@@ -312,6 +389,63 @@ def ingest_events(
         "duplicates": in_batch_duplicates + (len(rows) - inserted),
         "rejected": rejected,
     }
+
+
+def ingest_engagements(
+    db: Session,
+    engagements: list[Any],
+    *,
+    hub_user_id: int,
+    actor_email: str,
+    environment: str,
+    view_as_role_key: str | None = None,
+    view_as_scope_key: str | None = None,
+    view_as_context: dict | None = None,
+    access_for: Callable[[], ViewerAccess],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Insert active page-time intervals once, ignoring retry duplicates."""
+    received_at = now or datetime.now(timezone.utc)
+    rows: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    duplicates = 0
+    for index, raw in enumerate(engagements):
+        try:
+            row = validate_engagement(
+                raw, hub_user_id=hub_user_id, actor_email=actor_email,
+                environment=environment, received_at=received_at,
+            )
+        except EventRejected as exc:
+            rejected.append({"index": index, "reason": str(exc)})
+            continue
+        if row["engagement_id"] in seen:
+            duplicates += 1
+            continue
+        seen.add(row["engagement_id"])
+        row["view_as_role_key"] = view_as_role_key
+        row["view_as_scope_key"] = view_as_scope_key
+        row["view_as_context"] = view_as_context
+        rows.append(row)
+    if not rows:
+        return {"accepted": 0, "duplicates": duplicates, "rejected": rejected}
+    verify_engagement_identifiers(db, rows, access_for=access_for)
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    else:  # pragma: no cover
+        raise RuntimeError(f"Unsupported database dialect for product analytics: {dialect}")
+    statement = (
+        insert(HubProductEngagementV2)
+        .values(rows)
+        .on_conflict_do_nothing(index_elements=["engagement_id"])
+        .returning(HubProductEngagementV2.engagement_id)
+    )
+    accepted = len(db.execute(statement).scalars().all())
+    db.commit()
+    return {"accepted": accepted, "duplicates": duplicates + len(rows) - accepted, "rejected": rejected}
 
 
 # ── Admin queries ────────────────────────────────────────────────────────
@@ -393,6 +527,39 @@ def list_events(
     return [_serialize(row) for row in rows], total
 
 
+def list_events_for_page_scope(
+    db: Session,
+    filters: EventFilters,
+    *,
+    component_ids: set[str],
+    page_ids: set[str],
+    selection_events: set[str],
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return only candidates that can belong to one live page scope.
+
+    Page Insights must never read the whole environment and then filter it in
+    Python: that both wastes work and turns unrelated Hub activity into a
+    functional limit for a small page.  The router derives these opaque ids
+    from the current page tree before calling this function; this query only
+    narrows candidates and does not itself decide access.
+    """
+    model = HubProductEventV2
+    clauses = []
+    if component_ids:
+        clauses.append(model.component_id.in_(component_ids))
+    if page_ids and selection_events:
+        clauses.append(and_(model.event_name.in_(selection_events), model.target_id.in_(page_ids)))
+    if not clauses:
+        return [], 0
+    statement = _apply_filters(select(model), filters).where(or_(*clauses))
+    total = int(db.execute(select(func.count()).select_from(statement.subquery())).scalar_one())
+    if total > limit:
+        raise AnalyticsScopeTooBroad()
+    rows = db.execute(statement.order_by(model.occurred_at.desc(), model.id.desc()).limit(limit)).scalars().all()
+    return [_serialize(row) for row in rows], total
+
+
 def summarize_events(db: Session, filters: EventFilters) -> dict[str, Any]:
     model = HubProductEventV2
 
@@ -429,6 +596,179 @@ def summarize_events(db: Session, filters: EventFilters) -> dict[str, Any]:
         "by_page": grouped(model.page_route, limit=25),
         "by_day": [{"day": str(value), "count": int(count)} for value, count in by_day],
     }
+
+
+def summarize_event_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """In-memory equivalent for an editor's ACL-filtered event set."""
+    rows = list(rows)
+    def groups(key: str, limit: int | None = None) -> list[dict[str, Any]]:
+        values = Counter(str(row.get(key) or "") for row in rows)
+        result = [{"key": value, "count": count} for value, count in values.items() if value]
+        result.sort(key=lambda item: (-item["count"], item["key"]))
+        return result[:limit] if limit else result
+    days = Counter(str(row.get("occurred_at") or "")[:10] for row in rows)
+    return {
+        "totals": {"events": len(rows), "users": len({row.get("actor_email") for row in rows if row.get("actor_email")})},
+        "by_event": groups("event_name"), "by_component": groups("component_type"),
+        "by_trigger": groups("trigger"), "by_environment": groups("environment"),
+        "by_user": groups("actor_email", 25), "by_page": groups("page_route", 25),
+        "by_day": [{"day": day, "count": count} for day, count in sorted(days.items()) if day],
+    }
+
+
+def _engagement_statement(filters: EventFilters):
+    """The common, bounded filter set for active-time intervals."""
+    model = HubProductEngagementV2
+    statement = select(model)
+    if filters.date_from is not None:
+        statement = statement.where(model.ended_at >= datetime.combine(filters.date_from, datetime.min.time(), tzinfo=timezone.utc))
+    if filters.date_to is not None:
+        statement = statement.where(model.ended_at < datetime.combine(filters.date_to + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc))
+    for column, value in ((model.actor_email, filters.actor_email), (model.environment, filters.environment)):
+        normalized = (value or "").strip().lower()
+        if normalized:
+            statement = statement.where(func.lower(column) == normalized)
+    route = (filters.page_route or "").strip()
+    if route:
+        escaped = route.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        statement = statement.where(model.page_route.like(f"{escaped}%", escape="\\"))
+    return statement
+
+
+class AnalyticsScopeTooBroad(Exception):
+    """A scoped editor's read is too large to check exactly; nothing partial is returned."""
+
+
+# Filters with a truthful active-time meaning. Active time is page time: it
+# has no component, event, action or trigger, so those filters narrow clicks
+# only and are reported back as such rather than silently ignored.
+ENGAGEMENT_FILTERS = ("date_from", "date_to", "actor_email", "page_route", "environment")
+CLICK_ONLY_FILTERS = ("component_type", "event_name", "action", "trigger")
+# Distinct (nav tab, tab, route) bindings checked for one editor read. Hub
+# pages number in the hundreds, so this bounds a pathological dataset, not
+# normal use; beyond it the read fails rather than under-counting.
+MAX_ENGAGEMENT_GROUPS = 20_000
+
+
+def click_only_filters_in_use(filters: EventFilters) -> list[str]:
+    return [name for name in CLICK_ONLY_FILTERS if (getattr(filters, name) or "").strip()]
+
+
+def engagement_groups(db: Session, filters: EventFilters) -> list[dict[str, Any]]:
+    """Active time grouped by its page binding, for an editor's live check.
+
+    Every interval in the filter is counted: the database sums per
+    (nav_tab_id, tab_id, page_route), and the caller keeps or drops whole
+    groups after verifying the binding. Grouping, not a row limit, is what
+    keeps this bounded, so the editor total is exact. Raises
+    AnalyticsScopeTooBroad above MAX_ENGAGEMENT_GROUPS distinct bindings.
+    """
+    model = HubProductEngagementV2
+    statement = (
+        _engagement_statement(filters)
+        .with_only_columns(
+            model.nav_tab_id, model.tab_id, model.page_route,
+            func.coalesce(func.sum(model.active_seconds), 0), func.count(),
+        )
+        .group_by(model.nav_tab_id, model.tab_id, model.page_route)
+        .limit(MAX_ENGAGEMENT_GROUPS + 1)
+    )
+    try:
+        rows = db.execute(statement).all()
+    except ProgrammingError as exc:
+        # Same rolling-deployment allowance as `summarize_engagement`.
+        if not is_missing_engagement_table(exc):
+            raise
+        db.rollback()
+        return []
+    if len(rows) > MAX_ENGAGEMENT_GROUPS:
+        raise AnalyticsScopeTooBroad()
+    return [
+        {"nav_tab_id": nav, "tab_id": tab, "page_route": route, "active_seconds": int(seconds), "intervals": int(count)}
+        for nav, tab, route, seconds, count in rows
+    ]
+
+
+def engagement_groups_for_tabs(
+    db: Session, filters: EventFilters, tab_ids: set[str]
+) -> list[dict[str, Any]]:
+    """Exact active-time groups for an already verified page subtree."""
+    if not tab_ids:
+        return []
+    model = HubProductEngagementV2
+    statement = (
+        _engagement_statement(filters)
+        .where(model.tab_id.in_(tab_ids))
+        .with_only_columns(
+            model.nav_tab_id, model.tab_id, model.page_route,
+            func.coalesce(func.sum(model.active_seconds), 0), func.count(),
+        )
+        .group_by(model.nav_tab_id, model.tab_id, model.page_route)
+        .limit(MAX_ENGAGEMENT_GROUPS + 1)
+    )
+    try:
+        rows = db.execute(statement).all()
+    except ProgrammingError as exc:
+        if not is_missing_engagement_table(exc):
+            raise
+        db.rollback()
+        return []
+    if len(rows) > MAX_ENGAGEMENT_GROUPS:
+        raise AnalyticsScopeTooBroad()
+    return [
+        {"nav_tab_id": nav, "tab_id": tab, "page_route": route, "active_seconds": int(seconds), "intervals": int(count)}
+        for nav, tab, route, seconds, count in rows
+    ]
+
+
+def summarize_engagement_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate the `engagement_groups` an editor may currently see."""
+    rows = list(rows)
+    page_seconds = Counter()
+    for row in rows:
+        route = str(row.get("page_route") or "")
+        if route:
+            page_seconds[route] += int(row.get("active_seconds") or 0)
+    return {
+        "active_seconds": sum(int(row.get("active_seconds") or 0) for row in rows),
+        "intervals": sum(int(row.get("intervals") or 0) for row in rows),
+        "by_page": [
+            {"key": route, "active_seconds": seconds}
+            for route, seconds in sorted(page_seconds.items(), key=lambda item: (-item[1], item[0]))[:25]
+        ],
+    }
+
+
+def summarize_engagement(db: Session, filters: EventFilters) -> dict[str, Any]:
+    """Aggregate active page time under the same admin filters as clicks."""
+    model = HubProductEngagementV2
+    statement = _engagement_statement(filters)
+    try:
+        totals = db.execute(
+            statement.with_only_columns(
+                func.coalesce(func.sum(model.active_seconds), 0).label("seconds"),
+                func.count().label("intervals"),
+            )
+        ).mappings().one()
+        pages = db.execute(
+            statement.with_only_columns(
+                model.page_route.label("key"), func.coalesce(func.sum(model.active_seconds), 0).label("seconds")
+            ).group_by(model.page_route).order_by(func.sum(model.active_seconds).desc(), model.page_route).limit(25)
+        ).all()
+    except ProgrammingError as exc:
+        # Rolling deployment: click analytics must stay available before the
+        # additive engagement table is created. Do not mask any other DB
+        # failure; only the known missing-table condition is safe to degrade.
+        if not is_missing_engagement_table(exc):
+            raise
+        # PostgreSQL marks the whole transaction failed after an undefined
+        # table query. The caller still needs to run the existing click and
+        # destination queries in this session, so clear only this known,
+        # additive-schema failure before returning the neutral engagement
+        # result.
+        db.rollback()
+        return {"active_seconds": 0, "intervals": 0, "by_page": []}
+    return {"active_seconds": int(totals["seconds"] or 0), "intervals": int(totals["intervals"] or 0), "by_page": [{"key": key, "active_seconds": int(seconds)} for key, seconds in pages]}
 
 
 def location_groups(db: Session, filters: EventFilters) -> list[dict[str, Any]]:
@@ -565,6 +905,32 @@ def purge_expired_events(
         if not ids:
             break
         result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(model.occurred_at < cutoff))
+        db.commit()
+        deleted += int(result.rowcount or 0)
+        batches += 1
+        if len(ids) < batch_size:
+            break
+    return deleted
+
+
+def count_expired_engagements(db: Session, *, cutoff: datetime) -> int:
+    return int(db.execute(select(func.count()).select_from(HubProductEngagementV2).where(
+        HubProductEngagementV2.ended_at < cutoff
+    )).scalar_one())
+
+
+def purge_expired_engagements(
+    db: Session, *, cutoff: datetime, batch_size: int = 5_000, max_batches: int | None = None,
+) -> int:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    model = HubProductEngagementV2
+    deleted = batches = 0
+    while max_batches is None or batches < max_batches:
+        ids = db.execute(select(model.id).where(model.ended_at < cutoff).order_by(model.id).limit(batch_size)).scalars().all()
+        if not ids:
+            break
+        result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(model.ended_at < cutoff))
         db.commit()
         deleted += int(result.rowcount or 0)
         batches += 1

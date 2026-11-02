@@ -158,8 +158,8 @@ def assert_can_delegate(
     before.
 
     ``held`` replaces the granter's own assignment rows — View As passes the
-    adopted pair (``view_as_service.held_closures_for``), together with the
-    matching ``is_hub_admin`` (``view_as_service.pair_is_hub_admin``).
+    adopted pairs (``view_as_service.held_closures_for``), together with the
+    matching ``is_hub_admin`` (``view_as_service.any_pair_is_hub_admin``).
     """
     if is_hub_admin:
         return

@@ -13,12 +13,12 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
@@ -30,7 +30,7 @@ from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.hub import HubV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.page_content import PageContentV2
-from app.db_v2.models.product_analytics import HubProductEventV2
+from app.db_v2.models.product_analytics import HubProductEngagementV2, HubProductEventV2
 from app.db_v2.models.tab import TabV2
 from app.db_v2.models.thread import ThreadV2
 from app.dependencies import CurrentHubUser, get_current_hub_user
@@ -50,7 +50,7 @@ SENSITIVE_TITLE = "Jane Doe performance review"
 
 HUB_TABLES = [
     HubV2.__table__, NavTabV2.__table__, TabV2.__table__, GridstackV2.__table__, PageContentV2.__table__,
-    ComponentV2.__table__, ThreadV2.__table__, HubProductEventV2.__table__,
+    ComponentV2.__table__, ThreadV2.__table__, HubProductEventV2.__table__, HubProductEngagementV2.__table__,
 ]
 
 
@@ -127,6 +127,21 @@ def _event(name: str = "root_tab.selected", **overrides) -> dict:
     }
     event.update(overrides)
     return event
+
+
+def _engagement(**overrides) -> dict:
+    start = datetime.now(timezone.utc).replace(microsecond=0)
+    engagement = {
+        "engagement_id": str(uuid.uuid4()),
+        "page_route": "/finance/private-board",
+        "nav_tab_id": "nav-doc-1",
+        "tab_id": "root-doc-1",
+        "active_seconds": 3,
+        "started_at": start.isoformat(),
+        "ended_at": (start + timedelta(seconds=3)).isoformat(),
+    }
+    engagement.update(overrides)
+    return engagement
 
 
 class FakeLimiter:
@@ -239,12 +254,19 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         for p in self._patches:
             p.stop()
 
-    def _ingest(self, *events: dict):
-        return self.client.post("/v2/product-analytics/events", json={"events": list(events)})
+    def _ingest(self, *events: dict, query: str = ""):
+        return self.client.post(f"/v2/product-analytics/events{query}", json={"events": list(events)})
+
+    def _ingest_engagements(self, *engagements: dict, query: str = ""):
+        return self.client.post(f"/v2/product-analytics/engagements{query}", json={"engagements": list(engagements)})
 
     def _rows(self) -> list[HubProductEventV2]:
         with self.Session() as db:
             return db.query(HubProductEventV2).order_by(HubProductEventV2.id).all()
+
+    def _engagement_rows(self) -> list[HubProductEngagementV2]:
+        with self.Session() as db:
+            return db.query(HubProductEngagementV2).order_by(HubProductEngagementV2.id).all()
 
     # ── Ingestion ────────────────────────────────────────────────────────
 
@@ -260,6 +282,760 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(row.action, "select")
         # A route template: "finance" is a tab title slug and is never stored.
         self.assertEqual(row.page_route, "/dashboard/:tab")
+
+    def test_standard_view_as_keeps_real_actor_and_hides_verified_context(self) -> None:
+        """A simulated role/scope is diagnostic context, never impersonation.
+
+        The browser may request View As, but only the server-verified keys are
+        persisted.  The event remains owned by the real authenticated user
+        and public analytics responses deliberately expose neither key.
+        """
+        target = SimpleNamespace(role_key="program_member", scope_key="test_scope")
+        with patch.object(product_analytics.view_as_service, "resolve_user_id", return_value=MEMBER.hub_user_id), \
+                patch.object(product_analytics.view_as_service, "verify_view_as", return_value=target):
+            response = self._ingest(
+                _event(),
+                query="?view_as_role=program_member&view_as_scope=test_scope",
+            )
+        self.assertEqual(response.status_code, 200)
+        (row,) = self._rows()
+        self.assertEqual(row.actor_email, MEMBER.email)
+        self.assertEqual(row.hub_user_id, MEMBER.hub_user_id)
+        self.assertEqual((row.view_as_role_key, row.view_as_scope_key), ("program_member", "test_scope"))
+
+        self.current = ADMIN
+        returned = self.client.get("/v2/product-analytics/events").json()["data"][0]
+        self.assertNotIn("view_as_role_key", returned)
+        self.assertNotIn("view_as_scope_key", returned)
+
+    def test_incomplete_view_as_is_rejected_before_worker_or_write(self) -> None:
+        response = self._ingest(_event(), query="?view_as_role=program_member")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["code"], "view_as_incomplete")
+        self.assertEqual(self.worker_sessions, [])
+        self.assertEqual(self.request_sessions, 0)
+        self.assertEqual(self._rows(), [])
+
+    def test_new_view_as_selection_is_verified_and_private(self) -> None:
+        targets = [SimpleNamespace(role_key="editor", scope_key="one"),
+                   SimpleNamespace(role_key="member", scope_key="two")]
+        selection = SimpleNamespace(targets=targets, user=SimpleNamespace(id=42))
+        with patch.object(product_analytics.view_as_service, "resolve_user_id", return_value=2), \
+                patch.object(product_analytics.view_as_service, "resolve_view_as_selection", return_value=selection) as verify:
+            response = self._ingest(_event(), query="?view_as=editor%3Aone&view_as=member%3Atwo&view_as_user=other%40example.org")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(verify.call_args.args[2:], (["editor:one", "member:two"], "other@example.org"))
+        (row,) = self._rows()
+        self.assertEqual(row.actor_email, MEMBER.email)
+        self.assertEqual(row.view_as_context, {"pairs": [{"role": "editor", "scope": "one"}, {"role": "member", "scope": "two"}], "user_id": 42})
+        self.current = ADMIN
+        self.assertNotIn("view_as_context", self.client.get("/v2/product-analytics/events").json()["data"][0])
+
+    def test_new_view_as_refusal_writes_nothing(self) -> None:
+        refusal = product_analytics.view_as_service.ViewAsPairsError(403, "view_as_refused", "not allowed", [])
+        with patch.object(product_analytics.view_as_service, "resolve_user_id", return_value=2), \
+                patch.object(product_analytics.view_as_service, "resolve_view_as_selection", side_effect=refusal):
+            response = self._ingest(_event(), query="?view_as=editor%3Asecret")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self._rows(), [])
+
+    def test_refused_view_as_pair_writes_nothing(self) -> None:
+        refusal = product_analytics.view_as_service.ViewAsError(
+            403, "view_as_scope_not_allowed", "not allowed"
+        )
+        with patch.object(product_analytics.view_as_service, "resolve_user_id", return_value=MEMBER.hub_user_id), \
+                patch.object(product_analytics.view_as_service, "verify_view_as", side_effect=refusal):
+            response = self._ingest(_event(), query="?view_as_role=program_member&view_as_scope=secret")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"]["code"], "view_as_scope_not_allowed")
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(self.limiter.consumed, [])
+
+    def test_click_event_rows_carry_only_event_table_columns(self) -> None:
+        # Page bindings belong to `hub_product_engagements` only. A click
+        # event that also sends them (modified or newer client) is still
+        # stored; a row key with no column made every batch a 503.
+        response = self._ingest(_event(nav_tab_id="nav-doc-1", tab_id="root-doc-1"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["accepted"], 1)
+        row = service.validate_event(
+            _event(nav_tab_id="nav-doc-1", tab_id="root-doc-1"), hub_user_id=2, actor_email=MEMBER.email,
+            environment="sandbox", received_at=datetime.now(timezone.utc),
+        )
+        self.assertLessEqual(set(row), set(HubProductEventV2.__table__.columns.keys()))
+
+    def test_engagement_records_only_bounded_active_time_and_deduplicates_retries(self) -> None:
+        payload = _engagement(environment="production", actor_email="spoof@evil.test")
+        response = self._ingest_engagements(payload, payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"accepted": 1, "duplicates": 1, "rejected": []})
+        (row,) = self._engagement_rows()
+        self.assertEqual(row.actor_email, MEMBER.email)
+        self.assertEqual(row.environment, "sandbox")
+        self.assertEqual(row.page_route, "/:nav_tab/:tab")
+        self.assertEqual(row.nav_tab_id, "nav-doc-1")
+        self.assertEqual(row.tab_id, "root-doc-1")
+        self.assertEqual(row.active_seconds, 3)
+
+    def test_anonymous_view_as_request_is_server_suppressed_without_a_write(self) -> None:
+        """The browser normally creates no request in anonymous View As;
+        this covers a manually replayed valid request as well."""
+        query = "?view_as_role=program_member&view_as_scope=test_scope&anonymous=true"
+        event = self._ingest(_event(), query=query)
+        engagement = self._ingest_engagements(_engagement(), query=query)
+        self.assertEqual(event.json(), {"accepted": 0, "duplicates": 0, "rejected": []})
+        self.assertEqual(engagement.json(), {"accepted": 0, "duplicates": 0, "rejected": []})
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(self._engagement_rows(), [])
+        self.assertEqual(self.worker_sessions, [])
+        self.assertEqual(self.limiter.consumed, [])
+
+    def test_engagement_rejects_background_sized_or_inconsistent_intervals(self) -> None:
+        payload = _engagement(active_seconds=3)
+        payload["ended_at"] = (datetime.fromisoformat(payload["started_at"]) + timedelta(minutes=5)).isoformat()
+        response = self._ingest_engagements(payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["accepted"], 0)
+        self.assertEqual(len(response.json()["rejected"]), 1)
+        self.assertEqual(self._engagement_rows(), [])
+
+    def test_summary_reports_active_page_time_under_the_same_filters(self) -> None:
+        self.assertEqual(self._ingest_engagements(_engagement()).status_code, 200)
+        self.current = ADMIN
+        response = self.client.get("/v2/product-analytics/summary?environment=sandbox")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["engagement"], {
+            "active_seconds": 3,
+            "intervals": 1,
+            "by_page": [{"key": "/:nav_tab/:tab", "active_seconds": 3}],
+            "applied_filters": ["environment"],
+            "click_only_filters": [],
+        })
+
+    def test_authenticated_read_and_export_responses_are_never_cacheable(self) -> None:
+        self.current = ADMIN
+        responses = [
+            self.client.get("/v2/product-analytics/catalog"),
+            self.client.get("/v2/product-analytics/summary"),
+            self.client.get("/v2/product-analytics/events"),
+            self.client.get("/v2/product-analytics/export"),
+            self.client.get("/v2/product-analytics/export/xlsx"),
+        ]
+        for response in responses:
+            self.assertEqual(response.headers.get("cache-control"), "no-store")
+            self.assertEqual(response.headers.get("vary"), "Authorization")
+
+    def test_router_refusals_are_never_cacheable_either(self) -> None:
+        """403, 404, 422 and 503 answers are as private as a 200: each one
+        says something about a specific caller's access or data."""
+        down = OperationalError("SELECT", {}, Exception("database unavailable"))
+        self.current = ADMIN
+        self._ingest(_event(target_id="root-doc-1"), _event(target_id="root-doc-1"))
+        responses = {}
+        with patch.object(service, "summarize_events", side_effect=down):
+            responses["summary 503"] = self.client.get("/v2/product-analytics/summary")
+        with patch.object(service, "list_events_for_page_scope", side_effect=down):
+            responses["insights 503"] = self.client.get("/v2/product-analytics/pages/root-doc-1/insights")
+        with patch.object(service, "MAX_EXPORT_ROWS", 1):
+            responses["insights 422"] = self.client.get("/v2/product-analytics/pages/root-doc-1/insights")
+            self._edit_root_tab()
+            responses["summary 422"] = self.client.get("/v2/product-analytics/summary")
+        responses["insights 404"] = self.client.get("/v2/product-analytics/pages/root-doc-2/insights")
+        responses["people export 403"] = self.client.get("/v2/product-analytics/export/xlsx?include_people=true")
+        self.grants = {MEMBER.hub_user_id: [grant("hub", 1, "view")]}
+        responses["reader gate 403"] = self.client.get("/v2/product-analytics/summary")
+        for name, response in responses.items():
+            with self.subTest(name):
+                self.assertEqual(str(response.status_code), name.split()[-1])
+                self.assertEqual(response.headers.get("cache-control"), "no-store")
+                self.assertEqual(response.headers.get("vary"), "Authorization")
+
+    def test_summary_keeps_click_analytics_available_before_engagement_table_rollout(self) -> None:
+        """The additive active-time table must not break pre-existing click reports."""
+        missing_table = ProgrammingError(
+            "SELECT", {}, Exception('relation "hub_product_engagements" does not exist')
+        )
+        db = Mock()
+        db.execute.side_effect = missing_table
+
+        self.assertEqual(
+            service.summarize_engagement(db, service.EventFilters()),
+            {"active_seconds": 0, "intervals": 0, "by_page": []},
+        )
+        db.rollback.assert_called_once()
+
+    def test_editor_reads_only_currently_editable_resources_and_never_global_counts(self) -> None:
+        with self.Session() as db:
+            editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+        self.current = ADMIN
+        self.assertEqual(self._ingest(_event(target_id="root-doc-1"), _event(target_id="root-doc-2")).json()["accepted"], 2)
+        self.assertEqual(self._ingest_engagements(_engagement()).json()["accepted"], 1)
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
+        summary = self.client.get("/v2/product-analytics/summary").json()
+        self.assertEqual(summary["totals"]["events"], 1)
+        self.assertEqual(summary["by_page"][0]["count"], 1)
+        self.assertEqual(summary["engagement"]["active_seconds"], 3)
+        self.assertEqual(summary["engagement"]["intervals"], 1)
+        events = self.client.get("/v2/product-analytics/events").json()
+        self.assertEqual(events["total"], 1)
+        self.assertEqual(events["data"][0]["target_id"], "root-doc-1")
+        # CSV is legacy and carries person-level fields. Scoped editors use
+        # the privacy-safe default Excel export instead; this endpoint must
+        # not expose visitors' identities.
+        self.assertEqual(self.client.get("/v2/product-analytics/export").status_code, 403)
+
+    def test_editor_active_time_is_limited_to_currently_editable_bound_tabs(self) -> None:
+        """An editor receives time for their tab, never another tab or old route-only rows."""
+        self.current = ADMIN
+        own = _engagement(tab_id="root-doc-1")
+        other = _engagement(tab_id="root-doc-2")
+        legacy = _engagement(nav_tab_id=None, tab_id=None)
+        self.assertEqual(self._ingest_engagements(own, other, legacy).json()["accepted"], 3)
+        with self.Session() as db:
+            editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
+        response = self.client.get("/v2/product-analytics/summary")
+        self.assertEqual(response.status_code, 200)
+        engagement = response.json()["engagement"]
+        self.assertEqual((engagement["active_seconds"], engagement["intervals"], engagement["by_page"]),
+                         (3, 1, [{"key": "/:nav_tab/:tab", "active_seconds": 3}]))
+
+    def test_mismatched_navigation_and_tab_bindings_are_not_stored(self) -> None:
+        """Two valid resources must still form one real navigation tree."""
+        self.current = ADMIN
+        response = self._ingest_engagements(_engagement(nav_tab_id="nav-doc-1", tab_id="root-doc-2"))
+        self.assertEqual(response.status_code, 200)
+        (row,) = self._engagement_rows()
+        self.assertIsNone(row.nav_tab_id)
+        self.assertIsNone(row.tab_id)
+
+    def test_revoked_edit_grant_hides_analytics_on_the_next_read(self) -> None:
+        with self.Session() as db:
+            editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+            other = db.query(TabV2).filter(TabV2.document_id == "root-doc-2").one()
+        self.current = ADMIN
+        self._ingest(_event(target_id="root-doc-1"))
+        self._ingest_engagements(_engagement())
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
+        self.assertEqual(self.client.get("/v2/product-analytics/events").json()["total"], 1)
+        # The grant moves to another tab: still an editor, but nothing of the old tab remains.
+        self.grants = {MEMBER.hub_user_id: [grant("tab", other.id, "edit")]}
+        summary = self.client.get("/v2/product-analytics/summary").json()
+        self.assertEqual((summary["totals"]["events"], summary["engagement"]["active_seconds"]), (0, 0))
+        self.assertEqual(self.client.get("/v2/product-analytics/events").json()["total"], 0)
+        # Every edit grant gone: the page itself is refused.
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "view")]}
+        self.assertEqual(self.client.get("/v2/product-analytics/summary").status_code, 403)
+
+    def test_component_only_editor_gets_component_clicks_but_no_page_time(self) -> None:
+        self.current = ADMIN
+        self._ingest(_event("link.clicked", component_id="cmp-links", target_id=None), _event(target_id="root-doc-1"))
+        self._ingest_engagements(_engagement())
+        with self.Session() as db:
+            links = node(db, "cmp-links")
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant(*links, "edit")]}
+        summary = self.client.get("/v2/product-analytics/summary").json()
+        self.assertEqual(summary["by_event"], [{"key": "link.clicked", "count": 1}])
+        engagement = summary["engagement"]
+        self.assertEqual((engagement["active_seconds"], engagement["intervals"], engagement["by_page"]), (0, 0, []))
+
+    def test_page_insights_are_fixed_to_one_currently_editable_page(self) -> None:
+        """The page id is live-RBAC-scoped; unrelated ids cannot widen it."""
+        self.current = ADMIN
+        self._ingest(
+            _event("root_tab.selected", target_id="root-doc-1"),
+            _event("link.clicked", component_id="cmp-links"),
+            _event("button.clicked", component_id="cmp-button"),
+        )
+        self._ingest_engagements(_engagement(tab_id="root-doc-1"))
+        response = self.client.get("/v2/product-analytics/pages/root-doc-1/insights", params={"actor_email": "spoof@evil.test"})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["page"]["id"], "root-doc-1")
+        self.assertEqual(body["clicks"]["total"], 3)
+        self.assertEqual(body["active_time"]["active_seconds"], 3)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        # The other root is both a valid id and a different page. A member
+        # without current edit access receives the same generic 404 as a
+        # malformed candidate, not an existence signal.
+        self.current = MEMBER
+        with self.Session() as db:
+            editable_tab_id = db.query(TabV2.id).filter(TabV2.document_id == "root-doc-1").scalar()
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable_tab_id, "edit")]}
+        allowed = self.client.get("/v2/product-analytics/pages/root-doc-1/insights")
+        denied = self.client.get("/v2/product-analytics/pages/root-doc-2/insights")
+        malformed = self.client.get("/v2/product-analytics/pages/not a valid id/insights")
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual((denied.status_code, denied.json()), (404, {"detail": "Page insights are unavailable."}))
+        self.assertEqual((malformed.status_code, malformed.json()), (404, denied.json()))
+
+    # ── Page Insights: scale, scope and parity ───────────────────────────
+
+    _INSIGHTS = "/v2/product-analytics/pages/{}/insights"
+
+    def _insights(self, page_id: str, **kwargs):
+        return self.client.get(self._INSIGHTS.format(page_id), **kwargs)
+
+    def _insert_events(self, count: int, **overrides) -> None:
+        now = datetime.now(timezone.utc)
+        rows = [{
+            "event_id": str(uuid.uuid4()), "event_name": "root_tab.selected", "component_type": "root_tab",
+            "action": "select", "trigger": "click", "cascade_id": None, "hub_user_id": 2,
+            "actor_email": MEMBER.email, "environment": "sandbox", "page_route": "/:nav_tab/:tab",
+            "component_id": None, "target_id": "root-doc-2", "properties": {},
+            "occurred_at": now, "received_at": now, **overrides,
+        } for _ in range(count)]
+        with self.Session() as db:
+            db.execute(HubProductEventV2.__table__.insert(), rows)
+            db.commit()
+
+    def _add_variant(self, document_id: str = "variant-doc-1", widget: str = "cmp-variant-links") -> int:
+        """A tab variant as `create_tab_variant_v2` stores it: a sibling TabV2
+        with the parent's nav tree and its own root canvas."""
+        with self.Session() as db:
+            root = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+            variant = TabV2(document_id=document_id, title="Jane Doe Salary B", parent_tab_id=root.id, nav_tab_id=root.nav_tab_id)
+            db.add(variant)
+            db.flush()
+            canvas = GridstackV2(document_id=document_id, parent_tab_id=variant.id)
+            db.add(canvas)
+            db.flush()
+            db.add(ComponentV2(link=widget, type="links", title="Variant links", gridstack_id=canvas.id))
+            db.commit()
+            return variant.id
+
+    def _assert_private_404(self, response) -> None:
+        self.assertEqual((response.status_code, response.json()), (404, {"detail": "Page insights are unavailable."}))
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        self.assertEqual(response.headers.get("vary"), "Authorization")
+
+    def test_small_page_insights_stay_exact_when_the_hub_exceeds_every_global_cap(self) -> None:
+        """Unrelated Hub volume beyond the export and active-time caps must
+        neither reach the Page Insights query nor make a small page fail."""
+        self.current = ADMIN
+        self._ingest(
+            _event("root_tab.selected", target_id="root-doc-1"),
+            _event("link.clicked", component_id="cmp-links", properties={}),
+        )
+        self._ingest_engagements(_engagement(tab_id="root-doc-1"))
+        self._insert_events(service.MAX_EXPORT_ROWS + 1)
+        self._insert_intervals(1, tab_id="root-doc-2", nav_tab_id="nav-doc-2")
+        now = datetime.now(timezone.utc)
+        with self.Session() as db:
+            db.execute(HubProductEngagementV2.__table__.insert(), [{
+                "engagement_id": str(uuid.uuid4()), "hub_user_id": 2, "actor_email": MEMBER.email,
+                "environment": "sandbox", "page_route": f"/:nav_tab/:tab/{index}", "nav_tab_id": "nav-doc-2",
+                "tab_id": "root-doc-2", "active_seconds": 1, "started_at": now - timedelta(seconds=1),
+                "ended_at": now, "received_at": now,
+            } for index in range(service.MAX_ENGAGEMENT_GROUPS + 1)])
+            db.commit()
+
+        for reader in ("admin", "editor"):
+            with self.subTest(reader=reader):
+                if reader == "editor":
+                    self._edit_root_tab()
+                response = self._insights("root-doc-1")
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["clicks"]["total"], 2)
+                self.assertEqual((body["active_time"]["active_seconds"], body["active_time"]["intervals"]), (3, 1))
+        # The editor's Hub-wide summary is still bounded; only the page read is exact.
+        self.assertEqual(self.client.get("/v2/product-analytics/summary").status_code, 422)
+
+    def test_page_insights_place_events_by_target_only_for_the_three_selection_events(self) -> None:
+        """A non-selection target id equal to a page id is a collision, not a page."""
+        self.current = ADMIN
+        self._insert_events(1, target_id="root-doc-1")
+        self._insert_events(1, event_name="sub_tab.selected", component_type="sub_tab", target_id="root-doc-1")
+        for name, ctype in (("detail_card.details_opened", "detail_cards"), ("thread_item.opened", "thread"),
+                            ("navigation_tab.selected", "navigation_tab"), ("blocknote_tab.selected", "blocknote_tab")):
+            self._insert_events(1, event_name=name, component_type=ctype, target_id="root-doc-1")
+        body = self._insights("root-doc-1").json()
+        self.assertEqual(body["clicks"]["total"], 2)
+        self.assertEqual({item["key"] for item in body["clicks"]["by_action"]}, {"root_tab.selected", "sub_tab.selected"})
+
+    def test_page_insights_refusals_share_one_private_404(self) -> None:
+        with self.Session() as db:
+            root_id, nav_id = db.query(TabV2.id, TabV2.nav_tab_id).filter(TabV2.document_id == "root-doc-1").one()
+            other_nav_id = db.query(NavTabV2.id).filter(NavTabV2.document_id == "nav-doc-2").scalar()
+            deleted = TabV2(document_id="deleted-doc", title="Deleted", nav_tab_id=nav_id)
+            db.add(deleted)
+            db.flush()
+            db.delete(deleted)
+            db.add_all([
+                TabV2(document_id="orphan-tab", title="Orphan", nav_tab_id=9999),
+                TabV2(document_id="orphan-variant", title="Orphan variant", parent_tab_id=9999, nav_tab_id=nav_id),
+                TabV2(document_id="cross-variant", title="Cross", parent_tab_id=root_id, nav_tab_id=other_nav_id),
+            ])
+            db.commit()
+        variant_id = self._add_variant()
+        with self.Session() as db:
+            db.add(TabV2(document_id="nested-variant", title="Nested", parent_tab_id=variant_id, nav_tab_id=nav_id))
+            db.commit()
+        self._add_sub_tab("sub-doc-1")
+
+        self.current = ADMIN
+        for page_id in ("not a valid id", "x" * 129, "unknown-doc", "deleted-doc", "orphan-tab",
+                        "orphan-variant", "cross-variant", "nested-variant", "child-doc-1", "sub-doc-1"):
+            with self.subTest(reader="admin", page_id=page_id):
+                self._assert_private_404(self._insights(page_id))
+        self.assertEqual(self._insights("variant-doc-1").status_code, 200)
+
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", root_id, "edit"), grant("nav_tab", other_nav_id, "view")]}
+        for page_id in ("root-doc-2", "unknown-doc", "sub-doc-1"):
+            with self.subTest(reader="editor", page_id=page_id):
+                self._assert_private_404(self._insights(page_id))
+        self.assertEqual(self._insights("root-doc-1").status_code, 200)
+
+    def test_page_insights_keep_the_general_reader_gate_before_any_lookup(self) -> None:
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("hub", 1, "view")]}
+        existing, unknown = self._insights("root-doc-1"), self._insights("unknown-doc")
+        self.assertEqual(existing.status_code, 403)
+        self.assertEqual((unknown.status_code, unknown.json()), (existing.status_code, existing.json()))
+        for response in (existing, unknown):
+            self.assertEqual((response.headers.get("cache-control"), response.headers.get("vary")), ("no-store", "Authorization"))
+
+    def test_page_insights_ignore_scope_widening_parameters_and_get_bodies(self) -> None:
+        self.current = ADMIN
+        self._ingest(
+            _event("root_tab.selected", target_id="root-doc-1"),
+            _event("root_tab.selected", target_id="root-doc-2"),
+            _event("button.clicked", component_id="cmp-button", properties={}),
+        )
+        self._ingest_engagements(_engagement(tab_id="root-doc-1"), _engagement(tab_id="root-doc-2", nav_tab_id="nav-doc-2"))
+        baseline = self._insights("root-doc-1").json()
+        self.assertEqual((baseline["clicks"]["total"], baseline["active_time"]["active_seconds"]), (2, 3))
+        widening = {
+            "actor_email": ADMIN.email, "environment": "production", "component_type": "root_tab",
+            "event_name": "root_tab.selected", "page_route": "/", "page_id": "root-doc-2",
+            "tab_id": "root-doc-2", "nav_tab_id": "nav-doc-2", "page_ids": "root-doc-2",
+        }
+        self.assertEqual(self._insights("root-doc-1", params=widening).json(), baseline)
+        with_body = self.client.request("GET", self._INSIGHTS.format("root-doc-1"), json={"page_ids": ["root-doc-2"], **widening})
+        self.assertEqual(with_body.json(), baseline)
+
+    def test_root_page_insights_roll_up_variants_and_variants_report_only_themselves(self) -> None:
+        """Clicks and active time follow one policy: a root includes its current
+        variants; a variant is exactly its own page."""
+        variant_id = self._add_variant()
+        self.current = ADMIN
+        self._ingest(
+            _event("root_tab.selected", target_id="root-doc-1"),
+            _event("link.clicked", component_id="cmp-links", properties={}),
+            _event("view_tab.selected", target_id="variant-doc-1", properties={"tab_kind": "variant"}),
+            _event("link.clicked", component_id="cmp-variant-links", properties={}),
+        )
+        start = datetime.now(timezone.utc).replace(microsecond=0)
+        self._ingest_engagements(
+            _engagement(tab_id="root-doc-1", active_seconds=3),
+            _engagement(tab_id="variant-doc-1", active_seconds=5, started_at=start.isoformat(),
+                        ended_at=(start + timedelta(seconds=5)).isoformat()),
+        )
+        self.assertEqual([row.tab_id for row in self._engagement_rows()], ["root-doc-1", "variant-doc-1"])
+
+        def view(page_id):
+            body = self._insights(page_id).json()
+            return (body["page"]["kind"], body["page"]["variants_included"], body["clicks"]["total"],
+                    body["active_time"]["active_seconds"],
+                    [(row["id"], row["active_seconds"]) for row in body["time_by_tab"]])
+
+        root = ("tab", 1, 4, 8, [("root-doc-1", 3), ("variant-doc-1", 5)])
+        variant = ("variant", 0, 2, 5, [("variant-doc-1", 5)])
+        self.assertEqual((view("root-doc-1"), view("variant-doc-1")), (root, variant))
+        # An editor of the root sees the same roll-up; an editor of the variant
+        # alone gets the variant and never its parent.
+        self._edit_root_tab()
+        self.assertEqual((view("root-doc-1"), view("variant-doc-1")), (root, variant))
+        self.grants = {MEMBER.hub_user_id: [grant("tab", variant_id, "edit")]}
+        self.assertEqual(view("variant-doc-1"), variant)
+        self._assert_private_404(self._insights("root-doc-1"))
+
+    def test_sgs_sub_tabs_roll_into_their_host_page_and_are_not_addressable(self) -> None:
+        self._add_sub_tab("sub-doc-1")
+        with self.Session() as db:
+            sub = db.query(GridstackV2).filter(GridstackV2.document_id == "sub-doc-1").one()
+            db.add(ComponentV2(link="cmp-sub-links", type="links", title="Sub links", gridstack_id=sub.id))
+            db.commit()
+        self.current = ADMIN
+        self._ingest(
+            _event("sub_tab.selected", target_id="sub-doc-1", properties={"tab_kind": "sgs"}),
+            _event("link.clicked", component_id="cmp-sub-links", properties={}),
+        )
+        self._ingest_engagements(_engagement(tab_id="sub-doc-1"))
+        body = self._insights("root-doc-1").json()
+        self.assertEqual(body["clicks"]["total"], 2)
+        # Host-level time only: the page never claims an individual sub-tab row.
+        self.assertEqual(body["time_by_tab"], [{"id": "root-doc-1", "name": "Jane Doe Salary", "active_seconds": 3}])
+        self._assert_private_404(self._insights("sub-doc-1"))
+
+    def test_page_insights_count_a_mirror_only_when_its_original_is_editable(self) -> None:
+        with self.Session() as db:
+            other_id = db.query(TabV2.id).filter(TabV2.document_id == "root-doc-2").scalar()
+            canvas = GridstackV2(document_id="root-doc-2", parent_tab_id=other_id)
+            db.add(canvas)
+            db.flush()
+            db.add(ComponentV2(link="cmp-board-links", type="links", title="Board links", gridstack_id=canvas.id))
+            root_id = db.query(TabV2.id).filter(TabV2.document_id == "root-doc-1").scalar()
+            host = db.query(GridstackV2).filter(GridstackV2.parent_tab_id == root_id, GridstackV2.parent_id.is_(None)).one()
+            db.add(ComponentV2(link="cmp-board-mirror", type="mirror", title="Mirror", gridstack_id=host.id,
+                               props={"target_link": "cmp-board-links"}))
+            db.commit()
+        self.current = ADMIN
+        self._ingest(_event("link.clicked", component_id="cmp-board-mirror", properties={}))
+        self.assertEqual(self._insights("root-doc-1").json()["clicks"]["total"], 1)
+        self._edit_root_tab()
+        self.assertEqual(self._insights("root-doc-1").json()["clicks"]["total"], 0)
+        self.grants[MEMBER.hub_user_id].append(grant("tab", other_id, "edit"))
+        self.assertEqual(self._insights("root-doc-1").json()["clicks"]["total"], 1)
+
+    def test_scoped_editor_cannot_receive_other_people_emails(self) -> None:
+        self.current = ADMIN
+        self._ingest(_event(target_id="root-doc-1", actor_email="ignored@client.test"))
+        with self.Session() as db:
+            editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
+        summary = self.client.get("/v2/product-analytics/summary").json()
+        self.assertEqual(summary["by_user"], [])
+        event = self.client.get("/v2/product-analytics/events").json()["data"][0]
+        self.assertIsNone(event["actor_email"])
+        self.assertEqual(self.client.get("/v2/product-analytics/export").status_code, 403)
+
+    def _add_sub_tab(self, document_id: str) -> int:
+        """A sub-tab as the Hub stores it: a sub-gridstack (what
+        `/v2/tabs/{id}/children` returns) whose access lives on its
+        representation component. Returns that component's id."""
+        with self.Session() as db:
+            root = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+            host = db.query(GridstackV2).filter(GridstackV2.parent_tab_id == root.id, GridstackV2.parent_id.is_(None)).one()
+            sub = GridstackV2(document_id=document_id, name=SENSITIVE_TITLE, parent_id=host.id, parent_tab_id=root.id)
+            db.add(sub)
+            db.flush()
+            representation = ComponentV2(link=f"rep-{document_id}", type="gridstack", gridstack_id=host.id, current_grid_id=sub.id)
+            db.add(representation)
+            db.commit()
+            return representation.id
+
+    def test_sub_tab_ids_are_verified_through_their_representation_component(self) -> None:
+        """Child view tabs and sub-tabs are sub-gridstacks, not TabV2 rows."""
+        own = self._add_sub_tab("sub-doc-1")
+        self._add_sub_tab("sub-doc-2")
+        self.current = ADMIN
+        body = self._ingest(
+            _event("sub_tab.selected", target_id="sub-doc-1", properties={"tab_kind": "sgs"}),
+            _event("view_tab.selected", target_id="sub-doc-2", properties={"tab_kind": "child"}),
+        ).json()
+        self.assertEqual(body["accepted"], 2)
+        self.assertEqual([r.target_id for r in self._rows()], ["sub-doc-1", "sub-doc-2"])
+        self.assertEqual(self._ingest_engagements(_engagement(nav_tab_id=None, tab_id="sub-doc-1")).json()["accepted"], 1)
+        self.assertEqual(self._engagement_rows()[0].tab_id, "sub-doc-1")
+        # An editor of one sub-tab sees that sub-tab's clicks and time only.
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("component", own, "edit")]}
+        events = self.client.get("/v2/product-analytics/events").json()
+        self.assertEqual([e["target_id"] for e in events["data"]], ["sub-doc-1"])
+        self.assertEqual(self.client.get("/v2/product-analytics/summary").json()["engagement"]["active_seconds"], 3)
+        # Without access to the sub-tab, the id is dropped at ingest like any unknown id.
+        self.grants = {MEMBER.hub_user_id: [grant("nav_tab", 2, "view")]}
+        self._ingest(_event("sub_tab.selected", target_id="sub-doc-1"))
+        self.assertIsNone(self._rows()[-1].target_id)
+
+    # ── Active-time filters ──────────────────────────────────────────────
+
+    def test_click_only_filters_do_not_narrow_active_time_and_say_so(self) -> None:
+        self._ingest_engagements(_engagement())
+        self.current = ADMIN
+        engagement = self.client.get("/v2/product-analytics/summary?component_type=link&trigger=click").json()["engagement"]
+        # Active time is page time: a component filter cannot truthfully narrow it.
+        self.assertEqual(engagement["active_seconds"], 3)
+        self.assertEqual(engagement["click_only_filters"], ["component_type", "trigger"])
+        self.assertNotIn("component_type", engagement["applied_filters"])
+
+    def test_page_user_date_and_environment_filters_narrow_active_time(self) -> None:
+        self._ingest_engagements(_engagement())
+        self.current = ADMIN
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+        for query, expected in (
+            ("page_route=/:nav_tab", 3), ("page_route=/admin", 0),
+            (f"actor_email={MEMBER.email}", 3), ("actor_email=someone@renphil.org", 0),
+            (f"date_from={tomorrow}", 0), ("environment=sandbox", 3),
+        ):
+            with self.subTest(query=query):
+                engagement = self.client.get(f"/v2/product-analytics/summary?{query}").json()["engagement"]
+                self.assertEqual(engagement["active_seconds"], expected)
+                self.assertEqual(engagement["click_only_filters"], [])
+        self.environment = "production"
+        self.assertEqual(self.client.get("/v2/product-analytics/summary").json()["engagement"]["active_seconds"], 0)
+
+    def test_scoped_editor_cannot_filter_by_person(self) -> None:
+        with self.Session() as db:
+            editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+        self.current = ADMIN
+        self._ingest(_event(target_id="root-doc-1"))
+        self.assertTrue(self.client.get("/v2/product-analytics/catalog").json()["people_visible"])
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
+        self.assertFalse(self.client.get("/v2/product-analytics/catalog").json()["people_visible"])
+        for path in ("summary", "events", "export/xlsx"):
+            with self.subTest(path=path):
+                response = self.client.get(f"/v2/product-analytics/{path}?actor_email={ADMIN.email}")
+                self.assertEqual(response.status_code, 403)
+                self.assertNotIn(ADMIN.email, response.text)
+
+    # ── Editor scale ─────────────────────────────────────────────────────
+
+    def _insert_intervals(self, count: int, **overrides) -> None:
+        now = datetime.now(timezone.utc)
+        rows = [{
+            "engagement_id": str(uuid.uuid4()), "hub_user_id": 2, "actor_email": MEMBER.email,
+            "environment": "sandbox", "page_route": "/:nav_tab/:tab", "nav_tab_id": "nav-doc-1",
+            "tab_id": "root-doc-1", "active_seconds": 3, "started_at": now - timedelta(seconds=3),
+            "ended_at": now, "received_at": now, **overrides,
+        } for _ in range(count)]
+        with self.Session() as db:
+            db.execute(HubProductEngagementV2.__table__.insert(), rows)
+            db.commit()
+
+    def _edit_root_tab(self) -> None:
+        with self.Session() as db:
+            editable = db.query(TabV2).filter(TabV2.document_id == "root-doc-1").one()
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
+
+    def test_editor_active_time_counts_every_interval_not_a_capped_sample(self) -> None:
+        # More intervals than the 50,000 raw rows the editor path used to read.
+        count = service.MAX_EXPORT_ROWS + 25
+        self._insert_intervals(count)
+        self._insert_intervals(5, tab_id="root-doc-2", nav_tab_id="nav-doc-2")
+        self._edit_root_tab()
+        engagement = self.client.get("/v2/product-analytics/summary").json()["engagement"]
+        self.assertEqual((engagement["active_seconds"], engagement["intervals"]), (3 * count, count))
+
+    def test_editor_active_time_beyond_the_group_bound_fails_without_partial_totals(self) -> None:
+        for route in ("/:nav_tab/:tab", "/:nav_tab/:tab/:tab", "/:nav_tab/:tab/:tab/:tab"):
+            self._insert_intervals(2, page_route=route)
+        self._edit_root_tab()
+        with patch.object(service, "MAX_ENGAGEMENT_GROUPS", 2):
+            for path in ("summary", "export/xlsx"):
+                with self.subTest(path=path):
+                    response = self.client.get(f"/v2/product-analytics/{path}")
+                    self.assertEqual(response.status_code, 422)
+                    self.assertIn("Narrow the date range", response.json()["detail"])
+                    self.assertNotIn("active_seconds", response.text)
+            # Admin totals are a single SQL aggregate and remain complete.
+            self.current = ADMIN
+            self.assertEqual(self.client.get("/v2/product-analytics/summary").json()["engagement"]["active_seconds"], 18)
+
+    def test_editor_click_rows_beyond_the_bound_fail_explicitly(self) -> None:
+        self.current = ADMIN
+        self._ingest(_event(target_id="root-doc-1"), _event(target_id="root-doc-1"))
+        self._edit_root_tab()
+        with patch.object(service, "MAX_EXPORT_ROWS", 1):
+            for path in ("summary", "events"):
+                with self.subTest(path=path):
+                    response = self.client.get(f"/v2/product-analytics/{path}")
+                    self.assertEqual(response.status_code, 422)
+                    self.assertIn("Narrow the date range", response.json()["detail"])
+
+    # ── Read-time destinations ───────────────────────────────────────────
+
+    def test_sub_tab_resolves_to_a_readable_current_destination_without_storing_it(self) -> None:
+        own = self._add_sub_tab("sub-doc-1")
+        self.current = ADMIN
+        self._ingest(_event("sub_tab.selected", target_id="sub-doc-1", properties={"tab_kind": "sgs"}))
+        expected_path = "/jane-doe-review-hub/jane-doe-salary/jane-doe-performance-review"
+        (event,) = self.client.get("/v2/product-analytics/events").json()["data"]
+        self.assertEqual((event["target_name"], event["open_path"]), (SENSITIVE_TITLE, expected_path))
+        locations = self.client.get("/v2/product-analytics/summary").json()["by_location"]
+        self.assertEqual([(l["label"], l["href"]) for l in locations], [(SENSITIVE_TITLE, expected_path)])
+        # An editor of that sub-tab gets the same destination.
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("component", own, "edit")]}
+        (event,) = self.client.get("/v2/product-analytics/events").json()["data"]
+        self.assertEqual(event["open_path"], expected_path)
+        # Nothing readable was persisted.
+        with self.engine.connect() as conn:
+            dump = json.dumps([list(r) for r in conn.execute(text("SELECT * FROM hub_product_events"))], default=str)
+        self.assertNotIn("Jane", dump)
+        self.assertNotIn("jane-doe", dump)
+
+    def test_deleted_sub_tab_stays_opaque_and_unclickable(self) -> None:
+        self._add_sub_tab("sub-doc-1")
+        self.current = ADMIN
+        self._ingest(_event("sub_tab.selected", target_id="sub-doc-1"))
+        with self.Session() as db:
+            db.query(ComponentV2).filter(ComponentV2.link == "rep-sub-doc-1").delete()
+            db.query(GridstackV2).filter(GridstackV2.document_id == "sub-doc-1").delete()
+            db.commit()
+        (event,) = self.client.get("/v2/product-analytics/events").json()["data"]
+        self.assertEqual((event["target_id"], event["target_name"], event["open_path"]), ("sub-doc-1", None, None))
+        (location,) = self.client.get("/v2/product-analytics/summary").json()["by_location"]
+        self.assertIsNone(location["href"])
+        self.assertNotIn(SENSITIVE_TITLE, location["label"])
+
+    def test_names_and_destinations_need_the_readers_current_access(self) -> None:
+        self._add_sub_tab("sub-doc-1")
+        events = [
+            {"event_name": "navigation_tab.selected", "target_id": "nav-doc-1", "component_id": None, "page_route": "/"},
+            {"event_name": "root_tab.selected", "target_id": "root-doc-1", "component_id": None, "page_route": "/"},
+            {"event_name": "sub_tab.selected", "target_id": "sub-doc-1", "component_id": None, "page_route": "/"},
+            {"event_name": "link.clicked", "target_id": None, "component_id": "cmp-links", "page_route": "/"},
+            {"event_name": "thread_item.opened", "target_id": "7", "component_id": "cmp-thread", "page_route": "/"},
+            {"event_name": "detail_card.details_opened", "target_id": "card-a", "component_id": "cmp-mirror", "page_route": "/"},
+            {"event_name": "blocknote_tab.selected", "target_id": "cmp-sbn-child", "component_id": "cmp-sbn", "page_route": "/"},
+        ]
+        from app.services.product_analytics_refs import resolve_names
+
+        # Someone who can see only the unrelated nav tab gets nothing readable or clickable.
+        self.grants = {MEMBER.hub_user_id: [grant("nav_tab", 2, "view")]}
+        with self.Session() as db:
+            outsider = product_analytics._viewer_access(db, MEMBER)
+            resolved = resolve_names(db, [dict(e) for e in events], access=outsider)
+        for row in resolved:
+            with self.subTest(event=row["event_name"]):
+                self.assertEqual(
+                    [row[k] for k in ("target_name", "component_name", "open_path", "open_component_link", "open_component_name")],
+                    [None] * 5,
+                )
+        # A Hub-wide viewer gets every name and the mirror's server-derived original.
+        self.grants = {MEMBER.hub_user_id: [grant("hub", 1)]}
+        with self.Session() as db:
+            insider = product_analytics._viewer_access(db, MEMBER)
+            resolved = {r["event_name"]: r for r in resolve_names(db, [dict(e) for e in events], access=insider)}
+        self.assertEqual(resolved["sub_tab.selected"]["target_name"], SENSITIVE_TITLE)
+        self.assertEqual(resolved["detail_card.details_opened"]["open_component_link"], "cmp-cards")
+        self.assertEqual(resolved["detail_card.details_opened"]["mirror_component_link"], "cmp-mirror")
+
+    def test_mirror_opens_its_original_only_when_the_original_is_accessible(self) -> None:
+        from app.services.product_analytics_refs import resolve_names
+
+        with self.Session() as db:
+            mirror, cards = node(db, "cmp-mirror"), node(db, "cmp-cards")
+        event = {"event_name": "link.clicked", "target_id": None, "component_id": "cmp-mirror", "page_route": "/"}
+        self.grants = {MEMBER.hub_user_id: [grant(*mirror), grant(*cards)]}
+        with self.Session() as db:
+            (row,) = resolve_names(db, [dict(event)], access=product_analytics._viewer_access(db, MEMBER))
+        self.assertEqual((row["open_component_link"], row["mirror_component_link"]), ("cmp-cards", "cmp-mirror"))
+        self.grants = {MEMBER.hub_user_id: [grant(*mirror)]}
+        with self.Session() as db:
+            (row,) = resolve_names(db, [dict(event)], access=product_analytics._viewer_access(db, MEMBER))
+        self.assertIsNone(row["open_component_link"])
+        self.assertIsNone(row["open_component_name"])
+
+    def test_view_only_user_cannot_open_analytics_even_when_events_exist(self) -> None:
+        self.current = ADMIN
+        self._ingest(_event())
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("hub", 1, "view")]}
+        self.assertEqual(self.client.get("/v2/product-analytics/summary").status_code, 403)
+        self.assertEqual(self.client.get("/v2/product-analytics/events").status_code, 403)
+        self.assertEqual(self.client.get("/v2/product-analytics/export").status_code, 403)
 
     def test_component_and_action_are_derived_from_catalog_not_client(self) -> None:
         self._ingest(_event("button.clicked", component_type="root_tab", action="delete"))
@@ -866,8 +1642,16 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(events["root_tab.selected"]["open_path"], "/jane-doe-review-hub/jane-doe-salary")
         self.assertEqual(events["view_tab.selected"]["open_path"], "/jane-doe-review-hub/jane-doe-salary/jane-doe-medical-leave")
         self.assertEqual(events["link.clicked"]["open_component_link"], "cmp-links")
+        self.assertEqual(
+            events["link.clicked"]["open_path"],
+            "/jane-doe-review-hub/jane-doe-salary?component=cmp-links",
+        )
         mirror = events["detail_card.details_opened"]
         self.assertEqual(mirror["open_component_link"], "cmp-cards")
+        self.assertEqual(
+            mirror["open_path"],
+            "/jane-doe-review-hub/jane-doe-salary?component=cmp-cards",
+        )
         self.assertEqual(mirror["mirror_component_link"], "cmp-mirror")
         with self.engine.connect() as conn:
             stored = json.dumps([list(r) for r in conn.execute(text("SELECT * FROM hub_product_events")).all()], default=str)
@@ -1063,11 +1847,146 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             {(item["label"], item["href"], item["count"], item["mirror"]) for item in locations},
             {
                 ("Jane Doe Salary", "/jane-doe-review-hub/jane-doe-salary", 1, False),
-                ("Jane Doe cards", "/dashboard?component=cmp-cards", 1, True),
-                ("Jane Doe links", "/dashboard?component=cmp-links", 1, False),
+                ("Jane Doe cards", "/jane-doe-review-hub/jane-doe-salary?component=cmp-cards", 1, True),
+                ("Jane Doe links", "/jane-doe-review-hub/jane-doe-salary?component=cmp-links", 1, False),
             },
         )
         self.assertNotIn("secret/title", repr(locations))
+
+    def test_legacy_component_uri_is_replaced_with_the_current_readable_destination(self) -> None:
+        """A pre-release literal URI may help locate a widget, but is never
+        displayed or followed unless its current placement still matches."""
+        from app.services.product_analytics_refs import summarize_locations
+
+        raw_uri = "/jane-doe-review-hub/jane-doe-salary?component=cmp-links"
+        with self.Session() as db:
+            locations = summarize_locations(
+                db,
+                [{
+                    "event_name": "link.clicked", "component_id": None,
+                    "target_id": None, "page_route": raw_uri, "count": 2,
+                }],
+            )
+        self.assertEqual(locations, [{
+            "key": "path:/jane-doe-review-hub/jane-doe-salary?component=cmp-links",
+            "label": "Jane Doe links",
+            "href": "/jane-doe-review-hub/jane-doe-salary?component=cmp-links",
+            "count": 2,
+            "mirror": False,
+        }])
+        self.assertNotIn(raw_uri, locations[0]["label"])
+
+    def test_unresolved_legacy_uri_never_exposes_the_raw_path_or_component_id(self) -> None:
+        from app.services.product_analytics_refs import summarize_locations
+
+        raw_uri = "/private-review?component=not-a-real-component"
+        with self.Session() as db:
+            locations = summarize_locations(
+                db,
+                [{"event_name": "link.clicked", "component_id": None, "target_id": None,
+                  "page_route": raw_uri, "count": 1}],
+            )
+        self.assertEqual(locations[0]["label"], "Deleted or unavailable destination")
+        self.assertIsNone(locations[0]["href"])
+        self.assertNotIn("private-review", repr(locations))
+        self.assertNotIn("not-a-real-component", repr(locations))
+
+    def test_legacy_uri_cannot_relabel_an_action_as_the_wrong_component_type(self) -> None:
+        """A stale component parameter is only a lookup hint, never evidence.
+
+        A button cannot become a readable Link destination merely because an
+        old client happened to place its id in a link-click route.
+        """
+        from app.services.product_analytics_refs import summarize_locations
+
+        raw_uri = "/jane-doe-review-hub/jane-doe-salary?component=cmp-button"
+        with self.Session() as db:
+            locations = summarize_locations(
+                db,
+                [{"event_name": "link.clicked", "component_id": None, "target_id": None,
+                  "page_route": raw_uri, "count": 1}],
+            )
+        self.assertEqual(locations[0]["label"], "Deleted or unavailable destination")
+        self.assertIsNone(locations[0]["href"])
+        self.assertNotIn("cmp-button", repr(locations))
+
+    def test_legacy_uri_needs_the_same_page_an_expected_widget_type_and_current_access(self) -> None:
+        from app.services.product_analytics_refs import summarize_locations
+
+        raw_uri = "/jane-doe-review-hub/jane-doe-salary?component=cmp-links"
+        cases = {
+            # The widget has since moved to another page.
+            "moved": ("link.clicked", "/jane-doe-review-hub/old-page?component=cmp-links", None),
+            # Selection events have no widget, so a component hint proves nothing.
+            "no widget event": ("root_tab.selected", raw_uri, None),
+            # The reader cannot currently open that widget.
+            "no access": ("link.clicked", raw_uri, [grant("nav_tab", 2, "view")]),
+        }
+        for name, (event_name, route, grants) in cases.items():
+            with self.subTest(name):
+                self.grants = {MEMBER.hub_user_id: grants or [grant("hub", 1)]}
+                with self.Session() as db:
+                    access = product_analytics._viewer_access(db, MEMBER) if grants else None
+                    locations = summarize_locations(db, [{
+                        "event_name": event_name, "component_id": None, "target_id": None,
+                        "page_route": route, "count": 1,
+                    }], access=access)
+                self.assertEqual(locations, [{"key": "unresolved", "label": "Deleted or unavailable destination",
+                                              "href": None, "count": 1, "mirror": False}])
+
+    def test_event_list_destinations_are_current_names_never_routes_or_ids(self) -> None:
+        self.current = ADMIN
+        self._ingest(
+            _event("link.clicked", component_id="cmp-links", page_route="/secret/title", properties={}),
+            _event("button.clicked", component_id="cmp-button", page_route="/secret/title", properties={}),
+        )
+        with self.Session() as db:
+            db.query(ComponentV2).filter(ComponentV2.link == "cmp-button").delete()
+            db.commit()
+        data = self.client.get("/v2/product-analytics/events").json()["data"]
+        destinations = {(event["component_id"], event["destination_label"], event["destination_href"]) for event in data}
+        self.assertEqual(destinations, {
+            ("cmp-links", "Jane Doe links", "/jane-doe-review-hub/jane-doe-salary?component=cmp-links"),
+            ("cmp-button", "Deleted or unavailable destination", None),
+        })
+        for event in data:
+            self.assertNotIn("secret", event["destination_label"])
+            self.assertNotIn("cmp-", event["destination_label"])
+
+    def test_component_destination_uses_current_revealed_page_access(self) -> None:
+        """A component grant may use its current, ACL-revealed containing page."""
+        from app.services.product_analytics_refs import resolve_names
+
+        with self.Session() as db:
+            links = node(db, "cmp-links")
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant(*links)]}
+        with self.Session() as db:
+            access = product_analytics._viewer_access(db, MEMBER)
+            (event,) = resolve_names(
+                db,
+                [{"event_name": "link.clicked", "component_id": "cmp-links", "target_id": None, "page_route": "/"}],
+                access=access,
+            )
+        self.assertEqual(event["component_name"], "Jane Doe links")
+        self.assertEqual(event["open_path"], "/jane-doe-review-hub/jane-doe-salary?component=cmp-links")
+        self.assertEqual(event["open_component_link"], "cmp-links")
+
+    def test_unnamed_component_uses_a_readable_type_label_and_live_page_path(self) -> None:
+        """An optional widget title must never make a UUID the visible label."""
+        from app.services.product_analytics_refs import resolve_names
+
+        with self.Session() as db:
+            db.query(ComponentV2).filter(ComponentV2.link == "cmp-links").update({"title": "  "})
+            db.commit()
+        with self.Session() as db:
+            (event,) = resolve_names(
+                db,
+                [{"event_name": "link.clicked", "component_id": "cmp-links", "target_id": None, "page_route": "/"}],
+            )
+        self.assertEqual(event["component_name"], "Links component")
+        self.assertEqual(event["open_component_name"], "Links component")
+        self.assertEqual(event["open_path"], "/jane-doe-review-hub/jane-doe-salary?component=cmp-links")
 
     def test_events_pagination_is_bounded(self) -> None:
         self._seed()
@@ -1134,7 +2053,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertIn('filename="hub-product-usage.xlsx"', response.headers["content-disposition"])
         self.assertEqual(response.headers["cache-control"], "no-store")
         book = self._xlsx(response.content)
-        self.assertEqual(book["sheets"], ["Overview", "Activity by day", "By action", "By component", "Top pages", "Events"])
+        self.assertEqual(book["sheets"], ["Overview", "Activity by day", "By action", "By component", "Top pages", "Active time", "Events"])
         self.assertGreaterEqual(len(book["charts"]), 5)  # doughnut + one per report sheet
         for text in ("Sidebar navigation tab opened", "Root tab opened", "Reselect", "Default", "/dashboard/:tab", "Asia/Beirut", "not included"):
             self.assertIn(text, book["strings"], text)
@@ -1149,7 +2068,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('filename="hub-product-usage-with-people.xlsx"', response.headers["content-disposition"])
         book = self._xlsx(response.content)
-        self.assertEqual(book["sheets"], ["Overview", "Activity by day", "By action", "By component", "Top pages", "Top people", "Visited by person", "Events"])
+        self.assertEqual(book["sheets"], ["Overview", "Activity by day", "By action", "By component", "Top pages", "Active time", "Top people", "Visited by person", "Events"])
         self.assertIn("member@renphil.org", book["strings"])
         self.assertIn("admin@renphil.org", book["strings"])
         self.assertGreaterEqual(len(book["charts"]), 7)  # + Top people pie + per-person stacked bar

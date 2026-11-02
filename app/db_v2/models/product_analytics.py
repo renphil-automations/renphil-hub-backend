@@ -31,6 +31,14 @@ class HubProductEventV2(BaseV2):
     hub_user_id = Column(Integer, nullable=False)
     actor_email = Column(String(320), nullable=False)
     environment = Column(String(16), nullable=False)
+    # Standard View As remains attributed to the real authenticated actor.
+    # These optional, server-verified keys describe the adopted role/scope
+    # only for restricted operational investigation; they are never returned
+    # by the product analytics APIs or exports. Anonymous View As writes no
+    # analytics row at all.
+    view_as_role_key = Column(String(128), nullable=True)
+    view_as_scope_key = Column(String(128), nullable=True)
+    view_as_context = Column(JSON, nullable=True)
     # The route TEMPLATE (`/:nav_tab/:tab`, `/admin/bot-management`), never
     # the path itself: Hub URLs carry slugs derived from tab titles.
     page_route = Column(String(256), nullable=False)
@@ -48,4 +56,47 @@ class HubProductEventV2(BaseV2):
         Index("ix_hub_product_events_name_occurred", "event_name", "occurred_at"),
         Index("ix_hub_product_events_actor_occurred", "actor_email", "occurred_at"),
         Index("ix_hub_product_events_component_occurred", "component_type", "occurred_at"),
+    )
+
+
+class HubProductEngagementV2(BaseV2):
+    """A bounded interval of *active* time spent on one Hub page.
+
+    This intentionally contains no page title, URL, component label or free
+    text.  The browser stops an interval as soon as its tab is hidden, so
+    background, locked-screen and idle-away time is not represented as usage.
+    """
+
+    __tablename__ = "hub_product_engagements"
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    # Client-generated UUID; retries of a pagehide/visibility flush are safe.
+    engagement_id = Column(String(36), nullable=False, unique=True)
+    hub_user_id = Column(Integer, nullable=False)
+    actor_email = Column(String(320), nullable=False)
+    environment = Column(String(16), nullable=False)
+    # Same hidden simulation context as HubProductEventV2. It is not an
+    # impersonated user: actor_email always remains the real caller.
+    view_as_role_key = Column(String(128), nullable=True)
+    view_as_scope_key = Column(String(128), nullable=True)
+    view_as_context = Column(JSON, nullable=True)
+    # Same privacy-safe route template used by HubProductEventV2.
+    page_route = Column(String(256), nullable=False)
+    # Verified, opaque bindings for the navigation tree and the tab that was
+    # actually visible. They let an editor receive time only for pages they
+    # can still edit; routes alone are deliberately not sufficient for that.
+    nav_tab_id = Column(String(128), nullable=True)
+    tab_id = Column(String(128), nullable=True)
+    active_seconds = Column(Integer, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=False)
+    received_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_hub_product_engagements_ended_at", "ended_at"),
+        Index("ix_hub_product_engagements_environment_ended", "environment", "ended_at"),
+        Index("ix_hub_product_engagements_actor_ended", "actor_email", "ended_at"),
+        Index("ix_hub_product_engagements_route_ended", "page_route", "ended_at"),
+        Index("ix_hub_product_engagements_nav_ended", "nav_tab_id", "ended_at"),
+        Index("ix_hub_product_engagements_tab_ended", "tab_id", "ended_at"),
     )

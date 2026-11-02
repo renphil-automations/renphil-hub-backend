@@ -1,4 +1,4 @@
-"""Delete Hub product-usage events older than PRODUCT_ANALYTICS_RETENTION_DAYS.
+"""Delete expired Hub product-usage events and active-time intervals.
 
 Run once a day in every deployment that records events (see
 PRODUCT_ANALYTICS_EVENTS.md, "Retention"):
@@ -65,12 +65,18 @@ def run(
     with session_factory() as db:
         if args.dry_run:
             count = service.count_expired_events(db, cutoff=cutoff)
+            intervals = service.count_expired_engagements(db, cutoff=cutoff)
             out(f"dry run: {count} event(s) older than {cutoff.date().isoformat()} (retention {days} days) would be deleted.")
+            out(f"dry run: {intervals} active-time interval(s) would be deleted.")
             return EXIT_OK
         deleted = service.purge_expired_events(
             db, cutoff=cutoff, batch_size=args.batch_size, max_batches=args.max_batches,
         )
+        intervals = service.purge_expired_engagements(
+            db, cutoff=cutoff, batch_size=args.batch_size, max_batches=args.max_batches,
+        )
     out(f"deleted {deleted} event(s) older than {cutoff.date().isoformat()} (retention {days} days).")
+    out(f"deleted {intervals} active-time interval(s).")
     return EXIT_OK
 
 

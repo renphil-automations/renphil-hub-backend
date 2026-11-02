@@ -265,6 +265,7 @@ class ProductAnalyticsPostgresTests(unittest.TestCase):
         self.assertEqual(export.status_code, 200)
         self.assertEqual(len(export.text.strip().splitlines()), 2)
         self.current = MEMBER
+        self.access = ViewerAccess(visibility=None, full_access=False)
         self.assertEqual(self.client.get("/v2/product-analytics/summary").status_code, 403)
 
 

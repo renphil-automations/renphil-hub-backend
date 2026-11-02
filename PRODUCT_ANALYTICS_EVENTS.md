@@ -159,7 +159,7 @@ Privacy rules:
 - `0`, `off`, `disabled` or `none` disables purging (for a local or sandbox database you reset anyway).
 - Any other value must be a whole number from 30 to 3650. Otherwise the purge refuses to run (exit code 2) and deletes nothing. The API still starts, because the setting is only parsed by the purge.
 
-`python -m scripts.purge_product_analytics_events` deletes rows whose `occurred_at` is older than the cutoff, 5,000 rows per transaction (`--batch-size`, 100–50,000; `--max-batches` to cap one run). `--dry-run` only counts. It prints counts and the cutoff date, never row contents.
+`python -m scripts.purge_product_analytics_events` deletes click events whose `occurred_at` and active-time intervals whose `ended_at` are older than the cutoff. It processes 5,000 rows per transaction (`--batch-size`, 100–50,000); `--max-batches` limits batches separately for each table. `--dry-run` only counts. It prints counts and the cutoff date, never row contents. Run the table setup before scheduling this job so both analytics tables exist.
 
 **Required in Production: run it once a day** (for example 03:15 UTC) from the deployment's scheduler: Render cron job, GitHub Actions `schedule`, or the host's cron, with the backend's normal environment. A missed day only delays deletion by a day.
 
@@ -170,3 +170,29 @@ Privacy rules:
 3. Make sure Upstash is configured, or the ingest rate limit is off.
 4. Schedule the daily purge (above) in Production; set `PRODUCT_ANALYTICS_RETENTION_DAYS` only to change the 396-day default.
 5. Optional frontend kill switch: `VITE_PRODUCT_ANALYTICS_ENABLED=false`.
+
+## Known View As boundary
+
+The current multi-pair and View As user selection is verified against Hub's
+live View As rules during ingestion. The real caller remains the actor. Verified
+role/scope pairs and the selected user's internal ID are stored only in the
+nullable `view_as_context` field for internal diagnostics; analytics responses
+and exports must not expose it. Run the analytics table setup script before
+deploying this version to add that field to existing tables.
+
+Standard **View As** analytics remain attributed to the real authenticated
+caller. The adopted role and scope are verified by the backend and retained
+only as internal analytics context; they are not returned by analytics reads
+or exports. **Anonymous View As** normally sends no analytics at all, and the
+analytics ingestion endpoints suppress any request that explicitly carries
+`anonymous=true`.
+
+This is a product privacy control, not a forensic anti-tampering boundary: a
+caller who deliberately removes all View As parameters from their own browser
+request is indistinguishable from that same caller making an ordinary Hub
+request, so the backend cannot infer the discarded anonymous state. That can
+only record the caller's own activity; it cannot impersonate another user or
+reveal any data. A future server-issued View As session/token would be needed
+to make anonymous mode cryptographically non-bypassable. This limitation must
+remain in the PR description and release notes until that broader View As
+design is introduced.

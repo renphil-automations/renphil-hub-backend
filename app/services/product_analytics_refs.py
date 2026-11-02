@@ -31,9 +31,10 @@ id, the response never says which ids were dropped or why, and nothing about
 the decision is logged, so ingestion cannot be used to probe for records the
 caller cannot see.
 
-Names are resolved only when an All-Scopes admin READS events
-(`resolve_names`). They are returned in that response and nowhere else: not
-written to `hub_product_events`, not in the CSV export, not logged, not cached.
+Names and open destinations are resolved only when an authorized reader READS
+events (`resolve_names`), and only for records that reader can open now. They
+are returned in that response and nowhere else: not written to
+`hub_product_events`, not in the CSV export, not logged, not cached.
 """
 
 from __future__ import annotations
@@ -41,12 +42,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
+from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.tab import TabV2
@@ -173,6 +175,35 @@ def _card_ids(db: Session, components: Iterable[_ComponentInfo]) -> dict[int, se
     return out
 
 
+def _sub_tab_nodes(db: Session, document_ids: Iterable[str]) -> dict[str, tuple[str, int]]:
+    """Access node per sub-tab `document_id`.
+
+    Nav-tree child tabs and Super Gridstack sub-tabs are sub-gridstacks (what
+    `/v2/tabs/{id}/children` returns), not TabV2 rows. A sub-gridstack holds
+    no grants; its node is its representation component, the same rule
+    `access_visibility_service.resolve_gridstack_node` applies when a
+    `tabs_v2` route serves it. A sub-grid with no representation row stays
+    unresolved, i.e. invisible.
+    """
+    document_ids = {value for value in document_ids if value}
+    if not document_ids:
+        return {}
+    grids = dict(db.execute(
+        select(GridstackV2.document_id, GridstackV2.id)
+        .where(GridstackV2.document_id.in_(document_ids), GridstackV2.parent_id.is_not(None))
+    ).all())
+    if not grids:
+        return {}
+    representations = dict(db.execute(
+        select(ComponentV2.current_grid_id, ComponentV2.id).where(ComponentV2.current_grid_id.in_(set(grids.values())))
+    ).all())
+    return {
+        document_id: ("component", representations[grid_id])
+        for document_id, grid_id in grids.items()
+        if grid_id in representations
+    }
+
+
 def _norm_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
@@ -183,6 +214,7 @@ def verify_identifiers(
     *,
     access_for: Callable[[], ViewerAccess],
     actor_email: str,
+    require_edit: bool = False,
 ) -> None:
     """Keep only ids that the event's rule allows, the Hub records confirm,
     AND the reporting user can currently view.
@@ -236,6 +268,7 @@ def verify_identifiers(
                 select(TabV2.document_id, TabV2.id, TabV2.parent_tab_id).where(TabV2.document_id.in_(tab_ids))
             ).all()
         }
+    sub_tabs = _sub_tab_nodes(db, tab_ids - set(tabs))
     components = _load_components(db, component_links)
     sbn_parent: dict[str, int | None] = {}
     if components:
@@ -265,10 +298,11 @@ def verify_identifiers(
         return resolved[0]
 
     def can_view(node: tuple[str, int]) -> bool:
-        return access().verdict(node).view
+        verdict = access().verdict(node)
+        return verdict.edit if require_edit else verdict.view
 
     def is_granted(node: tuple[str, int]) -> bool:
-        return access().is_granted(node)
+        return access().verdict(node).edit if require_edit else access().is_granted(node)
 
     actor = _norm_email(actor_email)
 
@@ -296,7 +330,10 @@ def verify_identifiers(
         elif rule.target == "root_tab":
             verified = target in tabs and tabs[target][1] is None and can_view(("tab", tabs[target][0]))
         elif rule.target == "tab":
-            verified = target in tabs and can_view(("tab", tabs[target][0]))
+            if target in tabs:
+                verified = can_view(("tab", tabs[target][0]))
+            else:
+                verified = target in sub_tabs and can_view(sub_tabs[target])
         elif rule.target == "sbn_tab":
             child = components.get(target)
             verified = component is not None and child is not None and (
@@ -316,22 +353,372 @@ def verify_identifiers(
         row["target_id"] = target if verified else None
 
 
-def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return admin-view-only names and safe, live destinations for events.
+def filter_editable_events(
+    db: Session,
+    events: list[dict[str, Any]],
+    *,
+    access: ViewerAccess,
+    actor_email: str,
+) -> list[dict[str, Any]]:
+    """Return only events tied to a resource the viewer can edit *now*.
 
-    Read-time only, for the All-Scopes admin view. Unknown or deleted ids get
-    None and stay opaque. ``open_path`` is generated from current Hub records
-    rather than the stored route template, so it is both readable and safe to
-    follow. ``open_component_link`` feeds the existing component deep-link
-    navigator; a mirror deliberately resolves to its original component while
-    retaining ``mirror_component_link`` for audit context. None of these
-    derived values are persisted, exported, logged or cached.
+    This uses the same identifier resolver as ingest, with the stronger
+    ``edit`` predicate.  Untargeted events and fixed UI-only targets such as
+    Pending/History are deliberately excluded: they cannot be safely tied to
+    one editable Hub resource and must not become a side channel.
     """
+    if access.full_access:
+        return events
+    rows = [dict(event) for event in events]
+    verify_identifiers(
+        db, rows, access_for=lambda: access, actor_email=actor_email,
+        require_edit=True,
+    )
+    out: list[dict[str, Any]] = []
+    for original, row in zip(events, rows):
+        rule = ID_RULES.get(original.get("event_name"), IdRule())
+        # Fixed view codes and rows without a verified resource have no
+        # editable-object proof, so they never reach an editor's analytics.
+        if row.get("component_id") or (rule.target not in (None, "view_code") and row.get("target_id")):
+            out.append(row)
+    return out
+
+
+def verify_engagement_identifiers(
+    db: Session,
+    rows: list[dict[str, Any]],
+    *,
+    access_for: Callable[[], ViewerAccess],
+    require_edit: bool = False,
+) -> None:
+    """Keep active-time bindings only when they are real and accessible.
+
+    An active-time interval is tied to the navigation tree and the rendered
+    tab, never inferred from its route template.  Both identifiers are
+    browser supplied, so they receive the same live Hub visibility check as
+    click analytics.  A missing or inaccessible id is silently discarded;
+    callers receive no record-existence signal.
+    """
+    nav_candidates = {_candidate(row.get("nav_tab_id")) for row in rows}
+    tab_candidates = {_candidate(row.get("tab_id")) for row in rows}
+    nav_candidates.discard(None)
+    tab_candidates.discard(None)
+    nav_rows = db.execute(
+        select(NavTabV2.document_id, NavTabV2.id).where(NavTabV2.document_id.in_(nav_candidates))
+    ).all() if nav_candidates else []
+    tab_rows = db.execute(
+        select(TabV2.document_id, TabV2.id).where(TabV2.document_id.in_(tab_candidates))
+    ).all() if tab_candidates else []
+    nav_ids = dict(nav_rows)
+    tab_nodes: dict[str, tuple[str, int]] = {document_id: ("tab", tab_id) for document_id, tab_id in tab_rows}
+    tab_nodes.update(_sub_tab_nodes(db, tab_candidates - set(tab_nodes)))
+    # The nav tree each tab binding belongs to, loaded once per batch: a
+    # TabV2's own nav_tab_id (a variant carries its parent's), or, for a
+    # sub-tab, that of the tab owning its gridstack.
+    owner_nav: dict[str, int | None] = {}
+    if tab_nodes:
+        owner_nav.update(db.execute(
+            select(TabV2.document_id, TabV2.nav_tab_id).where(TabV2.document_id.in_(set(tab_nodes)))
+        ).all())
+        sub_docs = {doc for doc, node in tab_nodes.items() if node[0] != "tab"}
+        if sub_docs:
+            owner_nav.update(db.execute(
+                select(GridstackV2.document_id, TabV2.nav_tab_id)
+                .join(TabV2, GridstackV2.parent_tab_id == TabV2.id)
+                .where(GridstackV2.document_id.in_(sub_docs))
+            ).all())
+    access: ViewerAccess | None = None
+
+    def allowed(ref: tuple[str, int]) -> bool:
+        nonlocal access
+        if access is None:
+            access = access_for()
+        verdict = access.verdict(ref)
+        return verdict.edit if require_edit else verdict.view
+
+    for row in rows:
+        nav = _candidate(row.get("nav_tab_id"))
+        tab = _candidate(row.get("tab_id"))
+        valid_nav = nav if nav and nav in nav_ids and allowed(("nav_tab", nav_ids[nav])) else None
+        valid_tab = tab if tab and tab in tab_nodes and allowed(tab_nodes[tab]) else None
+
+        # When the browser supplies both bindings, they must describe the
+        # same page tree.  Validating each identifier independently would let
+        # a modified client combine two pages it may view and attribute time
+        # to the wrong navigation context.  A tab-only interval remains valid
+        # (for routes without a nav binding); a mismatched pair is discarded
+        # entirely, exactly like any other malformed binding.
+        if valid_nav and valid_tab and owner_nav.get(valid_tab) != nav_ids[valid_nav]:
+            valid_nav = None
+            valid_tab = None
+
+        row["nav_tab_id"] = valid_nav
+        row["tab_id"] = valid_tab
+
+
+def filter_editable_engagements(
+    db: Session,
+    intervals: list[dict[str, Any]],
+    *,
+    access: ViewerAccess,
+) -> list[dict[str, Any]]:
+    """Return active-time intervals tied to a currently editable page.
+
+    A tab binding is the precise page-level proof and takes priority. A
+    nav-only interval is retained only when that nav tree itself is editable.
+    Older route-only rows stay invisible to editors instead of leaking time.
+    """
+    if access.full_access:
+        return intervals
+    checked = [dict(interval) for interval in intervals]
+    verify_engagement_identifiers(db, checked, access_for=lambda: access, require_edit=True)
+    return [row for row in checked if row.get("tab_id") or row.get("nav_tab_id")]
+
+
+_MAX_SUB_TAB_DEPTH = 20
+
+
+def _sub_tab_trails(db: Session, document_ids: set[str]) -> dict[str, dict[str, Any]]:
+    """Name, access node and URL trail of each sub-tab (sub-gridstack).
+
+    The trail is the sub-gridstack names from just below the root canvas down
+    to the sub-tab, plus the TabV2 that owns that root canvas: the Hub URL is
+    that tab's path followed by each name's slug (`pathSegmentsForTab` and
+    `SgsCanvasHost`'s `${routeBase}/${slug}`). A broken chain gets no trail.
+    """
+    if not document_ids:
+        return {}
+    columns = (GridstackV2.id, GridstackV2.document_id, GridstackV2.name, GridstackV2.parent_id, GridstackV2.parent_tab_id)
+    grids = {row.id: row for row in db.execute(
+        select(*columns).where(GridstackV2.document_id.in_(document_ids), GridstackV2.parent_id.is_not(None))
+    ).all()}
+    targets = {row.document_id: row.id for row in grids.values()}
+    frontier = {row.parent_id for row in grids.values()} - set(grids)
+    for _ in range(_MAX_SUB_TAB_DEPTH):
+        if not frontier:
+            break
+        loaded = db.execute(select(*columns).where(GridstackV2.id.in_(frontier))).all()
+        grids.update({row.id: row for row in loaded})
+        frontier = {row.parent_id for row in loaded if row.parent_id is not None} - set(grids)
+    nodes = _sub_tab_nodes(db, set(targets))
+    out: dict[str, dict[str, Any]] = {}
+    for document_id, grid_id in targets.items():
+        names: list[str] = []
+        base_tab_id = None
+        current = grids.get(grid_id)
+        for _ in range(_MAX_SUB_TAB_DEPTH + 1):
+            if current is None:
+                break
+            if current.parent_id is None:
+                base_tab_id = current.parent_tab_id
+                break
+            names.insert(0, current.name or "")
+            current = grids.get(current.parent_id)
+        out[document_id] = {
+            "name": grids[grid_id].name,
+            "node": nodes.get(document_id),
+            "base_tab_id": base_tab_id,
+            "segments": names,
+        }
+    return out
+
+
+def _component_location_paths(
+    db: Session,
+    components: dict[str, dict[str, Any]],
+) -> dict[str, tuple[str, int]]:
+    """Resolve component links to the live page that contains them.
+
+    A component link by itself is not a useful destination.  The former
+    Analytics fallback sent every component to ``/dashboard?component=…``,
+    which loses its containing page.  This follows the authoritative
+    gridstack/tab tree and returns a current path plus the root TabV2 id used
+    by the caller for a live view-access check.  Nothing here is persisted.
+    """
+    grid_ids = {info.get("grid_id") for info in components.values() if info.get("grid_id") is not None}
+    if not grid_ids:
+        return {}
+
+    grids: dict[int, dict[str, Any]] = {}
+    frontier = set(grid_ids)
+    for _ in range(_MAX_SUB_TAB_DEPTH + 2):
+        pending = frontier - set(grids)
+        if not pending:
+            break
+        rows = db.execute(
+            select(GridstackV2.id, GridstackV2.parent_id, GridstackV2.parent_tab_id, GridstackV2.name)
+            .where(GridstackV2.id.in_(pending))
+        ).all()
+        if not rows:
+            break
+        for grid_id, parent_id, parent_tab_id, name in rows:
+            grids[grid_id] = {"parent_id": parent_id, "parent_tab_id": parent_tab_id, "name": name or ""}
+        frontier = {parent_id for _, parent_id, _, _ in rows if parent_id is not None}
+
+    tab_ids = {grid["parent_tab_id"] for grid in grids.values() if grid.get("parent_tab_id") is not None}
+    tabs: dict[int, dict[str, Any]] = {}
+    frontier = set(tab_ids)
+    for _ in range(_MAX_SUB_TAB_DEPTH + 2):
+        pending = frontier - set(tabs)
+        if not pending:
+            break
+        rows = db.execute(
+            select(TabV2.id, TabV2.title, TabV2.parent_tab_id, TabV2.nav_tab_id).where(TabV2.id.in_(pending))
+        ).all()
+        if not rows:
+            break
+        for tab_id, title, parent_id, nav_id in rows:
+            tabs[tab_id] = {"title": title or "", "parent_id": parent_id, "nav_id": nav_id}
+        frontier = {parent_id for _, _, parent_id, _ in rows if parent_id is not None}
+
+    nav_ids = {tab["nav_id"] for tab in tabs.values() if tab.get("nav_id") is not None}
+    nav_slugs = dict(
+        db.execute(select(NavTabV2.id, NavTabV2.slug).where(NavTabV2.id.in_(nav_ids))).all()
+    ) if nav_ids else {}
+
+    locations: dict[str, tuple[str, int]] = {}
+    for link, component in components.items():
+        grid = grids.get(component.get("grid_id"))
+        if grid is None:
+            continue
+        grid_segments: list[str] = []
+        for _ in range(_MAX_SUB_TAB_DEPTH + 1):
+            if grid is None:
+                break
+            if grid["parent_id"] is not None and grid["name"]:
+                grid_segments.insert(0, grid["name"])
+            if grid["parent_id"] is None:
+                break
+            grid = grids.get(grid["parent_id"])
+
+        root_tab_id = grid["parent_tab_id"] if grid is not None else None
+        tab = tabs.get(root_tab_id)
+        if tab is None:
+            continue
+        tab_segments: list[str] = []
+        for _ in range(_MAX_SUB_TAB_DEPTH + 1):
+            if tab is None:
+                break
+            tab_segments.insert(0, tab["title"])
+            if tab["parent_id"] is None:
+                break
+            tab = tabs.get(tab["parent_id"])
+        if tab is None or not tab_segments:
+            continue
+        nav_slug = nav_slugs.get(tab["nav_id"])
+        segments = [_slugify_title(part) for part in [*tab_segments, *grid_segments]]
+        if nav_slug and all(segments):
+            locations[link] = (f"/{nav_slug}/" + "/".join(segments), root_tab_id)
+    return locations
+
+
+def _component_display_name(component: dict[str, Any] | None) -> str | None:
+    """Return a readable, non-identifying label for a live component.
+
+    Component titles are optional.  Falling back to the component UUID makes
+    an otherwise authorized analytics row impossible to understand, so use a
+    stable type label instead.  The identifier remains only an opaque internal
+    reference and is never made the visible destination label.
+    """
+    if not component:
+        return None
+    title = component.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    component_type = component.get("type")
+    if isinstance(component_type, str) and component_type.strip():
+        return f"{component_type.replace('_', ' ').replace('-', ' ').title()} component"
+    return "Hub component"
+
+
+def _legacy_component_hint(value: Any) -> tuple[str, str] | None:
+    """A legacy ``/page?component=<link>`` hint, never a destination.
+
+    A short-lived pre-release build recorded a handful of literal Hub paths
+    that included the component deep-link query.  The stored path cannot be
+    shown again: it can contain title slugs and an opaque identifier.  We use
+    it only as a candidate lookup key, then require the *current* component
+    placement and the reader's live access before returning a fresh path.
+    """
+    if not isinstance(value, str) or len(value) > 2048:
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return None
+    candidates = parse_qs(parsed.query, keep_blank_values=False).get("component", [])
+    candidate = _candidate(candidates[0]) if len(candidates) == 1 else None
+    if not candidate:
+        return None
+    return parsed.path.rstrip("/") or "/", candidate
+
+
+def component_root_tab_ids(db: Session, links: Iterable[str]) -> dict[str, int]:
+    """Current root-tab placement for a set of component links.
+
+    This is deliberately a read-time relationship. Product event rows store
+    only the component's opaque link, never a page name or page URL. A page
+    insight therefore follows a widget's *current* placement and cannot
+    expose a historical location after a move or a deletion.
+    """
+    requested = {link for link in links if isinstance(link, str) and link}
+    if not requested:
+        return {}
+    rows = db.execute(
+        select(ComponentV2.link, ComponentV2.id, ComponentV2.title, ComponentV2.type, ComponentV2.props, ComponentV2.gridstack_id)
+        .where(ComponentV2.link.in_(requested))
+    ).all()
+    components = {
+        link: {"id": cid, "title": title, "type": ctype, "props": props or {}, "grid_id": grid_id}
+        for link, cid, title, ctype, props, grid_id in rows
+        if link
+    }
+    return {link: root_tab_id for link, (_path, root_tab_id) in _component_location_paths(db, components).items()}
+
+
+def resolve_names(
+    db: Session,
+    events: list[dict[str, Any]],
+    *,
+    access: ViewerAccess | None = None,
+) -> list[dict[str, Any]]:
+    """Return read-time names and safe, live destinations for events.
+
+    Read-time only. Unknown or deleted ids get None and stay opaque.
+    ``open_path`` is generated from current Hub records rather than the
+    stored route template, so it is both readable and safe to follow.
+    ``open_component_link`` feeds the existing component deep-link navigator;
+    a mirror deliberately resolves to its original component while retaining
+    ``mirror_component_link`` for audit context. None of these derived
+    values are persisted, exported, logged or cached.
+
+    ``access`` is the reader's live access (None only for trusted internal
+    callers). A name or destination is returned only when that reader can
+    currently open the record — the same gates the Hub uses to serve it:
+    ``view`` for a nav tab, tab, sub-tab or Super Block Note page, ``granted``
+    for a widget, and, for a mirror, ``granted`` on the original as well.
+    Anything else is returned exactly like a deleted record.
+    """
+
+    def can_view(node: tuple[str, int] | None) -> bool:
+        return node is not None and (access is None or access.verdict(node).view)
+
+    def is_granted(node: tuple[str, int] | None) -> bool:
+        return node is not None and (access is None or access.is_granted(node))
+
     nav_ids, tab_ids, links, thread_ids = set(), set(), set(), set()
-    for event in events:
+    legacy_component_hints: dict[int, tuple[str, str]] = {}
+    for index, event in enumerate(events):
         rule = ID_RULES.get(event.get("event_name"), IdRule())
         if event.get("component_id"):
             links.add(event["component_id"])
+        # A legacy URI is *not* trusted as a component binding. Keep only a
+        # shape-checked candidate so it can be validated against the current
+        # component table and placement below.
+        if not event.get("component_id"):
+            hint = _legacy_component_hint(event.get("page_route"))
+            if hint:
+                legacy_component_hints[index] = hint
+                links.add(hint[1])
         target = event.get("target_id")
         if not target:
             continue
@@ -344,38 +731,44 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
         elif rule.target == "thread" and _THREAD_ID_RE.match(target):
             thread_ids.add(int(target))
     component_rows = db.execute(
-        select(ComponentV2.link, ComponentV2.title, ComponentV2.type, ComponentV2.props)
+        select(ComponentV2.link, ComponentV2.id, ComponentV2.title, ComponentV2.type, ComponentV2.props, ComponentV2.gridstack_id)
         .where(ComponentV2.link.in_(links))
     ).all() if links else []
-    components = {link: {"title": title, "type": ctype, "props": props or {}}
-                  for link, title, ctype, props in component_rows}
+    components = {link: {"id": cid, "title": title, "type": ctype, "props": props or {}, "grid_id": grid_id}
+                  for link, cid, title, ctype, props, grid_id in component_rows}
     mirror_target_links = {
         info["props"].get("target_link")
         for info in components.values()
         if info["type"] == "mirror" and isinstance(info["props"].get("target_link"), str)
     }
     mirror_target_rows = db.execute(
-        select(ComponentV2.link, ComponentV2.title, ComponentV2.type)
+        select(ComponentV2.link, ComponentV2.id, ComponentV2.title, ComponentV2.type, ComponentV2.gridstack_id)
         .where(ComponentV2.link.in_(mirror_target_links))
     ).all() if mirror_target_links else []
-    mirror_targets = {link: {"title": title, "type": ctype} for link, title, ctype in mirror_target_rows}
+    mirror_targets = {link: {"id": cid, "title": title, "type": ctype, "grid_id": grid_id}
+                      for link, cid, title, ctype, grid_id in mirror_target_rows}
+    component_locations = _component_location_paths(db, {**components, **mirror_targets})
 
     nav_rows = db.execute(
-        select(NavTabV2.document_id, NavTabV2.title, NavTabV2.slug).where(NavTabV2.document_id.in_(nav_ids))
+        select(NavTabV2.document_id, NavTabV2.id, NavTabV2.title, NavTabV2.slug).where(NavTabV2.document_id.in_(nav_ids))
     ).all() if nav_ids else []
-    nav_details = {document_id: {"title": title, "slug": slug} for document_id, title, slug in nav_rows}
+    nav_details = {document_id: {"id": nid, "title": title, "slug": slug} for document_id, nid, title, slug in nav_rows}
     tab_rows = db.execute(
-        select(TabV2.document_id, TabV2.title, TabV2.parent_tab_id, TabV2.nav_tab_id)
+        select(TabV2.document_id, TabV2.id, TabV2.title, TabV2.parent_tab_id, TabV2.nav_tab_id)
         .where(TabV2.document_id.in_(tab_ids))
     ).all() if tab_ids else []
-    tab_details = {document_id: {"title": title, "parent_id": parent_id, "nav_id": nav_id}
-                   for document_id, title, parent_id, nav_id in tab_rows}
+    tab_details = {document_id: {"id": tid, "title": title, "parent_id": parent_id, "nav_id": nav_id}
+                   for document_id, tid, title, parent_id, nav_id in tab_rows}
+    # Child, view and sub-tab ids that are sub-gridstacks rather than TabV2s.
+    sub_tabs = _sub_tab_trails(db, tab_ids - set(tab_details))
     parent_ids = {info["parent_id"] for info in tab_details.values() if info["parent_id"] is not None}
+    parent_ids |= {trail["base_tab_id"] for trail in sub_tabs.values() if trail["base_tab_id"] is not None}
     parent_rows = db.execute(
-        select(TabV2.id, TabV2.title, TabV2.nav_tab_id)
+        select(TabV2.id, TabV2.title, TabV2.parent_tab_id, TabV2.nav_tab_id)
         .where(TabV2.id.in_(parent_ids))
     ).all() if parent_ids else []
-    parent_details = {tab_id: {"title": title, "nav_id": nav_id} for tab_id, title, nav_id in parent_rows}
+    parent_details = {tab_id: {"title": title, "parent_id": parent_id, "nav_id": nav_id}
+                      for tab_id, title, parent_id, nav_id in parent_rows}
     nav_ids_for_tabs = {
         nav_id for nav_id in [
             *(info["nav_id"] for info in tab_details.values()),
@@ -383,10 +776,24 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
         ] if nav_id is not None
     }
     nav_by_id = dict(db.execute(select(NavTabV2.id, NavTabV2.slug).where(NavTabV2.id.in_(nav_ids_for_tabs))).all()) if nav_ids_for_tabs else {}
-    thread_names = dict(db.execute(select(ThreadV2.id, ThreadV2.title).where(ThreadV2.id.in_(thread_ids))).all()) if thread_ids else {}
+    threads = {
+        tid: {"title": title, "component_id": component_id}
+        for tid, title, component_id in db.execute(
+            select(ThreadV2.id, ThreadV2.title, ThreadV2.component_id).where(ThreadV2.id.in_(thread_ids))
+        ).all()
+    } if thread_ids else {}
+
+    def root_tab_path(tab_id: int | None) -> str | None:
+        """`/<nav>/<root tab>` for a root TabV2 id; None for a variant or a gap."""
+        details = parent_details.get(tab_id) if tab_id is not None else None
+        if details is None or details["parent_id"] is not None:
+            return None
+        nav_slug = nav_by_id.get(details["nav_id"])
+        slug = _slugify_title(details["title"] or "")
+        return f"/{nav_slug}/{slug}" if nav_slug and slug else None
 
     out = []
-    for event in events:
+    for index, event in enumerate(events):
         rule = ID_RULES.get(event.get("event_name"), IdRule())
         target = event.get("target_id")
         target_name = None
@@ -397,13 +804,14 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
         if target:
             if rule.target == "nav_tab":
                 details = nav_details.get(target)
-                target_name = details["title"] if details else None
-                if details and details["slug"]:
-                    open_path = f"/{details['slug']}"
-            elif rule.target in ("root_tab", "tab"):
-                details = tab_details.get(target)
-                target_name = details["title"] if details else None
-                if details:
+                if details and can_view(("nav_tab", details["id"])):
+                    target_name = details["title"]
+                    if details["slug"]:
+                        open_path = f"/{details['slug']}"
+            elif rule.target in ("root_tab", "tab") and target in tab_details:
+                details = tab_details[target]
+                if can_view(("tab", details["id"])):
+                    target_name = details["title"]
                     parent = parent_details.get(details["parent_id"])
                     nav_slug = nav_by_id.get(details["nav_id"] or (parent or {}).get("nav_id"))
                     slug = _slugify_title(details["title"] or "")
@@ -414,29 +822,73 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
                             parent_slug = _slugify_title((parent or {}).get("title") or "")
                             if parent_slug:
                                 open_path = f"/{nav_slug}/{parent_slug}/{slug}"
+            elif rule.target == "tab" and target in sub_tabs:
+                trail = sub_tabs[target]
+                if can_view(trail["node"]):
+                    target_name = trail["name"]
+                    base = root_tab_path(trail["base_tab_id"])
+                    slugs = [_slugify_title(name) for name in trail["segments"]]
+                    if base and slugs and all(slugs):
+                        open_path = "/".join([base, *slugs])
             elif rule.target == "sbn_tab":
                 details = components.get(target)
-                target_name = details["title"] if details else None
-                if details and details["type"] != "mirror":
-                    open_component_link = target
-                    open_component_name = details["title"]
+                if details and can_view(("component", details["id"])):
+                    target_name = _component_display_name(details)
+                    if details["type"] != "mirror":
+                        open_component_link = target
+                        open_component_name = _component_display_name(details)
             elif rule.target == "thread" and _THREAD_ID_RE.match(target):
-                target_name = thread_names.get(int(target))
+                thread = threads.get(int(target))
+                if thread and is_granted(("component", thread["component_id"])):
+                    target_name = thread["title"]
         component_link = event.get("component_id")
+        if not component_link and index in legacy_component_hints:
+            legacy_path, candidate = legacy_component_hints[index]
+            current = component_locations.get(candidate)
+            candidate_component = components.get(candidate)
+            # Do not let a stale path claim a currently unrelated component.
+            # The fresh path must still be the same page before it becomes a
+            # readable destination.  It must also still be the component
+            # type expected by the recorded action, so an old link URI can
+            # never be reinterpreted as (for example) a Button click.
+            if (
+                current
+                and candidate_component
+                and current[0].rstrip("/") == legacy_path
+                and rule.component
+                and candidate_component["type"] in rule.component
+            ):
+                component_link = candidate
         component = components.get(component_link) if component_link else None
-        component_name = component["title"] if component else None
+        if component is not None and not is_granted(("component", component["id"])):
+            component = None
+        component_name = _component_display_name(component)
         if open_component_link is None and component_link and component:
             if component["type"] == "mirror":
                 candidate = component["props"].get("target_link")
                 target_component = mirror_targets.get(candidate) if isinstance(candidate, str) else None
-                if target_component and target_component["type"] != "mirror":
+                if (
+                    target_component
+                    and target_component["type"] != "mirror"
+                    and is_granted(("component", target_component["id"]))
+                ):
                     open_component_link = candidate
-                    open_component_name = target_component["title"]
+                    open_component_name = _component_display_name(target_component)
                     mirror_component_link = component_link
             else:
                 open_component_link = component_link
                 open_component_name = component_name
-        out.append({
+
+        # A component deep link must retain the page hint that contains the
+        # component.  The query parameter is server-derived from the current
+        # component row; the route is not taken from the recorded event.
+        # Refuse the enhanced destination unless the reader can still view
+        # that containing root tab as well as the component itself.
+        if open_component_link:
+            location = component_locations.get(open_component_link)
+            if location and can_view(("tab", location[1])):
+                open_path = f"{location[0]}?component={quote(open_component_link, safe='')}"
+        resolved = {
             **event,
             "component_name": component_name or None,
             "target_name": target_name or None,
@@ -444,32 +896,53 @@ def resolve_names(db: Session, events: list[dict[str, Any]]) -> list[dict[str, A
             "open_component_link": open_component_link,
             "open_component_name": open_component_name or None,
             "mirror_component_link": mirror_component_link,
-        })
+        }
+        _, resolved["destination_label"], resolved["destination_href"] = _destination(resolved)
+        out.append(resolved)
     return out
 
 
-def summarize_locations(db: Session, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Combine exact event groups into readable, clickable admin destinations.
+UNAVAILABLE_DESTINATION = "Deleted or unavailable destination"
+
+
+def _destination(event: dict[str, Any]) -> tuple[str, str, str | None]:
+    """(group key, readable label, internal href or None) for a resolved event.
+
+    The label is only ever a current, access-checked name from
+    `resolve_names`; the href only a server-derived path or the ACL-checked
+    component deep link. The stored route template, a title slug, a query
+    string or an opaque id is never a label: without a current name the
+    destination is the neutral, non-clickable `UNAVAILABLE_DESTINATION`.
+    """
+    name = event.get("target_name") or event.get("open_component_name") or event.get("component_name")
+    path = event.get("open_path")
+    component_link = event.get("open_component_link")
+    if name and path:
+        return f"path:{path}", name, path
+    if name and component_link:
+        return f"component:{component_link}", name, f"/dashboard?component={quote(component_link, safe='')}"
+    return "unresolved", UNAVAILABLE_DESTINATION, None
+
+
+def summarize_locations(
+    db: Session,
+    groups: list[dict[str, Any]],
+    *,
+    access: ViewerAccess | None = None,
+) -> list[dict[str, Any]]:
+    """Combine exact event groups into readable, clickable destinations.
 
     This is intentionally a read-time view, after the database has grouped by
     safe stored ids. ``href`` is either a server-derived internal path or the
-    existing component deep-link form. Unresolved/deleted records retain the
-    route template solely as an explicit technical fallback and cannot be
-    clicked.
+    existing component deep-link form, and only for a record the reader can
+    currently open (see `resolve_names`). Unresolved, deleted or inaccessible
+    records share one neutral, non-clickable row (see `_destination`); an old
+    stored route is never echoed, since it could carry title slugs, component
+    ids or query data.
     """
     combined: dict[str, dict[str, Any]] = {}
-    for event in resolve_names(db, groups):
-        path = event.get("open_path")
-        component_link = event.get("open_component_link")
-        if path:
-            key, href = f"path:{path}", path
-            label = event.get("target_name") or path
-        elif component_link:
-            key, href = f"component:{component_link}", f"/dashboard?component={quote(component_link, safe='')}"
-            label = event.get("target_name") or event.get("open_component_name") or event.get("component_name") or component_link
-        else:
-            route = event.get("page_route") or "/"
-            key, href, label = f"unresolved:{route}", None, f"Unavailable current destination ({route})"
+    for event in resolve_names(db, groups, access=access):
+        key, label, href = _destination(event)
         item = combined.setdefault(key, {
             "key": key,
             "label": label,

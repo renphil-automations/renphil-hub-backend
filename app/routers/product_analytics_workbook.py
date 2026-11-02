@@ -361,12 +361,17 @@ def build_product_usage_workbook(
     ws.write_string(3, 0, "Summary", section_f)
     ws.write_string(3, 1, "", section_f)
     active_days = [d for d in by_day if int(d["count"])]
+    engagement = summary.get("engagement") or {}
+    active_seconds = int(engagement.get("active_seconds") or 0)
+    intervals = int(engagement.get("intervals") or 0)
     rows: list[tuple[str, Any]] = [
         ("Recorded events", total),
         ("People", int(totals.get("users") or 0)),
         ("Deliberate clicks", clicks),
         ("  of which reselects", reselects),
         ("Default selections", defaults),
+        ("Foreground active time (seconds)", active_seconds),
+        ("Foreground intervals", intervals),
         ("Click share", _percent(clicks, total)),
         ("Active days", len(active_days)),
         ("First day (UTC)", str(active_days[0]["day"]) if active_days else "—"),
@@ -449,6 +454,26 @@ def build_product_usage_workbook(
         detail_rows=[[r["key"], int(r["count"]), _percent(int(r["count"]), total)] for r in by_page],
         chart_kind="bar",
     )
+    # Active time is deliberately its own report: it obeys only filters with
+    # a truthful page-time meaning (date, page route, environment and, for an
+    # All Scopes admin, person). Component/action/trigger filters narrow
+    # clicks but must not fabricate a duration for a link or button.
+    time_by_page = engagement.get("by_page") or []
+    _write_analytics_report_sheet(
+        workbook, sheet_name="Active time", title="Foreground active time", subtitle=(
+            subtitle + " Time is foreground page time, not time spent on individual clicks."
+        ),
+        series_headers=("Page route", "Active seconds"),
+        series_rows=[(r["key"], int(r["active_seconds"])) for r in time_by_page],
+        detail_headers=["Page route", "Active seconds", "Intervals"],
+        # Intervals are only available for the export total today; grouping
+        # is correctly page-scoped but not visit-scoped until visit_id exists.
+        detail_rows=[
+            [r["key"], int(r["active_seconds"]), intervals if len(time_by_page) == 1 else ""]
+            for r in time_by_page
+        ],
+        chart_kind="bar",
+    )
     if include_people:
         _write_people_sheets(workbook, summary=summary, events=events, descriptions=descriptions,
                              viewer_tz=viewer_tz, subtitle=subtitle, formats={
@@ -463,6 +488,7 @@ def build_product_usage_workbook(
         ("By action", [46, 30, 22, 12, 10]),
         ("By component", [26, 24, 12, 10]),
         ("Top pages", [34, 12, 10]),
+        ("Active time", [34, 18, 12]),
         ("Top people", [34, 12, 12, 12, 12, 14, 40, 21]),
     ):
         sheet = workbook.get_worksheet_by_name(sheet_name)

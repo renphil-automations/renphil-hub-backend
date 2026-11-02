@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.db_v2.models.product_analytics import HubProductEventV2
+from app.db_v2.models.product_analytics import HubProductEventV2, HubProductEngagementV2
 from app.services import product_analytics_service as service
 from scripts import purge_product_analytics_events as purge_script
 
@@ -48,6 +48,7 @@ class PurgeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
         HubProductEventV2.__table__.create(bind=self.engine)
+        HubProductEngagementV2.__table__.create(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
 
     def _add(self, *ages: timedelta) -> None:
@@ -106,7 +107,7 @@ class PurgeTests(unittest.TestCase):
         self._add(timedelta(days=500), timedelta(days=400), timedelta(days=5))
         code, lines = self._run("396", "--batch-size", "100")
         self.assertEqual(code, 0)
-        self.assertEqual(lines, ["deleted 2 event(s) older than 2025-09-25 (retention 396 days)."])
+        self.assertEqual(lines, ["deleted 2 event(s) older than 2025-09-25 (retention 396 days).", "deleted 0 active-time interval(s)."])
         self.assertEqual(self._count(), 1)
         self.assertNotIn("a@renphil.org", " ".join(lines))
 
@@ -116,6 +117,23 @@ class PurgeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("dry run: 1 event(s)", lines[0])
         self.assertEqual(self._count(), 2)
+
+    def test_script_retains_recent_intervals_and_deletes_expired(self) -> None:
+        with self.Session() as db:
+            for age in (500, 5):
+                at = NOW - timedelta(days=age)
+                db.add(HubProductEngagementV2(engagement_id=str(uuid.uuid4()), hub_user_id=1,
+                    actor_email="a@renphil.org", environment="sandbox", page_route="/:nav_tab",
+                    active_seconds=5, started_at=at, ended_at=at, received_at=at))
+            db.commit()
+        code, lines = self._run("396", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("1 active-time interval(s)", lines[1])
+        code, lines = self._run("396")
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[1], "deleted 1 active-time interval(s).")
+        with self.Session() as db:
+            self.assertEqual(db.query(HubProductEngagementV2).count(), 1)
 
     def test_script_disabled_deletes_nothing(self) -> None:
         self._add(timedelta(days=5000))
