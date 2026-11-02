@@ -768,6 +768,13 @@ def get_page_insights(
             1 for row in rows
             if row.get("trigger") == "click" and bool((row.get("properties") or {}).get("reselect"))
         )
+        # Only page-selection events that survived the page scope and live
+        # edit checks identify page openers. Component interactions do not.
+        page_openers = Counter(
+            row["actor_email"] for row in rows
+            if row.get("event_name") in _PAGE_SELECTION_EVENTS
+            and row.get("target_id") in scope.page_ids and row.get("actor_email")
+        )
         return {
             "page": scope.page,
             "environment": get_settings().hub_environment,
@@ -777,6 +784,7 @@ def get_page_insights(
                 {"id": document_id, "name": name, "active_seconds": seconds_by_tab.get(document_id, 0)}
                 for _, document_id, name in scope.tabs
             ],
+            "page_openers": [{"person": person, "openings": count} for person, count in page_openers.most_common()],
             "clicks": {
                 "total": clicks["totals"]["events"],
                 "clicks": triggers.get("click", 0),

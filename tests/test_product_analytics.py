@@ -748,6 +748,8 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         root = ("tab", 1, 4, 8, [("root-doc-1", 3), ("variant-doc-1", 5)])
         variant = ("variant", 0, 2, 5, [("variant-doc-1", 5)])
         self.assertEqual((view("root-doc-1"), view("variant-doc-1")), (root, variant))
+        self.assertEqual(self._insights("root-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 2}])
+        self.assertEqual(self._insights("variant-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 1}])
         # An editor of the root sees the same roll-up; an editor of the variant
         # alone gets the variant and never its parent.
         self._edit_root_tab()
@@ -817,6 +819,20 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         event = self.client.get("/v2/product-analytics/events").json()["data"][0]
         self.assertIsNone(event["actor_email"])
         self.assertEqual(self.client.get("/v2/product-analytics/export").status_code, 403)
+
+    def test_page_insights_openers_are_scoped_and_rechecked_after_revocation(self) -> None:
+        self.current = ADMIN
+        self._ingest(_event(target_id="root-doc-1"), _event(target_id="root-doc-2"),
+                     _event("button.clicked", component_id="cmp-button", properties={}))
+        self._edit_root_tab()
+        response = self._insights("root-doc-1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["page_openers"], [{"person": ADMIN.email, "openings": 1}])
+        self._assert_private_404(self._insights("root-doc-2"))
+        with self.Session() as db:
+            other_id = db.query(TabV2.id).filter_by(document_id="root-doc-2").scalar()
+        self.grants = {MEMBER.hub_user_id: [grant("tab", other_id, "edit")]}
+        self._assert_private_404(self._insights("root-doc-1"))
 
     def test_event_page_binding_is_derived_from_verified_placement_not_client(self) -> None:
         self.current = ADMIN
