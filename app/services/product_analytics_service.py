@@ -734,6 +734,29 @@ def engagement_groups_for_tabs(
     ]
 
 
+def engagement_people_for_tabs(db: Session, filters: EventFilters, tab_ids: set[str]) -> list[dict[str, Any]]:
+    """Bounded foreground-time groups to identify people within verified tabs."""
+    if not tab_ids:
+        return []
+    model = HubProductEngagementV2
+    statement = (
+        _engagement_statement(filters).where(model.tab_id.in_(tab_ids))
+        .with_only_columns(model.nav_tab_id, model.tab_id, model.actor_email, func.coalesce(func.sum(model.active_seconds), 0))
+        .group_by(model.nav_tab_id, model.tab_id, model.actor_email)
+        .limit(MAX_ENGAGEMENT_GROUPS + 1)
+    )
+    try:
+        rows = db.execute(statement).all()
+    except ProgrammingError as exc:
+        if not is_missing_engagement_table(exc):
+            raise
+        db.rollback()
+        return []
+    if len(rows) > MAX_ENGAGEMENT_GROUPS:
+        raise AnalyticsScopeTooBroad()
+    return [{"nav_tab_id": nav, "tab_id": tab, "actor_email": actor, "active_seconds": int(seconds)} for nav, tab, actor, seconds in rows]
+
+
 def summarize_engagement_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate the `engagement_groups` an editor may currently see."""
     rows = list(rows)

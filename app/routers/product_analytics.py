@@ -686,6 +686,7 @@ def get_product_event_catalog(
         # Lets the UI hide person-level controls for scoped editors; the
         # endpoints enforce the same boundary themselves.
         "people_visible": reader.access.full_access,
+        "event_people_visible": True,
         "engagement_filters": list(service.ENGAGEMENT_FILTERS),
     }
 
@@ -775,6 +776,11 @@ def get_page_insights(
             if row.get("event_name") in _PAGE_SELECTION_EVENTS
             and row.get("target_id") in scope.page_ids and row.get("actor_email")
         )
+        people_time: Counter[str] = Counter()
+        for group in filter_editable_engagements(db, service.engagement_people_for_tabs(db, filters, scope.page_ids), access=reader.access):
+            if group.get("actor_email"):
+                people_time[group["actor_email"]] += group["active_seconds"]
+        people = set(page_openers) | set(people_time)
         return {
             "page": scope.page,
             "environment": get_settings().hub_environment,
@@ -784,7 +790,7 @@ def get_page_insights(
                 {"id": document_id, "name": name, "active_seconds": seconds_by_tab.get(document_id, 0)}
                 for _, document_id, name in scope.tabs
             ],
-            "page_openers": [{"person": person, "openings": count} for person, count in page_openers.most_common()],
+            "page_openers": [{"person": person, "openings": page_openers[person], "active_seconds": people_time[person]} for person in sorted(people)],
             "clicks": {
                 "total": clicks["totals"]["events"],
                 "clicks": triggers.get("click", 0),
@@ -822,7 +828,6 @@ def list_product_events(
         else:
             all_rows, total = _rows_for_reader(db, filters, reader)
             data = all_rows[(bounded_page - 1) * bounded_page_size:bounded_page * bounded_page_size]
-            _redact_people_for_scoped_editor({}, data)
         # Read-time only: current names for ids this reader can open now.
         # Never stored, exported, logged or cached.
         data = resolve_names(db, data, access=reader.access)

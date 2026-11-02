@@ -748,8 +748,8 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         root = ("tab", 1, 4, 8, [("root-doc-1", 3), ("variant-doc-1", 5)])
         variant = ("variant", 0, 2, 5, [("variant-doc-1", 5)])
         self.assertEqual((view("root-doc-1"), view("variant-doc-1")), (root, variant))
-        self.assertEqual(self._insights("root-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 2}])
-        self.assertEqual(self._insights("variant-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 1}])
+        self.assertEqual(self._insights("root-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 2, "active_seconds": 8}])
+        self.assertEqual(self._insights("variant-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 1, "active_seconds": 5}])
         # An editor of the root sees the same roll-up; an editor of the variant
         # alone gets the variant and never its parent.
         self._edit_root_tab()
@@ -817,7 +817,10 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertNotEqual(self.client.get("/v2/product-analytics/summary").status_code, 200)
         self.grants = {MEMBER.hub_user_id: [grant("tab", editable.id, "edit")]}
         event = self.client.get("/v2/product-analytics/events").json()["data"][0]
-        self.assertIsNone(event["actor_email"])
+        self.assertEqual(event["actor_email"], ADMIN.email)
+        scoped = self.client.get("/v2/product-analytics/events").json()["data"]
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual(scoped[0]["target_id"], "root-doc-1")
         self.assertEqual(self.client.get("/v2/product-analytics/export").status_code, 403)
 
     def test_page_insights_openers_are_scoped_and_rechecked_after_revocation(self) -> None:
@@ -827,12 +830,21 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self._edit_root_tab()
         response = self._insights("root-doc-1")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["page_openers"], [{"person": ADMIN.email, "openings": 1}])
+        self.assertEqual(response.json()["page_openers"], [{"person": ADMIN.email, "openings": 1, "active_seconds": 0}])
         self._assert_private_404(self._insights("root-doc-2"))
         with self.Session() as db:
             other_id = db.query(TabV2.id).filter_by(document_id="root-doc-2").scalar()
         self.grants = {MEMBER.hub_user_id: [grant("tab", other_id, "edit")]}
         self._assert_private_404(self._insights("root-doc-1"))
+
+    def test_insights_includes_foreground_person_without_a_selection_event(self) -> None:
+        variant_id = self._add_variant()
+        self.current = ADMIN
+        self._ingest_engagements(_engagement(tab_id="variant-doc-1"))
+        self.current = MEMBER
+        self.grants = {MEMBER.hub_user_id: [grant("tab", variant_id, "edit")]}
+        body = self._insights("variant-doc-1").json()
+        self.assertEqual(body["page_openers"], [{"person": ADMIN.email, "openings": 0, "active_seconds": 3}])
 
     def test_event_page_binding_is_derived_from_verified_placement_not_client(self) -> None:
         self.current = ADMIN
