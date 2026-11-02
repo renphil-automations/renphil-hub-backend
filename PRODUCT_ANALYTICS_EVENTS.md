@@ -98,11 +98,11 @@ Existence is not enough. Every record-backed id is also checked against the **re
 - **Opened** only by a real, tracked navigation click that changes the selection: navigation tab, root tab, view tab, sub-tab or BlockNote tab.
 - **While open**, each selection that becomes active **below** the clicked level is recorded once as `trigger=default`, with `cascade_id` = the click's `event_id`. Each (level, target) is recorded at most once, so re-renders and StrictMode double effects cannot add events.
 - **Closed** when any of these happens first:
-  - the cascade completes: every instrumented navigation load (tab list, page content, variant list, sub-tab list, active pane content, Super Block Note tree) has settled and nothing changed for 600 ms;
+  - the cascade completes: every instrumented navigation load (tab list, page content, variant list, sub-tab list, active pane content, Super Block Note tree) has settled and nothing changed for 600 ms, after an initial 2-second load-registration grace period;
   - any other user input (capture-phase `pointerdown` / `keydown`);
   - any other tracked action (Quick Action, Add myself, link, metric modal and so on);
   - back/forward (`popstate`);
-  - the 8 s fallback.
+  - the 60-second fallback.
 - **Never opened** by page load, refresh, deep links, back/forward, hydration, state restoration or renders, so these record nothing.
 - **Reselect** (clicking the already-selected item) records that click once with `properties.reselect=true`, opens no transaction and closes any open one.
 - Byte-identical explicit actions within 50 ms are treated as one interaction. Deliberate repeat clicks are kept.
@@ -112,11 +112,12 @@ Existence is not enough. Every record-backed id is also checked against the **re
 | Method | Path | Access |
 |---|---|---|
 | POST | `/v2/product-analytics/events` | Any authenticated Hub user. Body `{events:[…]}`, 1–25 items, each validated on its own. Returns `{accepted, duplicates, rejected:[{index, reason}]}` |
-| GET | `/v2/product-analytics/catalog` | Admin with All Scopes (the existing Bot Management gate) |
-| GET | `/v2/product-analytics/summary` | Same |
-| GET | `/v2/product-analytics/events?page&page_size` | Same. `page_size` ≤ 200. Adds read-time `target_name` / `component_name` |
-| GET | `/v2/product-analytics/export` | Same. CSV, ≤ 50,000 rows, formula-injection safe |
-| GET | `/v2/product-analytics/export/xlsx?include_people=false&time_zone=…` | Same. Excel workbook in the Agent analytics workbook's format (see below). This is the export the admin view uses |
+| GET | `/v2/product-analytics/catalog` | All Scopes admin or user with current edit access to a Hub resource |
+| GET | `/v2/product-analytics/summary` | Same; editors receive only currently editable resources and scoped page openers |
+| GET | `/v2/product-analytics/events?page&page_size` | Same, scoped to currently editable resources; includes the actor and read-time names. `page_size` ≤ 200 |
+| GET | `/v2/product-analytics/pages/{page_id}/insights` | Current edit access to that page, or All Scopes admin; scope is rechecked per request |
+| GET | `/v2/product-analytics/export` | All Scopes admin only. CSV, ≤ 50,000 rows, formula-injection safe |
+| GET | `/v2/product-analytics/export/xlsx?include_people=false&time_zone=…` | Scoped editor or All Scopes admin; including people in the workbook requires All Scopes admin |
 
 Filters on all reads: `date_from`, `date_to` (UTC days), `actor_email`, `page_route` (prefix of the template), `component_type`, `event_name`, `action`, `environment`, `trigger`.
 
