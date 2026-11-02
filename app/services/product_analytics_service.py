@@ -843,7 +843,7 @@ def catalog_payload() -> list[dict[str, Any]]:
 
 # ── Retention ────────────────────────────────────────────────────────────
 
-DEFAULT_RETENTION_DAYS = 396  # 13 months: a full year-on-year comparison
+DEFAULT_RETENTION_DAYS = 365
 MIN_RETENTION_DAYS = 30
 MAX_RETENTION_DAYS = 3650
 _DISABLED_VALUES = frozenset({"0", "off", "disabled", "none"})
@@ -856,7 +856,7 @@ class RetentionConfigError(ValueError):
 def parse_retention_days(raw: Any) -> int | None:
     """Days to keep, or None when purging is explicitly disabled.
 
-    Unset/blank means the default (396). `0`, `off`, `disabled` or `none`
+    Unset/blank means the default (365). `0`, `off`, `disabled` or `none`
     disable purging. Anything else must be an integer between 30 and 3650;
     otherwise RetentionConfigError is raised and nothing may be deleted.
     """

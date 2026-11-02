@@ -615,11 +615,11 @@ class Settings(BaseSettings):
     # counted as Production ones; the browser never supplies it. Unset (or any
     # other value) is recorded as `unconfigured` rather than guessed.
     HUB_ENVIRONMENT: str = ""
-    # Days of `hub_product_events` to keep (default 396 ≈ 13 months). `0`/`off`
+    # Days of product analytics events and active time to keep. `0`/`off`
     # disables purging; anything outside 30–3650 makes the purge refuse to run.
     # Kept as text so a bad value can never stop the API from starting; it is
     # parsed by `product_analytics_service.parse_retention_days`.
-    PRODUCT_ANALYTICS_RETENTION_DAYS: str = "396"
+    PRODUCT_ANALYTICS_RETENTION_DAYS: str = "365"
 
     @property
     def hub_environment(self) -> str:

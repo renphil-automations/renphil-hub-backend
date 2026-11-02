@@ -9,7 +9,7 @@ PRODUCT_ANALYTICS_EVENTS.md, "Retention"):
 * Deletes only `hub_product_events` rows whose `occurred_at` is older than the
   retention period, `--batch-size` rows per transaction (default 5,000).
 * Prints counts and the cutoff date only, never row contents.
-* `PRODUCT_ANALYTICS_RETENTION_DAYS`: unset = 396 days; `0`/`off` = purging
+* `PRODUCT_ANALYTICS_RETENTION_DAYS`: unset = 365 days; `0`/`off` = purging
   disabled (exit 0, nothing deleted); anything else outside 30–3650 days is
   refused (exit 2, nothing deleted).
 """

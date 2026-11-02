@@ -19,10 +19,10 @@ NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
 
 
 class RetentionConfigTests(unittest.TestCase):
-    def test_default_is_396_days(self) -> None:
-        self.assertEqual(service.DEFAULT_RETENTION_DAYS, 396)
+    def test_default_is_365_days(self) -> None:
+        self.assertEqual(service.DEFAULT_RETENTION_DAYS, 365)
         for raw in (None, "", "  "):
-            self.assertEqual(service.parse_retention_days(raw), 396)
+            self.assertEqual(service.parse_retention_days(raw), 365)
 
     def test_explicit_disable(self) -> None:
         for raw in ("0", "off", "OFF", "disabled", "none"):
@@ -41,7 +41,7 @@ class RetentionConfigTests(unittest.TestCase):
     def test_settings_default(self) -> None:
         from app.config import Settings
 
-        self.assertEqual(Settings.model_fields["PRODUCT_ANALYTICS_RETENTION_DAYS"].default, "396")
+        self.assertEqual(Settings.model_fields["PRODUCT_ANALYTICS_RETENTION_DAYS"].default, "365")
 
 
 class PurgeTests(unittest.TestCase):
