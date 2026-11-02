@@ -917,10 +917,11 @@ def retention_cutoff(retention_days: int, now: datetime | None = None) -> dateti
     return (now or datetime.now(timezone.utc)) - timedelta(days=retention_days)
 
 
-def count_expired_events(db: Session, *, cutoff: datetime) -> int:
-    return int(db.execute(
-        select(func.count()).select_from(HubProductEventV2).where(HubProductEventV2.occurred_at < cutoff)
-    ).scalar_one())
+def count_expired_events(db: Session, *, cutoff: datetime, environment: str | None = None) -> int:
+    statement = select(func.count()).select_from(HubProductEventV2).where(HubProductEventV2.occurred_at < cutoff)
+    if environment is not None:
+        statement = statement.where(HubProductEventV2.environment == environment)
+    return int(db.execute(statement).scalar_one())
 
 
 def purge_expired_events(
@@ -949,10 +950,11 @@ def purge_expired_events(
     return deleted
 
 
-def count_expired_engagements(db: Session, *, cutoff: datetime) -> int:
-    return int(db.execute(select(func.count()).select_from(HubProductEngagementV2).where(
-        HubProductEngagementV2.ended_at < cutoff
-    )).scalar_one())
+def count_expired_engagements(db: Session, *, cutoff: datetime, environment: str | None = None) -> int:
+    statement = select(func.count()).select_from(HubProductEngagementV2).where(HubProductEngagementV2.ended_at < cutoff)
+    if environment is not None:
+        statement = statement.where(HubProductEngagementV2.environment == environment)
+    return int(db.execute(statement).scalar_one())
 
 
 def purge_expired_engagements(
@@ -997,21 +999,30 @@ def _deleted_page_predicate(table: str):
     raise ValueError("unknown analytics table")
 
 
-def count_deleted_page_records(db: Session, *, table: str) -> int:
+def _scoped_deleted_predicate(model, table: str, environment: str | None):
+    # Explicit parentheses are necessary when combining the OR predicate
+    # with the environment restriction in SQL.
+    predicate = text("(" + _deleted_page_predicate(table).text + ")")
+    return and_(model.environment == environment, predicate) if environment is not None else predicate
+
+
+def count_deleted_page_records(db: Session, *, table: str, environment: str | None = None) -> int:
     model = {"events": HubProductEventV2, "engagements": HubProductEngagementV2}[table]
-    return int(db.execute(select(func.count()).select_from(model).where(_deleted_page_predicate(table))).scalar_one())
+    return int(db.execute(select(func.count()).select_from(model).where(_scoped_deleted_predicate(model, table, environment))).scalar_one())
 
 
-def purge_deleted_page_records(db: Session, *, table: str, batch_size: int = 5_000, max_batches: int | None = None) -> int:
+def purge_deleted_page_records(db: Session, *, table: str, environment: str, batch_size: int = 5_000, max_batches: int | None = None) -> int:
+    if environment not in {"local", "sandbox", "production"}:
+        raise ValueError("a valid cleanup environment is required")
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     model = {"events": HubProductEventV2, "engagements": HubProductEngagementV2}[table]
     deleted = batches = 0
     while max_batches is None or batches < max_batches:
-        ids = db.execute(select(model.id).where(_deleted_page_predicate(table)).order_by(model.id).limit(batch_size)).scalars().all()
+        ids = db.execute(select(model.id).where(_scoped_deleted_predicate(model, table, environment)).order_by(model.id).limit(batch_size)).scalars().all()
         if not ids:
             break
-        result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(_deleted_page_predicate(table)))
+        result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(_scoped_deleted_predicate(model, table, environment)))
         db.commit()
         deleted += int(result.rowcount or 0)
         batches += 1

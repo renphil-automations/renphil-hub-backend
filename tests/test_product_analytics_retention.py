@@ -102,9 +102,9 @@ class PurgeTests(unittest.TestCase):
         with self.assertRaises(ValueError), self.Session() as db:
             service.purge_expired_events(db, cutoff=cutoff, batch_size=0)
 
-    def _run(self, raw: str | None, *argv: str) -> tuple[int, list[str]]:
+    def _run(self, raw: str | None, *argv: str, environment: str = "sandbox") -> tuple[int, list[str]]:
         lines: list[str] = []
-        code = purge_script.run(list(argv), session_factory=self.Session, raw_retention=raw, now=NOW, out=lines.append)
+        code = purge_script.run(list(argv), session_factory=self.Session, raw_retention=raw, environment=environment, now=NOW, out=lines.append)
         return code, lines
 
     def test_script_retains_expired_records_without_verified_archive(self) -> None:
@@ -120,6 +120,8 @@ class PurgeTests(unittest.TestCase):
         code, lines = self._run(None, "--dry-run")
         self.assertEqual(code, 0)
         self.assertIn("dry run: 1 event(s)", lines[0])
+        self.assertIn("remain until archiving is available", lines[0])
+        self.assertNotIn("would be deleted", lines[0])
         self.assertEqual(self._count(), 2)
 
     def test_script_retains_recent_intervals_and_deletes_expired(self) -> None:
@@ -132,7 +134,7 @@ class PurgeTests(unittest.TestCase):
             db.commit()
         code, lines = self._run("396", "--dry-run")
         self.assertEqual(code, 0)
-        self.assertIn("1 active-time interval(s)", lines[1])
+        self.assertIn("1 age-expired active-time interval(s)", lines[1])
         code, lines = self._run("396")
         self.assertEqual(code, 0)
         self.assertIn("verified analytics archiving", lines[1])
@@ -156,14 +158,14 @@ class PurgeTests(unittest.TestCase):
                     actor_email="a@renphil.org", environment="local", page_route="/:nav_tab", nav_tab_id=nav,
                     tab_id=tab, active_seconds=5, started_at=NOW, ended_at=NOW, received_at=NOW))
             db.commit()
-        code, lines = self._run("365", "--dry-run")
+        code, lines = self._run("365", "--dry-run", environment="local")
         self.assertEqual(code, 0)
         self.assertIn("2 events row(s)", lines[2])
         self.assertIn("2 engagements row(s)", lines[3])
         self.assertEqual(self._count(), 6)
         with self.Session() as db:
-            self.assertEqual(service.purge_deleted_page_records(db, table="events"), 2)
-            self.assertEqual(service.purge_deleted_page_records(db, table="engagements"), 2)
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 2)
+            self.assertEqual(service.purge_deleted_page_records(db, table="engagements", environment="local"), 2)
         self.assertEqual(self._count(), 4)
         with self.Session() as db:
             self.assertEqual(db.query(HubProductEngagementV2).count(), 3)
@@ -178,7 +180,7 @@ class PurgeTests(unittest.TestCase):
             db.commit()
         with self.Session() as db:
             self.assertEqual(service.count_deleted_page_records(db, table="events"), 1)
-            self.assertEqual(service.purge_deleted_page_records(db, table="events"), 1)
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 1)
         self.assertEqual(self._count(), 2)
 
     def test_deleted_original_page_removes_bound_event_even_if_component_moved(self) -> None:
@@ -191,7 +193,7 @@ class PurgeTests(unittest.TestCase):
                     page_route="/:nav_tab", component_id="component-live", page_id=page_id, properties={}, occurred_at=NOW, received_at=NOW))
             db.commit()
         with self.Session() as db:
-            self.assertEqual(service.purge_deleted_page_records(db, table="events"), 1)
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 1)
         self.assertEqual(self._count(), 2)
 
     def test_script_disabled_deletes_nothing(self) -> None:
@@ -208,6 +210,43 @@ class PurgeTests(unittest.TestCase):
             self.assertEqual(code, 2, raw)
             self.assertIn("refused", lines[0])
         self.assertEqual(self._count(), 1)
+
+    def test_cleanup_only_deletes_its_configured_environment(self) -> None:
+        with self.Session() as db:
+            for environment in ("sandbox", "production"):
+                for fields in ({"page_id": "deleted-page"}, {"component_id": "deleted-widget"}, {"target_id": "deleted-tab"}):
+                    db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="root_tab.selected", component_type="root_tab",
+                        action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment=environment,
+                        page_route="/:nav_tab", properties={}, occurred_at=NOW, received_at=NOW, **fields))
+                db.add(HubProductEngagementV2(engagement_id=str(uuid.uuid4()), hub_user_id=1,
+                    actor_email="a@renphil.org", environment=environment, page_route="/:nav_tab", tab_id="deleted-tab",
+                    active_seconds=5, started_at=NOW, ended_at=NOW, received_at=NOW))
+            db.commit()
+        code, lines = self._run("365", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("3 events row(s)", lines[2])
+        self.assertIn("1 engagements row(s)", lines[3])
+        code, lines = self._run("365")
+        self.assertEqual(code, 0)
+        self.assertIn("deleted 3 event(s) and 1 active-time", lines[0])
+        with self.Session() as db:
+            self.assertEqual({r.environment for r in db.query(HubProductEventV2)}, {"production"})
+            self.assertEqual({r.environment for r in db.query(HubProductEngagementV2)}, {"production"})
+
+    def test_cleanup_rejects_unconfigured_environment_without_deletion(self) -> None:
+        self._add(timedelta(days=5000))
+        code, lines = self._run("365", environment="unconfigured")
+        self.assertEqual(code, 2)
+        self.assertIn("HUB_ENVIRONMENT", lines[0])
+        self.assertEqual(self._count(), 1)
+        with self.Session() as db, self.assertRaises(ValueError):
+            service.purge_deleted_page_records(db, table="events", environment="unconfigured")
+
+    def test_cleanup_rejects_nonpositive_max_batches(self) -> None:
+        for value in ("0", "-1"):
+            code, lines = self._run("365", "--max-batches", value)
+            self.assertEqual(code, 2)
+            self.assertIn("--max-batches", lines[0])
 
     def test_script_rejects_unbounded_batch_sizes(self) -> None:
         self._add(timedelta(days=5000))

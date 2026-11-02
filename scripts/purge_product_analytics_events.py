@@ -32,6 +32,7 @@ def run(
     *,
     session_factory: Callable | None = None,
     raw_retention: str | None = None,
+    environment: str | None = None,
     now: datetime | None = None,
     out: Callable[[str], None] = print,
 ) -> int:
@@ -42,6 +43,9 @@ def run(
     args = parser.parse_args(argv)
     if not 100 <= args.batch_size <= 50_000:
         out("purge refused: --batch-size must be between 100 and 50000")
+        return EXIT_CONFIG
+    if args.max_batches is not None and args.max_batches < 1:
+        out("purge refused: --max-batches must be positive")
         return EXIT_CONFIG
 
     if raw_retention is None:
@@ -57,6 +61,13 @@ def run(
         out("purge disabled: PRODUCT_ANALYTICS_RETENTION_DAYS is off. Nothing was deleted.")
         return EXIT_OK
 
+    if environment is None:
+        from app.config import get_settings
+        environment = get_settings().hub_environment
+    if environment not in {"local", "sandbox", "production"}:
+        out("cleanup refused: HUB_ENVIRONMENT must be local, sandbox, or production. Nothing was deleted.")
+        return EXIT_CONFIG
+
     if session_factory is None:
         from app.db_v2.database import SessionLocalV2
 
@@ -64,19 +75,19 @@ def run(
     cutoff = service.retention_cutoff(days, now)
     with session_factory() as db:
         if args.dry_run:
-            count = service.count_expired_events(db, cutoff=cutoff)
-            intervals = service.count_expired_engagements(db, cutoff=cutoff)
-            out(f"dry run: {count} event(s) older than {cutoff.date().isoformat()} (retention {days} days) would be deleted.")
-            out(f"dry run: {intervals} active-time interval(s) would be deleted.")
+            count = service.count_expired_events(db, cutoff=cutoff, environment=environment)
+            intervals = service.count_expired_engagements(db, cutoff=cutoff, environment=environment)
+            out(f"dry run: {count} event(s) older than {cutoff.date().isoformat()} (retention {days} days) remain until archiving is available.")
+            out(f"dry run: {intervals} age-expired active-time interval(s) remain until archiving is available.")
             for table in ("events", "engagements"):
-                count = service.count_deleted_page_records(db, table=table)
-                out(f"dry run: {count} {table} row(s) reference deleted pages or tabs (may overlap expired rows).")
+                count = service.count_deleted_page_records(db, table=table, environment=environment)
+                out(f"dry run: {count} {table} row(s) reference deleted resources and would be deleted (may overlap age-expired rows).")
             return EXIT_OK
         # Deleted-resource records are removed without archiving. Age-expired
         # records remain untouched until archive-before-delete is implemented.
-        deleted_events = service.purge_deleted_page_records(db, table="events", batch_size=args.batch_size, max_batches=args.max_batches)
-        deleted_intervals = service.purge_deleted_page_records(db, table="engagements", batch_size=args.batch_size, max_batches=args.max_batches)
-    out(f"deleted {deleted_events} event(s) and {deleted_intervals} active-time interval(s) referencing deleted pages or tabs.")
+        deleted_events = service.purge_deleted_page_records(db, table="events", batch_size=args.batch_size, max_batches=args.max_batches, environment=environment)
+        deleted_intervals = service.purge_deleted_page_records(db, table="engagements", batch_size=args.batch_size, max_batches=args.max_batches, environment=environment)
+    out(f"deleted {deleted_events} event(s) and {deleted_intervals} active-time interval(s) referencing deleted resources.")
     out("Age-expired records were retained: verified analytics archiving is not configured.")
     return EXIT_OK
 
