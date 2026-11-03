@@ -866,6 +866,183 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             self.assertEqual(db.query(HubProductEventV2).filter_by(event_id=first["event_id"]).one().page_id, "root-doc-1")
             self.assertEqual(db.query(HubProductEventV2).filter_by(event_id=second["event_id"]).one().page_id, "root-doc-2")
 
+    def test_moved_component_history_follows_it_and_survives_deletion_of_its_old_page(self) -> None:
+        """A widget moved from page A to page B keeps its history, shown under
+        B (its current placement). Deleting A afterwards removes A's own
+        selection analytics and the components still on A, never the live
+        widget's history; the deleted page then answers the generic 404."""
+        self.current = ADMIN
+        self._ingest(
+            _event("link.clicked", component_id="cmp-links", target_id=None, properties={}),
+            _event("button.clicked", component_id="cmp-button", target_id=None, properties={}),
+            _event("root_tab.selected", target_id="root-doc-1"),
+        )
+        with self.Session() as db:
+            other = db.query(TabV2).filter_by(document_id="root-doc-2").one()
+            grid = GridstackV2(document_id="root-doc-2", parent_tab_id=other.id)
+            db.add(grid)
+            db.flush()
+            db.query(ComponentV2).filter_by(link="cmp-links").one().gridstack_id = grid.id
+            db.commit()
+        self.assertEqual(self._insights("root-doc-2").json()["clicks"]["by_action"], [{"key": "link.clicked", "count": 1}])
+        self.assertEqual(self._insights("root-doc-1").json()["clicks"]["total"], 2)
+        # Delete page A the way the Hub does: its variants, its canvases and
+        # every component still placed on them, then the tab row itself.
+        with self.Session() as db:
+            root = db.query(TabV2).filter_by(document_id="root-doc-1").one()
+            grid_ids = [g.id for g in db.query(GridstackV2).filter(GridstackV2.parent_tab_id == root.id)]
+            component_ids = [c.id for c in db.query(ComponentV2).filter(ComponentV2.gridstack_id.in_(grid_ids))]
+            db.query(ThreadV2).filter(ThreadV2.component_id.in_(component_ids)).delete(synchronize_session=False)
+            db.query(ComponentV2).filter(ComponentV2.id.in_(component_ids)).delete(synchronize_session=False)
+            db.query(GridstackV2).filter(GridstackV2.id.in_(grid_ids)).delete(synchronize_session=False)
+            db.query(TabV2).filter(TabV2.parent_tab_id == root.id).delete(synchronize_session=False)
+            db.delete(root)
+            db.commit()
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment=self.environment), 2)
+        rows = self._rows()
+        self.assertEqual([(r.event_name, r.component_id, r.page_id) for r in rows], [("link.clicked", "cmp-links", "root-doc-1")])
+        self.assertEqual(self._insights("root-doc-2").json()["clicks"]["by_action"], [{"key": "link.clicked", "count": 1}])
+        self._assert_private_404(self._insights("root-doc-1"))
+
+    def test_blocknote_tab_selected_through_a_mirror_keeps_its_page_target(self) -> None:
+        with self.Session() as db:
+            host = db.query(GridstackV2).first()
+            db.add(ComponentV2(link="cmp-sbn-mirror", type="mirror", title="Mirror of notebook", gridstack_id=host.id,
+                               props={"target_link": "cmp-sbn"}))
+            db.commit()
+        self.current = ADMIN
+        body = self._ingest(
+            _event("blocknote_tab.selected", component_id="cmp-sbn-mirror", target_id="cmp-sbn-child", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn-mirror", target_id="cmp-sbn", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-sbn-child", properties={"tab_kind": "sbn"}),
+            # A page of a different widget is still refused through a mirror.
+            _event("blocknote_tab.selected", component_id="cmp-sbn-mirror", target_id="cmp-links", properties={"tab_kind": "sbn"}),
+        ).json()
+        self.assertEqual(body["accepted"], 4)
+        self.assertEqual(
+            [(r.component_id, r.target_id) for r in self._rows()],
+            [("cmp-sbn-mirror", "cmp-sbn-child"), ("cmp-sbn-mirror", "cmp-sbn"), ("cmp-sbn", "cmp-sbn-child"), ("cmp-sbn-mirror", None)],
+        )
+
+    def test_blocknote_pages_nested_below_the_first_level_keep_their_target(self) -> None:
+        """A Super Block Note nests pages to arbitrary depth (a page's
+        `super_blocknote_id` may be another page). A click on a grandchild
+        page belongs to the notebook exactly like a click on a child page;
+        a page of another notebook is still refused."""
+        with self.Session() as db:
+            child = db.query(ComponentV2).filter_by(link="cmp-sbn-child").one()
+            grandchild = ComponentV2(link="cmp-sbn-grandchild", type="block_note", title="Deep page",
+                                     gridstack_id=child.gridstack_id, super_blocknote_id=child.id)
+            db.add(grandchild)
+            db.flush()
+            db.add(ComponentV2(link="cmp-sbn-great", type="block_note", title="Deeper page",
+                               gridstack_id=child.gridstack_id, super_blocknote_id=grandchild.id))
+            other = ComponentV2(link="cmp-sbn-2", type="super_block_note", title="Other notebook", gridstack_id=child.gridstack_id)
+            db.add(other)
+            db.flush()
+            db.add(ComponentV2(link="cmp-sbn-2-page", type="block_note", title="Other page",
+                               gridstack_id=child.gridstack_id, super_blocknote_id=other.id))
+            db.add(ComponentV2(link="cmp-sbn-mirror", type="mirror", title="Mirror of notebook",
+                               gridstack_id=child.gridstack_id, props={"target_link": "cmp-sbn"}))
+            db.commit()
+        self.current = ADMIN
+        body = self._ingest(
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-sbn-grandchild", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-sbn-great", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn-mirror", target_id="cmp-sbn-great", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-sbn-2-page", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn-2", target_id="cmp-sbn-great", properties={"tab_kind": "sbn"}),
+        ).json()
+        self.assertEqual(body["accepted"], 5)
+        self.assertEqual(
+            [r.target_id for r in self._rows()],
+            ["cmp-sbn-grandchild", "cmp-sbn-great", "cmp-sbn-great", None, None],
+        )
+
+    def _add_page_chain(self, depth: int, *, under: str = "cmp-sbn", prefix: str = "cmp-deep") -> list[str]:
+        """`depth` nested Super Block Note pages below `under`; returns their links, shallowest first."""
+        links: list[str] = []
+        with self.Session() as db:
+            parent = db.query(ComponentV2).filter_by(link=under).one()
+            for level in range(1, depth + 1):
+                page = ComponentV2(link=f"{prefix}-{level}", type="block_note", title=f"Level {level}",
+                                   gridstack_id=parent.gridstack_id, super_blocknote_id=parent.id)
+                db.add(page)
+                db.flush()
+                links.append(page.link)
+                parent = page
+            db.commit()
+        return links
+
+    def test_blocknote_pages_at_any_depth_are_accepted_and_a_cyclic_chain_terminates(self) -> None:
+        """The product does not bound Super Block Note nesting, so neither
+        does the verification: a page 30 levels down still belongs to its
+        notebook. A cyclic `super_blocknote_id` chain (corrupt data) must
+        end rather than hang the request, and never resolves to a notebook
+        it does not contain."""
+        deep = self._add_page_chain(30)
+        with self.Session() as db:
+            host = db.query(GridstackV2).first()
+            loop_a = ComponentV2(link="cmp-loop-a", type="block_note", title="Loop A", gridstack_id=host.id)
+            db.add(loop_a)
+            db.flush()
+            loop_b = ComponentV2(link="cmp-loop-b", type="block_note", title="Loop B", gridstack_id=host.id, super_blocknote_id=loop_a.id)
+            db.add(loop_b)
+            db.flush()
+            loop_a.super_blocknote_id = loop_b.id
+            db.commit()
+        self.current = ADMIN
+        body = self._ingest(
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id=deep[-1], properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id=deep[20], properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-loop-a", properties={"tab_kind": "sbn"}),
+            _event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-loop-b", properties={"tab_kind": "sbn"}),
+        ).json()
+        self.assertEqual(body["accepted"], 4)
+        self.assertEqual([r.target_id for r in self._rows()], [deep[-1], deep[20], None, None])
+
+    def test_nested_and_mirrored_blocknote_pages_the_reporter_cannot_view_are_dropped_like_missing_ones(self) -> None:
+        """Authorization is unchanged by the nested-page rule: a page the
+        reporter cannot view is dropped exactly like one that does not
+        exist — same response, same stored shape — whether reached
+        directly or through a mirror."""
+        deep = self._add_page_chain(3)
+        with self.Session() as db:
+            host = db.query(GridstackV2).first()
+            db.add(ComponentV2(link="cmp-sbn-mirror", type="mirror", title="Mirror of notebook", gridstack_id=host.id,
+                               props={"target_link": "cmp-sbn"}))
+            db.commit()
+            granted_page = db.query(ComponentV2.id).filter_by(link=deep[-1]).scalar()
+            mirror_id = db.query(ComponentV2.id).filter_by(link="cmp-sbn-mirror").scalar()
+            notebook_id = db.query(ComponentV2.id).filter_by(link="cmp-sbn").scalar()
+        self.current = MEMBER
+        # A grant on the deepest page reveals the notebook, that page, and
+        # the pages on the way to it (the fold mounts a granted node's
+        # ancestors so it can be reached, exactly as the UI serves them);
+        # a sibling page under the same notebook stays sealed.
+        self.grants = {MEMBER.hub_user_id: [grant("component", granted_page)]}
+        responses = {
+            "granted deep page": self._ingest(_event("blocknote_tab.selected", component_id="cmp-sbn", target_id=deep[-1], properties={"tab_kind": "sbn"})),
+            "sealed sibling page": self._ingest(_event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-sbn-secret", properties={"tab_kind": "sbn"})),
+            "mounted ancestor page": self._ingest(_event("blocknote_tab.selected", component_id="cmp-sbn", target_id=deep[0], properties={"tab_kind": "sbn"})),
+            "missing page": self._ingest(_event("blocknote_tab.selected", component_id="cmp-sbn", target_id="cmp-no-such-page", properties={"tab_kind": "sbn"})),
+        }
+        bodies = {name: (response.status_code, response.json()) for name, response in responses.items()}
+        self.assertEqual(bodies["sealed sibling page"], bodies["missing page"])
+        self.assertEqual(bodies["mounted ancestor page"], bodies["missing page"])
+        self.assertEqual(bodies["granted deep page"], bodies["missing page"])
+        self.assertEqual([(r.component_id, r.target_id) for r in self._rows()],
+                         [("cmp-sbn", deep[-1]), ("cmp-sbn", None), ("cmp-sbn", deep[0]), ("cmp-sbn", None)])
+        # Through a mirror: the mirror must be granted (position AND what it
+        # shows) and the page viewable; a grant on the mirror alone is not enough.
+        self.grants = {MEMBER.hub_user_id: [grant("component", mirror_id)]}
+        self._ingest(_event("blocknote_tab.selected", component_id="cmp-sbn-mirror", target_id=deep[-1], properties={"tab_kind": "sbn"}))
+        self.grants = {MEMBER.hub_user_id: [grant("component", mirror_id), grant("component", notebook_id)]}
+        self._ingest(_event("blocknote_tab.selected", component_id="cmp-sbn-mirror", target_id=deep[-1], properties={"tab_kind": "sbn"}))
+        self.assertEqual([(r.component_id, r.target_id) for r in self._rows()][4:],
+                         [(None, None), ("cmp-sbn-mirror", deep[-1])])
+        self.assertNotIn(SENSITIVE_TITLE, "".join(str(b) for b in bodies.values()))
+
     def _add_sub_tab(self, document_id: str) -> int:
         """A sub-tab as the Hub stores it: a sub-gridstack (what
         `/v2/tabs/{id}/children` returns) whose access lives on its

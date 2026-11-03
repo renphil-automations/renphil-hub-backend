@@ -208,6 +208,34 @@ def _norm_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def _sbn_ancestors(db: Session, component_ids: Iterable[int]) -> dict[int, set[int]]:
+    """Every Super Block Note ancestor (`super_blocknote_id` chain) of each
+    component id, up to the root. A Super Block Note nests to arbitrary depth
+    (a page's parent may itself be a page), so "belongs to this notebook" is
+    "the root is somewhere up the chain", not "the parent is the root".
+
+    The product enforces no depth limit (`access_visibility_service.
+    _component_parent`: "the nesting is unbounded by design"), so no depth
+    cap is applied here either — one would silently drop clicks on pages
+    below it. Termination comes from the per-id visited set: a cyclic chain
+    (corrupt data) stops as soon as it repeats, with one query per level."""
+    ancestors: dict[int, set[int]] = {cid: set() for cid in component_ids}
+    frontier = {cid: cid for cid in ancestors}  # component id -> node whose parent is next
+    while frontier:
+        parents = dict(db.execute(
+            select(ComponentV2.id, ComponentV2.super_blocknote_id).where(ComponentV2.id.in_(set(frontier.values())))
+        ).all())
+        next_frontier: dict[int, int] = {}
+        for cid, node in frontier.items():
+            parent = parents.get(node)
+            if parent is None or parent in ancestors[cid]:
+                continue
+            ancestors[cid].add(parent)
+            next_frontier[cid] = parent
+        frontier = next_frontier
+    return ancestors
+
+
 def verify_identifiers(
     db: Session,
     rows: list[dict[str, Any]],
@@ -270,11 +298,10 @@ def verify_identifiers(
         }
     sub_tabs = _sub_tab_nodes(db, tab_ids - set(tabs))
     components = _load_components(db, component_links)
-    sbn_parent: dict[str, int | None] = {}
-    if components:
-        sbn_parent = dict(db.execute(
-            select(ComponentV2.link, ComponentV2.super_blocknote_id).where(ComponentV2.link.in_(set(components)))
-        ).all())
+    sbn_ancestors = _sbn_ancestors(db, {
+        components[row["target_id"]].id for row in rows
+        if ID_RULES.get(row["event_name"], IdRule()).target == "sbn_tab" and row.get("target_id") in components
+    })
     threads: dict[int, tuple[int, str, str]] = {}
     if thread_ids:
         threads = {
@@ -335,9 +362,13 @@ def verify_identifiers(
             else:
                 verified = target in sub_tabs and can_view(sub_tabs[target])
         elif rule.target == "sbn_tab":
+            # The page must be the notebook itself or a page anywhere beneath
+            # it (pages nest). Through a mirror, `component` is the mirror row
+            # while the page belongs to the Super Block Note it shows, so the
+            # effective (shown) widget is the root to look for.
             child = components.get(target)
             verified = component is not None and child is not None and (
-                child.id == component.id or sbn_parent.get(target) == component.id
+                child.id == component.effective_id or component.effective_id in sbn_ancestors.get(child.id, ())
             ) and can_view(("component", child.id))
         elif rule.target == "thread":
             thread = threads.get(int(target))

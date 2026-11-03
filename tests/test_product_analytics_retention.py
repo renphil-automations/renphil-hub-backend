@@ -53,7 +53,19 @@ class PurgeTests(unittest.TestCase):
             for table in ("nav_tabs", "tabs", "gridstacks"):
                 connection.execute(text(f"CREATE TABLE {table} (document_id VARCHAR(255))"))
             connection.execute(text("CREATE TABLE components (link VARCHAR(255))"))
+            # A real Hub always has rows in all four tables; the cleanup
+            # refuses to run against a database that does not (see
+            # test_cleanup_refuses_when_hub_tables_are_empty).
+            connection.execute(text("INSERT INTO nav_tabs (document_id) VALUES ('nav-live')"))
+            connection.execute(text("INSERT INTO tabs (document_id) VALUES ('tab-live')"))
+            connection.execute(text("INSERT INTO gridstacks (document_id) VALUES ('sub-live')"))
+            connection.execute(text("INSERT INTO components (link) VALUES ('component-live')"))
         self.Session = sessionmaker(bind=self.engine)
+
+    def _empty_hub_tables(self, *tables: str) -> None:
+        with self.engine.begin() as connection:
+            for table in tables or service.HUB_RESOURCE_TABLES:
+                connection.execute(text(f"DELETE FROM {table}"))
 
     def _add(self, *ages: timedelta) -> None:
         with self.Session() as db:
@@ -143,9 +155,6 @@ class PurgeTests(unittest.TestCase):
 
     def test_deleted_pages_are_purged_but_live_and_unbound_history_stays(self) -> None:
         with self.Session() as db:
-            db.execute(text("INSERT INTO nav_tabs (document_id) VALUES ('nav-live')"))
-            db.execute(text("INSERT INTO tabs (document_id) VALUES ('tab-live')"))
-            db.execute(text("INSERT INTO gridstacks (document_id) VALUES ('sub-live')"))
             for kind, target in [("root_tab.selected", "tab-live"), ("root_tab.selected", "tab-deleted"),
                                  ("sub_tab.selected", "sub-live"), ("navigation_tab.selected", "nav-deleted"),
                                  ("root_tab.selected", None), ("link.clicked", "tab-deleted")]:
@@ -172,7 +181,6 @@ class PurgeTests(unittest.TestCase):
 
     def test_deleted_component_events_are_removed_but_existing_and_unbound_events_are_kept(self) -> None:
         with self.Session() as db:
-            db.execute(text("INSERT INTO components (link) VALUES ('component-live')"))
             for link in ("component-live", "component-deleted", None):
                 db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="link.clicked", component_type="links",
                     action="click", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
@@ -183,18 +191,98 @@ class PurgeTests(unittest.TestCase):
             self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 1)
         self.assertEqual(self._count(), 2)
 
-    def test_deleted_original_page_removes_bound_event_even_if_component_moved(self) -> None:
+    def test_moved_component_history_survives_deletion_of_its_original_page(self) -> None:
+        """A component interaction belongs to its component. A widget moved
+        away from a page before that page was deleted still exists, so its
+        history (which Page Insights show under its current placement) is
+        kept. A selection of the deleted page itself is removed."""
         with self.Session() as db:
-            db.execute(text("INSERT INTO components (link) VALUES ('component-live')"))
-            db.execute(text("INSERT INTO tabs (document_id) VALUES ('tab-live')"))
             for page_id in ("tab-live", "tab-deleted", None):
                 db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="link.clicked", component_type="links",
                     action="click", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
                     page_route="/:nav_tab", component_id="component-live", page_id=page_id, properties={}, occurred_at=NOW, received_at=NOW))
+            # The deleted page's own selection event: page_id = target_id.
+            db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="root_tab.selected", component_type="root_tab",
+                action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                page_route="/:nav_tab", target_id="tab-deleted", page_id="tab-deleted", properties={}, occurred_at=NOW, received_at=NOW))
+            # A component click whose component was deleted WITH its page.
+            db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="link.clicked", component_type="links",
+                action="click", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                page_route="/:nav_tab", component_id="component-deleted", page_id="tab-deleted", properties={}, occurred_at=NOW, received_at=NOW))
+            db.commit()
+        with self.Session() as db:
+            self.assertEqual(service.count_deleted_page_records(db, table="events", environment="local"), 2)
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 2)
+        self.assertEqual(self._count(), 3)
+        with self.Session() as db:
+            kept = {(r.component_id, r.page_id) for r in db.query(HubProductEventV2)}
+        self.assertEqual(kept, {("component-live", "tab-live"), ("component-live", "tab-deleted"), ("component-live", None)})
+
+    def test_deleted_blocknote_page_selections_are_removed(self) -> None:
+        with self.Session() as db:
+            db.execute(text("INSERT INTO components (link) VALUES ('sbn-root'), ('sbn-page-live')"))
+            for target in ("sbn-page-live", "sbn-page-deleted", "sbn-root", None):
+                db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="blocknote_tab.selected", component_type="blocknote_tab",
+                    action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                    page_route="/:nav_tab", component_id="sbn-root", target_id=target, properties={}, occurred_at=NOW, received_at=NOW))
             db.commit()
         with self.Session() as db:
             self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 1)
-        self.assertEqual(self._count(), 2)
+            self.assertEqual({r.target_id for r in db.query(HubProductEventV2)}, {"sbn-page-live", "sbn-root", None})
+
+    def test_cleanup_refuses_when_hub_tables_are_empty(self) -> None:
+        """An analytics table in a database without Hub rows (wrong
+        DATABASE_URL_V2, partial restore) would make every bound row look
+        deleted. The job refuses, in dry-run and for real, and deletes nothing."""
+        with self.Session() as db:
+            db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="root_tab.selected", component_type="root_tab",
+                action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="sandbox",
+                page_route="/:nav_tab", target_id="tab-live", page_id="tab-live", properties={}, occurred_at=NOW, received_at=NOW))
+            db.commit()
+        for empty in (("components",), ("nav_tabs", "tabs", "gridstacks", "components")):
+            with self.subTest(empty=empty):
+                self._empty_hub_tables(*empty)
+                for argv in (["--dry-run"], []):
+                    code, lines = self._run("365", *argv)
+                    self.assertEqual(code, 2)
+                    self.assertIn("refused", lines[0])
+                    self.assertIn(empty[0], lines[0])
+                    self.assertNotIn("would be deleted", " ".join(lines))
+                with self.Session() as db, self.assertRaises(service.CleanupPreconditionError):
+                    service.purge_deleted_page_records(db, table="events", environment="sandbox")
+                self.assertEqual(self._count(), 1)
+                with self.engine.begin() as connection:
+                    for table, value in zip(service.HUB_RESOURCE_TABLES, ("nav-live", "tab-live", "sub-live", "component-live")):
+                        if table in empty:
+                            column = "link" if table == "components" else "document_id"
+                            connection.execute(text(f"INSERT INTO {table} ({column}) VALUES ('{value}')"))
+        code, lines = self._run("365")
+        self.assertEqual((code, self._count()), (0, 1))
+
+    def test_an_environment_without_analytics_rows_passes_the_empty_hub_guard(self) -> None:
+        """A fresh deployment or a reset sandbox has empty Hub tables and no
+        analytics; there is nothing the cleanup could delete, so it is not
+        treated as a wrong database. The guard is per environment and comes
+        back with the first analytics row of that environment."""
+        self._empty_hub_tables()
+        with self.Session() as db:
+            db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="root_tab.selected", component_type="root_tab",
+                action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="production",
+                page_route="/:nav_tab", target_id="tab-live", page_id="tab-live", properties={}, occurred_at=NOW, received_at=NOW))
+            db.commit()
+        for argv in (["--dry-run"], []):
+            code, lines = self._run("365", *argv, environment="sandbox")
+            self.assertEqual(code, 0, lines)
+        with self.Session() as db:
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="sandbox"), 0)
+            with self.assertRaises(service.CleanupPreconditionError):
+                service.purge_deleted_page_records(db, table="events", environment="production")
+            with self.assertRaises(service.CleanupPreconditionError):
+                service.require_hub_resources(db)
+        self.assertEqual(self._count(), 1)
+        code, lines = self._run("365", environment="production")
+        self.assertEqual(code, 2, lines)
+        self.assertIn("refused", lines[0])
 
     def test_script_disabled_deletes_nothing(self) -> None:
         self._add(timedelta(days=5000))
@@ -247,6 +335,28 @@ class PurgeTests(unittest.TestCase):
             code, lines = self._run("365", "--max-batches", value)
             self.assertEqual(code, 2)
             self.assertIn("--max-batches", lines[0])
+
+    def test_a_resource_that_exists_again_at_delete_time_keeps_its_rows(self) -> None:
+        """The DELETE re-applies the predicate on the selected ids, so a row
+        selected as stale is kept if its resource exists when the DELETE
+        runs (the PostgreSQL suite exercises this with a real concurrent
+        transaction)."""
+        with self.Session() as db:
+            db.add(HubProductEventV2(event_id=str(uuid.uuid4()), event_name="root_tab.selected", component_type="root_tab",
+                action="select", trigger="click", hub_user_id=1, actor_email="a@renphil.org", environment="local",
+                page_route="/:nav_tab", target_id="tab-gone", page_id="tab-gone", properties={}, occurred_at=NOW, received_at=NOW))
+            db.commit()
+        with self.Session() as db:
+            def recreate(ids: list[int]) -> None:
+                self.assertEqual(len(ids), 1)
+                db.execute(text("INSERT INTO tabs (document_id) VALUES ('tab-gone')"))
+
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local", _after_select=recreate), 0)
+        self.assertEqual(self._count(), 1)
+        with self.engine.begin() as connection:
+            connection.execute(text("DELETE FROM tabs WHERE document_id = 'tab-gone'"))
+        with self.Session() as db:
+            self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="local"), 1)
 
     def test_script_rejects_unbounded_batch_sizes(self) -> None:
         self._add(timedelta(days=5000))

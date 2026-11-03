@@ -74,6 +74,11 @@ def run(
         session_factory = SessionLocalV2
     cutoff = service.retention_cutoff(days, now)
     with session_factory() as db:
+        try:
+            service.require_hub_resources(db, environment=environment)
+        except service.CleanupPreconditionError as exc:
+            out(f"cleanup refused: {exc} Nothing was deleted.")
+            return EXIT_CONFIG
         if args.dry_run:
             count = service.count_expired_events(db, cutoff=cutoff, environment=environment)
             intervals = service.count_expired_engagements(db, cutoff=cutoff, environment=environment)

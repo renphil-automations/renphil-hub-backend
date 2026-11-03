@@ -128,7 +128,11 @@ class ProductAnalyticsPostgresTests(unittest.TestCase):
                 conn.execute(text("CREATE TEMP TABLE components (link VARCHAR(255)) ON COMMIT DROP"))
                 for table in ("hub_product_events", "hub_product_engagements"):
                     conn.execute(text(f"CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS) ON COMMIT DROP"))
+                # The cleanup refuses a database whose Hub tables are empty.
+                conn.execute(text("INSERT INTO nav_tabs (document_id) VALUES ('live-nav')"))
                 conn.execute(text("INSERT INTO tabs (document_id) VALUES ('live-tab')"))
+                conn.execute(text("INSERT INTO gridstacks (document_id) VALUES ('live-sub')"))
+                conn.execute(text("INSERT INTO components (link) VALUES ('live-component')"))
                 conn.execute(text("INSERT INTO hub_product_engagements (engagement_id, hub_user_id, actor_email, environment, page_route, tab_id, active_seconds, started_at, ended_at, received_at) VALUES (:id, 1, 'qa@example.test', 'local', '/test', 'deleted-tab', 5, now(), now(), now())"), {"id": str(uuid.uuid4())})
                 conn.execute(text("INSERT INTO hub_product_engagements (engagement_id, hub_user_id, actor_email, environment, page_route, tab_id, active_seconds, started_at, ended_at, received_at) VALUES (:id, 1, 'qa@example.test', 'production', '/test', 'deleted-tab', 5, now(), now(), now())"), {"id": str(uuid.uuid4())})
                 with sessionmaker(bind=conn)() as db:

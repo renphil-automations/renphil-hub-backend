@@ -943,9 +943,10 @@ def purge_expired_events(
             break
         result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(model.occurred_at < cutoff))
         db.commit()
-        deleted += int(result.rowcount or 0)
+        removed = int(result.rowcount or 0)
+        deleted += removed
         batches += 1
-        if len(ids) < batch_size:
+        if len(ids) < batch_size or removed == 0:
             break
     return deleted
 
@@ -970,9 +971,10 @@ def purge_expired_engagements(
             break
         result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(model.ended_at < cutoff))
         db.commit()
-        deleted += int(result.rowcount or 0)
+        removed = int(result.rowcount or 0)
+        deleted += removed
         batches += 1
-        if len(ids) < batch_size:
+        if len(ids) < batch_size or removed == 0:
             break
     return deleted
 
@@ -980,8 +982,21 @@ def purge_expired_engagements(
 def _deleted_page_predicate(table: str):
     # NULL identifiers are deliberately retained: they are legacy/unbound
     # rows and absence of a binding does not prove a resource was deleted.
+    #
+    # Which resource an event belongs to, for deletion purposes:
+    # * A component interaction belongs to its component. It is removed when
+    #   that component no longer exists (deleting a page cascades to its
+    #   components, so page deletion is covered). Its `page_id` is the page
+    #   the component was on at ingest; a component that was MOVED before its
+    #   old page was deleted still exists, and its history follows it to the
+    #   current placement (Page Insights resolve placement at read time), so
+    #   that history is kept rather than deleted with the old page.
+    # * A selection event belongs to the nav tab, tab, sub-tab or Super Block
+    #   Note page it selected; it is removed when that target no longer
+    #   exists. `page_id` equals the target for tab selections, so the
+    #   `page_id` clause only matters for rows that carry no component.
     if table == "events":
-        return text("""(page_id IS NOT NULL AND NOT EXISTS
+        return text("""(page_id IS NOT NULL AND component_id IS NULL AND NOT EXISTS
             (SELECT 1 FROM tabs t WHERE t.document_id = hub_product_events.page_id) AND NOT EXISTS
             (SELECT 1 FROM gridstacks g WHERE g.document_id = hub_product_events.page_id)) OR (component_id IS NOT NULL AND NOT EXISTS
             (SELECT 1 FROM components c WHERE c.link = hub_product_events.component_id)) OR (target_id IS NOT NULL AND (
@@ -989,7 +1004,9 @@ def _deleted_page_predicate(table: str):
                 (SELECT 1 FROM nav_tabs n WHERE n.document_id = hub_product_events.target_id)) OR
             (event_name IN ('root_tab.selected', 'view_tab.selected', 'sub_tab.selected') AND NOT EXISTS
                 (SELECT 1 FROM tabs t WHERE t.document_id = hub_product_events.target_id) AND NOT EXISTS
-                (SELECT 1 FROM gridstacks g WHERE g.document_id = hub_product_events.target_id))))""")
+                (SELECT 1 FROM gridstacks g WHERE g.document_id = hub_product_events.target_id)) OR
+            (event_name = 'blocknote_tab.selected' AND NOT EXISTS
+                (SELECT 1 FROM components c WHERE c.link = hub_product_events.target_id))))""")
     if table == "engagements":
         return text("""(nav_tab_id IS NOT NULL AND NOT EXISTS
             (SELECT 1 FROM nav_tabs n WHERE n.document_id = hub_product_engagements.nav_tab_id)) OR
@@ -1011,19 +1028,86 @@ def count_deleted_page_records(db: Session, *, table: str, environment: str | No
     return int(db.execute(select(func.count()).select_from(model).where(_scoped_deleted_predicate(model, table, environment))).scalar_one())
 
 
-def purge_deleted_page_records(db: Session, *, table: str, environment: str, batch_size: int = 5_000, max_batches: int | None = None) -> int:
+# The Hub tables the deleted-resource predicate joins against. A database in
+# which any of them is empty cannot verify a single binding: every bound row
+# would look deleted. That is what a wrong DATABASE_URL_V2, a partial restore
+# or a fresh schema looks like, so the cleanup refuses instead of guessing.
+HUB_RESOURCE_TABLES = ("nav_tabs", "tabs", "gridstacks", "components")
+
+
+class CleanupPreconditionError(RuntimeError):
+    """The database cannot be used to decide what is deleted; nothing is deleted."""
+
+
+def hub_resource_counts(db: Session) -> dict[str, int]:
+    return {
+        table: int(db.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one())
+        for table in HUB_RESOURCE_TABLES
+    }
+
+
+def analytics_row_counts(db: Session, environment: str) -> dict[str, int]:
+    return {
+        table: int(db.execute(select(func.count()).select_from(model).where(model.environment == environment)).scalar_one())
+        for table, model in (("events", HubProductEventV2), ("engagements", HubProductEngagementV2))
+    }
+
+
+def require_hub_resources(db: Session, *, environment: str | None = None) -> dict[str, int]:
+    """Refuse deleted-resource cleanup unless every Hub table has rows.
+
+    With `environment`, an environment that holds no analytics rows at all
+    is exempt: it has nothing the cleanup could delete, so an empty Hub (a
+    fresh deployment, a reset sandbox) is not mistaken for a wrong database.
+    As soon as such an environment holds a single analytics row, the guard
+    applies again.
+    """
+    counts = hub_resource_counts(db)
+    empty = [table for table, count in counts.items() if count == 0]
+    if empty and environment is not None and not any(analytics_row_counts(db, environment).values()):
+        return counts
+    if empty:
+        raise CleanupPreconditionError(
+            "this database has no rows in " + ", ".join(empty)
+            + "; deleted-resource bindings cannot be verified here."
+        )
+    return counts
+
+
+def purge_deleted_page_records(
+    db: Session, *, table: str, environment: str, batch_size: int = 5_000, max_batches: int | None = None,
+    _after_select: Callable[[list[int]], None] | None = None,
+) -> int:
+    """Delete, in batches, rows reliably tied to deleted resources.
+
+    Each batch is selected and then deleted by one statement that re-applies
+    the same predicate on the selected ids, so a row whose resource exists
+    again (or whose binding changed) by the time the DELETE runs is kept; the
+    predicate is evaluated inside the DELETE's own snapshot. Concurrent runs
+    delete disjoint rows (each DELETE reports only what it removed) and never
+    error on each other. `_after_select` is a test seam that runs between
+    the selection and the deletion of a batch.
+    """
     if environment not in {"local", "sandbox", "production"}:
         raise ValueError("a valid cleanup environment is required")
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    require_hub_resources(db, environment=environment)
     model = {"events": HubProductEventV2, "engagements": HubProductEngagementV2}[table]
     deleted = batches = 0
     while max_batches is None or batches < max_batches:
         ids = db.execute(select(model.id).where(_scoped_deleted_predicate(model, table, environment)).order_by(model.id).limit(batch_size)).scalars().all()
         if not ids:
             break
+        if _after_select is not None:
+            _after_select(list(ids))
         result = db.execute(model.__table__.delete().where(model.id.in_(ids)).where(_scoped_deleted_predicate(model, table, environment)))
         db.commit()
-        deleted += int(result.rowcount or 0)
+        removed = int(result.rowcount or 0)
+        deleted += removed
         batches += 1
+        if removed == 0:
+            # The selection no longer matches at delete time (a concurrent
+            # run took it, or the resource reappeared). Never spin on it.
+            break
     return deleted
