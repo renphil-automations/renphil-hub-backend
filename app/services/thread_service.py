@@ -67,6 +67,7 @@ exception.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -410,7 +411,7 @@ def _moderated_component_ids(db: Session, access: ViewerAccess | None) -> list[i
 
 
 def _can_see_thread_revisions(
-    thread: ThreadV2, component: ComponentV2, user: UserInfo, access: ViewerAccess | None
+    thread: ThreadV2, component: ComponentV2, user: UserInfo | None, access: ViewerAccess | None
 ) -> bool:
     """plan_thread_edit_versioning_2026-09-22.md §4.4 / landmine 3 — "may
     this caller know about this thread's staged edits": the thread's author
@@ -423,9 +424,8 @@ def _can_see_thread_revisions(
     `ThreadDetail.pending_revisions` and `GET .../revisions/{id}`, so the
     three can't drift apart. `access=None` → author only (the editor arm is
     `_is_component_editor`, which is False without a real `ViewerAccess`)."""
-    return _norm_email(thread.author_email) == _norm_email(user.email) or _is_component_editor(
-        component, access
-    )
+    is_author = user is not None and _norm_email(thread.author_email) == _norm_email(user.email)
+    return is_author or _is_component_editor(component, access)
 
 
 # ---------------------------------------------------------
@@ -1422,7 +1422,7 @@ def _pending_revision_counts(
     db: Session,
     threads: list[ThreadV2],
     component: ComponentV2,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None,
 ) -> dict[int, int]:
@@ -1451,7 +1451,7 @@ def _pending_revision_summaries(
     db: Session,
     thread: ThreadV2,
     component: ComponentV2,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None,
 ) -> list[ThreadRevisionSummary]:
@@ -1636,10 +1636,15 @@ def list_threads_for_link(
     db: Session,
     link: str,
     cursor: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None = None,
+    anonymous: bool = False,
 ) -> ThreadListResponse:
+    """`user` is whose own pending/rejected threads, votes and authored
+    revisions show up — the caller normally, the selected user under
+    nobody (`None`) for `anonymous` or `view_as_user`, which therefore list
+    approved threads only with `my_vote` 0 (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
@@ -1648,17 +1653,18 @@ def list_threads_for_link(
     # plan §5.5 — every approved thread, plus the CALLER'S OWN pending/
     # rejected ones (M3: an author sees their own non-approved threads with
     # a status badge; nobody else's pending/rejected rows appear in the
-    # widget's list at all).
-    query = db.query(ThreadV2).filter(
-        ThreadV2.component_id == component.id,
-        or_(
-            ThreadV2.status == THREAD_STATUS_APPROVED,
+    # widget's list at all). `anonymous=True` drops that second arm, so the
+    # list is exactly what any other viewer would get: approved only.
+    visible_status = ThreadV2.status == THREAD_STATUS_APPROVED
+    if not anonymous and user is not None:
+        visible_status = or_(
+            visible_status,
             and_(
                 ThreadV2.author_email == _norm_email(user.email),
                 ThreadV2.status.in_((THREAD_STATUS_PENDING, THREAD_STATUS_REJECTED)),
             ),
-        ),
-    )
+        )
+    query = db.query(ThreadV2).filter(ThreadV2.component_id == component.id, visible_status)
     if cursor:
         after_created_at, after_id = _decode_cursor(cursor)
         # A row comparison, not two ANDed predicates (plan §4.3, finding
@@ -1678,7 +1684,7 @@ def list_threads_for_link(
     has_more = len(rows) > THREADS_PAGE_SIZE
     page = rows[:THREADS_PAGE_SIZE]
 
-    my_votes = _my_votes_for_threads(db, [t.id for t in page], user.email)
+    my_votes = _my_votes_for_threads(db, [t.id for t in page], user.email) if user is not None else {}
     # Scoped (plan_thread_edit_versioning §4.4, landmine 3) — 0 for any row
     # this caller neither authored nor edits.
     revision_counts = _pending_revision_counts(db, page, component, user, access=access)
@@ -1767,7 +1773,7 @@ def create_thread_for_link(
 
 
 def get_thread_by_id(
-    db: Session, thread_id: int, user: UserInfo, *, access: ViewerAccess | None = None
+    db: Session, thread_id: int, user: UserInfo | None, *, access: ViewerAccess | None = None
 ) -> ThreadDetail:
     """Fetch one thread's full content — any viewer with the widget's own
     view access, NOT author-only (session handoff 2026-08-20 §0/addendum:
@@ -1781,17 +1787,21 @@ def get_thread_by_id(
     not just the queue row); anyone else gets the SAME 404 a nonexistent id
     would — "this id exists but isn't yours" is never leaked. The `_check_
     view_access` 403 still runs FIRST (landmine 2): a caller with no view
-    access to the widget at all keeps getting 403, never 404."""
+    access to the widget at all keeps getting 403, never 404.
+
+    `user` is whose authorship, vote and authored revisions count — the
+    caller normally (View As pairs included), and nobody (`None`) for
+    `anonymous` or `view_as_user`."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
     # access to the widget at all must keep getting the existing 403, never
     # a 404 that would leak "this id exists but isn't approved/yours".
     _check_view_access(component, access)
     if thread.status != THREAD_STATUS_APPROVED:
-        is_author = _norm_email(thread.author_email) == _norm_email(user.email)
+        is_author = user is not None and _norm_email(thread.author_email) == _norm_email(user.email)
         if not (is_author or _is_component_editor(component, access)):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
-    my_vote = _my_vote_for_thread(db, thread.id, user.email)
+    my_vote = _my_vote_for_thread(db, thread.id, user.email) if user is not None else 0
     return _to_thread_detail(
         thread,
         my_vote,
@@ -2603,8 +2613,23 @@ def thread_history_facets(
     )
 
 
+def _view_as_etag_suffix(view_as: bool, view_as_user: str | None) -> str:
+    """`-va` for a View As body, plus a short hash of the selected user's
+    email so two View As bodies that differ only by `view_as_user` never
+    share a tag (the email itself stays out of the header)."""
+    if not view_as:
+        return ""
+    if not view_as_user:
+        return "-va"
+    return "-va-" + hashlib.sha256(view_as_user.encode()).hexdigest()[:12]
+
+
 def moderation_summary(
-    db: Session, *, access: ViewerAccess | None = None
+    db: Session,
+    *,
+    access: ViewerAccess | None = None,
+    view_as: bool = False,
+    view_as_user: str | None = None,
 ) -> tuple[ThreadModerationSummary, str]:
     """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
     top of the `ViewerAccess` the dependency already built; polled like the
@@ -2615,17 +2640,25 @@ def moderation_summary(
     browser's own HTTP cache revalidate one user's request against
     another's cached body). A Hub Admin with zero thread widgets still gets
     `can_moderate=True` — the section is part of their admin surface
-    regardless of whether any widget currently has a thread on it."""
+    regardless of whether any widget currently has a thread on it.
+
+    `view_as=True` means `access` was built from the View As parameters
+    (`dependencies.get_view_as_access`): its only direct grants are the
+    caller's own, with pairs only and without `anonymous`. `view_as` and
+    `view_as_user` are echoed in the body and suffix the ETag
+    (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
 
     if not component_ids:
         return (
             ThreadModerationSummary(
-                can_moderate=can_moderate, moderated_component_count=0, pending_count=0
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
+                view_as=view_as, view_as_user=view_as_user,
             ),
-            f'"{can_moderate_flag}-0-0-0"',
+            f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
 
     count, max_id = (
@@ -2636,13 +2669,15 @@ def moderation_summary(
     count = int(count or 0)
     etag = (
         f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
-        f'{int(max_id) if max_id is not None else 0}"'
+        f'{int(max_id) if max_id is not None else 0}{etag_suffix}"'
     )
     return (
         ThreadModerationSummary(
             can_moderate=can_moderate,
             moderated_component_count=len(component_ids),
             pending_count=count,
+            view_as=view_as,
+            view_as_user=view_as_user,
         ),
         etag,
     )
@@ -2895,7 +2930,11 @@ def revision_history_facets(
 
 
 def revision_moderation_summary(
-    db: Session, *, access: ViewerAccess | None = None
+    db: Session,
+    *,
+    access: ViewerAccess | None = None,
+    view_as: bool = False,
+    view_as_user: str | None = None,
 ) -> tuple[ThreadRevisionModerationSummary, str]:
     """`GET /threads/revision-moderation/summary` — Revision Management's
     own sidebar badge (amendment A4), the same shape and ETag discipline as
@@ -2903,17 +2942,19 @@ def revision_moderation_summary(
     `"{1 if can_moderate else 0}-{n_components}-{pending}-{max_pending_id}"`
     — so two callers with different bodies never share a tag (followups
     §1). Counts pending REVISIONS only; new threads are Threads
-    Management's."""
+    Management's. `view_as` behaves exactly as in `moderation_summary`."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
 
     if not component_ids:
         return (
             ThreadRevisionModerationSummary(
-                can_moderate=can_moderate, moderated_component_count=0, pending_count=0
+                can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
+                view_as=view_as, view_as_user=view_as_user,
             ),
-            f'"{can_moderate_flag}-0-0-0"',
+            f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
 
     count, max_id = (
@@ -2928,13 +2969,15 @@ def revision_moderation_summary(
     count = int(count or 0)
     etag = (
         f'"{can_moderate_flag}-{len(component_ids)}-{count}-'
-        f'{int(max_id) if max_id is not None else 0}"'
+        f'{int(max_id) if max_id is not None else 0}{etag_suffix}"'
     )
     return (
         ThreadRevisionModerationSummary(
             can_moderate=can_moderate,
             moderated_component_count=len(component_ids),
             pending_count=count,
+            view_as=view_as,
+            view_as_user=view_as_user,
         ),
         etag,
     )
@@ -2991,10 +3034,12 @@ def list_comments_for_thread(
     db: Session,
     thread_id: int,
     cursor: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     *,
     access: ViewerAccess | None = None,
 ) -> CommentListResponse:
+    """`user` is whose `my_vote` is reported — see `get_thread_by_id`;
+    `None` reports 0 on every comment while the counts stay exact."""
     thread, component = _require_thread_and_component(db, thread_id)
     _check_view_access(component, access)
     _require_approved(thread)
@@ -3017,7 +3062,7 @@ def list_comments_for_thread(
     has_more = len(rows) > COMMENTS_PAGE_SIZE
     page = rows[:COMMENTS_PAGE_SIZE]
 
-    my_votes = _my_votes_for_comments(db, [c.id for c in page], user.email)
+    my_votes = _my_votes_for_comments(db, [c.id for c in page], user.email) if user is not None else {}
     items = [_to_comment_summary(c, my_votes.get(c.id, 0)) for c in page]
     next_cursor = _encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
 
