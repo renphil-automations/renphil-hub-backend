@@ -35,6 +35,7 @@ from app.routers import (
     resource_grants,
     super_blocknote_v2,
     tabs_v2,
+    task_manager,
     threads,
     view_as,
 )
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(resource_grants.router, prefix=api_prefix)
     app.include_router(bookmarks.router, prefix=api_prefix)
     app.include_router(forms.router, prefix=api_prefix)
+    app.include_router(task_manager.router, prefix=api_prefix)
     app.include_router(view_as.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────

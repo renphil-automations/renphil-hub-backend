@@ -19,14 +19,15 @@ from app.db_v2.database import BaseV2
 
 
 class NotificationV2(BaseV2):
-    """One fan-out event. Six triggers: someone was @-mentioned, someone
+    """One fan-out event. Six thread triggers: someone was @-mentioned, someone
     commented on their thread (D6's original two), an editor approved /
     rejected their pending thread (plan_thread_moderation_2026-09-18.md
     §3.2, M1 — owner-approved 2026-09-19, phase 2d), or an editor approved /
     rejected their staged edit to an approved thread
     (plan_thread_edit_versioning_2026-09-22.md §4.6/§8, phase D). Every
     trigger writes the same row shape; only `type` and who `actor_*` names
-    differ."""
+    differ. The Airtable sync adds two more (a run started / finished, v1
+    plan §9), which carry no thread or component, only `link`."""
 
     __tablename__ = "notifications"
 
@@ -42,21 +43,24 @@ class NotificationV2(BaseV2):
     # 'mention' | 'thread_comment' (D6) | 'thread_approved' |
     # 'thread_rejected' (plan_thread_moderation §3.2, M1) |
     # 'thread_edit_approved' | 'thread_edit_rejected'
-    # (plan_thread_edit_versioning §4.6/§8). No CHECK — the service's
+    # (plan_thread_edit_versioning §4.6/§8) | 'airtable_sync_started' |
+    # 'airtable_sync_finished' (plan_airtable_sync v1 §9, C3). No CHECK — the
     # NOTIFICATION_TYPE_* constants are the source of truth, and the longest
-    # value (20 chars) fits without a column change.
+    # value (22 chars) fits without a column change.
     type = Column(String(32), nullable=False)
 
     actor_email = Column(String(320), nullable=True)
     actor_name = Column(String(255), nullable=True)
 
     # Navigation target resolves through this to the widget's `link`
-    # (plan §1.5, §7.3).
+    # (plan §1.5, §7.3). Both are set on every thread notification and NULL
+    # on the Airtable sync's (v1 plan §9.1: a sync run names no widget), which
+    # navigate through `link` instead.
     component_id = Column(
-        Integer, ForeignKey("components.id", ondelete="CASCADE"), nullable=False
+        Integer, ForeignKey("components.id", ondelete="CASCADE"), nullable=True
     )
     thread_id = Column(
-        Integer, ForeignKey("threads.id", ondelete="CASCADE"), nullable=False
+        Integer, ForeignKey("threads.id", ondelete="CASCADE"), nullable=True
     )
     # Set only when the mention/comment that produced this notification was
     # itself a comment, not the thread's own body.
@@ -68,6 +72,11 @@ class NotificationV2(BaseV2):
     # stripper (plan §4.8), never by a markdown parser. Phase 1 writes
     # nothing here.
     excerpt = Column(String(200), nullable=True)
+
+    # The in-app path to open, for notifications that have no thread (the
+    # Airtable sync's: `/admin/access-control/airtable-sync`). NULL on thread
+    # notifications, which navigate through `component_id` / `thread_id`.
+    link = Column(String(512), nullable=True)
 
     # NULL => unread. Never DECRemented/deleted — see plan §4.5 on why the
     # unread count is derived (COUNT(*) WHERE read_at IS NULL) rather than
