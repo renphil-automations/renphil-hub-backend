@@ -10,18 +10,23 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db_v2.database import get_db_v2
+from app.db_v2.models.component import ComponentV2
 from app.dependencies import (
+    CurrentHubUser,
     ViewAsAccess,
+    get_current_hub_user,
     get_current_user,
     get_edit_session,
     get_lock_view,
     get_view_as_access,
     get_viewer_access,
+    is_hub_admin,
 )
 from app.models.auth import UserInfo
 from app.routers.tabs import validate_document_id, value_error_to_http_exception
 from app.schemas.page_content import PageContentAPIResponse
 from app.schemas.tab import (
+    ComponentAccessUsersResponse,
     ComponentLockAPIResponse,
     CreateTabRequest,
     CreateTabVariantRequest,
@@ -40,13 +45,15 @@ from app.schemas.tab import (
     UpdateTabRequest,
 )
 from app.schemas.view_as import TabSummaryListViewAsAPIResponse, TabWorkspaceViewAsAPIResponse
-from app.services import edit_lock_service
+from app.services import component_access_service, edit_lock_service
 from app.services.access_visibility_service import (
     AccessDeniedError,
     ForceLockNotAllowedError,
     NodeNotViewableError,
     ViewerAccess,
+    granted_single_node,
 )
+from app.services.rbac_graph_service import RbacClosures
 from app.services.gridstack_service import (
     create_tab_v2,
     create_tab_variant_v2,
@@ -222,6 +229,42 @@ def get_component_location(
     if result is None:
         raise HTTPException(status_code=404, detail="Component not found, or cannot be located")
     return {"data": result}
+
+
+@router.get(
+    "/components/{component_id}/users",
+    response_model=ComponentAccessUsersResponse,
+    summary="List the users who can access a component",
+    description="""
+Every user (from `users`) with at least view on the component — through their
+role/scope assignments or a grant shared with their email, written on the
+component itself or on any ancestor — plus Hub Admins. `access_level` is
+`edit` or `view` (edit implies view, so each user appears once). Soft-deleted
+users are excluded. Sorted by name.
+
+The caller must themselves be able to view the component; otherwise — or for
+an unknown id — it's a 404.
+""",
+    responses={**COMMON_NOT_FOUND_RESPONSE},
+)
+def list_component_access_users(
+    component_id: int,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+) -> ComponentAccessUsersResponse:
+    component = db.query(ComponentV2).filter(ComponentV2.id == component_id).first()
+    # One closure snapshot for the caller's gate and the reverse fold; the
+    # single-node fast path avoids get_viewer_access's whole-tree build.
+    closures = RbacClosures(db)
+    if component is None or not (
+        is_hub_admin(db, current, closures=closures)
+        or granted_single_node(
+            db, current.hub_user_id, ("component", component.id), is_admin=False, closures=closures
+        )
+    ):
+        raise HTTPException(status_code=404, detail="Component not found")
+    users = component_access_service.list_users_with_component_access(db, component, closures=closures)
+    return ComponentAccessUsersResponse(success=True, component_id=component.id, users=users)
 
 
 @router.put(

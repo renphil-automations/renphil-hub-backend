@@ -439,7 +439,7 @@ def _can_see_thread_revisions(
 
 def derive_mention_token(name: str) -> str:
     """plan §5.5: the person's name with everything that isn't a Unicode
-    letter or digit removed — `Roy Abdelnour` -> `RoyAbdelnour`. Keeps
+    letter or digit removed — `John Doe` -> `JohnDoe`. Keeps
     accented letters as-is (no transliteration); drops apostrophes, hyphens,
     periods and spaces, which is what makes the result a single "word" the
     caret regex (frontend) and the word-boundary check (`_token_occurs_in_content`
@@ -453,7 +453,7 @@ def _token_occurs_in_content(content: str, token: str) -> bool:
     """plan §5.3 check 2 — "the token ... occurs in content, as `@<token>`
     at a word boundary." The trailing negative lookahead is the boundary:
     without it, a token that is a PREFIX of a longer run of letters/digits
-    (`@RoyAbdelnour` inside `@RoyAbdelnourite`) would count as a match.
+    (`@JohnDoe` inside `@JohnDoite`) would count as a match.
     `\\w` under Python's default Unicode `re` matches non-ASCII letters
     too, so this holds for the 3 of 148 eligible names with accented
     characters (plan D13's own note) without any extra handling."""
