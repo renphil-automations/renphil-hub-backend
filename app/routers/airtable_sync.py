@@ -5,6 +5,8 @@ Hub Admins only, for every endpoint.
 
   GET  /v2/airtable-sync/settings   the schedule
   PUT  /v2/airtable-sync/settings
+  GET  /v2/airtable-sync/notification-preference   the caller's own "Receive
+  PUT  /v2/airtable-sync/notification-preference   run notifications" choice
   GET  /v2/airtable-sync/mappings   Designation → role, plus the live
                                      Designation choices from Airtable
   PUT  /v2/airtable-sync/mappings   full replace
@@ -44,6 +46,7 @@ from app.schemas.airtable_sync import (
     DesignationMappingsAPIResponse,
     ItemStatusFilter,
     LogEntity,
+    NotificationPreferenceAPIResponse,
     ReplaceDesignationMappingsRequest,
     ResolveItemAPIResponse,
     ResolveItemRequest,
@@ -55,6 +58,7 @@ from app.schemas.airtable_sync import (
     SyncRunListAPIResponse,
     SyncSettingsAPIResponse,
     SyncStatusAPIResponse,
+    UpdateNotificationPreferenceRequest,
     UpdateSyncSettingsRequest,
 )
 from app.services.airtable_sync import airtable_reader, bulk_jobs, resolutions, runs_service, settings_service
@@ -126,6 +130,40 @@ def update_sync_settings(
         raise _conflict(e)
     db.commit()
     return {"data": data}
+
+
+# ---------------------------------------------------------
+# Run notifications (each admin's own)
+# ---------------------------------------------------------
+
+
+@router.get(
+    "/notification-preference",
+    response_model=NotificationPreferenceAPIResponse,
+    summary="Get whether the caller receives run notifications",
+    responses=FORBIDDEN_RESPONSE,
+)
+def get_notification_preference(
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+):
+    return {"data": {"enabled": settings_service.get_notifications_enabled(db, current.hub_user_id)}}
+
+
+@router.put(
+    "/notification-preference",
+    response_model=NotificationPreferenceAPIResponse,
+    summary="Set whether the caller receives run notifications",
+    responses=FORBIDDEN_RESPONSE,
+)
+def update_notification_preference(
+    request: UpdateNotificationPreferenceRequest,
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+):
+    enabled = settings_service.set_notifications_enabled(db, current.hub_user_id, request.enabled)
+    db.commit()
+    return {"data": {"enabled": enabled}}
 
 
 # ---------------------------------------------------------

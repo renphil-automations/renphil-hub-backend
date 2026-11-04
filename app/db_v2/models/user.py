@@ -112,6 +112,11 @@ class UserV2(BaseV2):
     # Airtable sync (AI Docs/plan_airtable_sync_v2_2026-10-21.md). NULL on
     # login-only rows and on rows the sync has not linked yet.
     airtable_record_id = Column(String(32), nullable=True)
+    # A Hub Admin's choice, from the sync tab, of whether their bell gets the
+    # Airtable sync's run notifications. NULL = never chose, which counts as on
+    # (so compare with `is_not(False)`, never `is_(True)`), and it stays NULL on
+    # everyone who isn't an admin. Not an HR field: the sync never writes it.
+    airtable_sync_notifications_enabled = Column(Boolean, nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
     )
