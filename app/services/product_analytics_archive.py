@@ -38,13 +38,9 @@ Guarantees (operational runbook: PRODUCT_ANALYTICS_ARCHIVE.md):
   registry row and the deletes are written. An abandoned upload that lands
   later can contain records of a resource deleted in the meantime — it is
   not registered and therefore not an archive, but it is bytes in the bucket
-  until `reconcile_leftovers` (a separate process) removes it: after a
-  grace period, under the job's lock, after re-checking the registry, only
-  if it carries this database's `registry-id` marker and — automatically —
-  only if every record in it is still live, otherwise only once an operator
-  has reviewed it. R2's DeleteObject is unconditional (it ignores
-  `If-Match`; verified 2026-11-04), so nothing here claims compare-and-
-  delete semantics.
+  until a separately reviewed cleanup process removes it. R2 reconciliation
+  reports such objects but cannot delete them: R2's DeleteObject ignores
+  `If-Match` and cannot safely compare and delete in one operation.
 * Archive bytes are deterministic for a given ordered set of rows (fixed ZIP
   member timestamps, sorted JSON keys, no run-specific data inside the ZIP),
   and the object key embeds the environment, table, first day, row-id range
@@ -482,12 +478,15 @@ class R2ArchiveStore:
 
 
 class R2ReconcileStore(R2ArchiveStore):
-    """The reconciliation's view of the bucket: everything the writer has,
-    plus list, HEAD-with-metadata and an unconditional delete. Built only by
-    `scripts/reconcile_product_analytics_archives.py`, with the reconciliation
-    credentials; the archive job never constructs this class, so the code
-    that can delete and the code that uploads are different objects even
-    while Cloudflare's token model cannot separate the two permissions."""
+    """Read-only reconciliation: list and inspect objects, but never mutate.
+
+    The underlying R2 token can still have broader permissions; this interface
+    restriction is not a replacement for provider-level authorization.
+    """
+
+    def put(self, key: str, data: bytes, metadata: Mapping[str, str] | None = None, *, if_none_match: bool = False) -> None:
+        """The reconciliation interface never uploads objects."""
+        raise ArchiveConfigError("R2 reconciliation is report-only")
 
     def stat(self, key: str) -> ObjectInfo | None:
         from botocore.exceptions import ClientError
@@ -511,9 +510,14 @@ class R2ReconcileStore(R2ArchiveStore):
         return found
 
     def delete(self, key: str) -> None:
-        """Unconditional. R2 ignores `If-Match` on DeleteObject (verified
-        2026-11-04), so no precondition is sent and none is assumed."""
-        self._client.delete_object(Bucket=self._bucket, Key=key)
+        """Fail closed: R2 does not enforce conditional DeleteObject.
+
+        A preceding HEAD cannot protect against replacement before deletion.
+        Do not expose an unconditional deletion operation through this store.
+        """
+        raise ArchiveConfigError(
+            "R2 leftover deletion is disabled because conditional deletion is not enforced"
+        )
 
 
 # ── Archive format ───────────────────────────────────────────────────────
@@ -1561,11 +1565,11 @@ def reconcile_leftovers(
     out: Any = None,
     storage: tuple[str, str] | None = None,
 ) -> ReconcileOutcome:
-    """Find — and, within strict limits, remove — objects under this
+    """Find objects under this
     environment's prefix that are not registered archives. Report-only by
-    default. What `delete=True` may remove automatically is deliberately
-    narrow; everything else is retained with a reason, and an operator can
-    remove a reviewed key with `reviewed_keys`.
+    default. Deletion is unavailable for R2 because its DeleteObject does
+    not enforce a conditional ETag. The deletion logic below is retained for
+    non-R2 test stores and must not be enabled for R2 without a new design.
 
     Rules, in the order they are applied to each listed object:
 
@@ -1623,6 +1627,10 @@ def reconcile_leftovers(
     if grace_hours < 0:
         raise ValueError("grace_hours must not be negative")
     reviewed = None if reviewed_keys is None else {key for key in reviewed_keys if key}
+    if (delete or reviewed is not None) and isinstance(store, R2ReconcileStore):
+        raise ArchiveConfigError(
+            "R2 leftover deletion is disabled because conditional deletion is not enforced; use report-only reconciliation"
+        )
     emit = out or (lambda line: logger.info("%s", line))
     moment = now or datetime.now(timezone.utc)
     scope = f"{prefix}/{environment}/"

@@ -1,23 +1,19 @@
 """Reconcile leftover objects in the product-analytics archive bucket.
 
     python -m scripts.reconcile_product_analytics_archives            # REPORT ONLY: list leftovers, delete nothing
-    python -m scripts.reconcile_product_analytics_archives --delete   # delete leftovers older than the grace period
+    # R2 deletion is disabled; reconciliation is report-only.
 
 A leftover is an object under `<prefix>/<HUB_ENVIRONMENT>/` whose key is not
 in the archive registry (`hub_product_analytics_archives`): an upload the
 archive job abandoned (deadline, lost connection, crash) that still landed.
 It is not an archive and nothing reads it, but its bytes stay in the bucket
-until this process removes them (runbook: PRODUCT_ANALYTICS_ARCHIVE.md,
+until a separate safe cleanup process removes them (runbook: PRODUCT_ANALYTICS_ARCHIVE.md,
 "Leftover objects").
 
-Uses the SEPARATE reconciliation identity (`R2_RECONCILE_ACCESS_KEY_ID` /
-`R2_RECONCILE_SECRET_ACCESS_KEY`: list + read + delete, never put). Deleting
-happens only with `--delete`, only for objects older than `--grace-hours`
-(default 24), and only inside a transaction that holds the archive job's own
-advisory lock, after re-checking the registry and the object's identity
-(`product_analytics_archive.reconcile_leftovers`). A registered archive is
-never deleted; a registered key whose object is missing is reported as an
-ALERT.
+Uses the reconciliation identity for read-only inspection. R2 object deletion
+is disabled: the service does not enforce conditional DeleteObject, and a
+prior HEAD cannot make deletion atomic. Leftover bytes remain in the bucket
+until a separate reviewed process is designed and carried out.
 
 Exit codes: 0 done; 1 a deletion failed or a registered archive is missing
 its object (investigate); 2 configuration refused (nothing touched); 3 an
@@ -60,12 +56,15 @@ def run(
     the run claims to be configured for."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--delete", action="store_true",
-                        help="delete leftovers that are provably redundant (every record still live), older than the grace period (default: report only)")
+                        help="unavailable for R2: conditional object deletion is not enforced")
     parser.add_argument("--delete-reviewed", metavar="KEY", nargs="+", default=None,
-                        help="delete exactly these reviewed leftover keys (never a registered or foreign object; grace period still applies)")
+                        help="unavailable for R2: conditional object deletion is not enforced")
     parser.add_argument("--grace-hours", type=float, default=archive.RECONCILE_GRACE_HOURS,
                         help=f"never touch an object younger than this (default {archive.RECONCILE_GRACE_HOURS:g})")
     args = parser.parse_args(argv)
+    if store is None and (args.delete or args.delete_reviewed):
+        out("reconcile refused: R2 leftover deletion is disabled because conditional deletion is not enforced. Nothing was touched.")
+        return EXIT_CONFIG
     if args.grace_hours < 1 and (args.delete or args.delete_reviewed):
         out("reconcile refused: --grace-hours must be at least 1 when deleting. Nothing was touched.")
         return EXIT_CONFIG
@@ -118,7 +117,7 @@ def run(
         f"{len(outcome.registered_missing)} registered archive(s) missing their object."
     )
     if not args.delete and not args.delete_reviewed:
-        out("report only: nothing was deleted. --delete removes leftovers whose records are all still live; --delete-reviewed KEY removes a key you reviewed.")
+        out("report only: nothing was deleted. R2 leftover deletion is disabled.")
     if outcome.failed or outcome.registered_missing:
         return EXIT_FAILED
     if outcome.locked:

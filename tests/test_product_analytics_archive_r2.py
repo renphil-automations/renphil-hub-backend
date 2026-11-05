@@ -74,13 +74,8 @@ class R2StoreMockTests(unittest.TestCase):
             self.store.head = original_head
         self.assertEqual(self.store.get("taken"), b"someone else's bytes")
 
-    def test_list_stat_with_metadata_and_unconditional_delete_against_the_mock(self) -> None:
-        """The reconciler's calls. The delete is unconditional on purpose: the
-        real R2 accepted a DeleteObject with a wrong If-Match and deleted the
-        object (probe of 2026-11-04; Cloudflare's S3 page lists no
-        precondition for DeleteObject), so the code sends none and relies on
-        the registry re-check under the job lock and the HEAD identity check
-        instead — neither of which this mock can strengthen."""
+    def test_list_stat_and_reject_unsafe_r2_deletion(self) -> None:
+        """R2 deletes are disabled even when a preceding HEAD succeeds."""
         scope = "hub-product-analytics/sandbox/"
         reconciler = archive.R2ReconcileStore(CONFIG, client=self.client)
         self.store.put(scope + "events/v3/2025/a.zip", b"aaaa", {"registry-id": "abc", "sha256": "x"})
@@ -95,10 +90,15 @@ class R2StoreMockTests(unittest.TestCase):
         self.assertIsNotNone(stat.last_modified.tzinfo)
         self.assertIsNone(reconciler.stat(scope + "events/v3/2025/missing.zip"))
         self.assertFalse(hasattr(self.store, "delete") or hasattr(self.store, "list"))  # the writer's class cannot list or delete
-        reconciler.delete(scope + "events/v3/2025/a.zip")
-        self.assertIsNone(reconciler.stat(scope + "events/v3/2025/a.zip"))
-        reconciler.delete(scope + "events/v3/2025/a.zip")  # already gone: S3 answers success (idempotent)
-        self.assertEqual(len(reconciler.list("hub-product-analytics/")), 2)
+        with self.assertRaises(archive.ArchiveConfigError):
+            reconciler.delete(scope + "events/v3/2025/a.zip")
+        with self.assertRaises(archive.ArchiveConfigError):
+            reconciler.put(scope + "events/v3/2025/a.zip", b"replacement")
+        self.assertIsNotNone(reconciler.stat(scope + "events/v3/2025/a.zip"))
+        for kwargs in ({"delete": True}, {"reviewed_keys": [scope + "events/v3/2025/a.zip"]}):
+            with self.assertRaises(archive.ArchiveConfigError):
+                archive.reconcile_leftovers(None, reconciler, environment="sandbox", prefix="hub-product-analytics", **kwargs)
+        self.assertEqual(len(reconciler.list("hub-product-analytics/")), 3)
 
     def test_reconcile_store_credentials_are_a_separate_identity(self) -> None:
         settings = SimpleNamespace(R2_ACCOUNT_ID=CONFIG.account_id, R2_BUCKET_NAME=CONFIG.bucket, PRODUCT_ANALYTICS_ARCHIVE_PREFIX=CONFIG.prefix,
@@ -113,6 +113,14 @@ class R2StoreMockTests(unittest.TestCase):
                                            credentials=archive.RECONCILE_CREDENTIALS)
         self.assertIn("R2_RECONCILE_SECRET_ACCESS_KEY", str(caught.exception))
         self.assertNotIn("reconcile-secret", str(caught.exception))
+
+    def test_cli_refuses_r2_deletion_before_loading_configuration(self) -> None:
+        from scripts import reconcile_product_analytics_archives as reconcile_job
+
+        for arguments in (["--delete"], ["--delete-reviewed", "hub-product-analytics/sandbox/example.zip"]):
+            lines = []
+            self.assertEqual(reconcile_job.run(arguments, out=lines.append), reconcile_job.EXIT_CONFIG)
+            self.assertIn("deletion is disabled", lines[0])
 
     def test_probe_fails_for_a_missing_bucket(self) -> None:
         missing = archive.R2ArchiveStore(archive.R2Config(account_id=CONFIG.account_id, access_key_id="k", secret_access_key="s",
