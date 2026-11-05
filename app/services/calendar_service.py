@@ -25,7 +25,7 @@ from fastapi import HTTPException, status
 from googleapiclient.errors import HttpError
 
 from app.config import Settings
-from app.helpers.exceptions import GoogleCalendarError
+from app.helpers.exceptions import GoogleCalendarBusyError, GoogleCalendarError
 from app.helpers.google_client import build_calendar_service
 from app.models.calendar import CalendarEvent, CalendarIndexEvent, CalendarSearchResult
 
@@ -38,10 +38,42 @@ _SEARCH_SCAN = 100
 _SEARCH_RETURN = 25
 # Optimistic-concurrency retries on a 412 (ETag precondition failed).
 _ATTENDANCE_MAX_ATTEMPTS = 4
+# Retries on Google rate limits and 5xx, done by the client's execute() with
+# exponential backoff and random jitter. Each retry also logs a "Sleeping ...
+# before retry" warning from googleapiclient.http, the only trace of a rate
+# limit that recovers. A user is waiting on the RSVP button, so its patch
+# retries less; the If-Match ETag keeps that retry safe.
+_READ_RETRIES = 3
+_WRITE_RETRIES = 1
 
 
 def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _google_error(exc: HttpError, action: str) -> HTTPException:
+    """Translate a Google failure that retries couldn't get past.
+
+    The whole org shares one quota, so rate limits are logged separately: they
+    are the signal for adding a cache (plan_calendar_carousel_2026-11-01.md §4b).
+    """
+    code = exc.resp.status if exc.resp is not None else 0
+    rate_limited = code == 429 or (
+        code == 403 and b"ratelimitexceeded" in (exc.content or b"").lower()
+    )
+    if rate_limited:
+        logger.warning(
+            "Google Calendar rate limit: %s failed after retries (%s %s).",
+            action, code, exc.reason,
+        )
+        return GoogleCalendarBusyError()
+    if code >= 500:
+        logger.warning(
+            "Google Calendar unavailable: %s failed after retries (%s %s).",
+            action, code, exc.reason,
+        )
+        return GoogleCalendarBusyError()
+    return GoogleCalendarError(f"{action} failed: {exc}")
 
 
 def _start_str(node: dict[str, Any] | None) -> str | None:
@@ -162,10 +194,10 @@ class CalendarService:
                         "items(id,summary,start,recurringEventId,recurrence)"
                     ),
                 )
-                .execute()
+                .execute(num_retries=_READ_RETRIES)
             )
         except HttpError as exc:
-            raise GoogleCalendarError(f"Calendar search failed: {exc}") from exc
+            raise _google_error(exc, "Calendar search") from exc
 
         needle = query.lower()
         results: list[CalendarSearchResult] = []
@@ -314,7 +346,7 @@ class CalendarService:
                 request.headers["If-Match"] = etag
 
             try:
-                request.execute()
+                request.execute(num_retries=_WRITE_RETRIES)
                 return attending
             except HttpError as exc:
                 if exc.resp is not None and exc.resp.status == 412:
@@ -323,7 +355,7 @@ class CalendarService:
                         event_id, attempt + 1,
                     )
                     continue
-                raise GoogleCalendarError(f"Could not update attendance: {exc}") from exc
+                raise _google_error(exc, "Attendance update") from exc
 
         raise GoogleCalendarError(
             "Could not update attendance after multiple attempts. Please retry."
@@ -336,7 +368,7 @@ class CalendarService:
             return (
                 self._service.events()
                 .get(calendarId=self._calendar_id, eventId=event_id)
-                .execute()
+                .execute(num_retries=_READ_RETRIES)
             )
         except HttpError as exc:
             if exc.resp is not None and exc.resp.status == 404:
@@ -344,7 +376,7 @@ class CalendarService:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Event not found. It may have been deleted.",
                 ) from exc
-            raise GoogleCalendarError(f"Could not read event: {exc}") from exc
+            raise _google_error(exc, "Event read") from exc
 
     def _resolve(
         self, event_id: str
@@ -463,12 +495,10 @@ class CalendarService:
                             "items(id,iCalUID,status,recurrence,created,organizer)"
                         ),
                     )
-                    .execute()
+                    .execute(num_retries=_READ_RETRIES)
                 )
             except HttpError as exc:
-                raise GoogleCalendarError(
-                    f"Could not list calendar series: {exc}"
-                ) from exc
+                raise _google_error(exc, "Calendar series list") from exc
             series.extend(
                 item
                 for item in resp.get("items", [])
@@ -504,12 +534,10 @@ class CalendarService:
                         pageToken=page_token,
                         fields="nextPageToken,items(id,start,end)",
                     )
-                    .execute()
+                    .execute(num_retries=_READ_RETRIES)
                 )
             except HttpError as exc:
-                raise GoogleCalendarError(
-                    f"Could not read event occurrences: {exc}"
-                ) from exc
+                raise _google_error(exc, "Event occurrences read") from exc
             items = resp.get("items", [])
             if items:
                 return items[0]

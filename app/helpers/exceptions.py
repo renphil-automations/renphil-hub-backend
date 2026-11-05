@@ -78,6 +78,17 @@ class GoogleCalendarError(HTTPException):
         )
 
 
+class GoogleCalendarBusyError(HTTPException):
+    """Raised when Google Calendar is still rate-limiting or failing after retries."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Calendar is busy — try again in a minute.",
+            headers={"Retry-After": "60"},
+        )
+
+
 class DifyError(HTTPException):
     """Raised when the Dify.ai API call fails."""
 
