@@ -89,6 +89,18 @@ class GoogleCalendarBusyError(HTTPException):
         )
 
 
+class CalendarEventGoneError(HTTPException):
+    """A 404 for a stored event with nothing to show.
+
+    ``gone_status`` keeps apart what a 404 alone can't: ``"expired"`` means it
+    ran its course, ``"unavailable"`` means it was deleted or cancelled.
+    """
+
+    def __init__(self, gone_status: str, detail: str) -> None:
+        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+        self.gone_status = gone_status
+
+
 class DifyError(HTTPException):
     """Raised when the Dify.ai API call fails."""
 

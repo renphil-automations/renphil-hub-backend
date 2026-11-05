@@ -18,18 +18,35 @@ moment cannot silently drop each other from the list.
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 from googleapiclient.errors import HttpError
 
 from app.config import Settings
-from app.helpers.exceptions import GoogleCalendarBusyError, GoogleCalendarError
+from app.helpers.exceptions import (
+    CalendarEventGoneError,
+    GoogleCalendarBusyError,
+    GoogleCalendarError,
+)
 from app.helpers.google_client import build_calendar_service
-from app.models.calendar import CalendarEvent, CalendarIndexEvent, CalendarSearchResult
+from app.models.calendar import (
+    CalendarBatchEntry,
+    CalendarEvent,
+    CalendarIndexEvent,
+    CalendarSearchResult,
+)
 
 logger = logging.getLogger(__name__)
+
+MAX_BATCH_EVENTS = 20
+# Shared by every batch in this process, so the limit holds however many viewers
+# load at once, and its threads keep their Google connections open between
+# batches (a new connection costs a few tenths of a second). Threads start on demand.
+_BATCH_POOL = ThreadPoolExecutor(max_workers=5, thread_name_prefix="calendar-batch")
 
 # Google's `q` param is full-text (matches description, location, attendees),
 # so results are additionally filtered to a case-insensitive SUMMARY substring
@@ -269,6 +286,56 @@ class CalendarService:
             attending=attending,
         )
 
+    def get_events(
+        self, event_ids: list[str], viewer_email: str
+    ) -> list[CalendarBatchEntry]:
+        """
+        Run ``get_event`` for each id and return one entry per id, in request
+        order. A failure only ever affects its own entry.
+
+        Once one lookup finds Google busy, retries have already run out, so the
+        ids not yet started report the same error without calling Google. That
+        eases the shared quota and stops a rate limit from costing every id its
+        own backoff sleeps.
+        """
+        busy = threading.Event()
+
+        def lookup(event_id: str) -> CalendarBatchEntry:
+            if not event_id.strip():
+                # A blank id would address Google's list endpoint, not an event.
+                return CalendarBatchEntry(requested_id=event_id, status="unavailable")
+            if busy.is_set():
+                return CalendarBatchEntry(
+                    requested_id=event_id,
+                    status="error",
+                    detail=GoogleCalendarBusyError().detail,
+                )
+            try:
+                return CalendarBatchEntry(
+                    requested_id=event_id,
+                    status="ok",
+                    event=self.get_event(event_id, viewer_email),
+                )
+            except CalendarEventGoneError as exc:
+                return CalendarBatchEntry(requested_id=event_id, status=exc.gone_status)
+            except HTTPException as exc:
+                if isinstance(exc, GoogleCalendarBusyError):
+                    busy.set()
+                return CalendarBatchEntry(
+                    requested_id=event_id, status="error", detail=str(exc.detail)
+                )
+            except Exception:  # e.g. network failures that outlast the retries
+                logger.exception("Calendar batch lookup failed for %s", event_id)
+                return CalendarBatchEntry(
+                    requested_id=event_id,
+                    status="error",
+                    detail="Could not load this event.",
+                )
+
+        unique_ids = list(dict.fromkeys(event_ids))
+        entries = dict(zip(unique_ids, _BATCH_POOL.map(lookup, unique_ids)))
+        return [entries[event_id] for event_id in event_ids]
+
     def get_index_event(self, event_id: str) -> CalendarIndexEvent:
         """Return a viewer-independent upcoming snapshot for search ingestion.
 
@@ -372,9 +439,8 @@ class CalendarService:
             )
         except HttpError as exc:
             if exc.resp is not None and exc.resp.status == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Event not found. It may have been deleted.",
+                raise CalendarEventGoneError(
+                    "unavailable", "Event not found. It may have been deleted."
                 ) from exc
             raise _google_error(exc, "Event read") from exc
 
@@ -401,30 +467,23 @@ class CalendarService:
 
         if not master.get("recurrence"):
             if str(master.get("status") or "").lower() == "cancelled":
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="This event is no longer available.",
+                raise CalendarEventGoneError(
+                    "unavailable", "This event is no longer available."
                 )
             if _event_has_ended(master.get("start"), master.get("end")):
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="This event has expired.",
-                )
+                raise CalendarEventGoneError("expired", "This event has expired.")
             return event_id, master, None
 
-        instance = (
-            None
-            if str(master.get("status") or "").lower() == "cancelled"
-            else self._next_instance(master)
-        )
+        cancelled = str(master.get("status") or "").lower() == "cancelled"
+        instance = None if cancelled else self._next_instance(master)
         if instance is not None:
             return event_id, master, instance
 
         continuation = self._find_continuation(master)
         if continuation is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="This event has no upcoming occurrences.",
+            raise CalendarEventGoneError(
+                "unavailable" if cancelled else "expired",
+                "This event has no upcoming occurrences.",
             )
         successor, instance = continuation
         logger.info(
