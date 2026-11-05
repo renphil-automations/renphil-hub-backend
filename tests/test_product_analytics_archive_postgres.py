@@ -175,7 +175,7 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         store.calls.clear()
         code, lines = self._run(store=store)
         self.assertEqual((code, self._count()), (0, 0))
-        self.assertEqual([call for call, _ in store.calls], ["head", "get"])
+        self.assertEqual([call for call, _ in store.calls], ["stat", "get"])
 
     def _blocking_store(self):
         inside_put, release = threading.Event(), threading.Event()
@@ -485,6 +485,88 @@ class ArchiveJobPostgresTests(unittest.TestCase):
     def test_a_stalled_readback_is_abandoned_at_the_deadline_and_releases_the_locks(self) -> None:
         self._assert_stall_is_abandoned("get")
 
+    def test_a_promotion_stalled_past_the_deadline_releases_the_locks_and_its_late_copy_never_overwrites(self) -> None:
+        """The copy stalls past the deadline: the batch is rolled back (a
+        waiting page deletion proceeds), nothing is registered or deleted,
+        the staging object is discarded. The next run promotes its own
+        staged copy. When the abandoned copy finally commits, the destination
+        condition refuses it — R2's documented order: the source was selected
+        when the request was made, the destination is checked at commit."""
+        rows = self._component_rows("component-live", "component-live")
+        self._insert_events(*rows)
+        inside, release = threading.Event(), threading.Event()
+        late: list[BaseException] = []
+
+        class StalledCopy(archive.MemoryArchiveStore):
+            stall = True
+
+            def copy(self, source_key, key, *, if_none_match=False):
+                if not self.stall:
+                    return super().copy(source_key, key, if_none_match=if_none_match)
+                self.stall = False
+                with self._lock:  # the source is selected now, before the stall
+                    data, metadata = self.objects[source_key], dict(self.metadata.get(source_key, {}))
+                inside.set()
+                release.wait(timeout=120)
+                try:
+                    with self._lock:
+                        self.calls.append(("copy", key))
+                        if if_none_match and key in self.objects:
+                            raise archive.ArchiveObjectExistsError(f"object already exists at {key}")
+                        self.objects[key], self.metadata[key], self.modified[key] = data, metadata, self.clock()
+                except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+                    late.append(exc)
+                    raise
+
+        store = StalledCopy()
+        result: list[tuple[int, list[str]]] = []
+        with patch.object(archive, "STORAGE_CALL_DEADLINE_S", 1.0):
+            thread = threading.Thread(target=lambda: result.append(self._run(store=store)))
+            thread.start()
+            self.assertTrue(inside.wait(timeout=30))
+            done: list[int] = []
+
+            def deleter() -> None:
+                with self.engine.begin() as connection:
+                    done.append(connection.execute(text("DELETE FROM components WHERE link = 'component-live'")).rowcount)
+
+            waiter = threading.Thread(target=deleter)
+            waiter.start()
+            thread.join(timeout=30)
+        self.assertFalse(thread.is_alive())
+        waiter.join(timeout=30)
+        code, lines = result[0]
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(any("ArchiveTimeoutError: storage promotion (COPY) did not complete within 1 s" in line for line in lines), lines)
+        self.assertEqual((done, self._count(), store.objects), ([1], 2, {}))  # locks released; the staging object discarded
+        with self.Session() as db:
+            self.assertEqual(self._registry(db), {})
+        # The rows now reference a deleted component: the next run deletes
+        # them without archiving; give it a live batch to promote instead.
+        self._add_component("component-after")
+        self._insert_events(self._event(timedelta(days=400)))
+        code, lines = self._run(store=store)
+        self.assertEqual(code, 0, lines)
+        self.assertIn("deleted 2 events row(s) referencing deleted resources (not archived).", lines)
+        (final,) = list(store.objects)
+        before = (store.objects[final], store.metadata[final], store.modified[final])
+        with self.Session() as db:
+            self.assertEqual(self._registry(db), {final: 1})
+        # The abandoned copy commits now. Its key differs from the promoted
+        # one (other rows), so it lands as an unregistered final-key leftover
+        # holding the deleted component's records — reported, never deleted
+        # by the code — while the promoted object is untouched.
+        release.set()
+        self._wait_for_objects(store, 2)
+        self.assertEqual((late, len(store.objects)), ([], 2))
+        self.assertEqual((store.objects[final], store.metadata[final], store.modified[final]), before)
+        leftover = next(key for key in store.objects if key != final)
+        self.assertFalse(archive.is_staging_key(leftover))
+        outcome = self._reconcile(store, grace_hours=0)
+        self.assertEqual((outcome.leftovers, outcome.retained_not_redundant, outcome.deleted, set(store.objects)), ([leftover], 1, 0, {final, leftover}))
+        # And a late copy onto a key that a later attempt has promoted is refused (shown without the database in
+        # test_product_analytics_archive.py::ConditionalPromotionTests::test_a_copy_abandoned_at_the_deadline_cannot_overwrite_a_later_promotion).
+
     def test_a_late_upload_after_the_deadline_can_land_but_is_never_an_archive(self) -> None:
         """Codex's ordering, reproduced exactly: the batch's PUT stalls past
         the deadline; the job rolls back and its locks are gone; the
@@ -517,6 +599,7 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         self.assertEqual(len(store.objects), 1)
         self.assertEqual({r["event_id"] for r in self._archived_records(store)}, {r["event_id"] for r in rows})
         (leftover,) = list(store.objects)
+        self.assertTrue(archive.is_staging_key(leftover))  # the job's PUT can only ever land under a staging key
         with self.Session() as db:
             self.assertEqual(self._registry(db), {})
             self.assertEqual(archive.unregistered_keys(db, [leftover]), [leftover])
@@ -532,6 +615,12 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         with self.Session() as db:
             self.assertEqual(self._registry(db), {})
             self.assertEqual(archive.unregistered_keys(db, [leftover]), [leftover])
+        # A staging object is never an archive, whatever it holds: the
+        # reconciliation deletes it after the grace period, with nothing to compare.
+        recent = self._reconcile(store, grace_hours=archive.RECONCILE_GRACE_HOURS)
+        self.assertEqual((recent.too_recent, recent.deleted, len(store.objects)), (1, 0, 1))
+        old = self._reconcile(store, now=datetime.now(timezone.utc) + timedelta(hours=25), grace_hours=archive.RECONCILE_GRACE_HOURS)
+        self.assertEqual((old.deleted_keys, store.objects), ([leftover], {}))
 
     def test_a_session_lost_after_registration_before_the_commit_registers_and_deletes_nothing(self) -> None:
         rows = self._component_rows("component-live", "component-live")
@@ -587,14 +676,15 @@ class ArchiveJobPostgresTests(unittest.TestCase):
     # ── reconciliation of leftovers under real concurrency ───────────────
     # The store fake behaves like the real R2 (verified 2026-11-04): DELETE is
     # unconditional, so a HEAD followed by a DELETE is never a compare-and-delete.
+    # That is why only staging objects are ever deleted: nothing at a staging
+    # key is or can become an archive.
 
     PREFIX = "hub-product-analytics"
 
-    def _reconcile(self, store, *, delete=True, grace_hours=0.0, now=None, lock_timeout_ms=800, lines=None, reviewed_keys=None) -> archive.ReconcileOutcome:
+    def _reconcile(self, store, *, delete=True, grace_hours=0.0, now=None, lock_timeout_ms=800, lines=None) -> archive.ReconcileOutcome:
         with self.Session() as db:
             return archive.reconcile_leftovers(db, store, environment="sandbox", prefix=self.PREFIX, now=now, grace_hours=grace_hours,
-                                               delete=delete, reviewed_keys=reviewed_keys, lock_timeout_ms=lock_timeout_ms,
-                                               out=(lines.append if lines is not None else None))
+                                               delete=delete, lock_timeout_ms=lock_timeout_ms, out=(lines.append if lines is not None else None))
 
     def _identity(self) -> str:
         with self.Session() as db:
@@ -603,57 +693,71 @@ class ArchiveJobPostgresTests(unittest.TestCase):
     def _old_store(self) -> archive.MemoryArchiveStore:
         return archive.MemoryArchiveStore(clock=lambda: datetime.now(timezone.utc) - timedelta(hours=48))
 
-    def _make_leftover(self, store, rows: list[dict], *, suffix: str, marker: str | None = ...) -> str:
-        """Insert `rows` (they stay live) and put the object the job would have
-        written for them, with the registry-id marker: a batch that uploaded
-        but never committed."""
+    def _leftover_payload(self, rows: list[dict]) -> bytes:
+        """Insert `rows` (they stay live) and build the bytes the job would write for them."""
         self._insert_events(*rows)
         with self.Session() as db:
             orm = db.query(HubProductEventV2).filter(HubProductEventV2.event_id.in_([r["event_id"] for r in rows])).order_by(HubProductEventV2.id).all()
             records = [archive.archive_row(r, "events", exclude=archive.VIEW_AS_COLUMNS) for r in orm]
-        payload = archive.make_archive(environment="sandbox", events=records, exclude_columns=archive.VIEW_AS_COLUMNS,
-                                       metadata={"table": "events", "selection": "age_expired_not_deleted_resource"})
-        key = f"{self.PREFIX}/sandbox/events/v3/2025/leftover-{suffix}.zip"
+        return archive.make_archive(environment="sandbox", events=records, exclude_columns=archive.VIEW_AS_COLUMNS,
+                                    metadata={"table": "events", "selection": "age_expired_not_deleted_resource"})
+
+    def _marker(self, marker) -> dict:
         metadata = {"sha256": "x", "format-version": "3"}
         if marker is ...:
             metadata[archive.REGISTRY_ID_METADATA] = self._identity()
         elif marker is not None:
             metadata[archive.REGISTRY_ID_METADATA] = marker
-        store.put(key, payload, metadata)
+        return metadata
+
+    def _make_leftover(self, store, rows: list[dict], *, suffix: str, marker: str | None = ...) -> str:
+        """An object under a FINAL key, as a promotion that landed after the
+        job gave its batch up leaves it (or as another writer put it)."""
+        key = f"{self.PREFIX}/sandbox/events/v3/2025/leftover-{suffix}.zip"
+        store.put(key, self._leftover_payload(rows), self._marker(marker))
+        return key
+
+    def _make_staging_leftover(self, store, rows: list[dict], *, name: str | None = None, marker: str | None = ...) -> str:
+        """An object under a STAGING key, as an upload the job abandoned leaves it."""
+        key = f"{self.PREFIX}/sandbox/{archive.STAGING_SEGMENT}/{name or uuid.uuid4().hex}.zip"
+        store.put(key, self._leftover_payload(rows), self._marker(marker))
         return key
 
     def test_reconciliation_waits_for_a_batch_that_uploaded_but_has_not_committed_its_registry_row(self) -> None:
-        """The object exists, the registry row does not yet: the batch holds the
-        job lock between its upload and its commit. The reconciler cannot take
-        the lock, deletes nothing, and once the batch commits the object is a
-        registered archive it will never touch."""
+        """The staging object and its promoted copy exist, the registry row
+        does not yet: the batch holds the job lock between its upload and its
+        commit. The reconciler cannot take the lock, deletes nothing, and
+        once the batch commits the final object is a registered archive it
+        will never touch and the staging object is gone."""
         rows = [self._event(timedelta(days=400)), self._event(timedelta(days=401))]
         self._insert_events(*rows)
-        store, inside_get, release = self._stalled_store("get")  # blocked in the readback: uploaded, not committed
+        store, inside_get, release = self._stalled_store("get")  # blocked in the readback: staged, promoted, not committed
         result: list[tuple[int, list[str]]] = []
         thread = threading.Thread(target=lambda: result.append(self._run(store=store)))
         thread.start()
         self.assertTrue(inside_get.wait(timeout=30))
         try:
-            self.assertEqual(len(store.objects), 1)
+            self.assertEqual(sorted(archive.is_staging_key(key) for key in store.objects), [False, True])
             with self.Session() as db:
-                self.assertEqual(archive.unregistered_keys(db, store.objects), list(store.objects))
+                self.assertEqual(set(archive.unregistered_keys(db, store.objects)), set(store.objects))
             lines: list[str] = []
             outcome = self._reconcile(store, lines=lines)
-            self.assertEqual((outcome.candidates, outcome.locked, outcome.deleted), (1, True, 0))
+            self.assertEqual((outcome.candidates, len(outcome.leftovers), outcome.locked, outcome.deleted), (1, 1, True, 0))
             self.assertTrue(any("an archive run holds the job lock" in line for line in lines), lines)
-            self.assertEqual(len(store.objects), 1)
+            self.assertEqual(len(store.objects), 2)
         finally:
             release.set()
             thread.join(timeout=60)
         self.assertEqual(result[0][0], 0, result[0][1])
         outcome = self._reconcile(store)
-        self.assertEqual((outcome.registered, outcome.candidates, outcome.deleted, len(store.objects)), (1, 0, 0, 1))
+        self.assertEqual((outcome.registered, outcome.staging_listed, outcome.candidates, outcome.leftovers, outcome.deleted, len(store.objects)),
+                         (1, 0, 0, [], 0, 1))
 
-    def test_reconciliation_rechecks_the_registry_under_the_lock_before_deleting(self) -> None:
-        """Between the listing and the deletion another run registers the
-        object (a retry that recognised an earlier upload). The re-check
-        under the job lock sees the registry row and the delete is skipped."""
+    def test_reconciliation_rechecks_the_registry_under_the_lock_before_acting(self) -> None:
+        """Between the listing and the inspection another run registers the
+        final-key object (a retry that recognised an earlier promotion). The
+        re-check under the job lock sees the registry row and the object is
+        skipped — it is an archive now."""
         rows = [self._event(timedelta(days=400)), self._event(timedelta(days=401))]
         self._insert_events(*rows)
 
@@ -667,8 +771,9 @@ class ArchiveJobPostgresTests(unittest.TestCase):
                 return super().get(key)
 
         store = CorruptOnce(clock=lambda: datetime.now(timezone.utc) - timedelta(hours=48))
-        self.assertEqual(self._run(store=store)[0], 1)  # uploaded, readback failed: an unregistered object
+        self.assertEqual(self._run(store=store)[0], 1)  # promoted, readback failed: an unregistered final object; staging discarded
         (key,) = list(store.objects)
+        self.assertFalse(archive.is_staging_key(key))
         real_registered_keys = archive.registered_keys
         calls: list[int] = []
 
@@ -684,16 +789,55 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         lines: list[str] = []
         with patch.object(archive, "registered_keys", registers_after_the_first_check):
             outcome = self._reconcile(store, lines=lines)
-        self.assertEqual((outcome.candidates, outcome.skipped_registered_late, outcome.deleted), (1, 1, 0))
+        self.assertEqual((outcome.leftovers, outcome.skipped_registered_late, outcome.deleted, outcome.redundant), ([key], 1, 0, 0))
         self.assertIn(key, store.objects)
         with self.Session() as db:
             self.assertEqual(self._registry(db), {key: 2})
         self.assertEqual(self._count(), 0)
 
+    def test_a_promotion_that_landed_but_was_never_committed_is_a_final_leftover_the_next_run_registers(self) -> None:
+        """The residual of the staging design: the copy reached the final key
+        but the batch did not commit (here: the readback failed). The staging
+        object is discarded at once; the final-key object stays unregistered,
+        is classified redundant by the reconciliation (its rows are live and
+        identical) and never deleted by it; the next run finds it under the
+        content-addressed key, verifies and registers it without uploading."""
+        rows = [self._event(timedelta(days=400)), self._event(timedelta(days=401))]
+        self._insert_events(*rows)
+
+        class CorruptOnce(archive.MemoryArchiveStore):
+            corrupt = True
+
+            def get(self, key):
+                if self.corrupt:
+                    self.corrupt = False
+                    return b"corrupt"
+                return super().get(key)
+
+        store = CorruptOnce(clock=lambda: datetime.now(timezone.utc) - timedelta(hours=48))
+        self.assertEqual(self._run(store=store)[0], 1)
+        (final,) = list(store.objects)
+        self.assertFalse(archive.is_staging_key(final))
+        self.assertEqual([key for call, key in store.calls if call == "delete_staging"], [key for call, key in store.calls if call == "put"])
+        lines: list[str] = []
+        outcome = self._reconcile(store, lines=lines)
+        self.assertEqual((outcome.leftovers, outcome.redundant, outcome.deleted, final in store.objects), ([final], 1, 0, True))
+        self.assertTrue(any(line.startswith("retained (redundant: every one of its 2 record(s) has an identical live row") for line in lines), lines)
+        self.assertFalse(any(call in {"delete", "delete_staging"} and key == final for call, key in store.calls))
+        code, lines = self._run(store=store)
+        self.assertEqual(code, 0, lines)
+        self.assertTrue(any("[already present, verified sha256" in line and ", registered]" in line for line in lines), lines)
+        self.assertEqual((self._count(), set(store.objects)), (0, {final}))
+        with self.Session() as db:
+            self.assertEqual(self._registry(db), {final: 2})
+        outcome = self._reconcile(store)
+        self.assertEqual((outcome.registered, outcome.leftovers, outcome.deleted), (1, [], 0))
+
     def test_a_late_upload_is_reconciled_only_after_the_grace_period_and_never_registered(self) -> None:
-        """A PUT that lands after the job timed out and released its locks: its
-        rows are still live (the batch never committed), so it is a redundant
-        leftover — never registered, deleted only after the grace period."""
+        """A PUT that lands after the job timed out and released its locks:
+        it lands under the staging key, its rows are still live (the batch
+        never committed) — never registered, deleted after the grace period
+        without any comparison (nothing at a staging key is an archive)."""
         rows = self._component_rows("component-live", "component-live")
         self._insert_events(*rows)
         store, inside, release = self._stalled_store("put")
@@ -705,11 +849,12 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         release.set()
         self._wait_for_objects(store, 1)
         (leftover,) = list(store.objects)
+        self.assertTrue(archive.is_staging_key(leftover))
         self.assertEqual(store.metadata[leftover][archive.REGISTRY_ID_METADATA], self._identity())
         recent = self._reconcile(store, grace_hours=archive.RECONCILE_GRACE_HOURS)
-        self.assertEqual((recent.too_recent, recent.candidates, recent.deleted), (1, 0, 0))
+        self.assertEqual((recent.staging_listed, recent.too_recent, recent.candidates, recent.deleted), (1, 1, 0, 0))
         report = self._reconcile(store, delete=False)
-        self.assertEqual((report.leftovers, report.deleted, len(store.objects)), ([leftover], 0, 1))
+        self.assertEqual((report.candidates, report.leftovers, report.deleted, len(store.objects)), (1, [], 0, 1))
         old = self._reconcile(store, now=datetime.now(timezone.utc) + timedelta(hours=25), grace_hours=archive.RECONCILE_GRACE_HOURS)
         self.assertEqual((old.deleted_keys, store.objects), ([leftover], {}))
         with self.Session() as db:
@@ -720,42 +865,40 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         with self.Session() as db:
             self.assertEqual(self._registry(db), {next(iter(store.objects)): 2})
 
-    def test_an_object_replaced_between_listing_and_head_is_skipped_but_after_head_it_is_deleted(self) -> None:
+    def test_a_staging_object_replaced_before_its_deletion_is_still_deleted_and_a_final_object_never_is(self) -> None:
         """What the unconditional delete means, shown rather than claimed: a
-        replacement before the HEAD is caught by the identity check; a
-        replacement after the HEAD is not — the object at the key is deleted.
-        Only a writer that bypasses the job's conditional PUT and the job lock
-        (a third-party tool with the bucket token) can produce that case."""
+        writer that bypasses the job (a third-party tool with the bucket
+        token) replaces the staging object after the reconciler's HEAD; the
+        replacement is what gets deleted — harmless, because nothing at a
+        staging key is or can become an archive (the registry stays empty,
+        the rows stay live). An object under a final key is never deleted,
+        replaced or not, and the store refuses to be asked."""
         store = self._old_store()
-        key = self._make_leftover(store, [self._event(timedelta(days=400))], suffix="replaced")
-
-        class ReplacedBeforeHead(archive.MemoryArchiveStore):
-            def stat(self, key):
-                archive.MemoryArchiveStore.put(self, key, b"replaced before head")
-                return super().stat(key)
-
-        before = ReplacedBeforeHead(clock=store.clock)
-        before.objects, before.metadata, before.modified = store.objects, store.metadata, store.modified
-        outcome = self._reconcile(before)
-        self.assertEqual((outcome.skipped_changed, outcome.deleted), (1, 0))
-        self.assertEqual(store.objects[key], b"replaced before head")
-        # Restore a genuine leftover, then replace it after the HEAD (inside the delete).
-        store.objects.pop(key)
-        key = self._make_leftover(store, [self._event(timedelta(days=401))], suffix="replaced")
+        key = self._make_staging_leftover(store, [self._event(timedelta(days=400))])
 
         class ReplacedAfterHead(archive.MemoryArchiveStore):
-            def delete(self, key):
+            def delete_staging(self, key):
                 archive.MemoryArchiveStore.put(self, key, b"replaced after head")
-                super().delete(key)  # unconditional, like R2: the replacement is what gets deleted
+                super().delete_staging(key)  # unconditional, like R2: the replacement is what gets deleted
 
         after = ReplacedAfterHead(clock=store.clock)
         after.objects, after.metadata, after.modified = store.objects, store.metadata, store.modified
         outcome = self._reconcile(after)
-        self.assertEqual((outcome.deleted_keys, key in store.objects), ([key], False))
+        self.assertEqual((outcome.deleted_keys, key in store.objects, self._count()), ([key], False, 1))
+        with self.Session() as db:
+            self.assertEqual(self._registry(db), {})
+        final = self._make_leftover(store, [self._event(timedelta(days=401))], suffix="final")
+        store.objects[final] = b"replaced"  # replaced by an outside writer before the run: invalid now, still never deleted
+        outcome = self._reconcile(store)
+        self.assertEqual((outcome.deleted, outcome.retained_invalid, outcome.leftovers, store.objects[final]), (0, 1, [final], b"replaced"))
+        self.assertFalse(any(call in {"delete", "delete_staging"} and k == final for call, k in store.calls))
+        with self.assertRaises(ValueError):
+            store.delete_staging(final)
+        self.assertIn(final, store.objects)
 
     def test_concurrent_reconcilers_serialise_and_an_interrupted_run_is_completed_by_the_next(self) -> None:
         store = self._old_store()
-        keys = [self._make_leftover(store, [self._event(timedelta(days=400 + i))], suffix=f"c{i}") for i in range(4)]
+        keys = [self._make_staging_leftover(store, [self._event(timedelta(days=400 + i))], name=f"c{i}") for i in range(4)]
         outcomes: list[archive.ReconcileOutcome] = []
         errors: list[BaseException] = []
         lock = threading.Lock()
@@ -780,16 +923,16 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual((sum(o.deleted for o in outcomes), sum(o.failed for o in outcomes), store.objects), (4, 0, {}))
         # Interruption: a failure on one key does not stop the others; the next run finishes the job.
-        keys = [self._make_leftover(store, [self._event(timedelta(days=500 + i))], suffix=f"i{i}") for i in range(3)]
+        keys = [self._make_staging_leftover(store, [self._event(timedelta(days=500 + i))], name=f"i{i}") for i in range(3)]
 
         class FailsOnce(archive.MemoryArchiveStore):
             failed = False
 
-            def delete(self, key):
+            def delete_staging(self, key):
                 if key == keys[1] and not self.failed:
                     self.failed = True
                     raise ConnectionResetError("interrupted")
-                super().delete(key)
+                super().delete_staging(key)
 
         flaky = FailsOnce(clock=store.clock)
         flaky.objects, flaky.metadata, flaky.modified = store.objects, store.metadata, store.modified
@@ -803,11 +946,12 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         self._insert_events(self._event(timedelta(days=400)))
         self.assertEqual(self._run(store=store)[0], 0)
         registered = set(store.objects)
-        foreign = {f"{self.PREFIX}/production/events/v3/2025/x.zip", f"{self.PREFIX}/local/events/v3/2025/x.zip",
-                   "another-prefix/sandbox/events/v3/2025/x.zip", f"{self.PREFIX}/sandbox-other/events/v3/2025/x.zip"}
+        foreign = {f"{self.PREFIX}/production/_staging/x.zip", f"{self.PREFIX}/local/_staging/x.zip",
+                   "another-prefix/sandbox/_staging/x.zip", f"{self.PREFIX}/sandbox-other/_staging/x.zip",
+                   f"{self.PREFIX}/production/events/v3/2025/x.zip"}
         for key in foreign:
             store.put(key, b"foreign", {archive.REGISTRY_ID_METADATA: self._identity()})
-        ours = self._make_leftover(store, [self._event(timedelta(days=410))], suffix="ours")
+        ours = self._make_staging_leftover(store, [self._event(timedelta(days=410))], name="ours")
         outcome = self._reconcile(store)
         self.assertEqual((outcome.listed, outcome.registered, outcome.deleted_keys), (len(registered) + 1, len(registered), [ours]))
         self.assertEqual(set(store.objects), registered | foreign)
@@ -816,28 +960,37 @@ class ArchiveJobPostgresTests(unittest.TestCase):
             self.assertEqual((again.candidates, again.deleted, again.failed), (0, 0, 0))
         self.assertEqual(set(store.objects), registered | foreign)
 
-    def test_reconciliation_retains_foreign_and_not_redundant_objects_and_deletes_reviewed_keys_only(self) -> None:
+    def test_reconciliation_retains_foreign_objects_and_classifies_final_leftovers_without_deleting_them(self) -> None:
+        """Objects without this registry's marker — another deployment's,
+        a tool's, anything not written by this job — are retained whether
+        they sit under a staging or a final key; final-key leftovers of this
+        registry are classified for the operator and retained too."""
         store = self._old_store()
         other = self._make_leftover(store, [self._event(timedelta(days=400))], suffix="other-registry", marker="11111111-1111-1111-1111-111111111111")
         unmarked = self._make_leftover(store, [self._event(timedelta(days=401))], suffix="unmarked", marker=None)
         gone = self._make_leftover(store, [self._event(timedelta(days=402), target_id="tab-doomed", page_id="tab-doomed")], suffix="cleanup-deleted")
+        staged_other = self._make_staging_leftover(store, [self._event(timedelta(days=403))], name="other-registry", marker="11111111-1111-1111-1111-111111111111")
+        staged_unmarked = self._make_staging_leftover(store, [self._event(timedelta(days=404))], name="unmarked", marker=None)
+        staged_ours = self._make_staging_leftover(store, [self._event(timedelta(days=405))], name="ours")
         with self.Session() as db:  # the cleanup removed the doomed row (its page no longer exists)
             self.assertEqual(service.purge_deleted_page_records(db, table="events", environment="sandbox"), 1)
         lines: list[str] = []
         outcome = self._reconcile(store, lines=lines)
-        self.assertEqual((outcome.deleted, outcome.retained_foreign, outcome.retained_not_redundant), (0, 2, 1))
-        self.assertEqual({key for key, _ in outcome.retained}, {other, unmarked, gone})
-        self.assertEqual(len(store.objects), 3)
-        reviewed = self._reconcile(store, reviewed_keys=[gone, other])
-        self.assertEqual((reviewed.deleted_keys, reviewed.retained_foreign), ([gone], 1))
-        self.assertEqual(set(store.objects), {other, unmarked})
+        self.assertEqual((outcome.deleted_keys, outcome.retained_foreign, outcome.retained_not_redundant, outcome.redundant), ([staged_ours], 4, 1, 0))
+        self.assertEqual({key for key, _ in outcome.retained}, {other, unmarked, gone, staged_other, staged_unmarked})
+        self.assertEqual(set(store.objects), {other, unmarked, gone, staged_other, staged_unmarked})
+        self.assertTrue(any(line.startswith("retained (1 of 1 record(s) have no identical live row") and line.endswith(gone) for line in lines), lines)
+        again = self._reconcile(store)
+        self.assertEqual((again.deleted, set(store.objects)), (0, {other, unmarked, gone, staged_other, staged_unmarked}))
 
     def test_a_restored_database_makes_registered_objects_redundant_not_lost(self) -> None:
         """After a database restore the registry rows and the live rows come
         back together: an object archived after the backup point has no
-        registry row but its records are live again, so it is redundant and
-        may be deleted (the next run re-archives). A registry row removed
-        while the rows stay absent is the dangerous half, and it is retained."""
+        registry row but its records are live again, so it is redundant —
+        and the next run recognises it under its content-addressed key and
+        registers it without uploading. A registry row removed while the
+        rows stay absent is the dangerous half: it is retained as not
+        redundant. Nothing under a final key is deleted in either case."""
         store = self._old_store()
         rows = [self._event(timedelta(days=400)), self._event(timedelta(days=401))]
         self._insert_events(*rows)
@@ -858,9 +1011,14 @@ class ArchiveJobPostgresTests(unittest.TestCase):
             connection.execute(text("DELETE FROM hub_product_events WHERE event_id IN :ids").bindparams(ids=tuple(r["event_id"] for r in rows)))
         self._insert_events(*[{**row, "id": next(a["id"] for a in archived["events"] if a["event_id"] == row["event_id"])} for row in rows])
         outcome = self._reconcile(store)
-        self.assertEqual((outcome.deleted_keys, store.objects), ([key], {}))
-        self.assertEqual(self._run(store=store)[0], 0)
-        self.assertEqual((self._count(), len(store.objects)), (0, 1))
+        self.assertEqual((outcome.deleted, outcome.redundant, key in store.objects), (0, 1, True))
+        self.assertIn("redundant: every one of its 2 record(s) has an identical live row", outcome.retained[0][1])
+        code, lines = self._run(store=store)
+        self.assertEqual(code, 0, lines)
+        self.assertTrue(any("[already present, verified sha256" in line and ", registered]" in line for line in lines), lines)
+        self.assertEqual((self._count(), set(store.objects)), (0, {key}))
+        with self.Session() as db:
+            self.assertEqual(self._registry(db), {key: 2})
 
     # ── redundancy is proven by content, under row locks ─────────────────
 
@@ -890,39 +1048,40 @@ class ArchiveJobPostgresTests(unittest.TestCase):
                 with self.engine.begin() as connection:  # put the row back exactly
                     connection.execute(text("DELETE FROM hub_product_events WHERE event_id = :e"), {"e": row["event_id"]})
                     connection.execute(HubProductEventV2.__table__.insert(), original)
-        # Identical again (same id, same content): redundant.
+        # Identical again (same id, same content): redundant — classified, still never deleted.
         outcome = self._reconcile(store)
-        self.assertEqual((outcome.deleted_keys, store.objects), ([key], {}))
+        self.assertEqual((outcome.deleted, outcome.redundant, key in store.objects), (0, 1, True))
 
     def test_a_live_row_updated_or_deleted_while_the_reconciler_decides_waits_for_the_decision(self) -> None:
         """The live rows are locked FOR SHARE from the comparison until the
-        object is deleted: a concurrent UPDATE or DELETE of them waits (here:
-        hits a lock timeout) instead of changing the data under the decision.
-        A change that lands BEFORE the comparison makes the object non-redundant."""
+        classification is recorded: a concurrent UPDATE or DELETE of them
+        waits (here: hits a lock timeout) instead of changing the data under
+        the decision, so "redundant" describes a consistent snapshot. A
+        change that lands BEFORE the comparison makes the object non-redundant."""
         store = self._old_store()
         row = self._event(timedelta(days=400))
         key = self._make_leftover(store, [row], suffix="racing")
         inside, release = threading.Event(), threading.Event()
+        real = archive.live_rows_identical_to_archive
 
-        class PausesBeforeDelete(archive.MemoryArchiveStore):
-            def delete(self, key):
-                inside.set()
-                release.wait(timeout=30)
-                super().delete(key)
+        def compare_then_pause(db, **kwargs):
+            result = real(db, **kwargs)
+            inside.set()
+            release.wait(timeout=30)
+            return result
 
-        pausing = PausesBeforeDelete(clock=store.clock)
-        pausing.objects, pausing.metadata, pausing.modified = store.objects, store.metadata, store.modified
         outcomes: list[archive.ReconcileOutcome] = []
-        thread = threading.Thread(target=lambda: outcomes.append(self._reconcile(pausing)))
-        thread.start()
-        self.assertTrue(inside.wait(timeout=30))
-        try:
-            self.assertTrue(self._blocked("UPDATE hub_product_events SET properties = '{}'::json WHERE event_id = '%s'" % row["event_id"]))
-            self.assertTrue(self._blocked("DELETE FROM hub_product_events WHERE event_id = '%s'" % row["event_id"]))
-        finally:
-            release.set()
-            thread.join(timeout=60)
-        self.assertEqual((outcomes[0].deleted_keys, store.objects), ([key], {}))
+        with patch.object(archive, "live_rows_identical_to_archive", compare_then_pause):
+            thread = threading.Thread(target=lambda: outcomes.append(self._reconcile(store)))
+            thread.start()
+            self.assertTrue(inside.wait(timeout=30))
+            try:
+                self.assertTrue(self._blocked("UPDATE hub_product_events SET properties = '{}'::json WHERE event_id = '%s'" % row["event_id"]))
+                self.assertTrue(self._blocked("DELETE FROM hub_product_events WHERE event_id = '%s'" % row["event_id"]))
+            finally:
+                release.set()
+                thread.join(timeout=60)
+        self.assertEqual((outcomes[0].redundant, outcomes[0].deleted, key in store.objects), (1, 0, True))
         self.assertEqual(self._count(), 1)  # the data is still live and unchanged
         # A change that commits before the comparison: retained.
         key = self._make_leftover(store, [self._event(timedelta(days=401))], suffix="changed-first")
@@ -939,7 +1098,7 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         duplicate = f"{self.PREFIX}/sandbox/events/v3/2025/leftover-duplicate.zip"
         store.put(duplicate, store.objects[key], store.metadata[key])  # a second leftover with the same records
         outcome = self._reconcile(store)
-        self.assertEqual((sorted(outcome.deleted_keys), store.objects), (sorted([key, duplicate]), {}))
+        self.assertEqual((outcome.deleted, outcome.redundant, set(store.objects)), (0, 2, {key, duplicate}))
         self.assertEqual(self._count(), 1)
         # An archive carrying the View As columns (explicit include) must match them too.
         with self.Session() as db:
@@ -950,10 +1109,10 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         with self.engine.begin() as connection:
             connection.execute(text("UPDATE hub_product_events SET view_as_role_key = 'other'"))
         outcome = self._reconcile(store)
-        self.assertEqual((outcome.deleted, outcome.retained_not_redundant), (0, 1))
+        self.assertEqual((outcome.deleted, outcome.retained_not_redundant, outcome.redundant), (0, 1, 2))
         with self.engine.begin() as connection:
             connection.execute(text("UPDATE hub_product_events SET view_as_role_key = 'role'"))
-        self.assertEqual(self._reconcile(store).deleted, 1)
+        self.assertEqual((self._reconcile(store).redundant, self._reconcile(store).deleted), (3, 0))
 
     def test_registry_identity_is_a_database_singleton_initialised_atomically(self) -> None:
         from sqlalchemy.exc import IntegrityError
@@ -1023,7 +1182,7 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         with self.Session() as db:  # a report-only run with other storage still reports (it binds nothing) and warns
             report = archive.reconcile_leftovers(db, store, environment="sandbox", prefix=self.PREFIX, grace_hours=0,
                                                  storage=("bucket-b", self.PREFIX), out=lines.append)
-            self.assertEqual(report.candidates, 1)
+            self.assertEqual((report.leftovers, report.candidates), ([leftover], 0))
         self.assertTrue(any(line.startswith("WARNING: the registry identity is bound to a different bucket/prefix") for line in lines), lines)
         with self.Session() as db:  # the deliberate operator re-bind keeps the id
             self.assertEqual(archive.rebind_registry_identity_storage(db, bucket="bucket-b", prefix=self.PREFIX), identity)
@@ -1065,7 +1224,7 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         code = reconcile_job.run([], engine=read_only, store=store, environment="sandbox", now=None, out=lines.append, storage=("bucket-a", self.PREFIX))
         self.assertEqual(code, 0, lines)
         self.assertIn("registry identity not initialised: ownership of objects cannot be established; a deleting run would refuse.", lines)
-        self.assertTrue(any(line.startswith("leftover (unregistered") for line in lines), lines)
+        self.assertTrue(any(line.startswith("leftover under a final key (unregistered") for line in lines), lines)
         with self.engine.connect() as connection:
             self.assertEqual(connection.execute(text("SELECT count(*) FROM hub_product_analytics_archive_identity")).scalar_one(), 0)
         self.assertEqual(self._count(), 2)
@@ -1225,7 +1384,11 @@ class ArchiveJobPostgresTests(unittest.TestCase):
         self.assertEqual(code, 1, lines)
         self.assertTrue(any(line.startswith("archive failed for events: OperationalError") for line in lines), lines)
         self.assertEqual(self._count(), 2)
-        self.assertEqual(len(store.objects), 1)  # uploaded before the session died: an orphan the next run recognises
+        # The upload landed under its staging key before the session died; the
+        # failure path discarded it (nothing was promoted), so no object is left.
+        self.assertEqual(store.objects, {})
+        self.assertEqual([call for call, _ in store.calls], ["stat", "put", "delete_staging"])
+        self.assertTrue(all(archive.is_staging_key(key) for call, key in store.calls if call != "stat"), store.calls)
 
     def test_statements_inside_the_batch_run_under_a_statement_timeout(self) -> None:
         self._insert_events(self._event(timedelta(days=400)))

@@ -283,10 +283,14 @@ class ArchiveJobTests(unittest.TestCase):
                 return b"corrupt"
 
         self._add(self._event(timedelta(days=400)))
-        code, lines = self._run(store=CorruptStore())
+        corrupt = CorruptStore()
+        code, lines = self._run(store=corrupt)
         self.assertEqual(code, 1)
         self.assertTrue(any("ArchiveIntegrityError: archive readback verification failed" in line for line in lines), lines)
         self.assertEqual(self._counts(), (1, 0))
+        # The failure path discards the staging object; the promoted copy stays an unregistered final-key object.
+        self.assertEqual([archive.is_staging_key(key) for key in corrupt.objects], [False])
+        self.assertEqual([call for call, _ in corrupt.calls], ["stat", "put", "copy", "get", "delete_staging"])
 
     def test_crash_after_upload_is_recovered_without_a_second_upload(self) -> None:
         class CrashAfterUpload(archive.MemoryArchiveStore):
@@ -310,9 +314,50 @@ class ArchiveJobTests(unittest.TestCase):
         code, lines = self._run(store=store)
         self.assertEqual(code, 0)
         self.assertEqual(self._counts(), (0, 0))
-        self.assertEqual([call for call, _ in store.calls], ["head", "get"])  # recognised, verified, never re-uploaded
+        self.assertEqual([call for call, _ in store.calls], ["stat", "get"])  # recognised, verified, never re-uploaded
         self.assertTrue(any("[already present, verified sha256" in line for line in lines), lines)
         self.assertEqual(self._archived_ids()["events"], {r.event_id for r in rows})
+
+    def test_a_promotion_refused_because_the_key_appeared_is_verified_and_either_reused_or_refused(self) -> None:
+        """Between the job's HEAD and its conditional copy another writer
+        commits the final key (here: an identical object — a late copy of an
+        earlier attempt — or a different one). The copy is refused; the job
+        verifies the object in full and registers it, or stops with nothing
+        overwritten. The staging object is deleted either way."""
+
+        class CompetingWriter(archive.MemoryArchiveStore):
+            def __init__(self, different: bool) -> None:
+                super().__init__()
+                self.different = different
+
+            def copy(self, source_key, key, *, if_none_match=False):
+                if key not in self.objects:
+                    with self._lock:  # the competing writer, not a call of ours
+                        data, metadata = self.objects[source_key], dict(self.metadata[source_key])
+                        self.objects[key], self.metadata[key], self.modified[key] = (bytes(len(data)) if self.different else data), metadata, self.clock()
+                super().copy(source_key, key, if_none_match=if_none_match)
+
+        rows = [self._event(timedelta(days=400 + i)) for i in range(3)]
+        self._add(*rows)
+        identical = CompetingWriter(different=False)
+        code, lines = self._run(store=identical)
+        self.assertEqual(code, 0, lines)
+        self.assertTrue(any("[already present, verified sha256" in line and ", registered]; deleted 3." in line for line in lines), lines)
+        self.assertEqual([call for call, _ in identical.calls], ["stat", "put", "copy", "stat", "get", "delete_staging"])
+        self.assertEqual(([archive.is_staging_key(key) for key in identical.objects], self._counts()), ([False], (0, 0)))
+        with self.Session() as db:
+            self.assertEqual({row.key for row in db.query(HubProductAnalyticsArchiveV2)}, set(identical.objects))
+        self.setUp()
+        self._add(*[self._event(timedelta(days=400 + i)) for i in range(3)])
+        different = CompetingWriter(different=True)
+        code, lines = self._run(store=different)
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(any("ArchiveIntegrityError: an object already exists at" in line and "was not overwritten" in line for line in lines), lines)
+        self.assertEqual([call for call, _ in different.calls], ["stat", "put", "copy", "stat", "get", "delete_staging"])
+        (final,) = list(different.objects)
+        self.assertEqual((archive.is_staging_key(final), different.objects[final], self._counts()), (False, bytes(len(different.objects[final])), (3, 0)))
+        with self.Session() as db:
+            self.assertEqual(db.query(HubProductAnalyticsArchiveV2).count(), 0)
 
     def test_an_existing_object_with_different_bytes_stops_the_job(self) -> None:
         rows = [self._event(timedelta(days=400))]
@@ -672,6 +717,22 @@ class ArchiveJobTests(unittest.TestCase):
         store.put(key, payload, metadata)
         return key
 
+    def _staging_leftover(self, store, rows, *, name: str | None = None, marker: str | None = ...) -> str:
+        """An object exactly like one the job uploads under a staging key for
+        `rows` (which stay in the live table) and then abandoned: never
+        promoted, never registered."""
+        records = [archive.archive_row(row, "events", exclude=archive.VIEW_AS_COLUMNS) for row in rows]
+        payload = archive.make_archive(environment="sandbox", events=records, exclude_columns=archive.VIEW_AS_COLUMNS,
+                                       metadata={"table": "events", "selection": "age_expired_not_deleted_resource"})
+        key = f"hub-product-analytics/sandbox/{archive.STAGING_SEGMENT}/{name or uuid.uuid4().hex}.zip"
+        metadata = {"sha256": "x", "format-version": "3"}
+        if marker is ...:
+            metadata[archive.REGISTRY_ID_METADATA] = self._identity()
+        elif marker is not None:
+            metadata[archive.REGISTRY_ID_METADATA] = marker
+        store.put(key, payload, metadata)
+        return key
+
     def _identity_rows(self) -> int:
         with self.engine.connect() as connection:
             return int(connection.execute(text("SELECT count(*) FROM hub_product_analytics_archive_identity")).scalar_one())
@@ -770,69 +831,168 @@ class ArchiveJobTests(unittest.TestCase):
         self.assertIn("the cleanup had deleted 1 events, 0 engagements row(s) referencing deleted resources (not archived); archived and deleted in committed batches: none.", failure)
         self.assertEqual(self._counts(), (1, 0))
 
-    def test_reconcile_reports_by_default_and_deletes_only_redundant_leftovers_in_its_own_scope(self) -> None:
+    def test_the_job_stages_every_upload_promotes_by_copy_and_never_puts_to_a_final_key(self) -> None:
+        """The property the leftover cleanup rests on: the job's only PUTs go
+        to random staging keys; final keys are only ever written by the
+        server-side copy, read back, registered, and the staging object is
+        deleted after the commit."""
+        self._add(self._event(timedelta(days=400)), self._engagement(timedelta(days=400)))
+        code, lines = self._run()
+        self.assertEqual(code, 0, lines)
+        puts = [key for call, key in self.store.calls if call == "put"]
+        copies = [key for call, key in self.store.calls if call == "copy"]
+        self.assertEqual((len(puts), len(copies)), (2, 2))
+        self.assertTrue(all(archive.is_staging_key(key) for key in puts), puts)
+        self.assertTrue(all(key.startswith("hub-product-analytics/sandbox/_staging/") for key in puts), puts)
+        self.assertTrue(all(not archive.is_staging_key(key) for key in copies), copies)
+        self.assertEqual([call for call, _ in self.store.calls], ["stat", "put", "copy", "get", "delete_staging"] * 2)
+        self.assertEqual([key for call, key in self.store.calls if call == "delete_staging"], puts)
+        self.assertEqual(sorted(self.store.objects), sorted(copies))
+        with self.Session() as db:
+            self.assertEqual({row.key for row in db.query(HubProductAnalyticsArchiveV2)}, set(copies))
+        self.assertEqual(self._counts(), (0, 0))
+        self.assertFalse(any("_staging" in line for line in lines), lines)  # nothing to note: the staging objects are gone
+
+    def test_a_staging_key_is_never_registered_or_used_as_an_archive_key(self) -> None:
+        payload = archive.make_archive(environment="sandbox", events=[])
+        manifest = archive.validate_archive(payload)
+        staged = archive.staging_key(prefix="hub-product-analytics", environment="sandbox")
+        self.assertTrue(archive.is_staging_key(staged))
+        self.assertTrue(staged.startswith("hub-product-analytics/sandbox/_staging/") and staged.endswith(".zip"))
+        self.assertNotEqual(staged, archive.staging_key(prefix="hub-product-analytics", environment="sandbox"))
+        self.assertFalse(archive.is_staging_key("hub-product-analytics/sandbox/events/v3/2025/2025-01-01_1-1_abc.zip"))
+        with self.Session() as db, self.assertRaises(ValueError):
+            archive.register_archive(db, key=staged, environment="sandbox", table="events", digest="x", manifest=manifest, registered_at=NOW)
+        with self.assertRaises(ValueError):
+            archive.ensure_archived(self.store, key=staged, payload=payload)
+        with self.assertRaises(ValueError):
+            archive.ensure_archived(self.store, key="hub-product-analytics/sandbox/events/v3/2025/x.zip", payload=payload,
+                                    staging_key="hub-product-analytics/sandbox/events/v3/2025/y.zip")
+        with self.assertRaises(ValueError):
+            self.store.delete_staging("hub-product-analytics/sandbox/events/v3/2025/x.zip")
+        self.assertEqual(self.store.calls, [])
+        with self.Session() as db:
+            self.assertEqual(db.query(HubProductAnalyticsArchiveV2).count(), 0)
+
+    def test_a_staging_object_that_cannot_be_deleted_after_the_commit_does_not_fail_the_batch(self) -> None:
+        class CannotDeleteStaging(archive.MemoryArchiveStore):
+            unreachable = True
+
+            def delete_staging(self, key):
+                if self.unreachable:
+                    self.calls.append(("delete_staging", key))
+                    raise OSError("storage unreachable")
+                super().delete_staging(key)
+
+        self._add(self._event(timedelta(days=400)))
+        store = CannotDeleteStaging()
+        code, lines = self._run(store=store)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(self._counts(), (0, 0))
+        staged = [key for key in store.objects if archive.is_staging_key(key)]
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(any(line.startswith("note: the staging object of this batch could not be deleted now (OSError)") and line.endswith(staged[0])
+                            for line in lines), lines)
+        self.assertNotIn("storage unreachable", "\n".join(lines))
+        # The reconciliation removes it after the grace period; the archive itself is untouched.
+        store.unreachable = False
+        with self.Session() as db:
+            recent = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", delete=True)
+            self.assertEqual((recent.too_recent, recent.deleted), (1, 0))
+            later = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics",
+                                                now=datetime.now(timezone.utc) + timedelta(hours=25), delete=True)
+        self.assertEqual((later.deleted_keys, later.registered), (staged, 1))
+        self.assertEqual([archive.is_staging_key(key) for key in store.objects], [False])
+
+    def test_reconcile_reports_by_default_and_deletes_only_old_staging_leftovers_in_its_own_scope(self) -> None:
         store, clock = self._clocked_store(NOW - timedelta(hours=48))
         self._add(self._event(timedelta(days=400)), self._engagement(timedelta(days=400)))
         self.assertEqual(self._run(store=store)[0], 0)
         registered = set(store.objects)
         live_rows = [self._event(timedelta(days=410 + i)) for i in range(3)]
         self._add(*live_rows)
+        staged = self._staging_leftover(store, live_rows, name="ours")
+        staged_foreign = self._staging_leftover(store, live_rows, name="foreign", marker="00000000-0000-0000-0000-000000000000")
+        staged_unmarked = self._staging_leftover(store, live_rows, name="unmarked", marker=None)
         redundant = self._leftover(store, live_rows, suffix="redundant")
         foreign = self._leftover(store, live_rows, suffix="foreign", marker="00000000-0000-0000-0000-000000000000")
-        unmarked = self._leftover(store, live_rows, suffix="unmarked", marker=None)
-        store.put("hub-product-analytics/sandbox/events/v3/2025/not-an-archive.zip", b"junk", {archive.REGISTRY_ID_METADATA: self._identity()})
+        junk = "hub-product-analytics/sandbox/events/v3/2025/not-an-archive.zip"
+        store.put(junk, b"junk", {archive.REGISTRY_ID_METADATA: self._identity()})
         clock[0] = NOW - timedelta(minutes=5)
-        recent = self._leftover(store, live_rows, suffix="recent")
-        store.put("hub-product-analytics/production/events/v3/2025/other-env.zip", b"env")
-        store.put("other-prefix/sandbox/events/v3/2025/other-prefix.zip", b"prefix")
+        recent = self._staging_leftover(store, live_rows, name="recent")
+        recent_final = self._leftover(store, live_rows, suffix="recent")
+        store.put("hub-product-analytics/production/_staging/other-env.zip", b"env", {archive.REGISTRY_ID_METADATA: self._identity()})
+        store.put("other-prefix/sandbox/_staging/other-prefix.zip", b"prefix", {archive.REGISTRY_ID_METADATA: self._identity()})
         before = dict(store.objects)
+        store.calls.clear()  # the job's own staging deletes are not the reconciliation's
         lines: list[str] = []
         with self.Session() as db:
             report = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, out=lines.append)
-        self.assertEqual((report.listed, report.registered, report.too_recent, report.candidates, report.deleted), (7, 2, 1, 4, 0))
+        self.assertEqual((report.listed, report.registered, report.staging_listed, report.too_recent, report.candidates), (10, 2, 4, 1, 3))
+        self.assertEqual((report.final_too_recent, sorted(report.leftovers), report.deleted, report.retained), (1, sorted([foreign, junk, redundant]), 0, []))
         self.assertEqual(store.objects, before)
-        self.assertFalse(any(call == "delete" for call, _ in store.calls))
+        self.assertFalse(any(call in {"delete", "delete_staging"} for call, _ in store.calls))
         with self.Session() as db:
             outcome = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, delete=True, out=lines.append)
-        self.assertEqual(outcome.deleted_keys, [redundant])
-        self.assertEqual((outcome.retained_foreign, outcome.retained_invalid, outcome.retained_not_redundant), (2, 1, 0))
-        self.assertEqual({key for key, _ in outcome.retained}, {foreign, unmarked, "hub-product-analytics/sandbox/events/v3/2025/not-an-archive.zip"})
-        self.assertEqual(set(store.objects), (set(before) - {redundant}))
+        self.assertEqual(outcome.deleted_keys, [staged])
+        self.assertEqual((outcome.redundant, outcome.retained_foreign, outcome.retained_invalid, outcome.retained_not_redundant), (1, 3, 1, 0))
+        self.assertEqual({key for key, _ in outcome.retained}, {staged_foreign, staged_unmarked, foreign, junk, redundant})
+        self.assertEqual(set(store.objects), set(before) - {staged})
         self.assertTrue(registered <= set(store.objects))
-        self.assertEqual(self._counts(), (3, 0))  # the leftover's rows are still live: nothing was lost
+        self.assertEqual([key for call, key in store.calls if call in {"delete", "delete_staging"}], [staged])
+        self.assertEqual(self._counts(), (3, 0))  # the leftovers' rows are still live: nothing was lost
+        self.assertTrue(any(line == f"deleted staging leftover: {staged}" for line in lines), lines)
+        self.assertTrue(any(line.startswith("retained (redundant: every one of its 3 record(s) has an identical live row") and line.endswith(redundant)
+                            for line in lines), lines)
         with self.Session() as db:
             again = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, delete=True)
-            self.assertEqual((again.deleted, again.too_recent, again.retained_foreign, again.retained_invalid), (0, 1, 2, 1))
+            self.assertEqual((again.deleted, again.too_recent, again.redundant, again.retained_foreign, again.retained_invalid), (0, 1, 1, 3, 1))
             later = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW + timedelta(hours=25), delete=True)
-        self.assertEqual((later.deleted_keys, later.too_recent), ([recent], 0))
+        self.assertEqual((later.deleted_keys, later.too_recent, later.final_too_recent, later.redundant), ([recent], 0, 0, 2))
+        self.assertIn(recent_final, store.objects)
 
-    def test_reconcile_retains_leftovers_whose_records_are_no_longer_live_until_an_operator_reviews_them(self) -> None:
+    def test_reconcile_never_deletes_an_object_under_a_final_key_whatever_its_state(self) -> None:
+        """The property the design rests on, asserted directly: no code path
+        deletes a final-key object — not a redundant one, not one replaced
+        while it is inspected, not an invalid one — and the stores refuse to
+        be asked. A test written against the previous design (delete the
+        redundant leftover) fails here."""
         store, _ = self._clocked_store(NOW - timedelta(hours=48))
         self._add(self._event(timedelta(days=400)))
         self.assertEqual(self._run(store=store)[0], 0)
         (registered,) = list(store.objects)
-        rows = [self._event(timedelta(days=410)), self._event(timedelta(days=411))]
+        rows = [self._event(timedelta(days=410))]
         self._add(*rows)
-        leftover = self._leftover(store, rows, suffix="cleanup-deleted")
-        with self.engine.begin() as connection:  # the cleanup later removed those rows (deleted resource)
-            connection.execute(text("DELETE FROM hub_product_events WHERE event_id IN (:a, :b)"), {"a": rows[0].event_id, "b": rows[1].event_id})
+        redundant = self._leftover(store, rows, suffix="redundant")
+
+        class ReplacedWhileInspected(archive.MemoryArchiveStore):
+            def get(self, key):  # a writer outside the job replaces the object right after it was read
+                data = super().get(key)
+                archive.MemoryArchiveStore.put(self, key, b"replaced")
+                return data
+
+        replacing = ReplacedWhileInspected(clock=store.clock)
+        replacing.objects, replacing.metadata, replacing.modified = store.objects, store.metadata, store.modified
+        with self.Session() as db:
+            outcome = archive.reconcile_leftovers(db, replacing, environment="sandbox", prefix="hub-product-analytics", now=NOW, delete=True)
+        self.assertEqual((outcome.deleted, outcome.redundant, outcome.leftovers), (0, 1, [redundant]))
+        self.assertEqual((set(store.objects), store.objects[redundant]), ({registered, redundant}, b"replaced"))
+        self.assertFalse(any(call in {"delete", "delete_staging"} for call, _ in replacing.calls), replacing.calls)
+        for final in (redundant, registered):
+            with self.assertRaises(ValueError):
+                store.delete_staging(final)
+        self.assertEqual(set(store.objects), {registered, redundant})
+        # A registry row pointing under the staging segment cannot come from this code: an alert, never acted on.
+        hand = "hub-product-analytics/sandbox/_staging/hand-registered.zip"
+        with self.engine.begin() as connection:
+            connection.execute(text("UPDATE hub_product_analytics_archives SET key = :k"), {"k": hand})
+        store.put(hand, store.objects[registered], store.metadata[registered])
         lines: list[str] = []
         with self.Session() as db:
-            outcome = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, delete=True, out=lines.append)
-        self.assertEqual((outcome.deleted, outcome.retained_not_redundant), (0, 1))
-        self.assertEqual(outcome.retained[0][0], leftover)
-        self.assertIn("2 of 2 record(s) have no identical live row", outcome.retained[0][1])
-        self.assertIn(leftover, store.objects)
-        with self.Session() as db:
-            with self.assertRaises(ValueError):
-                archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, reviewed_keys=["other-prefix/x.zip"])
-            refused = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, reviewed_keys=[registered], out=lines.append)
-        self.assertEqual((refused.deleted, registered in store.objects), (0, True))
-        self.assertTrue(any(line.startswith("reviewed key not deleted: not a leftover candidate") for line in lines), lines)
-        with self.Session() as db:
-            reviewed = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, reviewed_keys=[leftover], out=lines.append)
-        self.assertEqual((reviewed.deleted_keys, leftover in store.objects, registered in store.objects), ([leftover], False, True))
-        self.assertTrue(any(line == f"deleted reviewed leftover: {leftover}" for line in lines), lines)
+            alert = archive.reconcile_leftovers(db, store, environment="sandbox", prefix="hub-product-analytics", now=NOW, delete=True, out=lines.append)
+        self.assertEqual((alert.registered_staging, alert.registered, alert.deleted), ([hand], 1, 0))
+        self.assertIn(hand, store.objects)
+        self.assertTrue(any(line.startswith(f"ALERT: registered key {hand} lies under the staging segment") for line in lines), lines)
 
     def test_reconcile_never_deletes_registered_objects_and_continues_after_a_failure(self) -> None:
         store, _ = self._clocked_store(NOW - timedelta(hours=48))
@@ -841,14 +1001,14 @@ class ArchiveJobTests(unittest.TestCase):
         (registered,) = list(store.objects)
         rows_a, rows_b = [self._event(timedelta(days=410))], [self._event(timedelta(days=411))]
         self._add(*rows_a, *rows_b)
-        a = self._leftover(store, rows_a, suffix="a")
-        b = self._leftover(store, rows_b, suffix="b")
+        a = self._staging_leftover(store, rows_a, name="a")
+        b = self._staging_leftover(store, rows_b, name="b")
 
         class FailsOnB(archive.MemoryArchiveStore):
-            def delete(self, key):
+            def delete_staging(self, key):
                 if key == b:
                     raise OSError("storage unreachable")
-                super().delete(key)
+                super().delete_staging(key)
 
         flaky = FailsOnB(clock=store.clock)
         flaky.objects, flaky.metadata, flaky.modified = store.objects, store.metadata, store.modified
@@ -876,22 +1036,34 @@ class ArchiveJobTests(unittest.TestCase):
         self.assertEqual(self._run(store=store)[0], 0)
         rows = [self._event(timedelta(days=410))]
         self._add(*rows)
-        leftover = self._leftover(store, rows, suffix="script")
+        staged = self._staging_leftover(store, rows, name="script")
+        final = self._leftover(store, rows, suffix="script")
         lines: list[str] = []
         code = reconcile_job.run([], engine=self.engine, store=store, environment="sandbox", now=NOW, out=lines.append)
-        self.assertEqual((code, len(store.objects)), (0, 2))
-        self.assertTrue(any(line.startswith("report only: nothing was deleted.") for line in lines), lines)
-        self.assertTrue(any(line.startswith(f"leftover (unregistered, age 48.0 h): {leftover}") for line in lines), lines)
+        self.assertEqual((code, len(store.objects)), (0, 3))
+        self.assertIn("report only: nothing was deleted.", lines)
+        self.assertIn(f"staging leftover (unregistered, age 48.0 h): {staged}", lines)
+        self.assertIn(f"leftover under a final key (unregistered, age 48.0 h; never deleted automatically): {final}", lines)
         lines.clear()
         self.assertEqual(reconcile_job.run(["--delete", "--grace-hours", "0.5"], engine=self.engine, store=store, environment="sandbox", now=NOW, out=lines.append), 2)
-        self.assertEqual(reconcile_job.run(["--delete-reviewed", "other-prefix/x.zip"], engine=self.engine, store=store, environment="sandbox", now=NOW, out=lines.append), 2)
-        self.assertEqual(len(store.objects), 2)
+        with self.assertRaises(SystemExit):  # the operator deletion of reviewed final keys no longer exists
+            reconcile_job.run(["--delete-reviewed", final], engine=self.engine, store=store, environment="sandbox", now=NOW, out=lines.append)
+        self.assertEqual(len(store.objects), 3)
         lines.clear()
         code = reconcile_job.run(["--delete"], engine=self.engine, store=store, environment="sandbox", now=NOW, out=lines.append)
-        self.assertEqual((code, len(store.objects)), (0, 1))
-        self.assertTrue(any("deleted 1; retained 0 not redundant, 0 foreign, 0 invalid" in line for line in lines), lines)
+        self.assertEqual((code, len(store.objects)), (0, 2))
+        self.assertIn(final, store.objects)
+        summary = next(line for line in lines if line.startswith("reconcile (delete staging leftovers)"))
+        self.assertIn("staging: 1 unregistered, 0 within the grace period, 1 leftover(s), deleted 1; final keys: 1 unregistered leftover(s) past the grace period (never deleted), 0 within the grace period, 1 redundant, 0 not redundant, 0 invalid; 0 foreign", summary)
         self.assertFalse(any("a@renphil.org" in line for line in lines))
-
+        # A registry row under the staging segment makes the run exit 1.
+        with self.engine.begin() as connection:
+            connection.execute(text("UPDATE hub_product_analytics_archives SET key = :k"), {"k": staged})
+        store.put(staged, b"anything", {archive.REGISTRY_ID_METADATA: self._identity()})
+        lines.clear()
+        self.assertEqual(reconcile_job.run([], engine=self.engine, store=store, environment="sandbox", now=NOW, out=lines.append), 1)
+        self.assertTrue(any(line.startswith(f"ALERT: registered key {staged} lies under the staging segment") for line in lines), lines)
+        self.assertIn(staged, store.objects)
 
 if __name__ == "__main__":
     unittest.main()

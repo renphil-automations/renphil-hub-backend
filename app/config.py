@@ -632,10 +632,11 @@ class Settings(BaseSettings):
     R2_SECRET_ACCESS_KEY: str = ""
     R2_BUCKET_NAME: str = ""
     # A SECOND token for `scripts/reconcile_product_analytics_archives.py`
-    # only (Object Read + List + Delete on the same bucket; never Put). The
-    # scheduled writer above must not be able to list or delete, and this
-    # identity must not be able to write. Leave empty on the API and on the
-    # writer's schedule.
+    # only. The reconciliation lists, reads and deletes STAGING objects and
+    # never writes; Cloudflare's token levels cannot exclude delete or list,
+    # so that restriction is in the code, not in the token — keep the two
+    # identities separate anyway. Leave empty on the API and on the writer's
+    # schedule.
     R2_RECONCILE_ACCESS_KEY_ID: str = ""
     R2_RECONCILE_SECRET_ACCESS_KEY: str = ""
     # Key prefix inside the bucket; archives live under

@@ -15,8 +15,8 @@ from zipfile import ZipFile
 
 from app.services import product_analytics_archive as archive
 from app.services.product_analytics_archive import (
-    ArchiveConfigError, ArchiveIntegrityError, MemoryArchiveStore, R2ArchiveStore, R2Config,
-    archive_key, ensure_archived, make_archive, put_and_verify, validate_archive,
+    ArchiveConfigError, ArchiveIntegrityError, ArchiveObjectExistsError, ArchiveTimeoutError, MemoryArchiveStore, R2ArchiveStore,
+    R2Config, archive_key, ensure_archived, make_archive, put_and_verify, validate_archive,
 )
 
 AT = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -316,7 +316,7 @@ class VerifiedUploadTests(unittest.TestCase):
         self.assertEqual((digest, uploaded), (hashlib.sha256(payload).hexdigest(), True))
         self.assertEqual(store.metadata["k/batch.zip"], {"sha256": digest, "format-version": "3"})
         self.assertEqual(ensure_archived(store, key="k/batch.zip", payload=payload), (digest, False))
-        self.assertEqual([call for call, _ in store.calls], ["head", "put", "get", "head", "get"])
+        self.assertEqual([call for call, _ in store.calls], ["stat", "put", "get", "stat", "get"])
 
     def test_a_key_taken_between_head_and_put_is_never_overwritten(self) -> None:
         """Another writer lands right after our HEAD. The conditional PUT is
@@ -330,15 +330,16 @@ class VerifiedUploadTests(unittest.TestCase):
                 super().__init__()
                 self.other = other
 
-            def head(self, key):
-                size = super().head(key)
-                if size is None:
-                    MemoryArchiveStore.put(self, key, self.other)  # the other writer
-                return size
+            def stat(self, key):
+                info = super().stat(key)
+                if info is None:  # the other writer lands right after our HEAD
+                    with self._lock:
+                        self.objects[key], self.metadata[key], self.modified[key] = self.other, {"sha256": digest, "format-version": "3"}, self.clock()
+                return info
 
         identical = RacingStore(payload)
         self.assertEqual(ensure_archived(identical, key="k", payload=payload), (digest, False))
-        self.assertEqual([call for call, _ in identical.calls], ["head", "put", "put", "get"])
+        self.assertEqual([call for call, _ in identical.calls], ["stat", "put", "stat", "get"])
         different = RacingStore(b"someone else's bytes")
         with self.assertRaises(ArchiveIntegrityError):
             ensure_archived(different, key="k", payload=payload)
@@ -405,6 +406,218 @@ class VerifiedUploadTests(unittest.TestCase):
             put_and_verify(CorruptStore(), key="k", payload=payload)
         with self.assertRaises(ValueError):
             ensure_archived(store, key="", payload=payload)
+
+
+class ConditionalPromotionTests(unittest.TestCase):
+    """The staged upload is promoted by a copy that is conditional on the
+    final key being absent (R2's `cf-copy-destination-if-none-match: *`,
+    HTTP 412 when the key exists, checked when the copy is committed). The
+    memory store enforces that atomically, so every test here fails against
+    an unconditional copy."""
+
+    KEY = "p/sandbox/events/v3/2026/2026-01-01_1-1_abc.zip"
+    STAGED = "p/sandbox/_staging/attempt-1.zip"
+    META = {"registry-id": "r-1", "environment": "sandbox", "table": "events"}
+
+    def setUp(self) -> None:
+        self.payload = make_archive(environment="sandbox", events=[_event()])
+        self.sha = hashlib.sha256(self.payload).hexdigest()
+        self.stamped = {**self.META, "sha256": self.sha, "format-version": "3"}
+
+    def _racing(self, other: bytes | None, metadata: dict | None = None) -> MemoryArchiveStore:
+        """A store in which a competing writer commits `other` under the final
+        key between this writer's HEAD and its COPY (the copy then meets the
+        destination condition and is refused)."""
+        stamped = self.stamped
+
+        class Racing(MemoryArchiveStore):
+            def copy(self, source_key, key, *, if_none_match=False):
+                if other is not None and key not in self.objects:
+                    with self._lock:  # the competing writer, not a call of ours
+                        self.objects[key], self.metadata[key], self.modified[key] = other, stamped if metadata is None else metadata, self.clock()
+                super().copy(source_key, key, if_none_match=if_none_match)
+
+        return Racing()
+
+    def test_the_store_refuses_a_conditional_copy_onto_an_existing_key(self) -> None:
+        store = MemoryArchiveStore()
+        store.put("p/sandbox/_staging/src.zip", b"x", {"m": "1"})
+        store.put(self.KEY, b"other")
+        with self.assertRaises(ArchiveObjectExistsError):
+            store.copy("p/sandbox/_staging/src.zip", self.KEY, if_none_match=True)
+        self.assertEqual(store.objects[self.KEY], b"other")
+        store.copy("p/sandbox/_staging/src.zip", "p/sandbox/events/v3/2026/other.zip", if_none_match=True)
+        self.assertEqual((store.objects["p/sandbox/events/v3/2026/other.zip"], store.metadata["p/sandbox/events/v3/2026/other.zip"]), (b"x", {"m": "1"}))
+
+    def test_the_job_path_always_sends_the_destination_condition(self) -> None:
+        seen: list[bool] = []
+
+        class Recording(MemoryArchiveStore):
+            def copy(self, source_key, key, *, if_none_match=False):
+                seen.append(if_none_match)
+                super().copy(source_key, key, if_none_match=if_none_match)
+
+        store = Recording()
+        ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=self.STAGED)
+        self.assertEqual(seen, [True])
+
+    def test_a_competing_identical_object_committed_between_head_and_copy_is_verified_then_reused(self) -> None:
+        store = self._racing(self.payload)
+        self.assertEqual(ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=self.STAGED), (self.sha, False))
+        self.assertEqual([call for call, _ in store.calls], ["stat", "put", "copy", "stat", "get"])
+        self.assertEqual((store.objects[self.KEY], store.metadata[self.KEY]), (self.payload, self.stamped))
+        self.assertIn(self.STAGED, store.objects)  # the job deletes it after its commit
+        # Retry: recognised by the HEAD, no staging, no copy.
+        self.assertEqual(ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key="p/sandbox/_staging/attempt-2.zip"),
+                         (self.sha, False))
+        self.assertEqual([call for call, _ in store.calls][5:], ["stat", "get"])
+
+    def test_a_competing_different_object_is_never_overwritten_and_fails_closed(self) -> None:
+        cases = {
+            "different bytes, different size": (b"someone else's bytes", None),
+            "different bytes, same size": (bytes(len(self.payload)), None),
+            "same bytes, another registry's metadata": (self.payload, {**self.stamped, "registry-id": "r-2"}),
+            "same bytes, no sha256 metadata": (self.payload, {k: v for k, v in self.stamped.items() if k != "sha256"}),
+            "same bytes, other environment metadata": (self.payload, {**self.stamped, "environment": "production"}),
+            "same bytes, no metadata at all": (self.payload, {}),
+        }
+        for name, (other, metadata) in cases.items():
+            with self.subTest(name):
+                store = self._racing(other, metadata)
+                with self.assertRaises(ArchiveIntegrityError) as caught:
+                    ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=self.STAGED)
+                self.assertIn("was not overwritten", str(caught.exception))
+                self.assertEqual((store.objects[self.KEY], store.metadata[self.KEY]), (other, self.stamped if metadata is None else metadata))
+                self.assertEqual([call for call, _ in store.calls].count("copy"), 1)
+                # A retry does not help itself to the key either: the HEAD sees the other object and the same verification refuses it.
+                with self.assertRaises(ArchiveIntegrityError):
+                    ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key="p/sandbox/_staging/attempt-2.zip")
+                self.assertEqual(store.objects[self.KEY], other)
+
+    def test_a_refused_copy_whose_object_is_not_visible_afterwards_fails_closed(self) -> None:
+        """R2 documents that a NoSuchKey read is not proof that an unknown
+        write failed; a 412 followed by an absent HEAD is an inconsistency,
+        not a licence to copy again."""
+
+        class Vanishing(MemoryArchiveStore):
+            def copy(self, source_key, key, *, if_none_match=False):
+                self.calls.append(("copy", key))
+                raise ArchiveObjectExistsError(f"object already exists at {key}")
+
+        store = Vanishing()
+        with self.assertRaises(ArchiveIntegrityError) as caught:
+            ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=self.STAGED)
+        self.assertIn("no object is visible there now", str(caught.exception))
+        self.assertEqual([call for call, _ in store.calls], ["stat", "put", "copy", "stat"])
+        self.assertNotIn(self.KEY, store.objects)
+
+    def test_concurrent_promotions_of_one_key_commit_exactly_one_copy_and_the_other_verifies(self) -> None:
+        import threading
+
+        barrier = threading.Barrier(2)
+
+        class Simultaneous(MemoryArchiveStore):
+            def copy(self, source_key, key, *, if_none_match=False):
+                barrier.wait(timeout=10)  # both writers have passed their HEAD (key absent) and staged
+                super().copy(source_key, key, if_none_match=if_none_match)
+
+        store = Simultaneous()
+        results: list[tuple[str, bool]] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def writer(n: int) -> None:
+            try:
+                outcome = ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=f"p/sandbox/_staging/w{n}.zip")
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion
+                with lock:
+                    errors.append(exc)
+                return
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), sorted([(self.sha, True), (self.sha, False)]))
+        self.assertEqual((store.objects[self.KEY], store.metadata[self.KEY]), (self.payload, self.stamped))
+        self.assertEqual([call for call, _ in store.calls].count("copy"), 2)
+        self.assertEqual(sorted(key for key in store.objects if "_staging" in key), ["p/sandbox/_staging/w0.zip", "p/sandbox/_staging/w1.zip"])
+
+    def _stalled_copy_store(self):
+        """A store whose copy selects its source at request time, then
+        waits for `release`, then commits under the destination condition —
+        R2's documented order: source selected first, destination checked at
+        commit. Errors of the abandoned copy are collected in `late`."""
+        import threading
+
+        inside, release = threading.Event(), threading.Event()
+        late: list[BaseException] = []
+
+        class StalledCopy(MemoryArchiveStore):
+            stall = True
+
+            def copy(self, source_key, key, *, if_none_match=False):
+                if not self.stall:
+                    return super().copy(source_key, key, if_none_match=if_none_match)
+                self.stall = False
+                with self._lock:
+                    data, metadata = self.objects[source_key], dict(self.metadata.get(source_key, {}))
+                inside.set()
+                release.wait(timeout=30)
+                try:
+                    with self._lock:
+                        self.calls.append(("copy", key))
+                        if if_none_match and key in self.objects:
+                            raise ArchiveObjectExistsError(f"object already exists at {key}")
+                        self.objects[key] = data
+                        self.metadata[key] = metadata
+                        self.modified[key] = self.clock()
+                except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+                    late.append(exc)
+                    raise
+
+        return StalledCopy(), inside, release, late
+
+    def test_a_copy_abandoned_at_the_deadline_cannot_overwrite_a_later_promotion(self) -> None:
+        store, inside, release, late = self._stalled_copy_store()
+        with self.assertRaises(ArchiveTimeoutError):
+            ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=self.STAGED, deadline=0.3)
+        self.assertTrue(inside.is_set())
+        self.assertNotIn(self.KEY, store.objects)
+        # The retry (next run) promotes its own staged copy while the key is absent.
+        self.assertEqual(ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key="p/sandbox/_staging/attempt-2.zip"),
+                         (self.sha, True))
+        before = (store.objects[self.KEY], store.metadata[self.KEY], store.modified[self.KEY])
+        # The abandoned copy completes afterwards: refused by the destination condition, nothing replaced.
+        release.set()
+        for _ in range(100):
+            if late:
+                break
+            import time
+            time.sleep(0.05)
+        self.assertEqual([type(exc) for exc in late], [ArchiveObjectExistsError])
+        self.assertEqual((store.objects[self.KEY], store.metadata[self.KEY], store.modified[self.KEY]), before)
+
+    def test_a_copy_abandoned_at_the_deadline_that_lands_while_the_key_is_absent_is_recognised_by_the_retry(self) -> None:
+        store, inside, release, late = self._stalled_copy_store()
+        with self.assertRaises(ArchiveTimeoutError):
+            ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key=self.STAGED, deadline=0.3)
+        release.set()
+        for _ in range(100):
+            if self.KEY in store.objects:
+                break
+            import time
+            time.sleep(0.05)
+        self.assertEqual(late, [])
+        self.assertEqual(store.objects[self.KEY], self.payload)  # landed late, unregistered: the registry decides what is an archive
+        store.calls.clear()
+        self.assertEqual(ensure_archived(store, key=self.KEY, payload=self.payload, metadata=self.META, staging_key="p/sandbox/_staging/attempt-2.zip"),
+                         (self.sha, False))
+        self.assertEqual([call for call, _ in store.calls], ["stat", "get"])
 
 
 class StorageConfigTests(unittest.TestCase):

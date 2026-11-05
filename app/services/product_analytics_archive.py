@@ -8,8 +8,25 @@ An object in the bucket without a registry row is an abandoned upload, not an
 archive — the job cannot cancel an HTTP request it has given up on (a
 deadline, a lost connection or a killed process leaves the server-side
 outcome unknown), so the registry, not the bucket, is the authority. Anything
-that reads archives starts from the registry; leftovers are reconciled by an
-operator (runbook, "Leftover objects").
+that reads archives starts from the registry.
+
+HOW AN UPLOAD REACHES ITS KEY (staging and promotion): the bytes are uploaded
+to a fresh random key under `<prefix>/<env>/_staging/` (conditional, never
+registerable) and promoted to the content-addressed final key by a
+server-side copy that is itself conditional on the destination being absent
+(R2's `cf-copy-destination-if-none-match: *`, a beta extension: 412 when the
+key exists, checked when the copy is committed); the final object is read
+back and verified before the batch registers it and deletes its rows, and
+the staging object is deleted after the commit. A 412 on the copy means
+another writer committed the key first; that object is then verified in
+full (size, the metadata the job stamps, bytes) before it is reused, and
+anything else fails closed — the job never overwrites a final key. R2's DeleteObject is unconditional (verified against the
+real service 2026-11-04), so the only objects this code ever deletes
+automatically are staging objects: by construction none of them is or can
+become an archive (`register_archive` refuses staging keys), so deleting one
+— whatever is at the key by then — can never lose an archive. Unregistered
+objects under final keys are reported and classified by the reconciliation,
+never deleted by it (runbook, "Leftover objects").
 
 Records that reliably belong to a deleted Hub resource are deleted, not
 archived: the deleted-resource cleanup removes them first, the archive
@@ -35,12 +52,13 @@ Guarantees (operational runbook: PRODUCT_ANALYTICS_ARCHIVE.md):
   otherwise (`resource_lock_modes`); a resource deleted between selection
   and lock is detected and the batch is re-selected without any upload; the
   rule is re-checked after the readback, inside the locks, before the
-  registry row and the deletes are written. An abandoned upload that lands
-  later can contain records of a resource deleted in the meantime — it is
-  not registered and therefore not an archive, but it is bytes in the bucket
-  until a separately reviewed cleanup process removes it. R2 reconciliation
-  reports such objects but cannot delete them: R2's DeleteObject ignores
-  `If-Match` and cannot safely compare and delete in one operation.
+  registry row and the deletes are written. An abandoned staged upload that
+  lands later can contain records of a resource deleted in the meantime — it
+  is a staging object: never registered, never an archive, deleted by the
+  reconciliation after the grace period. An abandoned promotion (copy) that
+  lands later leaves an unregistered object under a final key; it is
+  reported and classified, never deleted automatically (R2's DeleteObject
+  ignores `If-Match`, so no compare-and-delete exists for it).
 * Archive bytes are deterministic for a given ordered set of rows (fixed ZIP
   member timestamps, sorted JSON keys, no run-specific data inside the ZIP),
   and the object key embeds the environment, table, first day, row-id range
@@ -48,8 +66,19 @@ Guarantees (operational runbook: PRODUCT_ANALYTICS_ARCHIVE.md):
   re-creates the same key on the next run, finds the object, verifies it and
   registers it without uploading twice — and only if its rows are still the
   same rows (a changed selection means different bytes and a different key).
-  A key that already exists with different content is refused, never
-  overwritten.
+  A final key that already exists with different content is refused, never
+  overwritten: the job's HEAD sees it, or — if a writer commits the key
+  between the HEAD and the copy — the copy's destination condition
+  (`cf-copy-destination-if-none-match: *`) is refused with 412 and the
+  existing object is verified (size, stamped metadata, bytes) before it is
+  reused; a mismatch stops the run. The destination condition is R2's own
+  check at commit time, like `If-None-Match` on PutObject; it is NOT atomic
+  with the source-side `x-amz-copy-source-if-*` conditions (the source is
+  selected earlier than the destination is committed), which this job does
+  not use: its source is its own random staging key, and the readback after
+  the copy verifies the bytes that reached the final key. None of this makes
+  DeleteObject conditional. Everything a token holder outside this job can
+  do to any object (overwrite, delete) remains outside this design.
 * One run per database at a time: a transaction-level advisory lock is taken
   inside every batch transaction (safe behind a transaction-pooling proxy,
   which the managed database's pooled endpoint is); a second run stops with
@@ -135,6 +164,12 @@ LOCK_MODES = ("key_share", "share")
 # The selected rows of this event name are tied to a page (tab or
 # sub-gridstack) by `target_id`.
 _PAGE_SELECTION_EVENTS = frozenset({"root_tab.selected", "view_tab.selected", "sub_tab.selected"})
+# Every upload goes to a fresh random key under this segment of the
+# environment's prefix and is promoted to its final key by a server-side
+# copy. A staging key is never registered (`register_archive` refuses it), so
+# a staging object is never an archive and deleting one can never lose an
+# archive: that is the only automatic deletion this module performs.
+STAGING_SEGMENT = "_staging"
 
 
 class ArchiveError(RuntimeError):
@@ -224,16 +259,32 @@ class ArchiveStore(Protocol):
         """The stored object's size in bytes, or None when the key is absent."""
         ...
 
+    def stat(self, key: str) -> ObjectInfo | None:
+        """HEAD with user metadata, or None when the key is absent."""
+        ...
+
+    def copy(self, source_key: str, key: str, *, if_none_match: bool = False) -> None:
+        """Server-side copy of `source_key` to `key`, user metadata included.
+        With `if_none_match`, refuse (ArchiveObjectExistsError) if `key`
+        already exists, checked by the storage service when the copy is
+        committed (R2: `cf-copy-destination-if-none-match: *`, 412)."""
+        ...
+
+    def delete_staging(self, key: str) -> None:
+        """Unconditional delete, accepted for staging keys ONLY (`ValueError`
+        for any other key); an absent key is not an error (S3 semantics)."""
+        ...
+
 
 class ReconcileStore(Protocol):
-    """What the reconciliation needs on top of reads: list, identify, delete.
-    The scheduled archive writer's store class has none of these.
-
-    `delete` is UNCONDITIONAL. Cloudflare R2 accepts `DeleteObject` with a
+    """What the reconciliation needs on top of reads: list, identify, and
+    delete staging objects. There is deliberately no operation that deletes
+    an object under a final key: Cloudflare R2 accepts `DeleteObject` with a
     wrong `If-Match` and deletes anyway (verified against the real service
     2026-11-04; its S3 compatibility page lists no precondition for
     DeleteObject), so a HEAD followed by a DELETE is never a compare-and-
-    delete, and nothing here pretends it is."""
+    delete, and the one deletion this interface offers does not need one:
+    a staging object is never an archive, whatever is at its key."""
 
     def get(self, key: str) -> bytes: ...
 
@@ -241,8 +292,9 @@ class ReconcileStore(Protocol):
 
     def list(self, prefix: str) -> list[ObjectInfo]: ...
 
-    def delete(self, key: str) -> None:
-        """Delete unconditionally; succeeds for an absent key too (S3 semantics)."""
+    def delete_staging(self, key: str) -> None:
+        """Unconditional delete of a staging object (`ValueError` for any
+        other key); an absent key is not an error."""
         ...
 
 
@@ -300,9 +352,35 @@ class MemoryArchiveStore:
             return [ObjectInfo(key, len(data), self._etag(data), self.modified[key])
                     for key, data in sorted(self.objects.items()) if key.startswith(prefix)]
 
-    def delete(self, key: str) -> None:
+    def copy(self, source_key: str, key: str, *, if_none_match: bool = False) -> None:
+        """Server-side copy, like R2's CopyObject: metadata carried over, a
+        fresh `last_modified`; with `if_none_match`, refused atomically (under
+        the store lock) when the destination exists, like R2's
+        `cf-copy-destination-if-none-match: *` at commit time."""
+        with self._lock:
+            self.calls.append(("copy", key))
+            if source_key not in self.objects:
+                raise KeyError(source_key)
+            if if_none_match and key in self.objects:
+                raise ArchiveObjectExistsError(f"object already exists at {key}")
+            self.objects[key] = self.objects[source_key]
+            self.metadata[key] = dict(self.metadata.get(source_key, {}))
+            self.modified[key] = self.clock()
+
+    def delete_staging(self, key: str) -> None:
         """Unconditional, like R2's DeleteObject: whatever is at the key now
-        is removed, and an absent key is not an error."""
+        is removed, and an absent key is not an error. Staging keys only."""
+        if not is_staging_key(key):
+            raise ValueError("only staging objects may be deleted through this store")
+        with self._lock:
+            self.calls.append(("delete_staging", key))
+            self.objects.pop(key, None)
+            self.metadata.pop(key, None)
+            self.modified.pop(key, None)
+
+    def delete(self, key: str) -> None:
+        """The raw unconditional delete (tests only: it is how a test plays a
+        writer outside the job). No production code path calls it."""
         with self._lock:
             self.calls.append(("delete", key))
             self.objects.pop(key, None)
@@ -316,9 +394,13 @@ _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 # `-`, so `.`/`..` segments (and anything starting with a dot) are refused.
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}){0,3}$")
 _REQUIRED_SETTINGS = ("R2_ACCOUNT_ID", "R2_BUCKET_NAME")
-# Two identities, two tokens: the scheduled writer (PutObject, GetObject,
-# HeadObject, HeadBucket — never list, never delete) and the reconciler
-# (ListBucket, GetObject, HeadObject, DeleteObject — never put).
+# Two identities, two tokens: the scheduled writer (PutObject, CopyObject,
+# GetObject, HeadObject, HeadBucket and DeleteObject for its own staging
+# objects — never list) and the reconciler (ListBucket, GetObject,
+# HeadObject, DeleteObject — never put or copy). R2 tokens are bucket-scoped
+# and have no "write without delete" level, so neither token enforces the
+# staging-only restriction: this code does (`delete_staging`), and the
+# runbook says so rather than calling the token a boundary.
 WRITER_CREDENTIALS = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
 RECONCILE_CREDENTIALS = ("R2_RECONCILE_ACCESS_KEY_ID", "R2_RECONCILE_SECRET_ACCESS_KEY")
 
@@ -408,10 +490,25 @@ class R2ArchiveStore:
     """
 
     CLIENT_TIMEOUTS = {"connect_timeout": 10, "read_timeout": 45, "max_attempts": 2}
+    # R2's beta extension header that makes CopyObject conditional on the
+    # DESTINATION (412 when it exists, checked when the copy is committed).
+    # boto3 has no parameter for it, so it is injected by a `before-call`
+    # handler for the one CopyObject call that asks for it (thread-local, so
+    # a copy running under `call_with_deadline` never leaks the header into
+    # another thread's call on the same client).
+    COPY_DESTINATION_IF_NONE_MATCH = "cf-copy-destination-if-none-match"
 
     def __init__(self, config: R2Config, client: Any | None = None) -> None:
         self._bucket = config.bucket
         self._client = client if client is not None else self._build_client(config)
+        self._copy_condition = threading.local()
+        self._client.meta.events.register("before-call.s3.CopyObject", self._add_copy_destination_condition,
+                                          unique_id=f"hub-archive-copy-condition-{id(self)}")
+
+    def _add_copy_destination_condition(self, params: dict[str, Any], **_: Any) -> None:
+        value = getattr(self._copy_condition, "value", None)
+        if value:
+            params.setdefault("headers", {})[self.COPY_DESTINATION_IF_NONE_MATCH] = value
 
     @staticmethod
     def _build_client(config: R2Config) -> Any:
@@ -472,22 +569,6 @@ class R2ArchiveStore:
                 return None
             raise
 
-    def probe(self) -> None:
-        """Read-only: confirm the bucket exists and the credentials may see it."""
-        self._client.head_bucket(Bucket=self._bucket)
-
-
-class R2ReconcileStore(R2ArchiveStore):
-    """Read-only reconciliation: list and inspect objects, but never mutate.
-
-    The underlying R2 token can still have broader permissions; this interface
-    restriction is not a replacement for provider-level authorization.
-    """
-
-    def put(self, key: str, data: bytes, metadata: Mapping[str, str] | None = None, *, if_none_match: bool = False) -> None:
-        """The reconciliation interface never uploads objects."""
-        raise ArchiveConfigError("R2 reconciliation is report-only")
-
     def stat(self, key: str) -> ObjectInfo | None:
         from botocore.exceptions import ClientError
 
@@ -499,6 +580,64 @@ class R2ReconcileStore(R2ArchiveStore):
             raise
         return ObjectInfo(key, int(head["ContentLength"]), str(head["ETag"]), _utc(head["LastModified"]), dict(head.get("Metadata") or {}))
 
+    def copy(self, source_key: str, key: str, *, if_none_match: bool = False) -> None:
+        """Server-side `CopyObject` of a staged upload to its final key, user
+        metadata and content type carried over (`MetadataDirective=COPY`).
+
+        With `if_none_match`, the request carries R2's beta extension header
+        `cf-copy-destination-if-none-match: *` (documented on Cloudflare's R2
+        "Extensions" page, read 2026-11-05): the service refuses the copy with
+        HTTP 412 if the destination exists, evaluated when the object is
+        committed to the bucket, like `If-None-Match` on PutObject. It is
+        documented as NOT atomic with the source-side `x-amz-copy-source-if-*`
+        conditions, which this store does not send. It says nothing about
+        DeleteObject, which stays unconditional. A separate boto3 probe verified sequential conditional copy behavior on real R2;
+        this archive implementation and concurrent real-service copies remain
+        unverified. Moto does not implement the destination header."""
+        from botocore.exceptions import ClientError
+
+        self._copy_condition.value = "*" if if_none_match else None
+        try:
+            self._client.copy_object(Bucket=self._bucket, Key=key, CopySource={"Bucket": self._bucket, "Key": source_key},
+                                     MetadataDirective="COPY")
+        except ClientError as exc:
+            if if_none_match and _is_precondition_failed(exc):
+                raise ArchiveObjectExistsError(f"object already exists at {key}") from exc
+            raise
+        finally:
+            self._copy_condition.value = None
+
+    def delete_staging(self, key: str) -> None:
+        """Unconditional `DeleteObject`, accepted for staging keys only. The
+        token cannot be scoped to the staging segment (R2 tokens are
+        bucket-wide); this check is the restriction, and it is a code check,
+        not an enforced boundary against other holders of the token."""
+        if not is_staging_key(key):
+            raise ValueError("only staging objects may be deleted through this store")
+        self._client.delete_object(Bucket=self._bucket, Key=key)
+
+    def probe(self) -> None:
+        """Read-only: confirm the bucket exists and the credentials may see it."""
+        self._client.head_bucket(Bucket=self._bucket)
+
+
+class R2ReconcileStore(R2ArchiveStore):
+    """Reconciliation: list and inspect objects, delete staging objects,
+    never write. There is no method that deletes an object under a final
+    key (see `ReconcileStore`).
+
+    The underlying R2 token can still have broader permissions; this interface
+    restriction is not a replacement for provider-level authorization.
+    """
+
+    def put(self, key: str, data: bytes, metadata: Mapping[str, str] | None = None, *, if_none_match: bool = False) -> None:
+        """The reconciliation interface never uploads objects."""
+        raise ArchiveConfigError("R2 reconciliation never writes objects")
+
+    def copy(self, source_key: str, key: str, *, if_none_match: bool = False) -> None:
+        """The reconciliation interface never promotes objects."""
+        raise ArchiveConfigError("R2 reconciliation never writes objects")
+
     def list(self, prefix: str) -> list[ObjectInfo]:
         """Every object under `prefix` (paginated). Listings carry no user
         metadata and may lag; the reconciler re-inspects each object (`stat`)
@@ -508,16 +647,6 @@ class R2ReconcileStore(R2ArchiveStore):
             for item in page.get("Contents") or []:
                 found.append(ObjectInfo(str(item["Key"]), int(item["Size"]), str(item["ETag"]), _utc(item["LastModified"])))
         return found
-
-    def delete(self, key: str) -> None:
-        """Fail closed: R2 does not enforce conditional DeleteObject.
-
-        A preceding HEAD cannot protect against replacement before deletion.
-        Do not expose an unconditional deletion operation through this store.
-        """
-        raise ArchiveConfigError(
-            "R2 leftover deletion is disabled because conditional deletion is not enforced"
-        )
 
 
 # ── Archive format ───────────────────────────────────────────────────────
@@ -765,52 +894,112 @@ def validate_archive(payload: bytes) -> dict[str, Any]:
 
 def ensure_archived(
     store: ArchiveStore, *, key: str, payload: bytes, heartbeat: Callable[[], Any] | None = None,
-    deadline: float | None = None, metadata: Mapping[str, str] | None = None,
+    deadline: float | None = None, metadata: Mapping[str, str] | None = None, staging_key: str | None = None,
+    on_staged: Callable[[], Any] | None = None,
 ) -> tuple[str, bool]:
     """Make sure `payload` is durably stored under `key`; return (sha256, uploaded).
 
-    An existing object is read back and must match byte for byte (crash
-    recovery after an earlier upload); a different object under the same
-    key is refused and never overwritten. The upload itself is conditional
-    (`If-None-Match: *`): if another writer took the key between the HEAD and
-    the PUT, the service refuses the PUT and the other writer's object is
-    read back and compared instead. A fresh upload is read back and verified
-    the same way before it counts.
+    An existing object (crash recovery after an earlier promotion, or a
+    competing writer's object) is reused only after a full verification —
+    visible, the payload's size, every metadata entry this call would have
+    stamped, and bytes that read back as the payload — and anything else is
+    refused with `ArchiveIntegrityError`, never overwritten. A fresh upload is
+    read back and verified before it counts.
 
-    Keys also embed the first 16 hex digits of the payload's SHA-256, so two
+    With `staging_key` (the job always passes one): the bytes are uploaded
+    to that key (conditional, `If-None-Match: *`; the key is random, so a
+    collision is a failure, never a reuse) and promoted to `key` by a
+    server-side copy that is conditional on `key` being absent — the job
+    never PUTs to a final key and never overwrites one. `on_staged` is
+    called once the staging PUT has returned (the job uses it to know there
+    is a staging object to delete). If the copy is refused because another
+    writer committed `key` between the HEAD and the copy (a late copy of an
+    earlier attempt of this batch, a concurrent run, anything else), the
+    object now at `key` is verified in full — it must be visible, have the
+    payload's size, carry every metadata entry this call would have stamped
+    (`registry-id`, `environment`, `table`, `sha256`, `format-version`) and
+    read back as the payload's bytes — before it is reused; any other
+    outcome raises `ArchiveIntegrityError` with nothing overwritten, for a
+    human. A PUT the caller gives up on can therefore land only under the
+    staging key, where it is never an archive and is deleted by the
+    reconciliation; a copy the caller gives up on can land under `key` only
+    while `key` is absent (rare: a server-side copy of a small object) and
+    is then an unregistered final-key object that the next run recognises
+    and registers if its rows are unchanged — it can never replace an object
+    a later attempt promoted (the condition refuses it).
+
+    Without `staging_key` (unit tests of this function only): a direct
+    conditional PUT; if another writer took the key between the HEAD and the
+    PUT, the service refuses the PUT and the other writer's object is read
+    back and compared instead.
+
+    Keys embed the first 16 hex digits of the payload's SHA-256, so two
     writers can only collide on a key when they hold the same bytes; a
     different object under the same key is therefore a corruption signal.
 
     `heartbeat` is called between consecutive storage calls; the job passes a
     trivial database statement so an open batch transaction is never idle for
     longer than one storage call. `deadline` bounds each storage call
-    (`call_with_deadline`): at most three calls are made — HEAD, then either
-    GET (object already present) or PUT and GET (fresh upload).
+    (`call_with_deadline`): at most five calls are made — HEAD (with
+    metadata), then either GET (object already present) or PUT (staging),
+    COPY and GET, or, after a refused COPY, HEAD and GET of the competing
+    object.
     """
     if not key or not payload:
         raise ValueError("archive key and payload are required")
+    if is_staging_key(key):
+        raise ValueError("a staging key cannot be an archive key")
+    if staging_key is not None and not is_staging_key(staging_key):
+        raise ValueError("the staging key must lie under the staging segment")
     expected = hashlib.sha256(payload).hexdigest()
     beat = heartbeat or (lambda: None)
+    object_metadata = {**dict(metadata or {}), "sha256": expected, "format-version": str(FORMAT_VERSION)}
 
     def matches_existing() -> bool:
         beat()
         return hashlib.sha256(call_with_deadline(lambda: store.get(key), deadline, what="readback (GET)")).hexdigest() == expected
 
-    existing = call_with_deadline(lambda: store.head(key), deadline, what="HEAD")
+    def verify_existing(current: ObjectInfo | None) -> None:
+        """The one rule for reusing an object already at `key`: visible, the
+        payload's size, every metadata entry this call would have stamped,
+        and bytes that read back as the payload. Anything else stops the run
+        with nothing overwritten."""
+        if current is None:
+            raise ArchiveIntegrityError(
+                f"the write to {key} was refused because the key existed, but no object is visible there now; "
+                "nothing was registered or deleted (storage inconsistency: re-run)"
+            ) from None
+        if current.size != len(payload) or any((current.metadata or {}).get(name) != value for name, value in object_metadata.items()):
+            raise ArchiveIntegrityError(f"an object already exists at {key} with different content or metadata; it was not overwritten") from None
+        if not matches_existing():
+            raise ArchiveIntegrityError(f"an object already exists at {key} with different content; it was not overwritten") from None
+
+    existing = call_with_deadline(lambda: store.stat(key), deadline, what="HEAD")
     if existing is not None:
-        if existing == len(payload) and matches_existing():
-            return expected, False
-        raise ArchiveIntegrityError(f"an object already exists at {key} with different content")
+        verify_existing(existing)
+        return expected, False
     beat()
-    try:
-        call_with_deadline(
-            lambda: store.put(key, payload, {**dict(metadata or {}), "sha256": expected, "format-version": str(FORMAT_VERSION)}, if_none_match=True),
-            deadline, what="upload (PUT)",
-        )
-    except ArchiveObjectExistsError:
-        if matches_existing():
+    if staging_key is None:
+        try:
+            call_with_deadline(lambda: store.put(key, payload, object_metadata, if_none_match=True), deadline, what="upload (PUT)")
+        except ArchiveObjectExistsError:
+            beat()
+            verify_existing(call_with_deadline(lambda: store.stat(key), deadline, what="HEAD"))
             return expected, False
-        raise ArchiveIntegrityError(f"an object already exists at {key} with different content") from None
+    else:
+        call_with_deadline(lambda: store.put(staging_key, payload, object_metadata, if_none_match=True), deadline, what="staged upload (PUT)")
+        if on_staged is not None:
+            on_staged()
+        beat()
+        try:
+            call_with_deadline(lambda: store.copy(staging_key, key, if_none_match=True), deadline, what="promotion (COPY)")
+        except ArchiveObjectExistsError:
+            # Another writer committed the final key between the HEAD and
+            # the copy. Never overwrite: verify what is there in full, reuse
+            # it only if it is exactly this object, otherwise stop for a human.
+            beat()
+            verify_existing(call_with_deadline(lambda: store.stat(key), deadline, what="HEAD"))
+            return expected, False
     if not matches_existing():
         raise ArchiveIntegrityError("archive readback verification failed")
     return expected, True
@@ -835,6 +1024,34 @@ def archive_key(*, prefix: str, environment: str, table: str, first_day: date, f
     """
     day = first_day.isoformat()
     return f"{prefix}/{environment}/{table}/v{FORMAT_VERSION}/{day[:4]}/{day}_{first_id}-{last_id}_{digest[:16]}.zip"
+
+
+def staging_key(*, prefix: str, environment: str) -> str:
+    """`<prefix>/<env>/_staging/<random uuid>.zip`: a fresh key for one upload
+    attempt. Random, so no two attempts (or writers) share one, and never
+    content-addressed, so nothing ever reuses or registers it."""
+    import uuid
+
+    return f"{prefix}/{environment}/{STAGING_SEGMENT}/{uuid.uuid4().hex}.zip"
+
+
+def is_staging_key(key: str) -> bool:
+    """Is this key under a staging segment (`<anything>/_staging/<anything>`)?"""
+    return f"/{STAGING_SEGMENT}/" in key
+
+
+def discard_staging(store: ArchiveStore, key: str, *, deadline: float | None = None) -> str | None:
+    """Best effort, after the batch's commit or rollback: delete the staging
+    object (whether or not the upload reached it — an absent key is fine, a
+    PUT that lands afterwards is a leftover the reconciliation removes).
+    Returns the error type name on failure, None on success; never raises,
+    because the archive's outcome is already decided and a staging object
+    left behind costs bytes, not data."""
+    try:
+        call_with_deadline(lambda: store.delete_staging(key), deadline, what="staging delete")
+    except Exception as exc:  # noqa: BLE001 - reported by type, never fatal
+        return type(exc).__name__
+    return None
 
 
 # ── Selection and orchestration ──────────────────────────────────────────
@@ -1017,6 +1234,8 @@ def register_archive(db: Session, *, key: str, environment: str, table: str, dig
     impossible, but a database without those locks (SQLite, tests) can race
     two identical batches, and a unique violation must then be "already
     registered", not an aborted transaction."""
+    if is_staging_key(key):
+        raise ValueError("a staging key is never registered: only promoted final keys are archives")
     time_range = (manifest.get("time_range") or {}).get(table) or {}
     id_range = (manifest.get("id_range") or {}).get(table) or {}
     inserted = _insert_ignoring_conflicts(
@@ -1314,10 +1533,14 @@ def archive_expired(
     4. Re-count the batch against the deleted-resource rule. A non-zero
        count means a resource was deleted between steps 2 and 3: roll back
        and select again — nothing was uploaded.
-    5. Encode, upload (or recognise an identical earlier upload), read back
-       and verify, each storage call under `STORAGE_CALL_DEADLINE_S`. A
-       heartbeat statement between storage calls keeps the transaction from
-       idling past the server's idle-in-transaction limit.
+    5. Encode, upload to a fresh staging key and promote it to the final key
+       by a server-side copy (or recognise an identical earlier object under
+       the final key), read back and verify, each storage call under
+       `STORAGE_CALL_DEADLINE_S`. The copy is conditional on the final key
+       being absent; if it is refused, the object another writer committed
+       there is verified in full and reused, or the run stops. A heartbeat
+       statement between storage calls keeps the transaction from idling
+       past the server's idle-in-transaction limit.
     6. Re-count once more. On PostgreSQL this is zero by construction; a
        non-zero count (no row locks, or a path that bypassed them) is an
        integrity failure: nothing is registered or deleted and the run
@@ -1325,6 +1548,11 @@ def archive_expired(
     7. Register the object (`register_archive`), delete exactly those ids
        (still restricted to the environment and the cutoff) and commit. Only
        this commit makes the object an archive.
+    8. After the commit (and, best effort, after a failure in steps 5-7 once
+       the transaction is rolled back): delete the staging object. A staging
+       object is never an archive, so this delete is safe whatever is at
+       the key; one that cannot be deleted now is removed by the
+       reconciliation after the grace period.
 
     Any exception propagates before the registry row and the delete of the
     current batch are committed; the caller rolls back (releasing every
@@ -1414,25 +1642,46 @@ def archive_expired(
             first_day=min(_utc(record[stamp_name]) for record in records).date(),
             first_id=ids[0], last_id=ids[-1], digest=hashlib.sha256(payload).hexdigest(),
         )
-        digest, uploaded = ensure_archived(store, key=key, payload=payload, heartbeat=heartbeat, deadline=STORAGE_CALL_DEADLINE_S,
-                                           metadata=object_metadata)
-        stale = _deleted_resource_count(db, table=table, ids=ids)
-        if stale:
-            raise ArchiveIntegrityError(
-                f"{stale} {table} row(s) of the batch came to reference a deleted resource while {key} was uploaded; "
-                "nothing was registered or deleted. That object is not an archive; reconcile it."
+        staged = staging_key(prefix=prefix, environment=environment)
+        staging_uploaded = False
+
+        def staged_now() -> None:
+            nonlocal staging_uploaded
+            staging_uploaded = True
+
+        try:
+            digest, uploaded = ensure_archived(store, key=key, payload=payload, heartbeat=heartbeat, deadline=STORAGE_CALL_DEADLINE_S,
+                                               metadata=object_metadata, staging_key=staged, on_staged=staged_now)
+            stale = _deleted_resource_count(db, table=table, ids=ids)
+            if stale:
+                raise ArchiveIntegrityError(
+                    f"{stale} {table} row(s) of the batch came to reference a deleted resource while {key} was uploaded; "
+                    "nothing was registered or deleted. That object is not an archive; reconcile it."
+                )
+            # Only now: register the object, then delete exactly these ids while
+            # they still match, in the one commit that makes the object an archive.
+            registered = register_archive(
+                db, key=key, environment=environment, table=table, digest=digest, manifest=validate_archive(payload),
+                registered_at=datetime.now(timezone.utc),
             )
-        # Only now: register the object, then delete exactly these ids while
-        # they still match, in the one commit that makes the object an archive.
-        registered = register_archive(
-            db, key=key, environment=environment, table=table, digest=digest, manifest=validate_archive(payload),
-            registered_at=datetime.now(timezone.utc),
-        )
-        result = db.execute(
-            model.__table__.delete().where(model.id.in_(ids), model.environment == environment, stamp < cutoff)
-        )
-        db.commit()
+            result = db.execute(
+                model.__table__.delete().where(model.id.in_(ids), model.environment == environment, stamp < cutoff)
+            )
+            db.commit()
+        except BaseException:
+            # The batch is lost either way; release the locks first, then
+            # remove the staging object if it can be removed now.
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001 - the connection may already be gone; the original error is what matters
+                pass
+            discard_staging(store, staged, deadline=STORAGE_CALL_DEADLINE_S)
+            raise
         removed = int(result.rowcount or 0)
+        if staging_uploaded:  # also after a refused promotion that reused the competing identical object
+            problem = discard_staging(store, staged, deadline=STORAGE_CALL_DEADLINE_S)
+            if problem is not None:
+                emit(f"note: the staging object of this batch could not be deleted now ({problem}); the reconciliation removes it after the grace period: {staged}")
         lock_failures = 0
         outcome.archived += len(ids)
         outcome.deleted += removed
@@ -1461,20 +1710,29 @@ class ReconcileOutcome:
     prefix: str
     listed: int = 0
     registered: int = 0
-    too_recent: int = 0
-    candidates: int = 0
+    # Staging objects: the only objects a run may delete.
+    staging_listed: int = 0
+    too_recent: int = 0  # staging objects within the grace period
+    candidates: int = 0  # staging objects past the grace period
     deleted: int = 0
     skipped_registered_late: int = 0
-    skipped_changed: int = 0
     skipped_absent: int = 0
+    # Unregistered objects under final keys: reported and (with `delete`)
+    # classified, never deleted by this code.
+    final_too_recent: int = 0
+    redundant: int = 0
     retained_foreign: int = 0
     retained_invalid: int = 0
     retained_not_redundant: int = 0
     failed: int = 0
     locked: bool = False
     registered_missing: list[str] = field(default_factory=list)
+    # Registered rows whose key lies under the staging segment: impossible
+    # through this code; an alert, never acted on.
+    registered_staging: list[str] = field(default_factory=list)
+    # Unregistered final-key objects past the grace period.
     leftovers: list[str] = field(default_factory=list)
-    # (key, reason) for every candidate that was inspected and NOT deleted.
+    # (key, reason) for every object that was inspected and NOT deleted.
     retained: list[tuple[str, str]] = field(default_factory=list)
     deleted_keys: list[str] = field(default_factory=list)
 
@@ -1560,62 +1818,55 @@ def reconcile_leftovers(
     now: datetime | None = None,
     grace_hours: float = RECONCILE_GRACE_HOURS,
     delete: bool = False,
-    reviewed_keys: Iterable[str] | None = None,
     lock_timeout_ms: int = LOCK_TIMEOUT_MS,
     out: Any = None,
     storage: tuple[str, str] | None = None,
 ) -> ReconcileOutcome:
-    """Find objects under this
-    environment's prefix that are not registered archives. Report-only by
-    default. Deletion is unavailable for R2 because its DeleteObject does
-    not enforce a conditional ETag. The deletion logic below is retained for
-    non-R2 test stores and must not be enabled for R2 without a new design.
+    """Find objects under this environment's prefix that are not registered
+    archives. Report-only by default; with `delete`, remove STAGING leftovers
+    (and classify final-key leftovers for the operator).
+
+    What may be deleted, and why it is safe without a conditional delete:
+    only objects under `<prefix>/<environment>/_staging/`. The job uploads
+    every batch to a fresh random staging key and promotes it to its final
+    key by a server-side copy; a staging key is never registered
+    (`register_archive` refuses it) and nothing reads or restores from one,
+    so whatever is at a staging key when the DELETE executes — the abandoned
+    upload, a late-landing one, or anything a writer outside this job put
+    there — is not an archive, and R2's unconditional DeleteObject (verified
+    2026-11-04) loses nothing. No HEAD-then-DELETE is dressed up as a
+    compare-and-delete here.
+
+    What is never deleted: anything under a final key. An unregistered
+    object there (an abandoned promotion that landed late, an object another
+    writer put there) is listed, and with `delete` classified as redundant
+    (every record has a byte-identical live row, `live_rows_identical_to_
+    archive`, so the next run re-creates and registers the same key), not
+    redundant, invalid, or foreign — for the operator.
 
     Rules, in the order they are applied to each listed object:
 
     1. Scope: only keys under `<prefix>/<environment>/`.
     2. Registered keys are never candidates; a registered key with no object
-       is reported (`registered_missing`), never acted on.
+       is reported (`registered_missing`); a registered key under the
+       staging segment cannot come from this code and is an alert
+       (`registered_staging`); neither is acted on.
     3. Grace: an object younger than `grace_hours` (by `last_modified`) is
        never a candidate. This does not assume an abandoned upload "has
        finished": a late object simply becomes a candidate on a later run.
-    4. Coordination: each deletion runs inside a transaction holding the
-       archive job's advisory lock (`pg_advisory_xact_lock`, waiting at most
-       `lock_timeout_ms`; on timeout the run stops, `locked=True`). A batch
-       between its upload and its commit holds that lock, so the reconciler
-       waits for it to commit or roll back; while the reconciler holds it no
-       batch can start or register. Two reconcilers serialise on it.
+    4. Coordination: each inspection or deletion runs inside a transaction
+       holding the archive job's advisory lock (`pg_advisory_xact_lock`,
+       waiting at most `lock_timeout_ms`; on timeout the run stops,
+       `locked=True`), so it never overlaps a batch between its upload and
+       its commit, and two reconcilers serialise.
     5. Registry re-check under the lock: a key registered since the listing
        is skipped.
-    6. Identity, best effort: a HEAD must still show the listed ETag and
-       size, otherwise the object is skipped as changed. This is NOT a
-       compare-and-delete — the delete that follows is unconditional (R2
-       ignores `If-Match` on DeleteObject) — so an object replaced between
-       this HEAD and the DELETE is deleted. Who could replace it: the archive
-       job never overwrites (every PUT is `If-None-Match: *`, refused while
-       the key exists, and the job holds this same lock), so only a writer
-       that bypasses both — a third-party tool with the bucket token — can.
-       That is the trust boundary; it is not enforced by this code.
-    7. Ownership: the HEAD's `registry-id` metadata must equal this
-       database's `registry_identity`; anything else (no marker, another
-       deployment's marker) is retained as foreign. A bucket shared by
-       mistake never loses another registry's objects to this one.
-    8. Automatic deletion (`delete=True`) only when the object is **provably
-       redundant**: it downloads and validates as an archive of this
-       environment and every one of its records has a live row (same record
-       id, same environment) that renders to the identical archived record —
-       every column including `id`, omitted columns excluded, timestamps and
-       JSON canonicalised (`live_rows_identical_to_archive`); those live rows
-       are locked `FOR SHARE` until the object is deleted, so they can be
-       neither changed nor removed in between. Deleting the object then
-       loses nothing — even if the registry were lost and restored, the data
-       is live and identical. Anything else (a record missing, changed, or of
-       another environment; an object that does not validate) is retained
-       with its reason for the operator.
-    9. Operator deletion (`reviewed_keys`): the listed keys only, after rules
-       1–7 (registered and foreign objects are still refused, the grace
-       period still applies), without rule 8. The operator has reviewed the
-       retained reason and decided.
+    6. Ownership: the HEAD's `registry-id` metadata must equal this
+       database's registry identity; anything else (no marker, another
+       deployment's marker) is retained as foreign, staging or not. A bucket
+       shared by mistake never loses another registry's objects to this one.
+    7. Staging candidates are deleted (`delete_staging`); final-key
+       candidates are classified and retained with the reason.
 
     Every key is independent: a failure is counted and the run continues; a
     re-run is idempotent; an interrupted run is completed by the next one.
@@ -1626,11 +1877,6 @@ def reconcile_leftovers(
         raise ValueError("a valid key prefix is required")
     if grace_hours < 0:
         raise ValueError("grace_hours must not be negative")
-    reviewed = None if reviewed_keys is None else {key for key in reviewed_keys if key}
-    if (delete or reviewed is not None) and isinstance(store, R2ReconcileStore):
-        raise ArchiveConfigError(
-            "R2 leftover deletion is disabled because conditional deletion is not enforced; use report-only reconciliation"
-        )
     emit = out or (lambda line: logger.info("%s", line))
     moment = now or datetime.now(timezone.utc)
     scope = f"{prefix}/{environment}/"
@@ -1642,30 +1888,25 @@ def reconcile_leftovers(
     # bound to other storage than this run is configured for.
     identity, bound = lookup_registry_identity(db)
     db.rollback()
-    deleting = delete or reviewed is not None
     if identity is None:
-        if deleting:
+        if delete:
             raise ArchiveConfigError(
                 "the registry identity is not initialised, so ownership of objects cannot be established; "
                 "run the archive job (or python -m scripts.create_product_analytics_archive_tables) first"
             )
         emit("registry identity not initialised: ownership of objects cannot be established; a deleting run would refuse.")
     elif storage is not None and bound is None:
-        if deleting:
+        if delete:
             raise ArchiveConfigError(
                 "the registry identity is not yet bound to storage (the archive job binds it on its first live run); "
                 "a deleting reconciliation refuses until then"
             )
         emit("registry identity not yet bound to storage: a deleting run would refuse until the archive job has run.")
     elif storage is not None and bound is not None and bound != tuple(storage):
-        if deleting:
+        if delete:
             check_registry_storage_binding(bound, storage)
         emit("WARNING: the registry identity is bound to a different bucket/prefix than this run is configured for; "
              "this report describes storage this database does not own (a cloned or restored database?). A deleting run would refuse.")
-    if reviewed is not None:
-        outside = sorted(key for key in reviewed if not key.startswith(scope))
-        if outside:
-            raise ValueError(f"reviewed keys must lie under {scope}: {', '.join(outside)}")
     listed = store.list(scope)
     outcome.listed = len(listed)
     known = registered_keys(db, [item.key for item in listed])
@@ -1678,91 +1919,115 @@ def reconcile_leftovers(
     ).scalars():
         if row not in listed_keys:
             outcome.registered_missing.append(row)
+        if is_staging_key(row):
+            outcome.registered_staging.append(row)
     db.rollback()
     for item in outcome.registered_missing:
         emit(f"ALERT: registered archive {item} was not in the listing (missing object or listing lag); never deleted, investigate.")
-    candidates: list[ObjectInfo] = []
+    for item in outcome.registered_staging:
+        emit(f"ALERT: registered key {item} lies under the staging segment, which this code never registers; never deleted, investigate.")
+    staging: list[ObjectInfo] = []
+    finals: list[ObjectInfo] = []
     for item in listed:
         if item.key in known:
             outcome.registered += 1
             continue
         age_hours = (moment - _utc(item.last_modified)).total_seconds() / 3600
-        if age_hours < grace_hours:
-            outcome.too_recent += 1
-            emit(f"recent unregistered object (age {age_hours:.1f} h < grace {grace_hours:g} h), left alone: {item.key}")
-            continue
-        candidates.append(item)
-        outcome.leftovers.append(item.key)
-        emit(f"leftover (unregistered, age {age_hours:.1f} h): {item.key}")
-    outcome.candidates = len(candidates)
-    if not delete and reviewed is None:
+        if is_staging_key(item.key):
+            outcome.staging_listed += 1
+            if age_hours < grace_hours:
+                outcome.too_recent += 1
+                emit(f"recent staging object (age {age_hours:.1f} h < grace {grace_hours:g} h), left alone: {item.key}")
+                continue
+            staging.append(item)
+            emit(f"staging leftover (unregistered, age {age_hours:.1f} h): {item.key}")
+        else:
+            if age_hours < grace_hours:
+                outcome.final_too_recent += 1
+                emit(f"recent unregistered object (age {age_hours:.1f} h < grace {grace_hours:g} h), left alone: {item.key}")
+                continue
+            finals.append(item)
+            outcome.leftovers.append(item.key)
+            emit(f"leftover under a final key (unregistered, age {age_hours:.1f} h; never deleted automatically): {item.key}")
+    outcome.candidates = len(staging)
+    if not delete:
         return outcome
-    if reviewed is not None:
-        candidate_keys = {item.key for item in candidates}
-        for key in sorted(reviewed - candidate_keys):
-            emit(f"reviewed key not deleted: not a leftover candidate (registered, too recent, or not listed): {key}")
-        candidates = [item for item in candidates if item.key in reviewed]
 
     def retain(key: str, counter: str, reason: str) -> None:
         setattr(outcome, counter, getattr(outcome, counter) + 1)
         outcome.retained.append((key, reason))
         emit(f"retained ({reason}): {key}")
 
-    for item in candidates:
+    def inspect(item: ObjectInfo) -> ObjectInfo | None:
+        """Rules 4-6 under the job lock; None when the object is not to be acted on."""
+        if registered_keys(db, [item.key]):
+            outcome.skipped_registered_late += 1
+            emit(f"skipped: registered since the listing: {item.key}")
+            return None
+        current = store.stat(item.key)
+        if current is None:
+            outcome.skipped_absent += 1
+            return None
+        if (current.metadata or {}).get(REGISTRY_ID_METADATA) != identity:
+            retain(item.key, "retained_foreign", "not written by this registry database (no or different registry-id metadata)")
+            return None
+        return current
+
+    for item in staging:
         try:
             if not _acquire_job_lock_blocking(db, timeout_ms=lock_timeout_ms):
                 outcome.locked = True
                 emit("an archive run holds the job lock; deletion stopped for this run, nothing further touched.")
                 break
-            if registered_keys(db, [item.key]):
-                outcome.skipped_registered_late += 1
-                emit(f"skipped: registered since the listing: {item.key}")
+            if inspect(item) is None:
                 db.rollback()
                 continue
-            current = store.stat(item.key)
-            if current is None:
-                outcome.skipped_absent += 1
-                db.rollback()
-                continue
-            if current.etag != item.etag or current.size != item.size:
-                outcome.skipped_changed += 1
-                emit(f"skipped: object changed since the listing: {item.key}")
-                db.rollback()
-                continue
-            marker = (current.metadata or {}).get(REGISTRY_ID_METADATA)
-            if marker != identity:
-                retain(item.key, "retained_foreign", "not written by this registry database (no or different registry-id metadata)")
-                db.rollback()
-                continue
-            if reviewed is None:
-                try:
-                    payload = call_with_deadline(lambda: store.get(item.key), STORAGE_CALL_DEADLINE_S, what="readback (GET)")
-                    manifest, records = archive_records(payload)
-                except ArchiveIntegrityError as exc:
-                    retain(item.key, "retained_invalid", f"does not validate as an archive: {exc}")
-                    db.rollback()
-                    continue
-                if manifest.get("environment") != environment:
-                    retain(item.key, "retained_foreign", "archive of another environment")
-                    db.rollback()
-                    continue
-                omitted = manifest.get("omitted_columns") or []
-                identical = total = 0
-                for table, table_records in records.items():
-                    same, count = live_rows_identical_to_archive(db, table=table, environment=environment, records=table_records, omitted_columns=omitted)
-                    identical += same
-                    total += count
-                if total == 0 or identical != total:
-                    retain(item.key, "retained_not_redundant",
-                           f"{total - identical} of {total} record(s) have no identical live row (missing, changed, or another environment: "
-                           "a cleanup-deleted leftover, a registration that is missing, or data that differs); operator review required")
-                    db.rollback()
-                    continue
-            store.delete(item.key)
+            store.delete_staging(item.key)
             db.rollback()  # releases the job lock; nothing was written to the database
             outcome.deleted += 1
             outcome.deleted_keys.append(item.key)
-            emit(f"deleted {'reviewed' if reviewed is not None else 'redundant'} leftover: {item.key}")
+            emit(f"deleted staging leftover: {item.key}")
+        except Exception as exc:  # noqa: BLE001 - one key must not stop the others; reported by type
+            db.rollback()
+            outcome.failed += 1
+            emit(f"failed on {item.key}: {type(exc).__name__}")
+    if outcome.locked:
+        return outcome
+    for item in finals:
+        try:
+            if not _acquire_job_lock_blocking(db, timeout_ms=lock_timeout_ms):
+                outcome.locked = True
+                emit("an archive run holds the job lock; inspection stopped for this run, nothing further touched.")
+                break
+            if inspect(item) is None:
+                db.rollback()
+                continue
+            try:
+                payload = call_with_deadline(lambda: store.get(item.key), STORAGE_CALL_DEADLINE_S, what="readback (GET)")
+                manifest, records = archive_records(payload)
+            except ArchiveIntegrityError as exc:
+                retain(item.key, "retained_invalid", f"does not validate as an archive: {exc}")
+                db.rollback()
+                continue
+            if manifest.get("environment") != environment:
+                retain(item.key, "retained_foreign", "archive of another environment")
+                db.rollback()
+                continue
+            omitted = manifest.get("omitted_columns") or []
+            identical = total = 0
+            for table, table_records in records.items():
+                same, count = live_rows_identical_to_archive(db, table=table, environment=environment, records=table_records, omitted_columns=omitted)
+                identical += same
+                total += count
+            if total == 0 or identical != total:
+                retain(item.key, "retained_not_redundant",
+                       f"{total - identical} of {total} record(s) have no identical live row (missing, changed, or another environment: "
+                       "a cleanup-deleted leftover, a registration that is missing, or data that differs); operator review required")
+            else:
+                retain(item.key, "redundant",
+                       f"redundant: every one of its {total} record(s) has an identical live row; the next archive run re-creates and "
+                       "registers this key if the rows are unchanged; an operator may delete it (never this code)")
+            db.rollback()
         except Exception as exc:  # noqa: BLE001 - one key must not stop the others; reported by type
             db.rollback()
             outcome.failed += 1

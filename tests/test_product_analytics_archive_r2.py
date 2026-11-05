@@ -54,6 +54,32 @@ class R2StoreMockTests(unittest.TestCase):
             archive.ensure_archived(self.store, key=key, payload=payload + b"x")
         self.assertEqual(archive.validate_archive(self.store.get(key))["events"], 1)
 
+    def test_a_staged_upload_is_promoted_by_a_server_side_copy_that_keeps_its_metadata(self) -> None:
+        """The job's path against the S3 API mock: PUT to the staging key,
+        CopyObject to the final key with `MetadataDirective=COPY`, readback;
+        the staging object is deleted afterwards and only a staging key may
+        be deleted. This proves the client wiring (moto implements
+        CopyObject as S3 does); CopyObject against the real R2 service is in
+        the runbook's probe plan."""
+        payload = archive.make_archive(environment="sandbox", events=[{"id": 1, "event_id": "e", "environment": "sandbox"}])
+        key = "hub-product-analytics/sandbox/events/v3/2025/2025-01-01_1-1_abc.zip"
+        staged = archive.staging_key(prefix="hub-product-analytics", environment="sandbox")
+        digest, uploaded = archive.ensure_archived(self.store, key=key, payload=payload, metadata={"registry-id": "abc"}, staging_key=staged)
+        self.assertEqual((digest, uploaded), (hashlib.sha256(payload).hexdigest(), True))
+        head = self.client.head_object(Bucket=CONFIG.bucket, Key=key)
+        self.assertEqual((head["ContentType"], head["Metadata"]), ("application/zip", {"registry-id": "abc", "sha256": digest, "format-version": "3"}))
+        self.assertEqual(self.store.get(key), payload)
+        self.assertEqual(self.store.head(staged), len(payload))  # the job deletes it after its commit
+        self.store.delete_staging(staged)
+        self.assertIsNone(self.store.head(staged))
+        self.store.delete_staging(staged)  # absent: not an error
+        again = archive.staging_key(prefix="hub-product-analytics", environment="sandbox")
+        self.assertEqual(archive.ensure_archived(self.store, key=key, payload=payload, staging_key=again), (digest, False))
+        self.assertIsNone(self.store.head(again))  # recognised: nothing was staged
+        with self.assertRaises(ValueError):
+            self.store.delete_staging(key)
+        self.assertEqual(self.store.head(key), len(payload))
+
     def test_conditional_put_is_refused_by_the_s3_api_mock(self) -> None:
         """moto enforces `If-None-Match: *` with HTTP 412, as S3 and R2
         document. This proves the client wiring, not the real R2 service
@@ -64,40 +90,146 @@ class R2StoreMockTests(unittest.TestCase):
         self.assertEqual(self.store.get("k"), b"first")
         payload = archive.make_archive(environment="sandbox", events=[{"id": 2, "event_id": "f", "environment": "sandbox"}])
         self.client.put_object(Bucket=CONFIG.bucket, Key="taken", Body=b"someone else's bytes")
-        original_head = self.store.head
+        original_stat = self.store.stat
         # Simulate the key being taken between our HEAD and our PUT.
-        self.store.head = lambda key: None
+        self.store.stat = lambda key: None
         try:
             with self.assertRaises(archive.ArchiveIntegrityError):
                 archive.ensure_archived(self.store, key="taken", payload=payload)
         finally:
-            self.store.head = original_head
+            self.store.stat = original_stat
         self.assertEqual(self.store.get("taken"), b"someone else's bytes")
 
-    def test_list_stat_and_reject_unsafe_r2_deletion(self) -> None:
-        """R2 deletes are disabled even when a preceding HEAD succeeds."""
+    def test_conditional_copy_sends_r2s_destination_header_per_call_and_maps_a_412(self) -> None:
+        """moto implements CopyObject but NOT R2's beta
+        `cf-copy-destination-if-none-match` header, so the mock cannot prove
+        the refusal. What it proves: the header is on the wire exactly when
+        asked (`*`), absent otherwise, isolated per call; and a 412 from the
+        service is mapped to `ArchiveObjectExistsError` only for a
+        conditional copy. The real service is the probe plan's business."""
+        from botocore.exceptions import ClientError
+
+        scope = "hub-product-analytics/sandbox/"
+        seen: list[dict] = []
+        self.client.meta.events.register("before-send.s3.CopyObject", lambda request, **_: seen.append({k.lower(): (v.decode() if isinstance(v, bytes) else v) for k, v in request.headers.items()}))
+        self.store.put(scope + "_staging/s.zip", b"bytes", {"registry-id": "abc"})
+        self.store.copy(scope + "_staging/s.zip", scope + "events/v3/2025/a.zip", if_none_match=True)
+        self.assertEqual(seen[-1].get(archive.R2ArchiveStore.COPY_DESTINATION_IF_NONE_MATCH), "*")
+        self.assertEqual(seen[-1].get("x-amz-metadata-directive"), "COPY")
+        self.store.copy(scope + "_staging/s.zip", scope + "events/v3/2025/b.zip")
+        self.assertNotIn(archive.R2ArchiveStore.COPY_DESTINATION_IF_NONE_MATCH, seen[-1])
+        self.assertEqual(self.store.stat(scope + "events/v3/2025/a.zip").metadata, {"registry-id": "abc"})
+        # Simulated, not evidence: moto ignores the header, so a conditional
+        # copy onto the existing key "succeeds" here. Against R2 this must be
+        # a 412 — the probe step that is still open.
+        self.store.copy(scope + "_staging/s.zip", scope + "events/v3/2025/a.zip", if_none_match=True)
+        self.assertEqual(seen[-1].get(archive.R2ArchiveStore.COPY_DESTINATION_IF_NONE_MATCH), "*")
+
+        class Refusing:
+            meta = SimpleNamespace(events=SimpleNamespace(register=lambda *args, **kwargs: None))
+            calls = 0
+
+            def copy_object(self, **kwargs):
+                self.calls += 1
+                raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "At least one of the pre-conditions you specified did not hold"},
+                                   "ResponseMetadata": {"HTTPStatusCode": 412}}, "CopyObject")
+
+        refusing = archive.R2ArchiveStore(CONFIG, client=Refusing())
+        with self.assertRaises(archive.ArchiveObjectExistsError):
+            refusing.copy(scope + "_staging/s.zip", scope + "events/v3/2025/a.zip", if_none_match=True)
+        with self.assertRaises(ClientError):  # an unconditional copy never asked for a precondition: not an "exists" outcome
+            refusing.copy(scope + "_staging/s.zip", scope + "events/v3/2025/a.zip")
+
+    def test_ensure_archived_verifies_a_competing_object_after_a_412_against_the_mock(self) -> None:
+        """The mock plus a thin shim that refuses the conditional copy with
+        412 when the destination exists — R2's documented behaviour, which
+        moto lacks — so that the full job path (HEAD absent → staged PUT →
+        refused COPY → HEAD → GET → verdict) runs through the S3 client."""
+        from botocore.exceptions import ClientError
+
+        scope = "hub-product-analytics/sandbox/"
+        key = scope + "events/v3/2025/2025-01-01_1-1_abc.zip"
+        payload = archive.make_archive(environment="sandbox", events=[{"id": 1, "event_id": "e", "environment": "sandbox"}])
+        digest = hashlib.sha256(payload).hexdigest()
+        stamped = {"registry-id": "abc", "sha256": digest, "format-version": "3"}
+        mock_client = self.client
+
+        class DestinationConditionShim:
+            def __getattr__(self, name):
+                return getattr(mock_client, name)
+
+            def copy_object(self, **kwargs):
+                try:
+                    mock_client.head_object(Bucket=kwargs["Bucket"], Key=kwargs["Key"])
+                except ClientError:
+                    return mock_client.copy_object(**kwargs)
+                raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "precondition failed"},
+                                   "ResponseMetadata": {"HTTPStatusCode": 412}}, "CopyObject")
+
+        store = archive.R2ArchiveStore(CONFIG, client=DestinationConditionShim())
+        original_stat = store.stat
+
+        def competing(other: bytes, metadata: dict):
+            """The key appears right after our HEAD: a writer committed `other`."""
+            def stat(k):
+                info = original_stat(k)
+                if info is None:
+                    mock_client.put_object(Bucket=CONFIG.bucket, Key=k, Body=other, Metadata=metadata)
+                return info
+            return stat
+
+        store.stat = competing(payload, stamped)
+        staged = archive.staging_key(prefix="hub-product-analytics", environment="sandbox")
+        self.assertEqual(archive.ensure_archived(store, key=key, payload=payload, metadata={"registry-id": "abc"}, staging_key=staged), (digest, False))
+        self.assertEqual(store.get(key), payload)
+        mock_client.delete_object(Bucket=CONFIG.bucket, Key=key)
+        store.stat = competing(b"someone else's bytes", stamped)
+        with self.assertRaises(archive.ArchiveIntegrityError):
+            archive.ensure_archived(store, key=key, payload=payload, metadata={"registry-id": "abc"}, staging_key=staged + ".2")
+        self.assertEqual(store.get(key), b"someone else's bytes")
+        mock_client.delete_object(Bucket=CONFIG.bucket, Key=key)
+        store.stat = competing(payload, {**stamped, "registry-id": "other"})
+        with self.assertRaises(archive.ArchiveIntegrityError):
+            archive.ensure_archived(store, key=key, payload=payload, metadata={"registry-id": "abc"}, staging_key=staged + ".3")
+        self.assertEqual(store.stat(key).metadata["registry-id"], "other")
+
+    def test_reconcile_store_lists_inspects_and_deletes_staging_objects_only(self) -> None:
+        """No R2 store has an operation that deletes an object under a final
+        key: the unsafe HEAD-then-DELETE is not expressible, not merely
+        disabled. Staging objects are deleted unconditionally — safe because
+        nothing at a staging key is ever an archive."""
         scope = "hub-product-analytics/sandbox/"
         reconciler = archive.R2ReconcileStore(CONFIG, client=self.client)
         self.store.put(scope + "events/v3/2025/a.zip", b"aaaa", {"registry-id": "abc", "sha256": "x"})
         self.store.put(scope + "events/v3/2025/b.zip", b"bbbbbb")
-        self.store.put("hub-product-analytics/production/events/v3/2025/c.zip", b"cc")
+        self.store.put(scope + "_staging/c.zip", b"cc", {"registry-id": "abc"})
+        self.store.put("hub-product-analytics/production/events/v3/2025/d.zip", b"dd")
         listed = reconciler.list(scope)
-        self.assertEqual([(item.key, item.size) for item in listed], [(scope + "events/v3/2025/a.zip", 4), (scope + "events/v3/2025/b.zip", 6)])
+        self.assertEqual([(item.key, item.size) for item in listed],
+                         [(scope + "_staging/c.zip", 2), (scope + "events/v3/2025/a.zip", 4), (scope + "events/v3/2025/b.zip", 6)])
         self.assertEqual(listed[0].metadata, {})  # listings carry no user metadata
         stat = reconciler.stat(scope + "events/v3/2025/a.zip")
-        self.assertEqual((stat.key, stat.size, stat.etag), (listed[0].key, listed[0].size, listed[0].etag))
+        self.assertEqual((stat.key, stat.size, stat.etag), (listed[1].key, listed[1].size, listed[1].etag))
         self.assertEqual(stat.metadata, {"registry-id": "abc", "sha256": "x"})
         self.assertIsNotNone(stat.last_modified.tzinfo)
         self.assertIsNone(reconciler.stat(scope + "events/v3/2025/missing.zip"))
-        self.assertFalse(hasattr(self.store, "delete") or hasattr(self.store, "list"))  # the writer's class cannot list or delete
-        with self.assertRaises(archive.ArchiveConfigError):
-            reconciler.delete(scope + "events/v3/2025/a.zip")
+        self.assertFalse(hasattr(self.store, "delete") or hasattr(self.store, "list"))  # the writer's class cannot list; no store can delete a final key
+        self.assertFalse(hasattr(reconciler, "delete"))
+        for final in (scope + "events/v3/2025/a.zip", scope + "events/v3/2025/b.zip"):
+            with self.assertRaises(ValueError):
+                reconciler.delete_staging(final)
+            with self.assertRaises(ValueError):
+                self.store.delete_staging(final)
+            self.assertIsNotNone(reconciler.stat(final))
         with self.assertRaises(archive.ArchiveConfigError):
             reconciler.put(scope + "events/v3/2025/a.zip", b"replacement")
-        self.assertIsNotNone(reconciler.stat(scope + "events/v3/2025/a.zip"))
-        for kwargs in ({"delete": True}, {"reviewed_keys": [scope + "events/v3/2025/a.zip"]}):
-            with self.assertRaises(archive.ArchiveConfigError):
-                archive.reconcile_leftovers(None, reconciler, environment="sandbox", prefix="hub-product-analytics", **kwargs)
+        with self.assertRaises(archive.ArchiveConfigError):
+            reconciler.copy(scope + "_staging/c.zip", scope + "events/v3/2025/e.zip")
+        self.assertEqual(self.store.get(scope + "events/v3/2025/a.zip"), b"aaaa")
+        self.assertIsNone(reconciler.stat(scope + "events/v3/2025/e.zip"))
+        reconciler.delete_staging(scope + "_staging/c.zip")
+        self.assertIsNone(reconciler.stat(scope + "_staging/c.zip"))
+        reconciler.delete_staging(scope + "_staging/c.zip")  # absent: not an error
         self.assertEqual(len(reconciler.list("hub-product-analytics/")), 3)
 
     def test_reconcile_store_credentials_are_a_separate_identity(self) -> None:
@@ -114,13 +246,17 @@ class R2StoreMockTests(unittest.TestCase):
         self.assertIn("R2_RECONCILE_SECRET_ACCESS_KEY", str(caught.exception))
         self.assertNotIn("reconcile-secret", str(caught.exception))
 
-    def test_cli_refuses_r2_deletion_before_loading_configuration(self) -> None:
+    def test_cli_delete_refuses_before_any_storage_call_when_configuration_is_incomplete(self) -> None:
+        """With the test environment's placeholder settings (no reconciliation
+        credentials) `--delete` is refused before a client is built; the
+        removed `--delete-reviewed` flag is an argument error."""
         from scripts import reconcile_product_analytics_archives as reconcile_job
 
-        for arguments in (["--delete"], ["--delete-reviewed", "hub-product-analytics/sandbox/example.zip"]):
-            lines = []
-            self.assertEqual(reconcile_job.run(arguments, out=lines.append), reconcile_job.EXIT_CONFIG)
-            self.assertIn("deletion is disabled", lines[0])
+        lines = []
+        self.assertEqual(reconcile_job.run(["--delete"], out=lines.append), reconcile_job.EXIT_CONFIG)
+        self.assertTrue(lines[0].startswith("reconcile refused:") and lines[0].endswith("Nothing was touched."), lines)
+        with self.assertRaises(SystemExit):
+            reconcile_job.run(["--delete-reviewed", "hub-product-analytics/sandbox/example.zip"], out=lines.append)
 
     def test_probe_fails_for_a_missing_bucket(self) -> None:
         missing = archive.R2ArchiveStore(archive.R2Config(account_id=CONFIG.account_id, access_key_id="k", secret_access_key="s",
