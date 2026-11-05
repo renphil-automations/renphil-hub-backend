@@ -5,6 +5,10 @@ All three endpoints act as the events account (GOOGLE_CALENDAR_ID) via the
 CalendarService. The RSVP endpoint takes the attendee identity strictly from
 the authenticated JWT, never from the request body, so a caller can only ever
 add or remove *themselves*.
+
+The routes are plain ``def`` so FastAPI runs them on worker threads: the Google
+client blocks, including while backing off from a rate limit, and on the event
+loop that would freeze every other Hub request.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ def _require_agent_sync_token(
     response_model=list[CalendarSearchResult],
     summary="Search upcoming events by title (admin edit-time picker)",
 )
-async def search_events(
+def search_events(
     query: str = Query(..., description="Case-insensitive title substring."),
     _user: UserInfo = Depends(get_current_user),
     service: CalendarService = Depends(get_calendar_service),
@@ -68,7 +72,7 @@ async def search_events(
     response_model=CalendarEvent,
     summary="Resolve a stored event to its next occurrence",
 )
-async def get_event(
+def get_event(
     event_id: str = Query(..., description="Stored event / series master id."),
     user: UserInfo = Depends(get_current_user),
     service: CalendarService = Depends(get_calendar_service),
@@ -82,7 +86,7 @@ async def get_event(
     response_model=CalendarIndexEvent,
     include_in_schema=False,
 )
-async def get_index_event(
+def get_index_event(
     event_id: str = Query(..., description="Stored event / series master id."),
     _service_auth: None = Depends(_require_agent_sync_token),
     service: CalendarService = Depends(get_calendar_service),
@@ -96,7 +100,7 @@ async def get_index_event(
     response_model=AttendanceResponse,
     summary="Add or remove yourself from an event",
 )
-async def set_attendance(
+def set_attendance(
     event_id: str,
     body: AttendanceRequest,
     user: UserInfo = Depends(get_current_user),
