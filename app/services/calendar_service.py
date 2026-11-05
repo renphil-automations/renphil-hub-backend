@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import HTTPException
 from googleapiclient.errors import HttpError
@@ -62,6 +64,10 @@ _ATTENDANCE_MAX_ATTEMPTS = 4
 # retries less; the If-Match ETag keeps that retry safe.
 _READ_RETRIES = 3
 _WRITE_RETRIES = 1
+# Event cache (plan_calendar_carousel_2026-11-01.md §4b). Ids come from signed-in
+# callers, so the size is capped as well as the age.
+_EVENT_CACHE_TTL_SECONDS = 60
+_EVENT_CACHE_MAX_ENTRIES = 2000
 
 
 def _now_rfc3339() -> str:
@@ -71,8 +77,9 @@ def _now_rfc3339() -> str:
 def _google_error(exc: HttpError, action: str) -> HTTPException:
     """Translate a Google failure that retries couldn't get past.
 
-    The whole org shares one quota, so rate limits are logged separately: they
-    are the signal for adding a cache (plan_calendar_carousel_2026-11-01.md §4b).
+    The whole org shares one quota, so rate limits are logged separately: with the
+    event cache in place, they are the signal to reconsider a request-counting
+    queue (plan_calendar_carousel_2026-11-01.md §0 #6).
     """
     code = exc.resp.status if exc.resp is not None else 0
     rate_limited = code == 429 or (
@@ -110,26 +117,38 @@ def _event_has_ended(
 ) -> bool:
     """Return True once a one-off event is fully in the past.
 
-    Google all-day event end dates are exclusive, so an event is expired when
-    that date is today or earlier. Timed events are compared in UTC. Missing or
-    malformed timestamps fail open here; the live Calendar API remains the
-    source of truth and callers can still render the event rather than deleting
-    it on a parsing accident.
+    Missing or malformed timestamps fail open here; the live Calendar API
+    remains the source of truth and callers can still render the event rather
+    than deleting it on a parsing accident.
+    """
+    ends_at = _end_instant(start_node, end_node)
+    return ends_at is not None and ends_at <= datetime.now(timezone.utc)
+
+
+def _end_instant(
+    start_node: dict[str, Any] | None,
+    end_node: dict[str, Any] | None,
+) -> datetime | None:
+    """When an event ends in UTC, or None if its timestamps can't be read.
+
+    Google all-day event end dates are exclusive, so an all-day event ends at
+    midnight UTC at the start of that date.
     """
     raw = _start_str(end_node) or _start_str(start_node)
     if not raw:
-        return False
+        return None
 
     try:
         if "T" not in raw:
-            return date.fromisoformat(raw) <= datetime.now(timezone.utc).date()
+            day = date.fromisoformat(raw)
+            return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         logger.warning("Could not parse Calendar end timestamp %r", raw)
-        return False
+        return None
 
 
 def _start_key(event: dict[str, Any]) -> datetime:
@@ -168,12 +187,147 @@ def _meeting_from(event: dict[str, Any]) -> tuple[str | None, str | None]:
     return None, None
 
 
+# (series_id, master, next_instance): see CalendarService._resolve.
+_Resolved = tuple[str, dict[str, Any], "dict[str, Any] | None"]
+
+
+@dataclass
+class _CachedLookup:
+    """One remembered ``_resolve`` outcome: a result, or the 404 it raised."""
+
+    expires_at: float
+    resolved: _Resolved | None = None
+    gone_status: str | None = None
+    gone_detail: str = ""
+
+    def outcome(self) -> _Resolved:
+        if self.resolved is None:
+            # A new exception each time: threads share this entry.
+            raise CalendarEventGoneError(self.gone_status or "unavailable", self.gone_detail)
+        return self.resolved
+
+
+class _EventCache:
+    """Short-lived ``_resolve`` outcomes, keyed by the requested event id.
+
+    Every Google call runs as one account, so the whole org shares its quota.
+    Google failures are never stored, and callers must not mutate what they get.
+
+    * Concurrent misses for one id share a single lookup, so viewers arriving
+      together cost Google one lookup rather than one each.
+    * An entry never outlives the occurrence it shows. The widget refetches just
+      after an event ends and doesn't ask again for up to 15 minutes, so a stored
+      answer at that moment would leave the ended event on screen.
+    * ``update_master`` detaches lookups already running. They may have read the
+      guest list before an RSVP, and must not store it over the newer one.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = _EVENT_CACHE_TTL_SECONDS,
+        max_entries: int = _EVENT_CACHE_MAX_ENTRIES,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._max_entries = max_entries
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: dict[str, _CachedLookup] = {}
+        self._running: dict[str, Future[_CachedLookup]] = {}
+
+    def has(self, event_id: str) -> bool:
+        with self._lock:
+            return self._live(event_id) is not None
+
+    def get_or_load(self, event_id: str, load: Callable[[], _Resolved]) -> _Resolved:
+        with self._lock:
+            entry = self._live(event_id)
+            if entry is not None:
+                return entry.outcome()
+            running = self._running.get(event_id)
+            if running is None:
+                mine: Future[_CachedLookup] = Future()
+                self._running[event_id] = mine
+        if running is not None:
+            return running.result().outcome()
+
+        try:
+            entry = self._entry_from(load)
+        except BaseException as exc:
+            self._finish(event_id, mine, None)
+            mine.set_exception(exc)
+            raise
+        self._finish(event_id, mine, entry)
+        mine.set_result(entry)
+        return entry.outcome()
+
+    def update_master(self, series_id: str, master: dict[str, Any]) -> None:
+        """Put a just-written or just-read series into every entry showing it."""
+        with self._lock:
+            for entry in self._entries.values():
+                if entry.resolved is not None and entry.resolved[0] == series_id:
+                    entry.resolved = (series_id, master, entry.resolved[2])
+            self._running.clear()
+
+    def _live(self, event_id: str) -> _CachedLookup | None:
+        entry = self._entries.get(event_id)
+        if entry is None or entry.expires_at <= self._clock():
+            return None
+        return entry
+
+    def _entry_from(self, load: Callable[[], _Resolved]) -> _CachedLookup:
+        try:
+            resolved = load()
+        except CalendarEventGoneError as exc:
+            return _CachedLookup(
+                expires_at=self._clock() + self._ttl,
+                gone_status=exc.gone_status,
+                gone_detail=str(exc.detail),
+            )
+        return _CachedLookup(expires_at=self._expiry_of(resolved), resolved=resolved)
+
+    def _expiry_of(self, resolved: _Resolved) -> float:
+        now = self._clock()
+        expires_at = now + self._ttl
+        _series_id, master, instance = resolved
+        shown = instance or master
+        ends_at = _end_instant(shown.get("start"), shown.get("end"))
+        if ends_at is not None:
+            end = ends_at.timestamp()
+            # An end already past means Google still calls it upcoming (an
+            # all-day event late in its day, or clock skew): use the plain TTL.
+            if now < end < expires_at:
+                return end
+        return expires_at
+
+    def _finish(
+        self,
+        event_id: str,
+        future: Future[_CachedLookup],
+        entry: _CachedLookup | None,
+    ) -> None:
+        with self._lock:
+            if self._running.get(event_id) is not future:
+                return  # Detached by update_master: this answer may be older.
+            del self._running[event_id]
+            if entry is None:
+                return
+            now = self._clock()
+            for key in [k for k, e in self._entries.items() if e.expires_at <= now]:
+                del self._entries[key]
+            self._entries.pop(event_id, None)
+            while len(self._entries) >= self._max_entries:
+                del self._entries[next(iter(self._entries))]  # Oldest stored.
+            self._entries[event_id] = entry
+
+
 class CalendarService:
     """Thin wrapper around the Google Calendar v3 API for one shared calendar."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._service = build_calendar_service(settings)
+        self._cache = _EventCache()
 
     @property
     def _calendar_id(self) -> str:
@@ -257,8 +411,11 @@ class CalendarService:
         ``_resolve``) — the widget RSVPs against it, so attendance lands on the
         live series. Raises 404 if the event is gone, a one-off has ended, or
         the series (and any continuation of it) has no future occurrences.
+
+        Served from the event cache, so Google-side edits can take up to a minute
+        to show. ``attending`` is worked out per viewer from the cached guest list.
         """
-        series_id, master, instance = self._resolve(event_id)
+        series_id, master, instance = self._resolve_cached(event_id)
 
         recurring = instance is not None
         start_node = (instance or master).get("start")
@@ -296,7 +453,10 @@ class CalendarService:
         Once one lookup finds Google busy, retries have already run out, so the
         ids not yet started report the same error without calling Google. That
         eases the shared quota and stops a rate limit from costing every id its
-        own backoff sleeps.
+        own backoff sleeps. Cached ids are still answered.
+
+        Cached ids are answered on this thread rather than through the pool, so
+        they don't queue behind other viewers' lookups.
         """
         busy = threading.Event()
 
@@ -304,7 +464,7 @@ class CalendarService:
             if not event_id.strip():
                 # A blank id would address Google's list endpoint, not an event.
                 return CalendarBatchEntry(requested_id=event_id, status="unavailable")
-            if busy.is_set():
+            if busy.is_set() and not self._cache.has(event_id):
                 return CalendarBatchEntry(
                     requested_id=event_id,
                     status="error",
@@ -333,7 +493,10 @@ class CalendarService:
                 )
 
         unique_ids = list(dict.fromkeys(event_ids))
-        entries = dict(zip(unique_ids, _BATCH_POOL.map(lookup, unique_ids)))
+        cached_ids = [event_id for event_id in unique_ids if self._cache.has(event_id)]
+        missing_ids = [event_id for event_id in unique_ids if event_id not in cached_ids]
+        entries = {event_id: lookup(event_id) for event_id in cached_ids}
+        entries.update(zip(missing_ids, _BATCH_POOL.map(lookup, missing_ids)))
         return [entries[event_id] for event_id in event_ids]
 
     def get_index_event(self, event_id: str) -> CalendarIndexEvent:
@@ -342,9 +505,10 @@ class CalendarService:
         Attendees and RSVP state are intentionally never read into the returned
         model. A deleted/cancelled event, an expired one-off event, or a recurring
         series with no future instance returns 404 so the Agent can remove stale
-        vectors instead of indexing cached widget metadata.
+        vectors instead of indexing cached widget metadata. Shares the event
+        cache, so this can be up to a minute behind Google.
         """
-        _series_id, master, instance = self._resolve(event_id)
+        _series_id, master, instance = self._resolve_cached(event_id)
 
         recurring = instance is not None
         start_node = (instance or master).get("start")
@@ -377,6 +541,10 @@ class CalendarService:
         ETag precondition and retried on 412 so simultaneous clicks cannot lose
         an attendee. No-ops (and sends no email) when already in the desired
         state, so re-clicking is harmless.
+
+        Reads Google directly rather than the event cache, because a write should
+        act on the live event, then puts the result in the cache so every viewer
+        sees the change straight away.
         """
         email_lower = email.lower()
         # Patch the series the widget is actually showing: a stale client may
@@ -389,10 +557,9 @@ class CalendarService:
             attendees: list[dict[str, Any]] = list(event.get("attendees", []) or [])
             present = any(a.get("email", "").lower() == email_lower for a in attendees)
 
-            if attending and present:
-                return True
-            if not attending and not present:
-                return False
+            if present == attending:
+                self._cache.update_master(event_id, event)
+                return attending
 
             if attending:
                 attendees.append({"email": email})
@@ -413,7 +580,10 @@ class CalendarService:
                 request.headers["If-Match"] = etag
 
             try:
-                request.execute(num_retries=_WRITE_RETRIES)
+                patched = request.execute(num_retries=_WRITE_RETRIES)
+                self._cache.update_master(
+                    event_id, {**event, "attendees": attendees, **patched}
+                )
                 return attending
             except HttpError as exc:
                 if exc.resp is not None and exc.resp.status == 412:
@@ -443,6 +613,10 @@ class CalendarService:
                     "unavailable", "Event not found. It may have been deleted."
                 ) from exc
             raise _google_error(exc, "Event read") from exc
+
+    def _resolve_cached(self, event_id: str) -> _Resolved:
+        """``_resolve`` through the event cache."""
+        return self._cache.get_or_load(event_id, lambda: self._resolve(event_id))
 
     def _resolve(
         self, event_id: str

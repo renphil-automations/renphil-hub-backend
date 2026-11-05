@@ -7,11 +7,12 @@ import pytest
 from fastapi import HTTPException
 
 from app.routers import calendar as calendar_router
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import CalendarService, _EventCache
 
 
 def _service(master: dict, instance: dict | None = None) -> CalendarService:
     service = object.__new__(CalendarService)
+    service._cache = _EventCache()  # type: ignore[attr-defined]
     service._get_raw = lambda _event_id: master  # type: ignore[method-assign]
     service._next_instance = lambda _event_id: instance  # type: ignore[method-assign]
     return service
