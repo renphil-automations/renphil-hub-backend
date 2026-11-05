@@ -150,7 +150,7 @@ R2 does not enforce conditional `DeleteObject`: our probe deleted an object desp
 
 The archive job may leave unregistered objects, including after an upload times out. They are not usable through the registered-archive restore flow and remain in the bucket. The report identifies candidates and registered objects missing from the listing. Their removal requires a separately designed and reviewed process; stopping writers and manually inspecting a key does not create an atomic compare-and-delete. Do not schedule deletion or apply a lifecycle rule to archive prefixes. A lifecycle rule on a shared archive prefix could delete registered archives as well.
 
-Cloudflare R2 credentials currently permit deletion; the writer's restricted interface is not a token-level permission boundary. Separate deployments need separate storage namespaces, and copied database identities cannot alone distinguish a clone from its source. The user-metadata round trip, listing behavior, deployment credentials and pooled endpoint remain to be verified before scheduling.
+Cloudflare R2 credentials currently permit deletion; the writer's restricted interface is not a token-level permission boundary. Separate deployments need separate storage namespaces, and copied database identities cannot alone distinguish a clone from its source. A test object verified metadata round-trip and exact-key listing; deployment credentials, target prefixes and the pooled endpoint still need validation before scheduling.
 
 Known limitations:
 

@@ -1755,7 +1755,7 @@ def reconcile_leftovers(
                 if total == 0 or identical != total:
                     retain(item.key, "retained_not_redundant",
                            f"{total - identical} of {total} record(s) have no identical live row (missing, changed, or another environment: "
-                           "a cleanup-deleted leftover, a registration that is missing, or data that differs); operator review, then --delete-reviewed")
+                           "a cleanup-deleted leftover, a registration that is missing, or data that differs); operator review required")
                     db.rollback()
                     continue
             store.delete(item.key)
