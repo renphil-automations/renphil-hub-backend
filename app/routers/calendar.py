@@ -24,11 +24,12 @@ from app.models.auth import UserInfo
 from app.models.calendar import (
     AttendanceRequest,
     AttendanceResponse,
+    CalendarBatchEntry,
     CalendarEvent,
     CalendarIndexEvent,
     CalendarSearchResult,
 )
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import MAX_BATCH_EVENTS, CalendarService
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,27 @@ def get_event(
 ):
     """Return the nearest upcoming occurrence plus the caller's RSVP state."""
     return service.get_event(event_id, user.email)
+
+
+@router.get(
+    "/events",
+    response_model=list[CalendarBatchEntry],
+    summary="Resolve several stored events to their next occurrences",
+)
+def get_events(
+    ids: list[str] = Query(
+        ...,
+        max_length=MAX_BATCH_EVENTS,
+        description="Stored event / series master ids; repeat the parameter.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    service: CalendarService = Depends(get_calendar_service),
+):
+    """Return one entry per id, in request order, for the carousel.
+
+    One failing id never fails the request: it gets its own status.
+    """
+    return service.get_events(ids, user.email)
 
 
 @router.get(
