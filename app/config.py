@@ -620,6 +620,34 @@ class Settings(BaseSettings):
     # Kept as text so a bad value can never stop the API from starting; it is
     # parsed by `product_analytics_service.parse_retention_days`.
     PRODUCT_ANALYTICS_RETENTION_DAYS: str = "365"
+    # Archive-before-delete for age-expired product analytics: a private
+    # Cloudflare R2 bucket reached through its S3-compatible endpoint
+    # (`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`). All four values are
+    # required by `scripts/archive_product_analytics.py` and validated there
+    # (`product_analytics_archive.R2Config.from_settings`); the API never reads
+    # them and never starts worse without them. Use an API token scoped to
+    # this one bucket with Object Read & Write only. Never log these values.
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET_NAME: str = ""
+    # A SECOND token for `scripts/reconcile_product_analytics_archives.py`
+    # only (Object Read + List + Delete on the same bucket; never Put). The
+    # scheduled writer above must not be able to list or delete, and this
+    # identity must not be able to write. Leave empty on the API and on the
+    # writer's schedule.
+    R2_RECONCILE_ACCESS_KEY_ID: str = ""
+    R2_RECONCILE_SECRET_ACCESS_KEY: str = ""
+    # Key prefix inside the bucket; archives live under
+    # `<prefix>/<environment>/<events|engagements>/v<format>/...`.
+    PRODUCT_ANALYTICS_ARCHIVE_PREFIX: str = "hub-product-analytics"
+    # Whether archives carry the internal View As diagnostics
+    # (`view_as_role_key`, `view_as_scope_key`, `view_as_context`). Default
+    # `omit` (decided 2026-11-03): the real actor identity analytics needs is
+    # kept, the diagnostics are not, and once the live rows are deleted they
+    # cannot be restored. `include` must be set explicitly — see
+    # PRODUCT_ANALYTICS_ARCHIVE.md, "Privacy".
+    PRODUCT_ANALYTICS_ARCHIVE_VIEW_AS: str = "omit"
 
     @property
     def hub_environment(self) -> str:

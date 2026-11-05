@@ -155,9 +155,10 @@ Privacy rules:
 
 ## Retention
 
-Archive integration is pending. The cleanup command does not delete records solely because they are old until verified archive-before-delete is implemented. It can delete records with verified references to deleted resources. Do not schedule age-based retention until the archive follow-up is deployed and reviewed.
+Two commands share one retention policy (`PRODUCT_ANALYTICS_RETENTION_DAYS`, default **365 days**) and one deleted-resource rule:
 
-`PRODUCT_ANALYTICS_RETENTION_DAYS` defaults to **365 days**.
+- `scripts/purge_product_analytics_events.py` deletes records with verified references to deleted resources and **retains** age-expired records (it has no archive). Keep using it only where age-based retention is deliberately not wanted.
+- `scripts/archive_product_analytics.py` is the scheduled retention job: it runs the same deleted-resource cleanup first (those rows are deleted, not archived), then archives age-expired records to the private R2 bucket as ZIP files and deletes them only after each archive is uploaded, read back and verified. While a batch is archived, the Hub rows it depends on are locked against deletion, so no record enters an archive after its resource was deleted; a resource deleted later does not reopen the archive. Runbook, ZIP format, required variables, recovery and monitoring: `PRODUCT_ANALYTICS_ARCHIVE.md`. Do not schedule it until that follow-up is reviewed and deployed with its storage configuration.
 
 - `0`, `off`, `disabled` or `none` disables purging (for a local or sandbox database you reset anyway).
 - Any other value must be a whole number from 30 to 3650. Otherwise the purge refuses to run (exit code 2) and deletes nothing. The API still starts, because the setting is only parsed by the purge.
@@ -175,7 +176,7 @@ New events also receive a nullable `page_id` derived on the server from an autho
 1. Create the table: `python -m scripts.create_product_analytics_tables` (idempotent `CREATE TABLE … IF NOT EXISTS` via `create_all(checkfirst=True)`; this branch has no Alembic). When the planned shared Alembic baseline lands, its `create_all` covers this model, so no extra revision or head is needed.
 2. Set `HUB_ENVIRONMENT` (`sandbox` / `production`) on each backend.
 3. Make sure Upstash is configured, or the ingest rate limit is off.
-4. Coordinate the archive follow-up before scheduling age-based retention; `PRODUCT_ANALYTICS_RETENTION_DAYS` defaults to 365 days.
+4. Configure the R2 archive bucket (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`; archives omit the View As diagnostics unless `PRODUCT_ANALYTICS_ARCHIVE_VIEW_AS=include`), create the archive registry (`python -m scripts.create_product_analytics_archive_tables`) and schedule `python -m scripts.archive_product_analytics` daily per environment after a reviewed `--dry-run`; run `scripts/reconcile_product_analytics_archives.py` weekly (report first; `--delete` removes only leftovers whose records are still live, `--delete-reviewed` the ones an operator reviewed); `scripts/restore_product_analytics_archive.py` restores a registered archive. `PRODUCT_ANALYTICS_RETENTION_DAYS` defaults to 365 days. See `PRODUCT_ANALYTICS_ARCHIVE.md`.
 5. Optional frontend kill switch: `VITE_PRODUCT_ANALYTICS_ENABLED=false`.
 
 ## Known View As boundary
