@@ -112,6 +112,11 @@ def run(
     if environment not in archive.ENVIRONMENTS:
         out("archive refused: HUB_ENVIRONMENT must be local, sandbox, or production. Nothing was deleted or uploaded.")
         return EXIT_CONFIG
+    try:
+        storage_timeout = archive.parse_storage_timeout(getattr(settings, "PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS", "240")) if settings is not None else None
+    except archive.ArchiveConfigError as exc:
+        out(f"archive refused: {exc}. Nothing was deleted or uploaded.")
+        return EXIT_CONFIG
     # `omit` unless the deployment says `include` explicitly (decided 2026-11-03).
     view_as_policy = str(getattr(settings, "PRODUCT_ANALYTICS_ARCHIVE_VIEW_AS", "omit") or "omit").strip().lower() if settings is not None else "omit"
     if view_as_policy not in archive.VIEW_AS_POLICIES:
@@ -268,7 +273,7 @@ def run(
                     archive.archive_expired(
                         db, store, table=table, environment=environment, cutoff=cutoff, prefix=prefix,
                         batch_size=args.batch_size, max_batches=args.max_batches, exclude_columns=exclude_columns, out=out,
-                        storage=storage, outcome=outcome,
+                        storage=storage, outcome=outcome, storage_timeout_seconds=storage_timeout,
                     )
                 except archive.ArchiveLockedError:
                     db.rollback()

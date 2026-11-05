@@ -86,6 +86,28 @@ class ArchiveJobTests(unittest.TestCase):
                        raw_retention=retention, environment=environment, now=NOW, out=lines.append, storage=storage)
         return code, lines
 
+    def test_storage_timeout_configuration_is_validated_before_cleanup(self):
+        self._add(self._event(timedelta(days=400)))
+        for value in ("0", "241", "nan", "inf", "bad", ""):
+            with self.subTest(value=value):
+                settings = SimpleNamespace(**{**GOOD_SETTINGS, "PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS": value})
+                code, _ = self._run(settings=settings)
+                self.assertEqual(code, job.EXIT_CONFIG)
+                self.assertEqual(self._counts(), (1, 0))
+                self.assertFalse(self.store.objects)
+
+    def test_configured_storage_timeout_reaches_archive_operations(self):
+        self._add(self._event(timedelta(days=400)))
+        settings = SimpleNamespace(**{**GOOD_SETTINGS, "PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS": "120"})
+        with patch.object(archive, "ensure_archived", wraps=archive.ensure_archived) as upload:
+            code, _ = self._run(settings=settings)
+        self.assertEqual(code, job.EXIT_OK)
+        self.assertEqual(upload.call_args.kwargs["deadline"], 120.0)
+
+    def test_default_storage_timeout_is_four_minutes(self):
+        self.assertEqual(archive.parse_storage_timeout("240"), 240.0)
+        self.assertEqual(archive.STORAGE_CALL_DEADLINE_S, 240.0)
+
     def _archived_ids(self) -> dict[str, set[str]]:
         found = {"events": set(), "engagements": set()}
         for key, payload in self.store.objects.items():

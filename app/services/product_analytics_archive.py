@@ -149,7 +149,7 @@ LOCK_RETRIES = 3
 # call is abandoned after this many seconds (`call_with_deadline`), and every
 # statement inside the batch transaction runs under this `statement_timeout`.
 # The arithmetic is in the runbook ("maximum wait").
-STORAGE_CALL_DEADLINE_S: float | None = 60.0
+STORAGE_CALL_DEADLINE_S: float | None = 240.0
 STATEMENT_TIMEOUT_MS = 15_000
 # The column the deleted-resource rule joins on, per Hub table, and the lock
 # that keeps it from changing. `FOR KEY SHARE` blocks DELETE and any UPDATE of
@@ -201,6 +201,17 @@ class ArchiveLockedError(ArchiveError):
 
 class ArchiveRestoreError(ArchiveError):
     """A restore was refused before any write (unregistered key, mismatch, missing object)."""
+
+
+def parse_storage_timeout(value: Any) -> float:
+    """Accept a finite 1–240 second deadline without disclosing configuration values."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ArchiveConfigError("PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS must be between 1 and 240 seconds") from None
+    if not 1 <= seconds <= 240:
+        raise ArchiveConfigError("PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS must be between 1 and 240 seconds")
+    return seconds
 
 
 def call_with_deadline(fn: Callable[[], Any], seconds: float | None, *, what: str) -> Any:
@@ -1511,6 +1522,7 @@ def archive_expired(
     out: Any = None,
     storage: tuple[str, str] | None = None,
     outcome: ArchiveOutcome | None = None,
+    storage_timeout_seconds: float | None = None,
     _after_select: Callable[[list[int]], None] | None = None,
 ) -> ArchiveOutcome:
     """Archive-before-delete, one bounded batch (one object) per transaction.
@@ -1650,7 +1662,8 @@ def archive_expired(
             staging_uploaded = True
 
         try:
-            digest, uploaded = ensure_archived(store, key=key, payload=payload, heartbeat=heartbeat, deadline=STORAGE_CALL_DEADLINE_S,
+            deadline = STORAGE_CALL_DEADLINE_S if storage_timeout_seconds is None else storage_timeout_seconds
+            digest, uploaded = ensure_archived(store, key=key, payload=payload, heartbeat=heartbeat, deadline=deadline,
                                                metadata=object_metadata, staging_key=staged, on_staged=staged_now)
             stale = _deleted_resource_count(db, table=table, ids=ids)
             if stale:
@@ -1675,11 +1688,11 @@ def archive_expired(
                 db.rollback()
             except Exception:  # noqa: BLE001 - the connection may already be gone; the original error is what matters
                 pass
-            discard_staging(store, staged, deadline=STORAGE_CALL_DEADLINE_S)
+            discard_staging(store, staged, deadline=STORAGE_CALL_DEADLINE_S if storage_timeout_seconds is None else storage_timeout_seconds)
             raise
         removed = int(result.rowcount or 0)
         if staging_uploaded:  # also after a refused promotion that reused the competing identical object
-            problem = discard_staging(store, staged, deadline=STORAGE_CALL_DEADLINE_S)
+            problem = discard_staging(store, staged, deadline=STORAGE_CALL_DEADLINE_S if storage_timeout_seconds is None else storage_timeout_seconds)
             if problem is not None:
                 emit(f"note: the staging object of this batch could not be deleted now ({problem}); the reconciliation removes it after the grace period: {staged}")
         lock_failures = 0
@@ -1821,6 +1834,7 @@ def reconcile_leftovers(
     lock_timeout_ms: int = LOCK_TIMEOUT_MS,
     out: Any = None,
     storage: tuple[str, str] | None = None,
+    storage_timeout_seconds: float | None = None,
 ) -> ReconcileOutcome:
     """Find objects under this environment's prefix that are not registered
     archives. Report-only by default; with `delete`, remove STAGING leftovers
@@ -2003,7 +2017,7 @@ def reconcile_leftovers(
                 db.rollback()
                 continue
             try:
-                payload = call_with_deadline(lambda: store.get(item.key), STORAGE_CALL_DEADLINE_S, what="readback (GET)")
+                payload = call_with_deadline(lambda: store.get(item.key), STORAGE_CALL_DEADLINE_S if storage_timeout_seconds is None else storage_timeout_seconds, what="readback (GET)")
                 manifest, records = archive_records(payload)
             except ArchiveIntegrityError as exc:
                 retain(item.key, "retained_invalid", f"does not validate as an archive: {exc}")

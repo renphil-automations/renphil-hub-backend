@@ -82,6 +82,11 @@ def run(
     if environment not in archive.ENVIRONMENTS:
         out("reconcile refused: HUB_ENVIRONMENT must be local, sandbox, or production. Nothing was touched.")
         return EXIT_CONFIG
+    try:
+        storage_timeout = archive.parse_storage_timeout(getattr(settings, "PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS", "240")) if settings is not None else None
+    except archive.ArchiveConfigError as exc:
+        out(f"reconcile refused: {exc}. Nothing was touched.")
+        return EXIT_CONFIG
     prefix = "hub-product-analytics"
     if store is None:
         try:
@@ -103,7 +108,7 @@ def run(
         try:
             outcome = archive.reconcile_leftovers(
                 db, store, environment=environment, prefix=prefix, now=now, grace_hours=args.grace_hours, delete=args.delete,
-                out=out, storage=storage,
+                out=out, storage=storage, storage_timeout_seconds=storage_timeout,
             )
         except archive.ArchiveConfigError as exc:
             out(f"reconcile refused: {exc}. Nothing was touched.")

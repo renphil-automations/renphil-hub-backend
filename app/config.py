@@ -642,6 +642,8 @@ class Settings(BaseSettings):
     # Key prefix inside the bucket; archives live under
     # `<prefix>/<environment>/<events|engagements>/v<format>/...`.
     PRODUCT_ANALYTICS_ARCHIVE_PREFIX: str = "hub-product-analytics"
+    # Per R2 operation, in seconds; validated by the archive commands.
+    PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS: str = "240"
     # Whether archives carry the internal View As diagnostics
     # (`view_as_role_key`, `view_as_scope_key`, `view_as_context`). Default
     # `omit` (decided 2026-11-03): the real actor identity analytics needs is
