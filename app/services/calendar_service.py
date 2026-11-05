@@ -166,21 +166,6 @@ def _start_key(event: dict[str, Any]) -> datetime:
         return datetime.max.replace(tzinfo=timezone.utc)
 
 
-def _start_key(event: dict[str, Any]) -> datetime:
-    """Sortable UTC start of an event; all-day dates count from midnight UTC."""
-    raw = _start_str(event.get("start")) or ""
-    try:
-        if "T" not in raw:
-            day = date.fromisoformat(raw)
-            return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except (TypeError, ValueError):
-        return datetime.max.replace(tzinfo=timezone.utc)
-
-
 def _meeting_from(event: dict[str, Any]) -> tuple[str | None, str | None]:
     """
     Return ``(join_url, provider_label)`` for the event's video conference.
