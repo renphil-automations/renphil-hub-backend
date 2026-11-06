@@ -108,6 +108,10 @@ class UserV2(BaseV2):
     is_deleted = Column(Boolean, nullable=False, default=False, server_default=false())
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     deleted_by = Column(String(320), nullable=True)
+    # The Airtable Users "Record ID" COLUMN (never the API id), set by the
+    # Airtable sync (AI Docs/plan_airtable_sync_v2_2026-10-21.md). NULL on
+    # login-only rows and on rows the sync has not linked yet.
+    airtable_record_id = Column(String(32), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
     )
@@ -133,6 +137,13 @@ class UserV2(BaseV2):
             unique=True,
             postgresql_where=text(_HAS_ALIAS_EMAIL),
             sqlite_where=text(_HAS_ALIAS_EMAIL),
+        ),
+        Index(
+            "uq_users_airtable_record_id",
+            "airtable_record_id",
+            unique=True,
+            postgresql_where=text("airtable_record_id IS NOT NULL"),
+            sqlite_where=text("airtable_record_id IS NOT NULL"),
         ),
     )
 
