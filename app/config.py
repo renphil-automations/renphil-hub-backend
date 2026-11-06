@@ -162,7 +162,6 @@ class Settings(BaseSettings):
     # ── Field names ───────────────────────────────────────────────────
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
-    TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
     USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
@@ -185,7 +184,6 @@ class Settings(BaseSettings):
     USERS_MANAGER_FIELD: str
     USERS_TECH_STACK_SELECTIONS_FIELD: str
     USERS_HEADSHOT_FIELD: str
-    USERS_FOR_WEBSITE_FIELD: str
     # Roles / Permissions
     ROLES_NAME_FIELD: str
     ROLES_PERMISSIONS_FIELD: str
@@ -288,30 +286,6 @@ class Settings(BaseSettings):
 
     # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
-
-    # ── Meeting Cadence fields ────────────────────────────────────────
-    AT_F_MC_MEETING_TITLE: str
-    AT_F_MC_DESCRIPTION: str
-    AT_F_MC_ATTACHMENT_URL: str
-
-    # ── Useful Links fields ───────────────────────────────────────────
-    AT_F_UL_DOCUMENT: str
-    AT_F_UL_DOCUMENT_URL: str
-    AT_F_UL_DESCRIPTION: str
-
-    # ── HR & Benefits fields ──────────────────────────────────────────
-    AT_F_HR_DOCUMENT: str
-    AT_F_HR_DOCUMENT_URL: str
-    AT_F_HR_DESCRIPTION: str
-
-    # ── Onboarding fields ─────────────────────────────────────────────
-    AT_F_OB_DOCUMENT: str
-    AT_F_OB_DOCUMENT_URL: str
-    AT_F_OB_NOTES: str
-
-    # ── Onboarding Calls fields ───────────────────────────────────────
-    AT_F_OBC_DATE: str
-    AT_F_OBC_NOTES: str
 
     # ── Quick Links fields ────────────────────────────────────────────
     AT_F_QL_ID: str
@@ -644,6 +618,25 @@ class Settings(BaseSettings):
     BOOKMARKS_SAVED_AT_FIELD: str = "saved_at"
     BOOKMARKS_TYPE_FIELD: str = "type"
     BOOKMARKS_TITLE_FIELD: str = "bookmark_title"
+
+    # ══════════════════════════════════════════════════════════════════
+    # Hub product-usage analytics (`hub_product_events`)
+    # ══════════════════════════════════════════════════════════════════
+    # Which deployment this API is: `local`, `sandbox` or `production`. Stamped
+    # server-side on every product-usage event so Sandbox clicks can never be
+    # counted as Production ones; the browser never supplies it. Unset (or any
+    # other value) is recorded as `unconfigured` rather than guessed.
+    HUB_ENVIRONMENT: str = ""
+    # Days of product analytics events and active time to keep. `0`/`off`
+    # disables purging; anything outside 30–3650 makes the purge refuse to run.
+    # Kept as text so a bad value can never stop the API from starting; it is
+    # parsed by `product_analytics_service.parse_retention_days`.
+    PRODUCT_ANALYTICS_RETENTION_DAYS: str = "365"
+
+    @property
+    def hub_environment(self) -> str:
+        value = self.HUB_ENVIRONMENT.strip().lower()
+        return value if value in {"local", "sandbox", "production"} else "unconfigured"
 
 
 def get_settings() -> Settings:
