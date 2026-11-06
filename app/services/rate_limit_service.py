@@ -51,6 +51,11 @@ RATE_LIMITS: dict[str, tuple[int, int]] = {
     "thread": (10, 3600),
     "comment": (30, 3600),
     "vote": (120, 3600),
+    # Hub product-usage analytics ingestion, per batch request. A batch holds
+    # at most 25 events and the browser flushes at most every 5 s (12
+    # scheduled batches/min, plus the occasional tab-hide flush), so 20/min
+    # never limits a person but caps a runaway client at 500 events/min.
+    "product_analytics": (20, 60),
 }
 
 # Atomic INCR-then-EXPIRE-only-on-the-first-hit-of-the-window, as a single
