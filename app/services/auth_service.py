@@ -27,7 +27,6 @@ from app.config import Settings
 from app.helpers.exceptions import GoogleOAuthError, UserNotAuthorizedError
 from app.helpers.google_client import build_oauth_flow
 from app.models.auth import TokenResponse, UserInfo
-from app.services.airtable_service import AirtableService
 from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
@@ -37,7 +36,7 @@ logger = logging.getLogger(__name__)
 _pkce_store: dict[str, tuple[str, str]] = {}
 
 # Which rule in `_enforce_login_allowed` let an email through.
-LoginAdmission = Literal["domain", "users", "airtable"]
+LoginAdmission = Literal["domain", "users"]
 
 
 def _generate_code_verifier() -> str:
@@ -85,16 +84,20 @@ class AuthService:
         self,
         code: str,
         state: str,
-        airtable_service: AirtableService,
         db: Session,
     ) -> tuple[TokenResponse, str]:
         """
         Complete the OAuth callback:
           - exchange auth code for tokens (with PKCE verifier)
           - verify & decode the id_token
-          - enforce the login allow-list (domain, users, Airtable)
-          - resolve the user's roles from the Airtable Access Control table
+          - enforce the login allow-list (domain, users)
           - mint a local JWT
+
+        Never touches Airtable (plan_login_airtable_removal_2026-10-31.md):
+        admission is decided by Postgres alone, and the token's `roles` is
+        always `[]` — nothing server-side reads it since phase 3
+        (`is_hub_admin` resolves from `role_assignments`), same as
+        `/auth/dev-login`.
 
         Returns (TokenResponse, frontend_redirect_uri).
         """
@@ -131,19 +134,9 @@ class AuthService:
         picture: str | None = id_info.get("picture")
 
         # Gate login: org domain, or a pre-registered external email
-        admitted_by = await self._enforce_login_allowed(email, airtable_service, db)
+        self._enforce_login_allowed(email, db)
 
-        # Auto-provision a Hub Member Access Control record for first-time
-        # users — except someone admitted through a `users` row (owner
-        # decision, 2026-10-04): their sign-in must keep depending on
-        # `users` alone, not on an Airtable record this would create.
-        if admitted_by != "users":
-            await airtable_service.ensure_access_control_member(email)
-
-        # Resolve roles from the Airtable Access Control table
-        roles: list[str] = await airtable_service.get_user_roles(email)
-
-        # Mint a local JWT for session management
+        roles: list[str] = []
         access_token = self._create_access_token(
             UserInfo(email=email, name=name, picture=picture, roles=roles)
         )
@@ -195,19 +188,15 @@ class AuthService:
         )
 
     # ── Login allow-list ────────────────────────────────────────────────
-    async def _enforce_login_allowed(
-        self, email: str, airtable_service: AirtableService, db: Session
-    ) -> LoginAdmission:
+    def _enforce_login_allowed(self, email: str, db: Session) -> LoginAdmission:
         """Gate login by email, returning which rule admitted it.
 
         Org-domain emails are always allowed. A non-org email is allowed only
-        when it is already known: first a `users` row signing in as it
-        (`work_email`, else `alias_email` — an HR row, or a person added from
-        the Access Control page's Users tab), then — as a fallback until the
-        AC cutover, after which only `users` will count — a record in the
-        Airtable Access Control table. Otherwise login is refused. Runs
-        BEFORE auto-provisioning so an unknown external email is never
-        provisioned into existence.
+        when a `users` row signs in as it (`work_email`, else `alias_email` —
+        an HR row, or a person added from the Access Control page's Users
+        tab). Otherwise login is refused. The Airtable Access Control table
+        is no longer a fallback (plan_login_airtable_removal_2026-10-31.md;
+        owner accepted that externals known only there lose access).
 
         `users.has_signed_in` is deliberately NOT checked (owner decision,
         2026-10-04): an admin-added person
@@ -218,6 +207,4 @@ class AuthService:
             return "domain"
         if find_user_by_email(db, email) is not None:
             return "users"
-        if await airtable_service.access_control_email_exists(email):
-            return "airtable"
         raise UserNotAuthorizedError(email)

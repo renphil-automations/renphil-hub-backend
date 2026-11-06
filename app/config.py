@@ -129,7 +129,6 @@ class Settings(BaseSettings):
     AWARDED_OPPORTUNITIES_TABLE: str
     DELIVERABLES_TABLE: str
     # RenPhil Hub base
-    ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
     FEEDBACKS_TABLE: str
@@ -137,7 +136,6 @@ class Settings(BaseSettings):
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
     OFFICE_SPACES_TABLE: str
-    ACCESS_CONTROL_TABLE: str
     TEAMS_TABLE: str
     USERS_TABLE: str
     ROLES_TABLE: str
@@ -162,15 +160,6 @@ class Settings(BaseSettings):
     ORGANIZATION_INFO_TABLE: str | None = None
 
     # ── Field names ───────────────────────────────────────────────────
-    # Admins / Access Control
-    ADMINS_EMAIL_FIELD: str
-    ACCESS_CONTROL_USER_EMAIL_FIELD: str
-    ACCESS_CONTROL_ROLES_FIELD: str
-    ACCESS_CONTROL_PERMISSIONS_FIELD: str
-    ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str
-    ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
@@ -201,9 +190,6 @@ class Settings(BaseSettings):
     ROLES_SCOPE_FIELD: str
     PERMISSIONS_NAME_FIELD: str
     PERMISSIONS_DESCRIPTION_FIELD: str
-
-    # Role auto-assigned to first-time authenticated users.
-    DEFAULT_MEMBER_ROLE: str = "Hub Member"
 
     # ── Fundraising (Total Moved & Deployed) fields ───────────────────
     AT_F_AMOUNT: str
@@ -390,6 +376,54 @@ class Settings(BaseSettings):
     ORG_DOMAIN: str | None = None
 
     # ══════════════════════════════════════════════════════════════════
+    # Airtable → Hub sync (AI Docs/plan_airtable_sync_v2_2026-10-21.md)
+    # ══════════════════════════════════════════════════════════════════
+    # All in the RenPhil Hub base (RENPHIL_HUB_BASE_ID). Prefixed
+    # AIRTABLE_SYNC_ because CLUSTERS_TABLE above already names the Fund &
+    # Program base's clusters table. Optional so the app boots without them;
+    # the sync endpoints that need one report it missing.
+    AIRTABLE_SYNC_PROGRAM_ROLES_TABLE: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_DESIGNATION_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_EMPLOYEE_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_PROGRAM_RECORD_ID_FIELD: str | None = None
+    # Cluster table
+    AIRTABLE_SYNC_CLUSTERS_TABLE: str | None = None
+    AIRTABLE_SYNC_CLUSTERS_NAME_FIELD: str | None = None
+    AIRTABLE_SYNC_CLUSTERS_RECORD_ID_FIELD: str | None = None
+    # "Public incl. Finance Dashboard" (the programs)
+    AIRTABLE_SYNC_PROGRAMS_TABLE: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_NAME_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_CLUSTER_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_CLUSTER_LINK_FIELD: str | None = None
+    # Users (USERS_TABLE): the fields the USERS_* settings above don't cover.
+    AIRTABLE_SYNC_USERS_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_IS_FELLOW_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_BIRTHDAY_OPT_OUT_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_POST_ON_WEBSITE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_NEW_HEADSHOT_BIO_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_ADD_TO_WEBSITE_DATE_FIELD: str | None = None
+    # The sync's own names for four fields whose shared USERS_* setting
+    # names a field Airtable doesn't have (owner, 2026-10-23). Blank → the
+    # shared setting is used.
+    AIRTABLE_SYNC_USERS_START_DATE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_END_DATE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_OFFICE_LOCATION_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_TECH_STACK_FIELD: str | None = None
+
+    # ══════════════════════════════════════════════════════════════════
+    # Cloudflare R2: headshots copied by the Airtable sync (plan v2 §7)
+    # ══════════════════════════════════════════════════════════════════
+    # Optional: without them the sync skips the Headshot field (one warning
+    # per run). The two keys are secrets: never log or print them.
+    R2_ACCESS_KEY_ID: str | None = None
+    R2_SECRET_ACCESS_KEY: str | None = None
+    R2_BUCKET: str | None = None
+    R2_ENDPOINT_URL: str | None = None
+    R2_KEY_PREFIX: str | None = None  # e.g. "headshots/" (trailing slash)
+    R2_PUBLIC_BASE_URL: str | None = None  # e.g. "https://pub-….r2.dev"
+
+    # ══════════════════════════════════════════════════════════════════
     # Gemini (Google Generative AI)
     # ══════════════════════════════════════════════════════════════════
     GEMINI_API_KEY: str | None = None
@@ -434,6 +468,10 @@ class Settings(BaseSettings):
     # Shared secret for POST /data/airtable/cache/refresh — same shape as
     # AGENT_SYNC_TOKEN below, sent as X-Sync-Token. Unset ⇒ 503.
     CACHE_REFRESH_TOKEN: str | None = None
+    # Shared secret for POST /v2/airtable-sync/tick (the Airtable → Hub
+    # sync's scheduler, called by the same cron), sent as X-Sync-Token.
+    # Unset ⇒ 503: no scheduled runs.
+    AIRTABLE_SYNC_TOKEN: str | None = None
     # A scheduled refresh will NOT re-walk a widget whose cached entry is
     # younger than this (plan_airtable_cache_scaling_2026-08-08.md §4.4).
     #

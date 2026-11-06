@@ -86,9 +86,6 @@ from app.models.airtable import (
     FeedbackCreate,
     FeedbackRecord,
     AwardedOpportunityRecord,
-    AccessControlAssign,
-    AccessControlRecord,
-    AccessControlRevoke,
     CheckinReportingPeriodRecord,
     ClusterRecord,
     CountResponse,
@@ -4449,51 +4446,6 @@ async def _require_admin_dep(
 
 
 @router.get(
-    "/access-control",
-    response_model=list[AccessControlRecord],
-    dependencies=[Depends(_require_admin_dep)],
-    summary="List all Access Control records (admin only)",
-)
-@airtable_cache(table="ACCESS_CONTROL_TABLE")
-async def list_access_control(
-    airtable_service: AirtableService = Depends(get_airtable_service),
-):
-    return await airtable_service.list_access_control_records()
-
-
-@router.post(
-    "/access-control/assign",
-    response_model=AccessControlRecord,
-    summary="Upsert role(s) and/or permission(s) for a user email (admin only)",
-)
-@invalidates_cache(["list_access_control"])
-async def assign_access_control(
-    payload: AccessControlAssign = Body(...),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-    airtable_service: AirtableService = Depends(get_airtable_service),
-):
-    _require_admin(db, current)
-    return await airtable_service.upsert_access_control(payload)
-
-
-@router.post(
-    "/access-control/revoke",
-    response_model=AccessControlRecord,
-    summary="Remove role(s) and/or permission(s) for a user email (admin only)",
-)
-@invalidates_cache(["list_access_control"])
-async def revoke_access_control(
-    payload: AccessControlRevoke = Body(...),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-    airtable_service: AirtableService = Depends(get_airtable_service),
-):
-    _require_admin(db, current)
-    return await airtable_service.revoke_access_control(payload)
-
-
-@router.get(
     "/access-control/team-emails",
     response_model=list[str],
     summary="Unique Work Email values from the Teams table",
@@ -4538,7 +4490,7 @@ async def get_permissions(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Role (admin only)",
 )
-@invalidates_cache(["get_roles", "list_access_control"])
+@invalidates_cache(["get_roles"])
 async def create_role(
     payload: RoleCreate = Body(...),
     current: CurrentHubUser = Depends(get_current_hub_user),
@@ -4554,7 +4506,7 @@ async def create_role(
     response_model=Role,
     summary="Update a Role: name, scope, and/or permissions (admin only)",
 )
-@invalidates_cache(["get_roles", "list_access_control"])
+@invalidates_cache(["get_roles"])
 async def update_role(
     role_id: str = Path(..., description="Role record id."),
     payload: RoleUpdate = Body(...),
@@ -4571,7 +4523,7 @@ async def update_role(
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a Role (admin only)",
 )
-@invalidates_cache(["get_roles", "list_access_control"])
+@invalidates_cache(["get_roles"])
 async def delete_role(
     role_id: str = Path(..., description="Role record id."),
     current: CurrentHubUser = Depends(get_current_hub_user),
