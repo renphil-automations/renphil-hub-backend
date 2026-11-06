@@ -508,6 +508,12 @@ class CalendarService:
         vectors instead of indexing cached widget metadata. Shares the event
         cache, so this can be up to a minute behind Google.
         """
+        if not event_id.strip():
+            # A blank id would address Google's list endpoint, not an event.
+            raise CalendarEventGoneError(
+                "unavailable", "This event is no longer available."
+            )
+
         _series_id, master, instance = self._resolve_cached(event_id)
 
         recurring = instance is not None
