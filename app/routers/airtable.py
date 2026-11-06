@@ -1545,21 +1545,25 @@ def _airtable_component_visible_to(
     db: Session,
     link: str,
     email: str,
-    roles: list[str],
 ) -> ComponentV2 | None:
-    """Return the component for `link` only when `email`/`roles` can view it.
+    """Return the component for `link` only when `email` can view it.
 
     Rebuilt during the 2026-09-15 sandbox merge: the access_control_service
     engine this originally called (`can_view` over an `effective_ac` blob)
     was torn out on this branch for the granted_single_node/effective_pairs
     design — mirrors `_resolve_airtable_bundle_and_access`'s own
     is_hub_admin-or-granted_single_node shape, the same primitive this
-    file's other six routes already use. `email`/`roles` here are an
-    arbitrary verified Agent identity (see get_airtable_personal_context's
-    own docstring), not necessarily the caller's own JWT, so this resolves
+    file's other six routes already use. `email` here is an arbitrary
+    verified Agent identity (see get_airtable_personal_context's own
+    docstring), not necessarily the caller's own JWT, so this resolves
     hub_user_id itself rather than taking a CurrentHubUser — an identity
     with no hub_users row (never logged in) has no grants either way and
     fails closed to None, exactly like an unknown link does.
+
+    Both checks read Postgres on every call, so a revocation applies at once.
+    Role names are not an input: `is_hub_admin` ignores them, and the Airtable
+    lookup that used to supply them is gone
+    (plan_login_airtable_removal_2026-10-31.md).
     """
     bundle = get_airtable_component_bundle(db, link)
     if bundle is None:
@@ -1571,7 +1575,7 @@ def _airtable_component_visible_to(
 
     closures = _LazyRbacClosures(db)
     current = CurrentHubUser(
-        info=UserInfo(email=email, name="", picture=None, roles=list(roles or [])),
+        info=UserInfo(email=email, name="", picture=None, roles=[]),
         hub_user_id=hub_user.id,
         email=email,
     )
@@ -1623,12 +1627,6 @@ async def get_airtable_personal_context(
     """
 
     email = str(identity.get("email") or "").strip().lower()
-    # The signed context binds the user email to the trusted Agent, but roles
-    # inside it are a login-time JWT snapshot. Reload current Hub roles before
-    # any component visibility decision so revocations and All Scopes changes
-    # take effect immediately.
-    live_roles = await airtable_service.get_user_roles(email)
-    roles = [str(role).strip() for role in live_roles if str(role).strip()]
 
     links = await asyncio.to_thread(list_airtable_component_links, db)
     total_links = len(links)
@@ -1643,7 +1641,6 @@ async def get_airtable_personal_context(
             db,
             link,
             email,
-            roles,
         )
         if component is None:
             continue
