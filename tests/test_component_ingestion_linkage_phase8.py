@@ -10,7 +10,7 @@ def _fake_db():
     return SimpleNamespace(commit=MagicMock(), rollback=MagicMock())
 
 
-def test_nav_access_write_returns_component_receipts(monkeypatch):
+def test_nav_access_control_write_does_not_reindex_descendants(monkeypatch):
     db = _fake_db()
     nav = SimpleNamespace(
         id=7,
@@ -22,34 +22,31 @@ def test_nav_access_write_returns_component_receipts(monkeypatch):
         protected=False,
         icon=None,
         updated_at=None,
+        locked=False,
+        locked_by=None,
+        locked_at=None,
     )
-    touched = [("tab", 10)]
-    receipt = {"component_id": 365, "action": "upsert"}
+    new_access = {"viewers": {"example": ["User"]}, "admins": {}}
 
     monkeypatch.setattr(
         nav_tab_service,
         "get_nav_tab_by_document_id",
         lambda _db, _document_id: nav,
     )
-    monkeypatch.setattr(
-        nav_tab_service,
-        "apply_write",
-        lambda _db, _ref, _ac: touched,
-    )
-    monkeypatch.setattr(
-        nav_tab_service,
-        "_refresh_index_for_touched",
-        lambda _db, refs: [receipt] if refs == touched else [],
-    )
+    reindex = MagicMock()
+    monkeypatch.setattr(nav_tab_service, "_nav_tab_component_search_updates", reindex)
 
     result = nav_tab_service.update_nav_tab_v2(
         db,
         "nav-v2",
-        access_control={"viewers": {}, "admins": {}},
+        access_control=new_access,
     )
 
     assert result is not None
-    assert result["search_updates"] == [receipt]
+    assert result["access_control"] == new_access
+    assert nav.access_control == new_access
+    assert result["search_updates"] == []
+    reindex.assert_not_called()
     db.commit.assert_called_once()
     db.rollback.assert_not_called()
 
@@ -66,6 +63,9 @@ def test_nav_rename_reindexes_all_descendant_component_metadata(monkeypatch):
         protected=False,
         icon=None,
         updated_at=None,
+        locked=False,
+        locked_by=None,
+        locked_at=None,
     )
     receipt = {"component_id": 371, "action": "upsert"}
 

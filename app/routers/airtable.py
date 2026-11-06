@@ -38,6 +38,7 @@ from fastapi import (
     Path,
     Query,
     Request,
+    Response,
     status,
 )
 
@@ -4317,14 +4318,13 @@ async def create_announcement(
     summary="Submit a new feedback (Date & Time set server-side)",
 )
 async def create_feedback(
-    payload: FeedbackCreate = Body(...),
-    user: UserInfo = Depends(get_current_user),
-    airtable_service: AirtableService = Depends(get_airtable_service),
+    request: Request,
+    response: Response,
+    current: CurrentHubUser = Depends(get_current_hub_user),
 ):
-    return await airtable_service.create_feedback(
-        payload,
-        from_email=str(user.email),
-    )
+    from app.routers.hub_feedback import PRIVATE, submit_legacy_feedback
+    response.headers.update(PRIVATE)
+    return await submit_legacy_feedback(request, current)
 
 
 @router.patch(
