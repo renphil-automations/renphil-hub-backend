@@ -10,7 +10,7 @@ def _fake_db():
     return SimpleNamespace(commit=MagicMock(), rollback=MagicMock())
 
 
-def test_nav_access_write_returns_component_receipts(monkeypatch):
+def test_legacy_nav_access_metadata_does_not_trigger_search_refresh(monkeypatch):
     db = _fake_db()
     nav = SimpleNamespace(
         id=7,
@@ -22,25 +22,18 @@ def test_nav_access_write_returns_component_receipts(monkeypatch):
         protected=False,
         icon=None,
         updated_at=None,
+        locked=False,
+        locked_by=None,
+        locked_at=None,
     )
-    touched = [("tab", 10)]
-    receipt = {"component_id": 365, "action": "upsert"}
 
     monkeypatch.setattr(
         nav_tab_service,
         "get_nav_tab_by_document_id",
         lambda _db, _document_id: nav,
     )
-    monkeypatch.setattr(
-        nav_tab_service,
-        "apply_write",
-        lambda _db, _ref, _ac: touched,
-    )
-    monkeypatch.setattr(
-        nav_tab_service,
-        "_refresh_index_for_touched",
-        lambda _db, refs: [receipt] if refs == touched else [],
-    )
+    refresh = MagicMock()
+    monkeypatch.setattr(nav_tab_service, "_nav_tab_component_search_updates", refresh)
 
     result = nav_tab_service.update_nav_tab_v2(
         db,
@@ -49,7 +42,8 @@ def test_nav_access_write_returns_component_receipts(monkeypatch):
     )
 
     assert result is not None
-    assert result["search_updates"] == [receipt]
+    assert result["search_updates"] == []
+    refresh.assert_not_called()
     db.commit.assert_called_once()
     db.rollback.assert_not_called()
 
@@ -66,6 +60,9 @@ def test_nav_rename_reindexes_all_descendant_component_metadata(monkeypatch):
         protected=False,
         icon=None,
         updated_at=None,
+        locked=False,
+        locked_by=None,
+        locked_at=None,
     )
     receipt = {"component_id": 371, "action": "upsert"}
 

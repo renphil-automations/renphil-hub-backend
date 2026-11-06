@@ -33,6 +33,7 @@ from app.routers import (
     locks_v2,
     nav_tabs,
     product_analytics,
+    product_analytics_archive_trigger,
     rbac,
     rbac_assignments,
     resource_grants,
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(dify.router, prefix=api_prefix)
     app.include_router(bot_management.router, prefix=api_prefix)
     app.include_router(product_analytics.router, prefix=api_prefix)
+    app.include_router(product_analytics_archive_trigger.router, prefix=api_prefix)
     app.include_router(airtable.router, prefix=api_prefix)
     app.include_router(agent_access.router, prefix=api_prefix)
     app.include_router(calendar.router, prefix=api_prefix)
