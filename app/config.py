@@ -173,7 +173,6 @@ class Settings(BaseSettings):
     ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
-    TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
     USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
@@ -196,7 +195,6 @@ class Settings(BaseSettings):
     USERS_MANAGER_FIELD: str
     USERS_TECH_STACK_SELECTIONS_FIELD: str
     USERS_HEADSHOT_FIELD: str
-    USERS_FOR_WEBSITE_FIELD: str
     # Roles / Permissions
     ROLES_NAME_FIELD: str
     ROLES_PERMISSIONS_FIELD: str
@@ -302,30 +300,6 @@ class Settings(BaseSettings):
 
     # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
-
-    # ── Meeting Cadence fields ────────────────────────────────────────
-    AT_F_MC_MEETING_TITLE: str
-    AT_F_MC_DESCRIPTION: str
-    AT_F_MC_ATTACHMENT_URL: str
-
-    # ── Useful Links fields ───────────────────────────────────────────
-    AT_F_UL_DOCUMENT: str
-    AT_F_UL_DOCUMENT_URL: str
-    AT_F_UL_DESCRIPTION: str
-
-    # ── HR & Benefits fields ──────────────────────────────────────────
-    AT_F_HR_DOCUMENT: str
-    AT_F_HR_DOCUMENT_URL: str
-    AT_F_HR_DESCRIPTION: str
-
-    # ── Onboarding fields ─────────────────────────────────────────────
-    AT_F_OB_DOCUMENT: str
-    AT_F_OB_DOCUMENT_URL: str
-    AT_F_OB_NOTES: str
-
-    # ── Onboarding Calls fields ───────────────────────────────────────
-    AT_F_OBC_DATE: str
-    AT_F_OBC_NOTES: str
 
     # ── Quick Links fields ────────────────────────────────────────────
     AT_F_QL_ID: str
