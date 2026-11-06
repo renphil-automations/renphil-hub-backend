@@ -74,6 +74,7 @@ def run(
     now: datetime | None = None,
     out: Callable[[str], None] = print,
     storage: tuple[str, str] | None = None,
+    progress_out: dict[str, Any] | None = None,
 ) -> int:
     """`storage` is only for tests that inject a `store`: the (bucket, prefix)
     the run claims to be configured for, used for the identity binding check."""
@@ -289,6 +290,14 @@ def run(
                     f"batch(es) ({outcome.registered} registered, {outcome.reused} already present); deleted {outcome.deleted}; "
                     f"{outcome.reselected} batch(es) re-selected because a resource was deleted before the batch was locked."
                 )
+            if progress_out is not None:
+                progress_out.update({
+                    "cleanup": dict(progress["cleanup"]),
+                    "archived": {table: outcome.archived for table, outcome in progress["archived"].items()},
+                    # A full batch may have more work; one further call confirms it.
+                    "has_more": any(value >= args.batch_size for value in progress["cleanup"].values())
+                    or any(outcome.archived >= args.batch_size for outcome in progress["archived"].values()),
+                })
             return EXIT_OK
         finally:
             db.close()

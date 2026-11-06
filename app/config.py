@@ -644,6 +644,8 @@ class Settings(BaseSettings):
     PRODUCT_ANALYTICS_ARCHIVE_PREFIX: str = "hub-product-analytics"
     # Per R2 operation, in seconds; validated by the archive commands.
     PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS: str = "240"
+    # Dedicated scheduler credential; never expose it to the browser.
+    PRODUCT_ANALYTICS_ARCHIVE_TRIGGER_TOKEN: str = ""
     # Whether archives carry the internal View As diagnostics
     # (`view_as_role_key`, `view_as_scope_key`, `view_as_context`). Default
     # `omit` (decided 2026-11-03): the real actor identity analytics needs is

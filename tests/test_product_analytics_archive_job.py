@@ -108,6 +108,22 @@ class ArchiveJobTests(unittest.TestCase):
         self.assertEqual(archive.parse_storage_timeout("240"), 240.0)
         self.assertEqual(archive.STORAGE_CALL_DEADLINE_S, 240.0)
 
+    def test_bounded_run_reports_possible_backlog_until_next_batch_confirms_empty(self):
+        self._add(*(self._event(timedelta(days=400)) for _ in range(100)))
+        progress = {}
+        result = job.run(["--batch-size", "100", "--max-batches", "1"], engine=self.engine,
+            store=self.store, raw_retention="365", environment="sandbox", now=NOW,
+            out=lambda _: None, progress_out=progress)
+        self.assertEqual(result, job.EXIT_OK)
+        self.assertEqual(progress["archived"]["events"], 100)
+        self.assertTrue(progress["has_more"])
+        next_progress = {}
+        result = job.run(["--batch-size", "100", "--max-batches", "1"], engine=self.engine,
+            store=self.store, raw_retention="365", environment="sandbox", now=NOW,
+            out=lambda _: None, progress_out=next_progress)
+        self.assertEqual(result, job.EXIT_OK)
+        self.assertFalse(next_progress["has_more"])
+
     def _archived_ids(self) -> dict[str, set[str]]:
         found = {"events": set(), "engagements": set()}
         for key, payload in self.store.objects.items():
