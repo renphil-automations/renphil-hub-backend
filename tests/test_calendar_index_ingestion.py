@@ -99,6 +99,20 @@ def test_index_event_rejects_cancelled_event() -> None:
     assert exc_info.value.status_code == 404
 
 
+def test_index_event_rejects_blank_id_without_calling_google() -> None:
+    def no_google_call(_event_id: str) -> dict:
+        raise AssertionError("a blank id must not reach Google")
+
+    for blank_id in ("", "   "):
+        service = _service({})
+        service._get_raw = no_google_call  # type: ignore[method-assign]
+
+        with pytest.raises(HTTPException) as exc_info:
+            service.get_index_event(blank_id)
+
+        assert exc_info.value.status_code == 404
+
+
 def test_internal_calendar_endpoint_token_check_is_constant_time_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
