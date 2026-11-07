@@ -16,8 +16,8 @@ except ImportError:  # pragma: no cover - optional test dependency
     mock_aws = None
 
 CONFIG = archive.R2Config.from_settings(SimpleNamespace(
-    R2_ACCOUNT_ID="0123456789abcdef0123456789abcdef", R2_ACCESS_KEY_ID="AKIAEXAMPLEKEYID",
-    R2_SECRET_ACCESS_KEY="s3cr3t-value-that-is-long-enough", R2_BUCKET_NAME="renphil-hub-analytics-archive-bucket",
+    ANALYTICS_ARCHIVE_R2_ACCOUNT_ID="0123456789abcdef0123456789abcdef", ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID="AKIAEXAMPLEKEYID",
+    ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY="s3cr3t-value-that-is-long-enough", ANALYTICS_ARCHIVE_R2_BUCKET_NAME="renphil-hub-analytics-archive-bucket",
     PRODUCT_ANALYTICS_ARCHIVE_PREFIX="hub-product-analytics",
 ))
 
@@ -233,17 +233,17 @@ class R2StoreMockTests(unittest.TestCase):
         self.assertEqual(len(reconciler.list("hub-product-analytics/")), 3)
 
     def test_reconcile_store_credentials_are_a_separate_identity(self) -> None:
-        settings = SimpleNamespace(R2_ACCOUNT_ID=CONFIG.account_id, R2_BUCKET_NAME=CONFIG.bucket, PRODUCT_ANALYTICS_ARCHIVE_PREFIX=CONFIG.prefix,
-                                   R2_ACCESS_KEY_ID="writer-key", R2_SECRET_ACCESS_KEY="writer-secret-long-enough-xx",
-                                   R2_RECONCILE_ACCESS_KEY_ID="reconcile-key", R2_RECONCILE_SECRET_ACCESS_KEY="reconcile-secret-long-enough")
+        settings = SimpleNamespace(ANALYTICS_ARCHIVE_R2_ACCOUNT_ID=CONFIG.account_id, ANALYTICS_ARCHIVE_R2_BUCKET_NAME=CONFIG.bucket, PRODUCT_ANALYTICS_ARCHIVE_PREFIX=CONFIG.prefix,
+                                   ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID="writer-key", ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY="writer-secret-long-enough-xx",
+                                   ANALYTICS_ARCHIVE_R2_RECONCILE_ACCESS_KEY_ID="reconcile-key", ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY="reconcile-secret-long-enough")
         writer = archive.R2Config.from_settings(settings)
         reconciler = archive.R2Config.from_settings(settings, credentials=archive.RECONCILE_CREDENTIALS)
         self.assertEqual((writer.role, writer.access_key_id), ("writer", "writer-key"))
         self.assertEqual((reconciler.role, reconciler.access_key_id), ("reconcile", "reconcile-key"))
         with self.assertRaises(archive.ArchiveConfigError) as caught:
-            archive.R2Config.from_settings(SimpleNamespace(**{**vars(settings), "R2_RECONCILE_SECRET_ACCESS_KEY": ""}),
+            archive.R2Config.from_settings(SimpleNamespace(**{**vars(settings), "ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY": ""}),
                                            credentials=archive.RECONCILE_CREDENTIALS)
-        self.assertIn("R2_RECONCILE_SECRET_ACCESS_KEY", str(caught.exception))
+        self.assertIn("ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY", str(caught.exception))
         self.assertNotIn("reconcile-secret", str(caught.exception))
 
     def test_cli_delete_refuses_before_any_storage_call_when_configuration_is_incomplete(self) -> None:

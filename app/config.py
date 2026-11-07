@@ -634,23 +634,23 @@ class Settings(BaseSettings):
     PRODUCT_ANALYTICS_RETENTION_DAYS: str = "365"
     # Archive-before-delete for age-expired product analytics: a private
     # Cloudflare R2 bucket reached through its S3-compatible endpoint
-    # (`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`). All four values are
+    # (`https://<ANALYTICS_ARCHIVE_R2_ACCOUNT_ID>.r2.cloudflarestorage.com`). All four values are
     # required by `scripts/archive_product_analytics.py` and validated there
     # (`product_analytics_archive.R2Config.from_settings`); the API never reads
     # them and never starts worse without them. Use an API token scoped to
     # this one bucket with Object Read & Write only. Never log these values.
-    R2_ACCOUNT_ID: str = ""
-    R2_ACCESS_KEY_ID: str = ""
-    R2_SECRET_ACCESS_KEY: str = ""
-    R2_BUCKET_NAME: str = ""
+    ANALYTICS_ARCHIVE_R2_ACCOUNT_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY: str = ""
+    ANALYTICS_ARCHIVE_R2_BUCKET_NAME: str = ""
     # A SECOND token for `scripts/reconcile_product_analytics_archives.py`
     # only. The reconciliation lists, reads and deletes STAGING objects and
     # never writes; Cloudflare's token levels cannot exclude delete or list,
     # so that restriction is in the code, not in the token — keep the two
     # identities separate anyway. Leave empty on the API and on the writer's
     # schedule.
-    R2_RECONCILE_ACCESS_KEY_ID: str = ""
-    R2_RECONCILE_SECRET_ACCESS_KEY: str = ""
+    ANALYTICS_ARCHIVE_R2_RECONCILE_ACCESS_KEY_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY: str = ""
     # Key prefix inside the bucket; archives live under
     # `<prefix>/<environment>/<events|engagements>/v<format>/...`.
     PRODUCT_ANALYTICS_ARCHIVE_PREFIX: str = "hub-product-analytics"

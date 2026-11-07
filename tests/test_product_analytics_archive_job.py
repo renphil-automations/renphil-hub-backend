@@ -24,8 +24,8 @@ from scripts import archive_product_analytics as job
 
 NOW = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
 GOOD_SETTINGS = dict(
-    R2_ACCOUNT_ID="0123456789abcdef0123456789abcdef", R2_ACCESS_KEY_ID="AKIAEXAMPLEKEYID",
-    R2_SECRET_ACCESS_KEY="s3cr3t-value-that-is-long-enough", R2_BUCKET_NAME="renphil-hub-analytics-archive-bucket",
+    ANALYTICS_ARCHIVE_R2_ACCOUNT_ID="0123456789abcdef0123456789abcdef", ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID="AKIAEXAMPLEKEYID",
+    ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY="s3cr3t-value-that-is-long-enough", ANALYTICS_ARCHIVE_R2_BUCKET_NAME="renphil-hub-analytics-archive-bucket",
     PRODUCT_ANALYTICS_ARCHIVE_PREFIX="hub-product-analytics", PRODUCT_ANALYTICS_RETENTION_DAYS="365", hub_environment="sandbox",
 )
 # The View As diagnostics are omitted unless a deployment says `include` explicitly.
@@ -229,9 +229,9 @@ class ArchiveJobTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("dry run: 1 engagements row(s) older than") for line in lines), lines)
         self.assertEqual(lines[-1], "dry run: no archive was uploaded and nothing was deleted.")
         # A dry run without storage configuration still reports, and says the live job would refuse.
-        code, lines = self._run("--dry-run", store=None, settings=SimpleNamespace(**{**GOOD_SETTINGS, "R2_BUCKET_NAME": ""}))
+        code, lines = self._run("--dry-run", store=None, settings=SimpleNamespace(**{**GOOD_SETTINGS, "ANALYTICS_ARCHIVE_R2_BUCKET_NAME": ""}))
         self.assertEqual(code, 0)
-        self.assertTrue(any("storage configuration is not usable (missing archive storage configuration: R2_BUCKET_NAME)" in line for line in lines), lines)
+        self.assertTrue(any("storage configuration is not usable (missing archive storage configuration: ANALYTICS_ARCHIVE_R2_BUCKET_NAME)" in line for line in lines), lines)
         self.assertEqual(self._counts(), (3, 1))
 
     def test_deleted_resource_rows_are_deleted_not_archived(self) -> None:
@@ -536,7 +536,7 @@ class ArchiveJobTests(unittest.TestCase):
         cases = {
             "retention off": dict(retention="off", expected=(0, "disabled")),
             "retention invalid": dict(retention="7", expected=(2, "refused")),
-            "no storage": dict(store=None, settings=SimpleNamespace(**{**GOOD_SETTINGS, "R2_SECRET_ACCESS_KEY": ""}), expected=(2, "R2_SECRET_ACCESS_KEY")),
+            "no storage": dict(store=None, settings=SimpleNamespace(**{**GOOD_SETTINGS, "ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY": ""}), expected=(2, "ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY")),
             "bad batch": dict(argv=("--batch-size", "10"), expected=(2, "--batch-size")),
             "bad max": dict(argv=("--max-batches", "0"), expected=(2, "--max-batches")),
         }
@@ -546,7 +546,7 @@ class ArchiveJobTests(unittest.TestCase):
                                         settings=case.get("settings"))
                 self.assertEqual(code, case["expected"][0], lines)
                 self.assertIn(case["expected"][1], lines[0])
-                self.assertNotIn(GOOD_SETTINGS["R2_ACCESS_KEY_ID"], "\n".join(lines))
+                self.assertNotIn(GOOD_SETTINGS["ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID"], "\n".join(lines))
         self.assertEqual((self.store.calls, self._counts()), ([], (1, 0)))
 
     def test_concurrent_runs_without_a_database_lock_still_delete_each_row_once(self) -> None:

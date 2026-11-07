@@ -621,25 +621,25 @@ class ConditionalPromotionTests(unittest.TestCase):
 
 
 class StorageConfigTests(unittest.TestCase):
-    GOOD = dict(R2_ACCOUNT_ID="0123456789abcdef0123456789abcdef", R2_ACCESS_KEY_ID="AKIAEXAMPLEKEYID",
-                R2_SECRET_ACCESS_KEY="s3cr3t-value-that-is-long-enough", R2_BUCKET_NAME="renphil-hub-analytics-archive-bucket",
+    GOOD = dict(ANALYTICS_ARCHIVE_R2_ACCOUNT_ID="0123456789abcdef0123456789abcdef", ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID="AKIAEXAMPLEKEYID",
+                ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY="s3cr3t-value-that-is-long-enough", ANALYTICS_ARCHIVE_R2_BUCKET_NAME="renphil-hub-analytics-archive-bucket",
                 PRODUCT_ANALYTICS_ARCHIVE_PREFIX="hub-product-analytics")
 
     def test_valid_settings_build_the_endpoint_and_hide_secrets(self) -> None:
         config = R2Config.from_settings(SimpleNamespace(**self.GOOD))
         self.assertEqual(config.endpoint_url, "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com")
         self.assertEqual(config.describe(), "bucket=renphil-hub-analytics-archive-bucket prefix=hub-product-analytics")
-        for secret in (self.GOOD["R2_SECRET_ACCESS_KEY"], self.GOOD["R2_ACCESS_KEY_ID"], self.GOOD["R2_ACCOUNT_ID"]):
+        for secret in (self.GOOD["ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY"], self.GOOD["ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID"], self.GOOD["ANALYTICS_ARCHIVE_R2_ACCOUNT_ID"]):
             self.assertNotIn(secret, repr(config))
             self.assertNotIn(secret, str(config))
             self.assertNotIn(secret, config.describe())
 
     def test_invalid_settings_are_refused_naming_the_variable_only(self) -> None:
         cases = {
-            "missing": ({"R2_SECRET_ACCESS_KEY": "", "R2_BUCKET_NAME": None}, "R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME"),
-            "account": ({"R2_ACCOUNT_ID": "not valid!"}, "R2_ACCOUNT_ID"),
-            "bucket": ({"R2_BUCKET_NAME": "Bad_Bucket"}, "R2_BUCKET_NAME"),
-            "secret": ({"R2_SECRET_ACCESS_KEY": "short"}, "R2_SECRET_ACCESS_KEY"),
+            "missing": ({"ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY": "", "ANALYTICS_ARCHIVE_R2_BUCKET_NAME": None}, "ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY, ANALYTICS_ARCHIVE_R2_BUCKET_NAME"),
+            "account": ({"ANALYTICS_ARCHIVE_R2_ACCOUNT_ID": "not valid!"}, "ANALYTICS_ARCHIVE_R2_ACCOUNT_ID"),
+            "bucket": ({"ANALYTICS_ARCHIVE_R2_BUCKET_NAME": "Bad_Bucket"}, "ANALYTICS_ARCHIVE_R2_BUCKET_NAME"),
+            "secret": ({"ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY": "short"}, "ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY"),
             "prefix": ({"PRODUCT_ANALYTICS_ARCHIVE_PREFIX": "../escape"}, "PRODUCT_ANALYTICS_ARCHIVE_PREFIX"),
         }
         for name, (overrides, expected) in cases.items():
@@ -647,7 +647,7 @@ class StorageConfigTests(unittest.TestCase):
                 with self.assertRaises(ArchiveConfigError) as caught:
                     R2Config.from_settings(SimpleNamespace(**{**self.GOOD, **overrides}))
                 self.assertIn(expected, str(caught.exception))
-                for secret in (self.GOOD["R2_SECRET_ACCESS_KEY"], self.GOOD["R2_ACCESS_KEY_ID"], self.GOOD["R2_ACCOUNT_ID"]):
+                for secret in (self.GOOD["ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY"], self.GOOD["ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID"], self.GOOD["ANALYTICS_ARCHIVE_R2_ACCOUNT_ID"]):
                     self.assertNotIn(secret, str(caught.exception))
 
     def test_r2_store_builds_a_scoped_s3_client_without_logging_credentials(self) -> None:
@@ -657,10 +657,10 @@ class StorageConfigTests(unittest.TestCase):
             R2ArchiveStore(config)
         _, kwargs = client.call_args
         self.assertEqual((kwargs["endpoint_url"], kwargs["region_name"]), (config.endpoint_url, "auto"))
-        self.assertEqual(kwargs["aws_secret_access_key"], self.GOOD["R2_SECRET_ACCESS_KEY"])
+        self.assertEqual(kwargs["aws_secret_access_key"], self.GOOD["ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY"])
         self.assertEqual(kwargs["config"].signature_version, "s3v4")
         self.assertEqual(kwargs["config"].request_checksum_calculation, "when_required")
-        self.assertNotIn(self.GOOD["R2_SECRET_ACCESS_KEY"], "\n".join(logs.output))
+        self.assertNotIn(self.GOOD["ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY"], "\n".join(logs.output))
 
 
 if __name__ == "__main__":
