@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build, Resource
+from googleapiclient.http import HttpRequest, build_http
 from google_auth_oauthlib.flow import Flow
 
 from app.config import Settings
@@ -100,4 +103,22 @@ def build_calendar_service(settings: Settings) -> Resource:
         client_secret=settings.GOOGLE_CLIENT_SECRET,
         scopes=CALENDAR_SCOPES,
     )
-    return build("calendar", "v3", credentials=credentials, cache_discovery=False)
+
+    # The calendar routes run on worker threads and httplib2 isn't thread-safe,
+    # so each thread gets its own transport, which keeps its connection open
+    # across the several Google calls one lookup makes. Credentials stay shared,
+    # so the access token is only refreshed once.
+    transports = threading.local()
+
+    def build_request(_http, *args, **kwargs) -> HttpRequest:
+        if not hasattr(transports, "http"):
+            transports.http = AuthorizedHttp(credentials, http=build_http())
+        return HttpRequest(transports.http, *args, **kwargs)
+
+    return build(
+        "calendar",
+        "v3",
+        http=AuthorizedHttp(credentials, http=build_http()),
+        requestBuilder=build_request,
+        cache_discovery=False,
+    )

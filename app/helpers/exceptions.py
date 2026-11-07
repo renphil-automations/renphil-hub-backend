@@ -78,6 +78,29 @@ class GoogleCalendarError(HTTPException):
         )
 
 
+class GoogleCalendarBusyError(HTTPException):
+    """Raised when Google Calendar is still rate-limiting or failing after retries."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Calendar is busy — try again in a minute.",
+            headers={"Retry-After": "60"},
+        )
+
+
+class CalendarEventGoneError(HTTPException):
+    """A 404 for a stored event with nothing to show.
+
+    ``gone_status`` keeps apart what a 404 alone can't: ``"expired"`` means it
+    ran its course, ``"unavailable"`` means it was deleted or cancelled.
+    """
+
+    def __init__(self, gone_status: str, detail: str) -> None:
+        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+        self.gone_status = gone_status
+
+
 class DifyError(HTTPException):
     """Raised when the Dify.ai API call fails."""
 

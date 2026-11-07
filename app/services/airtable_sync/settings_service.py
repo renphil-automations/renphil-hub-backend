@@ -3,6 +3,7 @@
 
   - the schedule (the single `airtable_sync_settings` row)
   - the Program Roles "Designation" → Hub role mapping
+  - each admin's own "Receive run notifications" choice
 
 Flushes, never commits; the router owns the transaction.
 """
@@ -24,6 +25,7 @@ from app.db_v2.models.airtable_sync import (
     AirtableSyncSettingsV2,
 )
 from app.db_v2.models.role import RoleV2
+from app.db_v2.models.user import UserV2
 from app.services.rbac_assignment_service import HUB_ADMIN_ROLE_KEY
 
 SETTINGS_ROW_ID = 1
@@ -139,6 +141,21 @@ def update_settings(
     row.updated_at = _utc_now()
     db.flush()
     return serialize_settings(row)
+
+
+# ---------------------------------------------------------
+# Run notifications (each admin's own)
+# ---------------------------------------------------------
+
+
+def get_notifications_enabled(db: Session, user_id: int) -> bool:
+    return db.get(UserV2, user_id).airtable_sync_notifications_enabled is not False
+
+
+def set_notifications_enabled(db: Session, user_id: int, enabled: bool) -> bool:
+    db.get(UserV2, user_id).airtable_sync_notifications_enabled = enabled
+    db.flush()
+    return enabled
 
 
 # ---------------------------------------------------------

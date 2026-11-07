@@ -7,11 +7,12 @@ import pytest
 from fastapi import HTTPException
 
 from app.routers import calendar as calendar_router
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import CalendarService, _EventCache
 
 
 def _service(master: dict, instance: dict | None = None) -> CalendarService:
     service = object.__new__(CalendarService)
+    service._cache = _EventCache()  # type: ignore[attr-defined]
     service._get_raw = lambda _event_id: master  # type: ignore[method-assign]
     service._next_instance = lambda _event_id: instance  # type: ignore[method-assign]
     return service
@@ -96,6 +97,20 @@ def test_index_event_rejects_cancelled_event() -> None:
         service.get_index_event("cancelled-event")
 
     assert exc_info.value.status_code == 404
+
+
+def test_index_event_rejects_blank_id_without_calling_google() -> None:
+    def no_google_call(_event_id: str) -> dict:
+        raise AssertionError("a blank id must not reach Google")
+
+    for blank_id in ("", "   "):
+        service = _service({})
+        service._get_raw = no_google_call  # type: ignore[method-assign]
+
+        with pytest.raises(HTTPException) as exc_info:
+            service.get_index_event(blank_id)
+
+        assert exc_info.value.status_code == 404
 
 
 def test_internal_calendar_endpoint_token_check_is_constant_time_shape(

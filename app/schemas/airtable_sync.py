@@ -62,6 +62,23 @@ class UpdateSyncSettingsRequest(StrictRequestModel):
 
 
 # ---------------------------------------------------------
+# Run notifications (each admin's own)
+# ---------------------------------------------------------
+
+
+class NotificationPreferenceResponse(BaseModel):
+    enabled: bool
+
+
+class NotificationPreferenceAPIResponse(BaseModel):
+    data: NotificationPreferenceResponse
+
+
+class UpdateNotificationPreferenceRequest(StrictRequestModel):
+    enabled: StrictBool
+
+
+# ---------------------------------------------------------
 # Designation → role mapping
 # ---------------------------------------------------------
 

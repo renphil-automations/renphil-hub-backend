@@ -9,7 +9,9 @@
                  "Airtable sync failed: <short error>"
 
 Previews send none (C3), and neither do item resolutions. A start that 409s
-never reaches `launch`, so it notifies nobody.
+never reaches `launch`, so it notifies nobody. An admin who turned off "Receive
+run notifications" gets none of these, failures included; the choice is read
+when each note is sent.
 
 Retries (plan_airtable_sync_retries_interval §7): a scheduled attempt is a
 run with `scheduled_slot` set, numbered by its rank among that slot's runs.
@@ -84,15 +86,20 @@ def _clip(text: str, limit: int = EXCERPT_MAX) -> str:
 
 
 def admin_recipients(db: Session, *, exclude_user_id: int | None = None) -> list[str]:
-    """The login email of every Hub Admin (soft-deleted ones are never in
-    the set), minus `exclude_user_id`. Normalized and de-duplicated, like
-    the thread notifications' `recipient_email`."""
+    """The login email of every Hub Admin who receives run notifications
+    (soft-deleted ones are never in the set), minus `exclude_user_id`.
+    Normalized and de-duplicated, like the thread notifications'
+    `recipient_email`."""
     from app.services.rbac_graph_service import hub_admin_user_ids
 
     ids = hub_admin_user_ids(db) - {exclude_user_id}
     if not ids:
         return []
-    rows = db.query(UserV2.work_email, UserV2.alias_email).filter(UserV2.id.in_(ids), UserV2.not_deleted()).all()
+    rows = (
+        db.query(UserV2.work_email, UserV2.alias_email)
+        .filter(UserV2.id.in_(ids), UserV2.not_deleted(), UserV2.airtable_sync_notifications_enabled.is_not(False))
+        .all()
+    )
     emails = {(work or "").strip().lower() or (alias or "").strip().lower() for work, alias in rows}
     return sorted(e for e in emails if e)
 
