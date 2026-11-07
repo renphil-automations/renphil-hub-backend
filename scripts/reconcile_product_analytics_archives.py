@@ -18,7 +18,7 @@ object another writer put there) is reported and classified (redundant, not
 redundant, invalid, foreign) and never deleted by this script; the runbook
 ("Leftover objects") says what an operator may do with it.
 
-Uses the reconciliation identity (`R2_RECONCILE_*`; list, read, delete —
+Uses the reconciliation identity (`ANALYTICS_ARCHIVE_R2_RECONCILE_*`; list, read, delete —
 never put or copy). The token cannot be scoped to the staging segment, so the
 staging-only rule is enforced by this code, not by R2.
 

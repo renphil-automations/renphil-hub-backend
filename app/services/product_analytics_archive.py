@@ -404,7 +404,7 @@ _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 # Up to four path segments; a segment must start with a letter, digit, `_` or
 # `-`, so `.`/`..` segments (and anything starting with a dot) are refused.
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}){0,3}$")
-_REQUIRED_SETTINGS = ("R2_ACCOUNT_ID", "R2_BUCKET_NAME")
+_REQUIRED_SETTINGS = ("ANALYTICS_ARCHIVE_R2_ACCOUNT_ID", "ANALYTICS_ARCHIVE_R2_BUCKET_NAME")
 # Two identities, two tokens: the scheduled writer (PutObject, CopyObject,
 # GetObject, HeadObject, HeadBucket and DeleteObject for its own staging
 # objects — never list) and the reconciler (ListBucket, GetObject,
@@ -412,8 +412,8 @@ _REQUIRED_SETTINGS = ("R2_ACCOUNT_ID", "R2_BUCKET_NAME")
 # and have no "write without delete" level, so neither token enforces the
 # staging-only restriction: this code does (`delete_staging`), and the
 # runbook says so rather than calling the token a boundary.
-WRITER_CREDENTIALS = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
-RECONCILE_CREDENTIALS = ("R2_RECONCILE_ACCESS_KEY_ID", "R2_RECONCILE_SECRET_ACCESS_KEY")
+WRITER_CREDENTIALS = ("ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID", "ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY")
+RECONCILE_CREDENTIALS = ("ANALYTICS_ARCHIVE_R2_RECONCILE_ACCESS_KEY_ID", "ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY")
 
 
 @dataclass(frozen=True)
@@ -431,25 +431,25 @@ class R2Config:
     @classmethod
     def from_settings(cls, settings: Any, *, credentials: tuple[str, str] = WRITER_CREDENTIALS) -> "R2Config":
         key_name, secret_name = credentials
-        names = ("R2_ACCOUNT_ID", key_name, secret_name, "R2_BUCKET_NAME")
+        names = ("ANALYTICS_ARCHIVE_R2_ACCOUNT_ID", key_name, secret_name, "ANALYTICS_ARCHIVE_R2_BUCKET_NAME")
         values = {name: str(getattr(settings, name, "") or "").strip() for name in names}
         missing = [name for name, value in values.items() if not value]
         if missing:
             raise ArchiveConfigError("missing archive storage configuration: " + ", ".join(missing))
-        if not _ACCOUNT_RE.match(values["R2_ACCOUNT_ID"]):
-            raise ArchiveConfigError("R2_ACCOUNT_ID is not a valid account identifier")
-        if not _BUCKET_RE.match(values["R2_BUCKET_NAME"]):
-            raise ArchiveConfigError("R2_BUCKET_NAME is not a valid bucket name")
+        if not _ACCOUNT_RE.match(values["ANALYTICS_ARCHIVE_R2_ACCOUNT_ID"]):
+            raise ArchiveConfigError("ANALYTICS_ARCHIVE_R2_ACCOUNT_ID is not a valid account identifier")
+        if not _BUCKET_RE.match(values["ANALYTICS_ARCHIVE_R2_BUCKET_NAME"]):
+            raise ArchiveConfigError("ANALYTICS_ARCHIVE_R2_BUCKET_NAME is not a valid bucket name")
         if any(ch.isspace() for ch in values[key_name] + values[secret_name]) or len(values[secret_name]) < 16:
             raise ArchiveConfigError(f"{key_name} / {secret_name} are not usable credentials")
         prefix = str(getattr(settings, "PRODUCT_ANALYTICS_ARCHIVE_PREFIX", "") or "").strip().strip("/")
         if not _PREFIX_RE.match(prefix):
             raise ArchiveConfigError("PRODUCT_ANALYTICS_ARCHIVE_PREFIX is not a valid key prefix")
         return cls(
-            account_id=values["R2_ACCOUNT_ID"],
+            account_id=values["ANALYTICS_ARCHIVE_R2_ACCOUNT_ID"],
             access_key_id=values[key_name],
             secret_access_key=values[secret_name],
-            bucket=values["R2_BUCKET_NAME"],
+            bucket=values["ANALYTICS_ARCHIVE_R2_BUCKET_NAME"],
             prefix=prefix,
             role="reconcile" if credentials == RECONCILE_CREDENTIALS else "writer",
         )
