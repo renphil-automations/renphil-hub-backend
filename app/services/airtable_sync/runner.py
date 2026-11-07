@@ -8,9 +8,10 @@
           row's summary is also published as each step starts
           (`current_step`, `_progress`), for the tab's progress line
 
-A real run notifies every Hub Admin when it starts (in `launch`, so only
-after the caller's commit: a 409 notifies nobody) and when its row is closed
-(`_finish`); previews notify nobody (notifications.py, v1 C3).
+A real run notifies the Hub Admins whose mode takes that note when it starts
+(in `launch`, so only after the caller's commit: a 409 notifies nobody) and
+when its row is closed (`_finish`); previews notify nobody (notifications.py,
+v1 C3).
 
 The lock is the `running` row itself (owner's choice, 2026-10-22; see
 AirtableSyncRunV2): at most one row may be `running`, enforced by the partial
@@ -531,8 +532,8 @@ class SyncRunner:
         """Close the run row from a fresh session (the run's own may be
         broken). Only a row still `running` is touched: one already marked
         `interrupted` by a later start keeps that status, and sends no end
-        notification. A closed real run notifies every Hub Admin (advisory:
-        after the commit, from its own session)."""
+        notification. A closed real run notifies the Hub Admins whose mode
+        takes that note (advisory: after the commit, from its own session)."""
         now = _utc_now()
         closed = False
         db = self.session_factory()

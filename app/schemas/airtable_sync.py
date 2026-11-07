@@ -12,6 +12,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from app.db_v2.models.airtable_sync import INTERVAL_MINUTES
+from app.db_v2.models.user import AIRTABLE_SYNC_NOTIFICATION_MODES
 from app.schemas.tab import StrictRequestModel
 
 # "HH:MM", 24-hour.
@@ -66,8 +67,11 @@ class UpdateSyncSettingsRequest(StrictRequestModel):
 # ---------------------------------------------------------
 
 
+NotificationMode = Literal[AIRTABLE_SYNC_NOTIFICATION_MODES]
+
+
 class NotificationPreferenceResponse(BaseModel):
-    enabled: bool
+    mode: NotificationMode
 
 
 class NotificationPreferenceAPIResponse(BaseModel):
@@ -75,7 +79,7 @@ class NotificationPreferenceAPIResponse(BaseModel):
 
 
 class UpdateNotificationPreferenceRequest(StrictRequestModel):
-    enabled: StrictBool
+    mode: NotificationMode
 
 
 # ---------------------------------------------------------

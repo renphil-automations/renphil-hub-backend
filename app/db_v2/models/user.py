@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     Date,
     DateTime,
@@ -30,6 +31,18 @@ def _default_name(context) -> str:
     params = context.get_current_parameters()
     return params.get("work_email") or params.get("alias_email") or ""
 
+
+# `users.airtable_sync_notifications_mode`. Kept beside the CHECK that enforces
+# them, so the services, the API and the migration script import one definition.
+# NULL means "never chose" and counts as the default.
+AIRTABLE_SYNC_NOTIFICATION_MODES = ("all", "failures", "none")
+AIRTABLE_SYNC_NOTIFICATION_DEFAULT_MODE = "all"
+AIRTABLE_SYNC_NOTIFICATIONS_MODE_CHECK_NAME = "ck_users_airtable_sync_notifications_mode"
+AIRTABLE_SYNC_NOTIFICATIONS_MODE_CHECK = (
+    "airtable_sync_notifications_mode IN ("
+    + ", ".join(repr(mode) for mode in AIRTABLE_SYNC_NOTIFICATION_MODES)
+    + ")"
+)
 
 # Partial: the 30-odd HR rows with no email at all must not collide on "".
 _HAS_WORK_EMAIL = "work_email IS NOT NULL AND work_email <> ''"
@@ -112,11 +125,12 @@ class UserV2(BaseV2):
     # Airtable sync (AI Docs/plan_airtable_sync_v2_2026-10-21.md). NULL on
     # login-only rows and on rows the sync has not linked yet.
     airtable_record_id = Column(String(32), nullable=True)
-    # A Hub Admin's choice, from the sync tab, of whether their bell gets the
-    # Airtable sync's run notifications. NULL = never chose, which counts as on
-    # (so compare with `is_not(False)`, never `is_(True)`), and it stays NULL on
+    # A Hub Admin's choice, from the sync tab, of which Airtable sync run
+    # notifications their bell gets: all / failures / none. NULL = never chose,
+    # which counts as `all` (so every query must coalesce it: a plain
+    # `mode != 'none'` silently drops those admins), and it stays NULL on
     # everyone who isn't an admin. Not an HR field: the sync never writes it.
-    airtable_sync_notifications_enabled = Column(Boolean, nullable=True)
+    airtable_sync_notifications_mode = Column(String(8), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
     )
@@ -150,6 +164,7 @@ class UserV2(BaseV2):
             postgresql_where=text("airtable_record_id IS NOT NULL"),
             sqlite_where=text("airtable_record_id IS NOT NULL"),
         ),
+        CheckConstraint(AIRTABLE_SYNC_NOTIFICATIONS_MODE_CHECK, name=AIRTABLE_SYNC_NOTIFICATIONS_MODE_CHECK_NAME),
     )
 
     @hybrid_property

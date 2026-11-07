@@ -25,7 +25,8 @@ Retries and the bulk hold (plan_airtable_sync_retries_interval §3, §6):
 
   - every tick first reaps a stale `running` row of any kind, in its own
     short transaction (`runner.reap_stale`), even with the schedule off; a
-    reaped scheduled attempt (slot set) then gets its end note (§7);
+    reaped scheduled attempt (slot set) or manual run then gets its end note
+    (§7), a preview none;
   - a slot already used is retried (`decide_retry`) while its latest
     attempt failed or was interrupted: up to MAX_ATTEMPTS runs per slot, on
     the next tick (RETRY_WAIT 0, so the cron's cadence is the spacing),
@@ -311,9 +312,9 @@ def retry_outlook(db: Session, run: AirtableSyncRunV2, now: datetime) -> bool:
 
 
 def _notify_reaped(runner: SyncRunner, run_id: int) -> None:
-    """The end note for a scheduled attempt the tick reaped (plan §3.4 step
-    1, §7): its thread's `_finish` will find the row closed and send none.
-    Advisory: an error is logged, never raised."""
+    """The end note for a scheduled attempt or manual run the tick reaped
+    (plan §3.4 step 1, §7): its thread's `_finish` will find the row closed
+    and send none. Advisory: an error is logged, never raised."""
     try:
         runner.notifier.finished(runner.session_factory, run_id)
     except Exception:
@@ -343,13 +344,18 @@ def tick(db: Session, runner: SyncRunner, *, now: datetime | None = None) -> dic
 
     # 1. Reap, in its own short transaction: a dead run of any kind closes
     # within a tick of going stale, even when nothing is due. A scheduled
-    # attempt notifies like a failure, after the commit; nothing else does.
+    # attempt or a manual run notifies like a failure, after the commit; a
+    # preview, or a scheduled run from before RI-1 (no slot), doesn't.
     take_sync_lock(db)
     reaped = reap_stale(db, now, INTERRUPTED_BY_TICK)
-    reaped_attempt = reaped.id if reaped is not None and reaped.scheduled_slot is not None else None
+    reaped_note = (
+        reaped.id
+        if reaped is not None and (reaped.scheduled_slot is not None or reaped.trigger == "manual")
+        else None
+    )
     db.commit()
-    if reaped_attempt is not None:
-        _notify_reaped(runner, reaped_attempt)
+    if reaped_note is not None:
+        _notify_reaped(runner, reaped_note)
 
     # 2. Decide. Two overlapping ticks: the second waits here until the
     # first has committed, then sees the slot already used.

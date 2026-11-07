@@ -1,17 +1,24 @@
 """The sync's bell notifications (v1 plan §9.1, C3; plan v2 §12 phase 7).
 
   run_started    after the run row is committed (`SyncRunner.launch`): every
-                 Hub Admin, minus the starter on a manual run
+                 Hub Admin on `all`, minus the starter on a manual run
                  ("Manual Airtable sync started by <admin>")
   run_finished   after the run row is closed (`SyncRunner._finish`): every
-                 Hub Admin. The excerpt is the summary line ("Airtable sync
+                 Hub Admin on `all`, plus those on `failures` for a final
+                 failure. The excerpt is the summary line ("Airtable sync
                  finished: 12 updated, 3 created, 5 conflicts, 4 warnings") or
                  "Airtable sync failed: <short error>"
 
 Previews send none (C3), and neither do item resolutions. A start that 409s
-never reaches `launch`, so it notifies nobody. An admin who turned off "Receive
-run notifications" gets none of these, failures included; the choice is read
-when each note is sent.
+never reaches `launch`, so it notifies nobody.
+
+Each admin's "Receive run notifications" mode is read when each note is sent:
+NULL (never chose) or `all` gets every note, `failures` only final failures,
+`none` nothing. A final failure is a real run that did not succeed and has no
+retry planned: a failed manual run, a scheduled first attempt with no retry
+planned, or "failed after n attempts". So a `failures` admin misses a failure
+if a planned retry never happens (schedule turned off, cron stopped, next slot
+arrives first): accepted by the owner, 2026-11-06.
 
 Retries (plan_airtable_sync_retries_interval §7): a scheduled attempt is a
 run with `scheduled_slot` set, numbered by its rank among that slot's runs.
@@ -19,9 +26,10 @@ Attempts 2–3 send no start note. A failed attempt says "… failed (attempt n
 of 3), retrying: …" when `scheduler.retry_outlook` plans a retry, "… failed
 after n attempts: …" when it doesn't and n > 1, today's text when n = 1; a
 success on attempt n > 1 says "finished on attempt n of 3". A scheduled
-attempt reaped by the tick gets the same end note (`scheduler.tick`); one
-reaped by a manual start still notifies nobody. Runs without a slot (manual,
-previews, scheduled runs from before RI-1) read as before.
+attempt or a manual run reaped by the tick gets the same end note
+(`scheduler.tick`); a run reaped by a manual start still notifies nobody.
+Runs without a slot (manual, previews, scheduled runs from before RI-1) read
+as before.
 
 Recipients come from `rbac_graph_service.hub_admin_user_ids`, the one seam
 for "who is an admin" (it already skips soft-deleted users, v1 §11), not v1
@@ -43,11 +51,12 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.airtable_sync import AirtableSyncItemV2, AirtableSyncRunV2
 from app.db_v2.models.notification import NotificationV2
-from app.db_v2.models.user import UserV2
+from app.db_v2.models.user import AIRTABLE_SYNC_NOTIFICATION_DEFAULT_MODE, UserV2
 from app.services.thread_service import (
     NOTIFICATION_TYPE_AIRTABLE_SYNC_FINISHED,
     NOTIFICATION_TYPE_AIRTABLE_SYNC_STARTED,
@@ -58,6 +67,10 @@ logger = logging.getLogger(__name__)
 # The Airtable Sync tab (v1 plan §10; built in phase 8).
 LINK = "/admin/access-control/airtable-sync"
 EXCERPT_MAX = 200  # notifications.excerpt is String(200)
+
+# Who gets which note, by `users.airtable_sync_notifications_mode`.
+MODES_FOR_EVERY_NOTE = ("all",)
+MODES_FOR_FINAL_FAILURE = ("all", "failures")
 
 # Item kinds counted as "conflicts" in the summary line: both sides changed
 # (v1 M1). Every other open item is a "warning".
@@ -85,9 +98,13 @@ def _clip(text: str, limit: int = EXCERPT_MAX) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def admin_recipients(db: Session, *, exclude_user_id: int | None = None) -> list[str]:
-    """The login email of every Hub Admin who receives run notifications
+def admin_recipients(
+    db: Session, *, exclude_user_id: int | None = None, final_failure: bool = False
+) -> list[str]:
+    """The login email of every Hub Admin whose mode takes this note
     (soft-deleted ones are never in the set), minus `exclude_user_id`.
+    `final_failure` says the note is one, which `failures` admins also get.
+    NULL (never chose) must count as `all`, hence the coalesce.
     Normalized and de-duplicated, like the thread notifications'
     `recipient_email`."""
     from app.services.rbac_graph_service import hub_admin_user_ids
@@ -95,9 +112,14 @@ def admin_recipients(db: Session, *, exclude_user_id: int | None = None) -> list
     ids = hub_admin_user_ids(db) - {exclude_user_id}
     if not ids:
         return []
+    mode = func.coalesce(UserV2.airtable_sync_notifications_mode, AIRTABLE_SYNC_NOTIFICATION_DEFAULT_MODE)
     rows = (
         db.query(UserV2.work_email, UserV2.alias_email)
-        .filter(UserV2.id.in_(ids), UserV2.not_deleted(), UserV2.airtable_sync_notifications_enabled.is_not(False))
+        .filter(
+            UserV2.id.in_(ids),
+            UserV2.not_deleted(),
+            mode.in_(MODES_FOR_FINAL_FAILURE if final_failure else MODES_FOR_EVERY_NOTE),
+        )
         .all()
     )
     emails = {(work or "").strip().lower() or (alias or "").strip().lower() for work, alias in rows}
@@ -149,8 +171,12 @@ def attempt_number(db: Session, run: AirtableSyncRunV2) -> int | None:
     return ids.index(run.id) + 1 if run.id in ids else None
 
 
-def finished_line(db: Session, run: AirtableSyncRunV2) -> str:
-    """v1 §5.1 step 4. A failure (or an interruption) is a `finished` with
+def _end_note(db: Session, run: AirtableSyncRunV2) -> tuple[str, bool]:
+    """(excerpt, is it a final failure). One function, so both come from ONE
+    `retry_outlook` result: a "retrying" note can never reach a `failures`
+    admin, and a final-failure note can never miss one.
+
+    v1 §5.1 step 4. A failure (or an interruption) is a `finished` with
     the failure text; the run's `error` is already short and secret-free.
     A scheduled attempt gets §7's retry wording."""
     from app.services.airtable_sync import scheduler  # scheduler → runner → notifications
@@ -161,18 +187,26 @@ def finished_line(db: Session, run: AirtableSyncRunV2) -> str:
         error = run.error or run.status
         # Judged as of the run's end: the notifier's own clock plays no part.
         if n is not None and scheduler.retry_outlook(db, run, as_utc(run.finished_at) or _utc_now()):
-            return _clip(f"Scheduled Airtable sync failed (attempt {n} of {scheduler.MAX_ATTEMPTS}), retrying: {error}")
+            return (
+                _clip(f"Scheduled Airtable sync failed (attempt {n} of {scheduler.MAX_ATTEMPTS}), retrying: {error}"),
+                False,
+            )
         if n is not None and n > 1:
-            return _clip(f"Scheduled Airtable sync failed after {n} attempts: {error}")
-        return _clip(f"Airtable sync failed: {error}")
+            return _clip(f"Scheduled Airtable sync failed after {n} attempts: {error}"), True
+        return _clip(f"Airtable sync failed: {error}"), True
     conflicts, warnings = _open_items(db, run.id)
     head = "Airtable sync finished"
     if n is not None and n > 1:
         head = f"Airtable sync finished on attempt {n} of {scheduler.MAX_ATTEMPTS}"
-    return _clip(
+    excerpt = _clip(
         f"{head}: {_step_total(run.summary, UPDATED_COUNTS)} updated, "
         f"{_step_total(run.summary, CREATED_COUNTS)} created, {conflicts} conflicts, {warnings} warnings"
     )
+    return excerpt, False
+
+
+def finished_line(db: Session, run: AirtableSyncRunV2) -> str:
+    return _end_note(db, run)[0]
 
 
 def _write(
@@ -238,11 +272,12 @@ def run_started(session_factory: Callable[[], Session], run_id: int) -> int | No
 
 def run_finished(session_factory: Callable[[], Session], run_id: int) -> int | None:
     def body(db: Session, run: AirtableSyncRunV2) -> int:
+        excerpt, final_failure = _end_note(db, run)
         return _write(
             db,
             NOTIFICATION_TYPE_AIRTABLE_SYNC_FINISHED,
-            admin_recipients(db),
-            excerpt=finished_line(db, run),
+            admin_recipients(db, final_failure=final_failure),
+            excerpt=excerpt,
             actor=_starter(db, run),
         )
 
