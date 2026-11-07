@@ -227,8 +227,10 @@ class Settings(BaseSettings):
     AT_F_REVIEW_UNTIL: str
     AT_F_PERIOD: str
 
+    # Primary-key field name shared by every Airtable table looked up by ID.
+    AIRTABLE_ID_FIELD: str = "Id"
+
     # ── Announcements fields ──────────────────────────────────────────
-    AT_F_ANN_ID: str
     AT_F_ANN_TITLE: str
     AT_F_ANN_CONTENT: str
     AT_F_ANN_AUTHOR_EMAIL: str
@@ -252,7 +254,6 @@ class Settings(BaseSettings):
     AT_F_FEEDBACK_RESPONSE: str = "Response"
 
     # ── Tickets fields ────────────────────────────────────────────────
-    AT_F_TICKET_ID: str
     AT_F_TICKET_TITLE: str
     AT_F_TICKET_DESCRIPTION: str
     AT_F_TICKET_STATUS: str
@@ -267,7 +268,6 @@ class Settings(BaseSettings):
     AT_F_TICKET_PARENT_LINK: str
 
     # ── Grant Application Resources fields ────────────────────────────
-    AT_F_GAR_ID: str | None = None
     AT_F_GAR_DOCUMENT: str | None = None
     AT_F_GAR_DOCUMENT_URL: str | None = None
     AT_F_GAR_NOTES: str | None = None
@@ -275,7 +275,6 @@ class Settings(BaseSettings):
     AT_F_GAR_TABS: str | None = None
 
     # ── Finance Links fields ──────────────────────────────────────────
-    AT_F_FL_ID: str
     AT_F_FL_DOCUMENT: str
     AT_F_FL_DOCUMENT_URL: str
 
@@ -288,7 +287,6 @@ class Settings(BaseSettings):
     AT_F_GDT_UI_PAGE: str
 
     # ── Quick Links fields ────────────────────────────────────────────
-    AT_F_QL_ID: str
     AT_F_QL_ANCHOR_TEXT: str
     AT_F_QL_URL: str
     AT_F_QL_EMAIL: str
@@ -296,23 +294,19 @@ class Settings(BaseSettings):
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
     # ── Quick Actions fields ──────────────────────────────────────────
-    AT_F_QA_ID: str = "ID"
     AT_F_QA_ACTION: str
 
     # ── Partnerships Links fields ─────────────────────────────────────
-    AT_F_PL_ID: str
     AT_F_PL_TEXT: str
     AT_F_PL_LINK: str
     AT_F_PL_CATEGORY: str
     AT_F_PL_TYPE: str
 
     # ── Policy Links fields ───────────────────────────────────────────
-    AT_F_POL_ID: str | None = None
     AT_F_POL_TEXT: str | None = None
     AT_F_POL_URL: str | None = None
 
     # ── Events Quick Links fields ───────────────────────────────────
-    AT_F_EQL_ID: str | None = None
     AT_F_EQL_TITLE: str | None = None
     AT_F_EQL_ANCHOR_TEXT: str | None = None
     AT_F_EQL_TYPE: str | None = None
@@ -320,35 +314,30 @@ class Settings(BaseSettings):
     AT_F_EQL_EMAIL: str | None = None
 
     # ── Finance Quick Links fields ──────────────────────────────────
-    AT_F_FQL_ID: str | None = None
     AT_F_FQL_ANCHOR_TEXT: str | None = None
     AT_F_FQL_URL: str | None = None
     AT_F_FQL_ENTITY: str | None = None
     AT_F_FQL_TABS: str | None = None
 
     # ── Comms Quick Links fields ────────────────────────────────────
-    AT_F_CQL_ID: str = "ID"
     AT_F_CQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_CQL_TYPE: str = "Type"
     AT_F_CQL_URL: str = "URL"
     AT_F_CQL_EMAIL: str = "Email"
 
     # ── HR Quick Links fields ───────────────────────────────────────
-    AT_F_HRQL_ID: str = "ID"
     AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_HRQL_TYPE: str = "Type"
     AT_F_HRQL_URL: str = "URL"
     AT_F_HRQL_EMAIL: str = "Email"
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
-    AT_F_DDL_ID: str | None = None
     AT_F_DDL_ANCHOR_TEXT: str | None = None
     AT_F_DDL_URL: str | None = None
     AT_F_DDL_ENTITY: str | None = None
     AT_F_DDL_TABS: str | None = None
 
     # ── Board Member List fields ─────────────────────────────────────
-    AT_F_BM_ID: str | None = None
     AT_F_BM_TITLE: str | None = None
     AT_F_BM_FULL_NAME: str | None = None
     AT_F_BM_ROLE: str | None = None
@@ -357,7 +346,6 @@ class Settings(BaseSettings):
     AT_F_BM_ENTITY: str | None = None
     AT_F_BM_TABS: str | None = None
     # ── Organization Info fields ────────────────────────────────
-    AT_F_OI_ID: str | None = None
     AT_F_OI_TITLE: str | None = None
     AT_F_OI_CONTENT: str | None = None
     AT_F_OI_ENTITY: str | None = None

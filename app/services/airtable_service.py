@@ -4845,7 +4845,7 @@ class AirtableService:
         )
 
     # Announcement field name constants (loaded from settings/.env)
-    _F_ANN_ID = _S.AT_F_ANN_ID
+    _F_ANN_ID = _S.AIRTABLE_ID_FIELD
     _F_ANN_TITLE = _S.AT_F_ANN_TITLE
     _F_ANN_CONTENT = _S.AT_F_ANN_CONTENT
     _F_ANN_AUTHOR_EMAIL = _S.AT_F_ANN_AUTHOR_EMAIL
@@ -5248,7 +5248,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════════
     # Grant Application Resources (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
-    _F_GAR_ID = _S.AT_F_GAR_ID
+    _F_GAR_ID = _S.AIRTABLE_ID_FIELD
     _F_GAR_DOCUMENT = _S.AT_F_GAR_DOCUMENT
     _F_GAR_DOCUMENT_URL = _S.AT_F_GAR_DOCUMENT_URL
     _F_GAR_NOTES = _S.AT_F_GAR_NOTES
@@ -5420,7 +5420,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Finance Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_FL_ID = _S.AT_F_FL_ID
+    _F_FL_ID = _S.AIRTABLE_ID_FIELD
     _F_FL_DOCUMENT = _S.AT_F_FL_DOCUMENT
     _F_FL_DOCUMENT_URL = _S.AT_F_FL_DOCUMENT_URL
 
@@ -5758,7 +5758,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Partnerships Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_PL_ID = _S.AT_F_PL_ID
+    _F_PL_ID = _S.AIRTABLE_ID_FIELD
     _F_PL_TEXT = _S.AT_F_PL_TEXT
     _F_PL_LINK = _S.AT_F_PL_LINK
     _F_PL_CATEGORY = _S.AT_F_PL_CATEGORY
@@ -5952,7 +5952,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Policy Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_POL_ID = _S.AT_F_POL_ID
+    _F_POL_ID = _S.AIRTABLE_ID_FIELD
     _F_POL_TEXT = _S.AT_F_POL_TEXT
     _F_POL_URL = _S.AT_F_POL_URL
 
@@ -6098,7 +6098,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Events Quick Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_EQL_ID = _S.AT_F_EQL_ID
+    _F_EQL_ID = _S.AIRTABLE_ID_FIELD
     _F_EQL_TITLE = _S.AT_F_EQL_TITLE
     _F_EQL_ANCHOR_TEXT = _S.AT_F_EQL_ANCHOR_TEXT
     _F_EQL_TYPE = _S.AT_F_EQL_TYPE
@@ -6256,7 +6256,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Finance Quick Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_FQL_ID = _S.AT_F_FQL_ID
+    _F_FQL_ID = _S.AIRTABLE_ID_FIELD
     _F_FQL_ANCHOR_TEXT = _S.AT_F_FQL_ANCHOR_TEXT
     _F_FQL_URL = _S.AT_F_FQL_URL
     _F_FQL_ENTITY = _S.AT_F_FQL_ENTITY
@@ -6410,7 +6410,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # RenPhil Due Diligence Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_DDL_ID = _S.AT_F_DDL_ID
+    _F_DDL_ID = _S.AIRTABLE_ID_FIELD
     _F_DDL_ANCHOR_TEXT = _S.AT_F_DDL_ANCHOR_TEXT
     _F_DDL_URL = _S.AT_F_DDL_URL
     _F_DDL_ENTITY = _S.AT_F_DDL_ENTITY
@@ -6576,7 +6576,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Board Member List (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_BM_ID = _S.AT_F_BM_ID
+    _F_BM_ID = _S.AIRTABLE_ID_FIELD
     _F_BM_TITLE = _S.AT_F_BM_TITLE
     _F_BM_FULL_NAME = _S.AT_F_BM_FULL_NAME
     _F_BM_ROLE = _S.AT_F_BM_ROLE
@@ -6743,7 +6743,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Organization Info (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_OI_ID = _S.AT_F_OI_ID
+    _F_OI_ID = _S.AIRTABLE_ID_FIELD
     _F_OI_TITLE = _S.AT_F_OI_TITLE
     _F_OI_CONTENT = _S.AT_F_OI_CONTENT
     _F_OI_ENTITY = _S.AT_F_OI_ENTITY
@@ -6935,13 +6935,13 @@ class AirtableService:
     # Quick Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
     # Quick Links field name constants (loaded from settings/.env)
-    _F_QL_ID = _S.AT_F_QL_ID
+    _F_QL_ID = _S.AIRTABLE_ID_FIELD
     _F_QL_ANCHOR_TEXT = _S.AT_F_QL_ANCHOR_TEXT
     _F_QL_URL = _S.AT_F_QL_URL
     _F_QL_EMAIL = _S.AT_F_QL_EMAIL
     _F_QL_ACTION = _S.AT_F_QL_ACTION
     _F_QL_QA_LINK = _S.AT_F_QL_QUICK_ACTIONS_LINK
-    _F_QA_ID = _S.AT_F_QA_ID
+    _F_QA_ID = _S.AIRTABLE_ID_FIELD
     _F_QA_ACTION = _S.AT_F_QA_ACTION
 
     def _quick_links_table(self):
@@ -7256,7 +7256,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Comms Quick Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_CQL_ID = _S.AT_F_CQL_ID
+    _F_CQL_ID = _S.AIRTABLE_ID_FIELD
     _F_CQL_ANCHOR_TEXT = _S.AT_F_CQL_ANCHOR_TEXT
     _F_CQL_TYPE = _S.AT_F_CQL_TYPE
     _F_CQL_URL = _S.AT_F_CQL_URL
@@ -7407,7 +7407,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # HR Quick Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_HRQL_ID = _S.AT_F_HRQL_ID
+    _F_HRQL_ID = _S.AIRTABLE_ID_FIELD
     _F_HRQL_ANCHOR_TEXT = _S.AT_F_HRQL_ANCHOR_TEXT
     _F_HRQL_TYPE = _S.AT_F_HRQL_TYPE
     _F_HRQL_URL = _S.AT_F_HRQL_URL
@@ -7866,7 +7866,7 @@ class AirtableService:
         )
 
     # Ticket field name constants (loaded from settings/.env)
-    _F_TICKET_ID = _S.AT_F_TICKET_ID
+    _F_TICKET_ID = _S.AIRTABLE_ID_FIELD
     _F_TICKET_TITLE = _S.AT_F_TICKET_TITLE
     _F_TICKET_DESCRIPTION = _S.AT_F_TICKET_DESCRIPTION
     _F_TICKET_STATUS = _S.AT_F_TICKET_STATUS
