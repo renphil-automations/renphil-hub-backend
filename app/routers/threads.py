@@ -26,6 +26,23 @@ by analogy with delete (landmine 8). The static `/threads/moderation/*`
 routes (`pending`, `history` + facets, `summary`) are declared ABOVE
 `/threads/{thread_id}`, same convention as the mention directory above.
 
+REJECTION REASONS + RESUBMISSION (plan_thread_reject_resubmit_2026-11-07.md
+§5). Both reject routes REQUIRE a `RejectRequest` body (`{reason}`, trimmed,
+1..1000) — a bodiless reject is a 422. The pending queue orders by
+`submitted_at` (a resubmission joins the back); History is grouped by
+thread, with any-match filters over its decided rounds. The thread's AUTHOR
+may `POST /threads/{id}/resubmit` (changed text only — 409
+`unchanged_resubmission`; 409 `closed` once closed) or `.../close` (final,
+no reopen — plan §12) a declined thread; `GET /threads/{id}/submission-
+history` is its round timeline (author or editor);
+`GET /threads/component/{link}/declined` is the author's inbox (`items` =
+open, `closed` = closed). The revision twins
+(`.../revisions/{rid}/resubmit|close|chain`) do the same for a declined edit
+(a rework is a linked new revision). A declined edit also closes itself
+(`superseded`) when a newer version of its thread goes live; the publisher
+confirms through the `earlier_revisions_pending` 409 (`declined_open`) and
+`overwrite: true`, and the edit's author gets a `thread_edit_closed` bell.
+
 THREAD VERSIONING (plan_thread_edit_versioning_2026-09-22.md, phase A, with
 the 2026-09-23 amendments). Every published version of a thread is a
 revision. A non-editor author's PATCH of an approved thread is staged as a
@@ -85,9 +102,12 @@ from app.schemas.thread import (
     CommentListResponse,
     CommentSummary,
     CommentUpdateRequest,
+    DeclinedItemsResponse,
     MentionableUser,
     NotificationListResponse,
+    RejectRequest,
     RevisionDecisionRequest,
+    RevisionResubmitRequest,
     ThreadCreateRequest,
     ThreadDetail,
     ThreadDetailViewAsResponse,
@@ -100,6 +120,8 @@ from app.schemas.thread import (
     ThreadRevisionHistoryFacets,
     ThreadRevisionModerationListResponse,
     ThreadRevisionModerationSummary,
+    ThreadResubmitRequest,
+    ThreadSubmissionRound,
     ThreadUpdateRequest,
     ThreadUpdateResult,
     ThreadWidgetCounts,
@@ -222,6 +244,30 @@ async def get_thread_widget_counts(
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(thread_service.thread_widget_counts, db, link, access=access)
+
+
+@router.get(
+    "/threads/component/{link}/declined",
+    response_model=DeclinedItemsResponse,
+    summary="The caller's own declined items on one widget (reject/resubmit plan §4.7)",
+    responses=THREAD_VIEW_AS_RESPONSES,
+)
+async def list_declined_items(
+    link: str = Path(..., description="The thread widget component's stable `link`."),
+    anonymous: bool = Depends(get_view_as_anonymous),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
+):
+    """The author's "Revisions" inbox: declined threads and declined,
+    not-yet-reworked edits, newest decline first, capped at 100 with
+    `truncated`. Empty for a no-subject caller (`anonymous` /
+    `view_as_user`), the same subject rule as the widget list."""
+    subject = _thread_subject(user, selection, anonymous)
+    return await asyncio.to_thread(
+        thread_service.list_declined_items, db, link, subject, access=view_as_access.access
+    )
 
 
 # ---------------------------------------------------------
@@ -528,20 +574,106 @@ async def approve_thread(
 @router.post(
     "/threads/{thread_id}/reject",
     response_model=ThreadModerationRow,
-    summary="Reject a pending thread — an editor of its widget or any ancestor",
+    summary="Reject a pending thread, with a required reason — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
         409: {"description": "Thread has already been reviewed"},
+        422: {"description": "Missing body, or `reason` empty/whitespace or over 1000 characters"},
     },
 )
 async def reject_thread(
+    payload: RejectRequest,
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.decide_thread, db, thread_id, user, approve=False, access=access
+        thread_service.decide_thread,
+        db,
+        thread_id,
+        user,
+        approve=False,
+        reason=payload.reason,
+        access=access,
+    )
+
+
+# ---------------------------------------------------------
+# Author rework of a declined thread
+# (plan_thread_reject_resubmit_2026-11-07.md §4.3, §4.5, §4.6). Author-only;
+# the gates live in the service.
+# ---------------------------------------------------------
+
+
+@router.post(
+    "/threads/{thread_id}/resubmit",
+    response_model=ThreadDetail,
+    summary="Resubmit your own declined thread with changes",
+    responses={
+        403: {"description": "No access to the widget, or caller is not the thread's author"},
+        404: {"description": "Thread not found"},
+        409: {"description": "`detail.code` is `not_rejected`, `closed` or `unchanged_resubmission`"},
+    },
+)
+async def resubmit_thread(
+    payload: ThreadResubmitRequest,
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.resubmit_thread,
+        db,
+        thread_id,
+        user,
+        payload.title,
+        payload.content,
+        payload.mentions,
+        access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/close",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Close your own declined thread (final; it stays readable under Closed)",
+    responses={
+        403: {"description": "No access to the widget, or caller is not the thread's author"},
+        404: {"description": "Thread not found"},
+        409: {"description": "`detail.code` is `not_rejected`"},
+    },
+)
+async def close_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    await asyncio.to_thread(
+        thread_service.close_rejected_thread, db, thread_id, user, access=access
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/threads/{thread_id}/submission-history",
+    response_model=list[ThreadSubmissionRound],
+    summary="Every decided submission round of a thread, plus the pending one — author or editor",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "Thread not found, or caller may not see it"},
+    },
+)
+async def get_thread_submission_history(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.get_thread_submission_history, db, thread_id, user, access=access
     )
 
 
@@ -584,7 +716,9 @@ async def get_thread_revision(
         404: {"description": "No such revision on this thread"},
         409: {
             "description": "`detail.code` is `already_decided` (the revision is no longer pending) "
-            "or `earlier_revisions_pending` (older pending edits exist and `overwrite` was not set)"
+            "or `earlier_revisions_pending` (older pending edits exist, and/or open declined "
+            "edits below this version would be closed as superseded — `detail.earlier` / "
+            "`detail.declined_open` — and `overwrite` was not set)"
         },
     },
 )
@@ -612,14 +746,16 @@ async def approve_thread_revision(
 @router.post(
     "/threads/{thread_id}/revisions/{revision_id}/reject",
     response_model=ThreadRevisionDetail,
-    summary="Reject a staged edit — an editor of its widget or any ancestor",
+    summary="Reject a staged edit, with a required reason — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
         404: {"description": "No such revision on this thread"},
         409: {"description": "`detail.code` is `already_decided`"},
+        422: {"description": "Missing body, or `reason` empty/whitespace or over 1000 characters"},
     },
 )
 async def reject_thread_revision(
+    payload: RejectRequest,
     thread_id: int = Path(...),
     revision_id: int = Path(...),
     db: Session = Depends(get_db_v2),
@@ -633,7 +769,88 @@ async def reject_thread_revision(
         revision_id,
         user,
         approve=False,
+        reason=payload.reason,
         access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/revisions/{revision_id}/resubmit",
+    response_model=ThreadUpdateResult,
+    summary="Rework your own declined edit into a linked new revision",
+    responses={
+        403: {"description": "No access to the widget, or caller did not submit this edit"},
+        404: {"description": "No such revision on this thread"},
+        409: {
+            "description": "`detail.code` is `not_rejected`, `closed` (with `closed_kind` / "
+            "`closed_by_version`), `already_resubmitted`, `unchanged_resubmission`, "
+            "`no_change` or `earlier_revisions_pending`"
+        },
+    },
+)
+async def resubmit_thread_revision(
+    payload: RevisionResubmitRequest,
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.resubmit_revision,
+        db,
+        thread_id,
+        revision_id,
+        user,
+        payload.title,
+        payload.content,
+        payload.mentions,
+        overwrite=payload.overwrite,
+        access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/revisions/{revision_id}/close",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Close your own declined edit (final; it stays readable under Closed)",
+    responses={
+        403: {"description": "No access to the widget, or caller did not submit this edit"},
+        404: {"description": "No such revision on this thread"},
+        409: {"description": "`detail.code` is `not_rejected` or `already_resubmitted`"},
+    },
+)
+async def close_thread_revision(
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    await asyncio.to_thread(
+        thread_service.close_rejected_revision, db, thread_id, revision_id, user, access=access
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/threads/{thread_id}/revisions/{revision_id}/chain",
+    response_model=list[ThreadRevisionDetail],
+    summary="The rework chain a revision belongs to, oldest first — author or editor",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "No such revision on this thread, or caller may not see it"},
+    },
+)
+async def get_thread_revision_chain(
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.get_revision_chain, db, thread_id, revision_id, user, access=access
     )
 
 
@@ -672,7 +889,8 @@ async def get_thread(
         409: {
             "description": "Thread was rejected and can no longer be edited; or (editor, "
             "`detail.code` = `earlier_revisions_pending`) the thread has pending author "
-            "edits and `overwrite` was not set"
+            "edits and/or open declined edits this would close (`detail.declined_open`) "
+            "and `overwrite` was not set"
         },
     },
 )

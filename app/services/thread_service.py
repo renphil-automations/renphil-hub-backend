@@ -73,11 +73,13 @@ import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, case, func, or_, tuple_
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, aliased, object_session
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.notification import NotificationV2
@@ -86,6 +88,7 @@ from app.db_v2.models.thread import (
     THREAD_WIDGET_TYPE,
     ThreadCommentV2,
     ThreadRevisionV2,
+    ThreadSubmissionV2,
     ThreadV2,
     ThreadVoteV2,
 )
@@ -95,10 +98,14 @@ from app.schemas.thread import (
     MAX_MENTIONS_PER_POST,
     CommentListResponse,
     CommentSummary,
+    DeclinedEditItem,
+    DeclinedItemsResponse,
+    DeclinedThreadItem,
     MentionableUser,
     MentionInput,
     NotificationEntry,
     NotificationListResponse,
+    PreviousRejection,
     RevisionPerson,
     ThreadDetail,
     ThreadHistoryFacets,
@@ -112,6 +119,8 @@ from app.schemas.thread import (
     ThreadRevisionModerationRow,
     ThreadRevisionModerationSummary,
     ThreadRevisionSummary,
+    ThreadRoundDecision,
+    ThreadSubmissionRound,
     ThreadSummary,
     ThreadUpdateResult,
     ThreadWidgetCounts,
@@ -147,6 +156,12 @@ NOTIFICATION_TYPE_THREAD_APPROVED = "thread_approved"
 NOTIFICATION_TYPE_THREAD_REJECTED = "thread_rejected"
 NOTIFICATION_TYPE_THREAD_EDIT_APPROVED = "thread_edit_approved"
 NOTIFICATION_TYPE_THREAD_EDIT_REJECTED = "thread_edit_rejected"
+# plan_thread_reject_resubmit_2026-11-07.md §12.6 (owner decision R4): an
+# OPEN declined edit was closed automatically because a newer version of its
+# thread went live (§12.4). Recipient = the edit's submitter, actor = whoever
+# published that version; excerpt "Superseded by v{K}". No migration (same
+# `String(32)`, no CHECK).
+NOTIFICATION_TYPE_THREAD_EDIT_CLOSED = "thread_edit_closed"
 # The Airtable sync's two (plan_airtable_sync v1 §9, C3), written by
 # `airtable_sync/notifications.py`. They carry no thread or component:
 # `component_id` / `thread_id` are NULL and `link` says where to go.
@@ -155,8 +170,11 @@ NOTIFICATION_TYPE_AIRTABLE_SYNC_FINISHED = "airtable_sync_finished"
 
 # Thread status values (D5, lifecycle in plan_thread_moderation_2026-09-18.md
 # §2). An editor's own post, or a decided pending one, is 'approved'; a
-# viewer's post lands 'pending' until an editor decides; 'rejected' is
-# terminal (no resubmit-on-edit — a PATCH on a rejected thread is a 409).
+# viewer's post lands 'pending' until an editor decides. A PATCH on a
+# 'rejected' thread is still a 409 (no resubmit-on-edit), but since
+# plan_thread_reject_resubmit_2026-11-07.md the author can resubmit it
+# through the explicit `resubmit_thread` (back to 'pending') or close it for
+# good (`close_rejected_thread`, plan §12).
 THREAD_STATUS_APPROVED = "approved"
 THREAD_STATUS_PENDING = "pending"
 THREAD_STATUS_REJECTED = "rejected"
@@ -182,6 +200,17 @@ REVISION_ORIGIN_ORIGINAL = "original"
 REVISION_ORIGIN_AUTHOR = "author"
 REVISION_ORIGIN_EDITOR = "editor"
 REVISION_ORIGINS = (REVISION_ORIGIN_ORIGINAL, REVISION_ORIGIN_AUTHOR, REVISION_ORIGIN_EDITOR)
+
+# plan_thread_reject_resubmit §12.3 — why a declined item was closed. A
+# thread is only ever closed by its author; an edit also closes itself when
+# a newer version of its thread goes live (§12.4).
+CLOSED_KIND_AUTHOR = "author"
+CLOSED_KIND_SUPERSEDED = "superseded"
+
+# plan §12.8 G3 — the status of a SYNTHESIZED submission round (never a
+# `thread_submissions` row): an editor-author's resubmission that went live
+# at once, without a decision.
+SUBMISSION_STATUS_PUBLISHED = "published"
 
 
 # ---------------------------------------------------------
@@ -912,6 +941,24 @@ def _notify_new_thread_comment(
     )
 
 
+REASON_EXCERPT_MAX_LENGTH = 200
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _reason_excerpt(reason: str) -> str:
+    """plan_thread_reject_resubmit_2026-11-07.md §4.8 / D9 — a decline's
+    bell excerpt: `"Reason: " + reason`, whitespace runs collapsed to one
+    space, truncated to 200 characters (an ellipsis replaces the overflow).
+
+    Deliberately NOT `generate_notification_excerpt` (landmine 5): that is a
+    MARKDOWN stripper and eats `()[]*_`, but a reason is plain text (D1) —
+    `(see [doc])` must reach the bell verbatim."""
+    text_ = "Reason: " + _WHITESPACE_RUN.sub(" ", reason or "").strip()
+    if len(text_) <= REASON_EXCERPT_MAX_LENGTH:
+        return text_
+    return text_[: REASON_EXCERPT_MAX_LENGTH - 1].rstrip() + "…"
+
+
 def _notify_thread_decision(
     db: Session,
     thread: ThreadV2,
@@ -919,6 +966,7 @@ def _notify_thread_decision(
     reviewer: UserInfo,
     approved: bool,
     component_id: int,
+    reason: str | None = None,
 ) -> None:
     """plan_thread_moderation_2026-09-18.md §3.2 / M1 (owner-approved
     2026-09-19) — tell the AUTHOR that an editor decided their pending
@@ -937,6 +985,10 @@ def _notify_thread_decision(
     thread can only be `pending` if their grant arrived after they posted);
     the "no self-pings" rule both existing writers follow applies.
 
+    A DECLINE's excerpt is the reviewer's reason (`_reason_excerpt`,
+    plan_thread_reject_resubmit D9), not the thread's content; an approval's
+    is unchanged.
+
     Does not commit — the caller (`decide_thread`) owns the transaction,
     same convention as every other write function in this module."""
     recipient = _norm_email(thread.author_email)
@@ -952,7 +1004,11 @@ def _notify_thread_decision(
             component_id=component_id,
             thread_id=thread.id,
             comment_id=None,
-            excerpt=generate_notification_excerpt(thread.content),
+            excerpt=(
+                generate_notification_excerpt(thread.content)
+                if approved or reason is None
+                else _reason_excerpt(reason)
+            ),
             read_at=None,
             created_at=_utc_now(),
         )
@@ -967,6 +1023,7 @@ def _notify_thread_edit_decision(
     reviewer: UserInfo,
     approved: bool,
     component_id: int,
+    reason: str | None = None,
 ) -> None:
     """plan_thread_edit_versioning_2026-09-22.md §4.6 — `_notify_thread_
     decision` transplanted onto a staged EDIT: tell the revision's SUBMITTER
@@ -985,6 +1042,9 @@ def _notify_thread_edit_decision(
     Called once per decision, for the decided revision only. Revisions an
     overwrite-approve displaces get NO row: one click, one bell row.
 
+    A DECLINE's excerpt is the reviewer's reason (`_reason_excerpt`,
+    plan_thread_reject_resubmit D9); an approval's is unchanged.
+
     Does not commit — the caller (`decide_thread_revision`) owns the
     transaction."""
     recipient = _norm_email(revision.submitted_by_email)
@@ -1000,7 +1060,11 @@ def _notify_thread_edit_decision(
             component_id=component_id,
             thread_id=thread.id,
             comment_id=None,
-            excerpt=generate_notification_excerpt(revision.content),
+            excerpt=(
+                generate_notification_excerpt(revision.content)
+                if approved or reason is None
+                else _reason_excerpt(reason)
+            ),
             read_at=None,
             created_at=_utc_now(),
         )
@@ -1328,6 +1392,8 @@ def _to_thread_summary(
         # (ThreadV2 has no deferred columns), so this costs no extra query.
         content_excerpt=generate_preview_excerpt(thread.content),
         pending_revision_count=pending_revision_count,
+        resubmission_count=thread.resubmission_count or 0,
+        submitted_at=thread.submitted_at or thread.created_at,
     )
 
 
@@ -1354,6 +1420,22 @@ def _to_thread_detail(
     )
 
 
+def _resubmission_of_version(revision: ThreadRevisionV2) -> int | None:
+    """The version of the declined edit `revision` reworks ("Resubmission of
+    v5"), or None. A PK read through the row's own session — reworks are
+    rare, so this is not batched; a revision without a link costs nothing."""
+    if revision.resubmission_of_id is None:
+        return None
+    session = object_session(revision)
+    if session is None:
+        return None
+    return (
+        session.query(ThreadRevisionV2.version)
+        .filter(ThreadRevisionV2.id == revision.resubmission_of_id)
+        .scalar()
+    )
+
+
 def _to_revision_summary(revision: ThreadRevisionV2) -> ThreadRevisionSummary:
     return ThreadRevisionSummary(
         id=revision.id,
@@ -1369,6 +1451,13 @@ def _to_revision_summary(revision: ThreadRevisionV2) -> ThreadRevisionSummary:
         reviewed_by_name=revision.reviewed_by_name,
         reviewed_at=revision.reviewed_at,
         content_excerpt=generate_notification_excerpt(revision.content),
+        rejection_reason=revision.rejection_reason,
+        resubmission_of_id=revision.resubmission_of_id,
+        resubmission_of_version=_resubmission_of_version(revision),
+        resubmission_number=revision.resubmission_number or 0,
+        closed_at=revision.closed_at,
+        closed_kind=revision.closed_kind,
+        closed_by_version=revision.closed_by_version,
     )
 
 
@@ -1548,10 +1637,131 @@ def _widget_title_and_location_for_components(
     return result
 
 
-def _to_moderation_rows(db: Session, threads: list[ThreadV2]) -> list[ThreadModerationRow]:
+def _is_self_published_resubmission(thread: ThreadV2, rounds: list[ThreadSubmissionV2]) -> bool:
+    """plan §12.8 G3 — the thread is live and its LAST submission round has
+    no stored decision: the editor-author resubmitted it and it published at
+    once (D5), which writes no round (M5). Only a resubmission qualifies
+    (`resubmission_count > 0`), so an editor's own post (round 0, never
+    decided) never does."""
+    count = thread.resubmission_count or 0
+    if thread.status != THREAD_STATUS_APPROVED or count <= 0:
+        return False
+    highest = max((r.round for r in rounds), default=-1)
+    return count > highest
+
+
+def _published_round(thread: ThreadV2, v1: ThreadRevisionV2) -> SimpleNamespace:
+    """The SYNTHESIZED G3 round (never stored): snapshot = v1 (the text that
+    went live), reviewer = v1's publisher and instant, no reason. Shaped
+    like a `ThreadSubmissionV2` row so both of its readers can treat it as
+    one."""
+    return SimpleNamespace(
+        round=thread.resubmission_count or 0,
+        status=SUBMISSION_STATUS_PUBLISHED,
+        title=v1.title,
+        content=v1.content,
+        mentions=list(v1.mentions or []),
+        reason=None,
+        submitted_by_email=_norm_email(thread.author_email),
+        submitted_by_name=thread.author_name,
+        submitted_at=thread.submitted_at,
+        reviewed_by_email=v1.reviewed_by_email,
+        reviewed_by_name=v1.reviewed_by_name,
+        reviewed_at=v1.reviewed_at,
+    )
+
+
+def _round_fields(
+    db: Session,
+    threads: list[ThreadV2],
+    *,
+    matched_rounds: dict[int, list[int]] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """`thread_id -> {last_decision, decision_count, previous_rejection,
+    matched_rounds}` for one page of moderation rows
+    (plan_thread_reject_resubmit §3/§4.6) — ONE query over the page's
+    `thread_submissions`, batched like `_pending_revision_counts`.
+
+    `previous_rejection` is the newest REJECTED round, but only for a
+    pending RESUBMISSION (`status == 'pending' and resubmission_count > 0`);
+    None otherwise. `last_decision` is the highest-numbered decided round —
+    or, when the thread was finally published by its editor-author without
+    a decision (plan §12.8 G3), the synthesized `published` round (one more
+    query, for the page's qualifying threads only). `decision_count` and
+    `matched_rounds` count STORED (explicit) decisions only."""
+    ids = [t.id for t in threads]
+    by_thread: dict[int, list[ThreadSubmissionV2]] = {i: [] for i in ids}
+    if ids:
+        for row in (
+            db.query(ThreadSubmissionV2)
+            .filter(ThreadSubmissionV2.thread_id.in_(ids))
+            .order_by(ThreadSubmissionV2.thread_id, ThreadSubmissionV2.round)
+            .all()
+        ):
+            by_thread[row.thread_id].append(row)
+
+    self_published = [t for t in threads if _is_self_published_resubmission(t, by_thread.get(t.id, []))]
+    v1_by_thread: dict[int, ThreadRevisionV2] = {}
+    if self_published:
+        v1_by_thread = {
+            r.thread_id: r
+            for r in db.query(ThreadRevisionV2).filter(
+                ThreadRevisionV2.thread_id.in_([t.id for t in self_published]),
+                ThreadRevisionV2.version == 1,
+            )
+        }
+
+    result: dict[int, dict[str, Any]] = {}
+    for thread in threads:
+        rounds = by_thread.get(thread.id, [])
+        last: Any = rounds[-1] if rounds else None
+        v1 = v1_by_thread.get(thread.id)
+        if v1 is not None:
+            last = _published_round(thread, v1)
+        previous_rejection = None
+        if thread.status == THREAD_STATUS_PENDING and (thread.resubmission_count or 0) > 0:
+            rejected = [r for r in rounds if r.status == THREAD_STATUS_REJECTED]
+            if rejected:
+                r = rejected[-1]
+                previous_rejection = PreviousRejection(
+                    round=r.round,
+                    reason=r.reason,
+                    reviewed_by_email=r.reviewed_by_email,
+                    reviewed_by_name=r.reviewed_by_name,
+                    reviewed_at=r.reviewed_at,
+                )
+        result[thread.id] = {
+            "closed_at": thread.closed_at,
+            "closed_kind": thread.closed_kind,
+            "previous_rejection": previous_rejection,
+            "last_decision": (
+                ThreadRoundDecision(
+                    round=last.round,
+                    status=last.status,
+                    reason=last.reason,
+                    reviewed_by_email=last.reviewed_by_email,
+                    reviewed_by_name=last.reviewed_by_name,
+                    reviewed_at=last.reviewed_at,
+                )
+                if last is not None
+                else None
+            ),
+            "decision_count": len(rounds),
+            "matched_rounds": list((matched_rounds or {}).get(thread.id, [])),
+        }
+    return result
+
+
+def _to_moderation_rows(
+    db: Session,
+    threads: list[ThreadV2],
+    *,
+    matched_rounds: dict[int, list[int]] | None = None,
+) -> list[ThreadModerationRow]:
     """`ThreadV2` rows (already the caller's page, already ordered) ->
     `ThreadModerationRow`s, with `widget_title`/`location_label` computed
-    once per distinct component (see above), not once per thread."""
+    once per distinct component (see above), not once per thread, and the
+    round fields (`_round_fields`) in one query for the page."""
     if not threads:
         return []
 
@@ -1561,6 +1771,7 @@ def _to_moderation_rows(db: Session, threads: list[ThreadV2]) -> list[ThreadMode
         for c in db.query(ComponentV2).filter(ComponentV2.id.in_(component_ids)).all()
     }
     info_by_component = _widget_title_and_location_for_components(db, components)
+    round_fields = _round_fields(db, threads, matched_rounds=matched_rounds)
 
     items: list[ThreadModerationRow] = []
     for thread in threads:
@@ -1579,6 +1790,7 @@ def _to_moderation_rows(db: Session, threads: list[ThreadV2]) -> list[ThreadMode
                 component_link=component.link,
                 widget_title=widget_title,
                 location_label=location_label,
+                **round_fields[thread.id],
             )
         )
     return items
@@ -1595,6 +1807,7 @@ def _to_moderation_row(db: Session, thread: ThreadV2, component: ComponentV2) ->
         component_link=component.link,
         widget_title=widget_title,
         location_label=location_label,
+        **_round_fields(db, [thread])[thread.id],
     )
 
 
@@ -1650,18 +1863,26 @@ def list_threads_for_link(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
     _check_view_access(component, access)
 
-    # plan §5.5 — every approved thread, plus the CALLER'S OWN pending/
-    # rejected ones (M3: an author sees their own non-approved threads with
-    # a status badge; nobody else's pending/rejected rows appear in the
-    # widget's list at all). `anonymous=True` drops that second arm, so the
-    # list is exactly what any other viewer would get: approved only.
+    # plan §5.5 — every approved thread, plus the CALLER'S OWN pending ones
+    # (an author sees their own awaiting-review threads with a status
+    # badge; nobody else's pending rows appear in the widget's list at
+    # all). `anonymous=True` drops that second arm, so the list is exactly
+    # what any other viewer would get: approved only.
+    #
+    # plan_thread_reject_resubmit_2026-11-07.md §4.2 (owner decision 5)
+    # DELIBERATELY narrows 2a's M3 rule: the author's REJECTED threads no
+    # longer appear here — they live in the author's inbox
+    # (`list_declined_items`), counted by `declined_count` below. A CLOSED
+    # thread is always rejected (ck_threads_closed_shape), so this list
+    # never needs to filter on `closed_at` — closed items never appear in
+    # the threads list (owner decision R5).
     visible_status = ThreadV2.status == THREAD_STATUS_APPROVED
     if not anonymous and user is not None:
         visible_status = or_(
             visible_status,
             and_(
                 ThreadV2.author_email == _norm_email(user.email),
-                ThreadV2.status.in_((THREAD_STATUS_PENDING, THREAD_STATUS_REJECTED)),
+                ThreadV2.status == THREAD_STATUS_PENDING,
             ),
         )
     query = db.query(ThreadV2).filter(ThreadV2.component_id == component.id, visible_status)
@@ -1696,7 +1917,14 @@ def list_threads_for_link(
     ]
     next_cursor = _encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
 
-    return ThreadListResponse(items=items, next_cursor=next_cursor)
+    # plan_thread_reject_resubmit §4.7 — the caller's OWN declined items on
+    # this widget (two cheap COUNTs, the inbox's exact predicate). 0 for a
+    # no-subject caller (`anonymous` / view-as with no user).
+    declined_count = 0
+    if not anonymous and user is not None:
+        declined_count = _declined_count(db, component.id, user.email)
+
+    return ThreadListResponse(items=items, next_cursor=next_cursor, declined_count=declined_count)
 
 
 def create_thread_for_link(
@@ -1739,6 +1967,9 @@ def create_thread_for_link(
         down_count=0,
         comment_count=0,
         created_at=now,
+        # plan_thread_reject_resubmit §2.1 — the first submission instant.
+        submitted_at=now,
+        resubmission_count=0,
     )
     db.add(thread)
     db.flush()  # assigns thread.id — the notifications below FK to it
@@ -1791,7 +2022,12 @@ def get_thread_by_id(
 
     `user` is whose authorship, vote and authored revisions count — the
     caller normally (View As pairs included), and nobody (`None`) for
-    `anonymous` or `view_as_user`."""
+    `anonymous` or `view_as_user`.
+
+    plan_thread_reject_resubmit §12.7: a CLOSED declined thread is NOT a
+    404 for its author (that was the superseded soft-delete rule) — it
+    reads like any other rejected thread, read-only, so old bell rows still
+    open it."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
     # access to the widget at all must keep getting the existing 403, never
@@ -1799,7 +2035,8 @@ def get_thread_by_id(
     _check_view_access(component, access)
     if thread.status != THREAD_STATUS_APPROVED:
         is_author = user is not None and _norm_email(thread.author_email) == _norm_email(user.email)
-        if not (is_author or _is_component_editor(component, access)):
+        is_editor = _is_component_editor(component, access)
+        if not (is_author or is_editor):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
     my_vote = _my_vote_for_thread(db, thread.id, user.email) if user is not None else 0
     return _to_thread_detail(
@@ -1959,22 +2196,128 @@ def _next_revision_version(db: Session, thread: ThreadV2) -> int:
 
 
 def _earlier_revisions_conflict(
-    earlier: list[ThreadRevisionV2], revision: ThreadRevisionV2 | None
+    earlier: list[ThreadRevisionV2],
+    revision: ThreadRevisionV2 | None,
+    declined_open: list[ThreadRevisionV2] | None = None,
 ) -> HTTPException:
     """The 409 `earlier_revisions_pending` body, shared by an out-of-order
     approve (`revision` = the one being approved) and an editor's PATCH over
-    pending author edits (`revision` = None — nothing was created)."""
-    noun = "edit" if len(earlier) == 1 else "edits"
-    verb = "is" if len(earlier) == 1 else "are"
+    pending author edits (`revision` = None — nothing was created).
+
+    plan_thread_reject_resubmit §12.5 (owner decision R3): also carries
+    `declined_open` — the OPEN declined edits that publishing would close as
+    superseded (§12.4) — and is raised when EITHER list is non-empty, so the
+    publisher confirms once for both. `earlier` may be `[]`."""
+    declined_open = declined_open or []
+    parts: list[str] = []
+    if earlier:
+        noun = "edit" if len(earlier) == 1 else "edits"
+        verb = "is" if len(earlier) == 1 else "are"
+        parts.append(f"There {verb} {len(earlier)} earlier {noun} still awaiting review")
+    if declined_open:
+        noun = "edit" if len(declined_open) == 1 else "edits"
+        parts.append(
+            f"{len(declined_open)} declined {noun} will be closed as superseded"
+        )
     return HTTPException(
         status.HTTP_409_CONFLICT,
         detail={
             "code": "earlier_revisions_pending",
-            "message": f"There {verb} {len(earlier)} earlier {noun} still awaiting review",
+            "message": "; ".join(parts),
             "revision": _to_revision_summary(revision).model_dump(mode="json") if revision else None,
             "earlier": [_to_revision_summary(r).model_dump(mode="json") for r in earlier],
+            "declined_open": [_to_revision_summary(r).model_dump(mode="json") for r in declined_open],
         },
     )
+
+
+def _not_reworked(db: Session):
+    """`NOT EXISTS (a revision whose resubmission_of_id = this one)`,
+    correlated to the outer `ThreadRevisionV2` (D4's anti-join)."""
+    rework = aliased(ThreadRevisionV2)
+    return ~db.query(rework.id).filter(rework.resubmission_of_id == ThreadRevisionV2.id).exists()
+
+
+def _open_declined_filter(db: Session):
+    """The "OPEN declined edit" predicate (plan §12.3): an author's edit that
+    was declined, is not closed, and has not been reworked (no revision
+    links back to it). Shared by the auto-close and the inbox / count."""
+    return and_(
+        ThreadRevisionV2.status == REVISION_STATUS_REJECTED,
+        ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
+        ThreadRevisionV2.closed_at.is_(None),
+        _not_reworked(db),
+    )
+
+
+def _open_declined_edits_below(
+    db: Session, thread_id: int, version: int, *, exclude_id: int | None = None
+) -> list[ThreadRevisionV2]:
+    """plan §12.4 — the OPEN declined edits of `thread_id` that version
+    `version` going live would close: `version < K` only (a declined v8
+    built on a then-pending v7 is still current when v7 goes live).
+    `exclude_id` drops a rework's own source while the 409 is computed
+    (before the new linked row exists). Call under the threads-row lock."""
+    query = db.query(ThreadRevisionV2).filter(
+        ThreadRevisionV2.thread_id == thread_id,
+        ThreadRevisionV2.version < version,
+        _open_declined_filter(db),
+    )
+    if exclude_id is not None:
+        query = query.filter(ThreadRevisionV2.id != exclude_id)
+    return query.order_by(ThreadRevisionV2.version.asc()).all()
+
+
+def _close_superseded(
+    db: Session,
+    thread: ThreadV2,
+    revisions: list[ThreadRevisionV2],
+    *,
+    live_version: int,
+    publisher: UserInfo,
+    component_id: int,
+    now: datetime,
+) -> None:
+    """plan §12.4 / §12.6 — close each OPEN declined edit as `superseded` by
+    `live_version`, and bell its submitter (`thread_edit_closed`, actor =
+    the publisher, excerpt "Superseded by v{K}"). The existing self-
+    exclusion applies: an editor-author who just confirmed closing their own
+    declined edit gets no bell. Does not commit."""
+    publisher_email = _norm_email(publisher.email)
+    for revision in revisions:
+        revision.closed_at = now
+        revision.closed_kind = CLOSED_KIND_SUPERSEDED
+        revision.closed_by_version = live_version
+        recipient = _norm_email(revision.submitted_by_email)
+        if recipient == publisher_email or _recipient_is_deleted(db, recipient):
+            continue
+        db.add(
+            NotificationV2(
+                recipient_email=recipient,
+                type=NOTIFICATION_TYPE_THREAD_EDIT_CLOSED,
+                actor_email=publisher_email,
+                actor_name=publisher.name,
+                component_id=component_id,
+                thread_id=thread.id,
+                comment_id=None,
+                excerpt=f"Superseded by v{live_version}",
+                read_at=None,
+                created_at=now,
+            )
+        )
+
+
+def _rework_link(resubmission_of: ThreadRevisionV2 | None) -> dict[str, Any]:
+    """The link columns of a rework (plan_thread_reject_resubmit §2.3,
+    owner decision 9): `resubmission_of_id` → the declined edit, and
+    `resubmission_number` = the declined one's number + 1. `{}` for an
+    ordinary edit (the columns' defaults: NULL / 0)."""
+    if resubmission_of is None:
+        return {}
+    return {
+        "resubmission_of_id": resubmission_of.id,
+        "resubmission_number": (resubmission_of.resubmission_number or 0) + 1,
+    }
 
 
 def _apply_editor_edit(
@@ -1988,6 +2331,8 @@ def _apply_editor_edit(
     *,
     overwrite: bool,
     access: ViewerAccess | None,
+    resubmission_of: ThreadRevisionV2 | None = None,
+    resolved_mentions: list[dict[str, str]] | None = None,
 ) -> ThreadUpdateResult:
     """Amendment A2 (2026-09-23) — an EDITOR-author's edit of an approved
     thread goes live immediately AND is recorded as an auto-approved
@@ -2004,21 +2349,37 @@ def _apply_editor_edit(
     opt-in-on-the-wire rule owner decision 4 set for an out-of-order
     approve.
 
+    plan_thread_reject_resubmit §12.4/§12.5: the same 409 also fires when
+    the edit would close OPEN declined edits (`declined_open`); with
+    `overwrite=True` they are closed as `superseded` by the new version,
+    and each submitter other than this editor gets a `thread_edit_closed`
+    bell.
+
     A no-op (title, content and mention emails all equal the live thread)
     writes nothing and is never a conflict. Mentions keep the pre-
     versioning rule: validated, and only newly added ones notified, inline,
-    with the editor as the actor."""
+    with the editor as the actor.
+
+    `resubmission_of` (plan_thread_reject_resubmit §4.4, D5): the rework of
+    a declined edit by an author who is now an editor. The caller
+    (`resubmit_revision`) has already locked the thread and the declined
+    revision, resolved the mentions (`resolved_mentions`) and refused both
+    "unchanged vs declined" and "unchanged vs live", so the values here are
+    a full snapshot and the no-op branch below is skipped. The new row
+    carries the link."""
     # Threads row first, then revisions — the order every writer here takes.
     thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
 
     new_title = title if title is not None else thread.title
     new_content = content if content is not None else thread.content
-    if mentions is not None:
+    if resolved_mentions is not None:
+        new_mentions = list(resolved_mentions)
+    elif mentions is not None:
         new_mentions = _validate_and_resolve_mentions(db, mentions, new_content, component=component)
     else:
         new_mentions = list(thread.mentions or [])
 
-    if (
+    if resubmission_of is None and (
         new_title == thread.title
         and new_content == thread.content
         and _mention_emails(new_mentions) == _mention_emails(thread.mentions)
@@ -2046,8 +2407,18 @@ def _apply_editor_edit(
         .order_by(ThreadRevisionV2.version.asc())
         .all()
     )
-    if pending and not overwrite:
-        conflict = _earlier_revisions_conflict(pending, None)
+    # plan §12.4/§12.5 — this edit goes live at MAX(version)+1, above every
+    # existing row, so EVERY open declined edit would be superseded — except
+    # a rework's own source, which the new row is about to link (it is
+    # "reworked", not closed). Same confirm as the pending list.
+    declined_open = _open_declined_edits_below(
+        db,
+        thread.id,
+        _next_revision_version(db, thread),
+        exclude_id=resubmission_of.id if resubmission_of is not None else None,
+    )
+    if (pending or declined_open) and not overwrite:
+        conflict = _earlier_revisions_conflict(pending, None, declined_open)
         db.rollback()  # release the lock before raising
         raise conflict
 
@@ -2086,8 +2457,21 @@ def _apply_editor_edit(
         reviewed_by_email=editor_email,
         reviewed_by_name=user.name,
         reviewed_at=now,
+        **_rework_link(resubmission_of),
     )
     db.add(revision)
+    # Flush the (possibly linked) new row FIRST, so a rework's own source
+    # reads as reworked, not open, in the close query (plan §12.4).
+    db.flush()
+    _close_superseded(
+        db,
+        thread,
+        _open_declined_edits_below(db, thread.id, next_version),
+        live_version=next_version,
+        publisher=user,
+        component_id=component.id,
+        now=now,
+    )
 
     # plan §5.7 — "on edit: notify only newly added mentions", unchanged.
     _notify_newly_added_mentions(
@@ -2126,6 +2510,8 @@ def _stage_thread_edit(
     mentions: list[MentionInput] | None,
     *,
     access: ViewerAccess | None,
+    resubmission_of: ThreadRevisionV2 | None = None,
+    resolved_mentions: list[dict[str, str]] | None = None,
 ) -> ThreadUpdateResult:
     """plan_thread_edit_versioning_2026-09-22.md §4.2 — store a non-editor
     author's edit of an approved thread as a pending `thread_revisions`
@@ -2133,7 +2519,15 @@ def _stage_thread_edit(
     NEVER touched here — that is the whole point (landmine 7: if
     `threads.status` moved, `_require_approved` would close comments and
     votes on a live thread). No notification is written at submit; the
-    mention fan-out happens at approval (`decide_thread_revision`)."""
+    mention fan-out happens at approval (`decide_thread_revision`).
+
+    `resubmission_of` (plan_thread_reject_resubmit §4.4, landmine 9): the
+    rework of a declined edit. Its base is the DECLINED revision, not the
+    "latest pending else live" rule below — so the caller
+    (`resubmit_revision`) passes a full snapshot with already-resolved
+    mentions, has already refused "unchanged vs declined" and "unchanged vs
+    live", and the no-op branch (which compares against latest-pending/live)
+    is skipped. The new row carries the link."""
     # Lock the THREADS row first — the same order `decide_thread_revision`
     # takes (threads, then revisions), so a submit and a decision on the
     # same thread can never deadlock on Postgres. This is also what
@@ -2163,7 +2557,9 @@ def _stage_thread_edit(
     # as the write-through path); only the fan-out moves to approval.
     # Omitted mentions carry over from the base, unvalidated — exactly what
     # an omitted `mentions` means on the write-through path too.
-    if mentions is not None:
+    if resolved_mentions is not None:
+        new_mentions = list(resolved_mentions)
+    elif mentions is not None:
         new_mentions = _validate_and_resolve_mentions(db, mentions, new_content, component=component)
     else:
         new_mentions = list(base.mentions or [])
@@ -2171,7 +2567,7 @@ def _stage_thread_edit(
     # No-op (owner-approved 2026-09-23): an edit identical to its base
     # writes nothing — no do-nothing revision lands in an editor's queue
     # (an unchanged Save in the composer sends all three fields).
-    if (
+    if resubmission_of is None and (
         new_title == base.title
         and new_content == base.content
         and _mention_emails(new_mentions) == _mention_emails(base.mentions)
@@ -2211,6 +2607,7 @@ def _stage_thread_edit(
         submitted_by_email=_norm_email(user.email),
         submitted_by_name=user.name,
         submitted_at=_utc_now(),
+        **_rework_link(resubmission_of),
     )
     db.add(revision)
     db.commit()
@@ -2244,6 +2641,646 @@ def delete_thread_by_id(
 
 
 # ---------------------------------------------------------
+# Rejection reasons, resubmission and author delete
+# (plan_thread_reject_resubmit_2026-11-07.md §4.1, §4.3–§4.7).
+#
+# Every writer here is AUTHOR-ONLY (`_require_author`, landmine 6): an editor
+# or Hub Admin who is not the author gets 403 — never `_require_component_
+# editor`, never the admin bypass. Lock order is the threads row FIRST, then
+# the revision (landmine 8), the order `_stage_thread_edit` and
+# `decide_thread_revision` take. 409 bodies are `{"code", "message", ...}`,
+# the versioning 409s' shape.
+# ---------------------------------------------------------
+
+# plan §4.7 — the inbox is not paginated; capped, with `truncated`.
+DECLINED_ITEMS_CAP = 100
+# plan §12.7 — the inbox's read-only "Closed" list; capped, with
+# `closed_truncated`.
+CLOSED_ITEMS_CAP = 50
+
+
+def _require_reason(approve: bool, reason: str | None) -> str | None:
+    """Defense in depth behind `RejectRequest` (plan §4.1): a reject
+    without a reason is a 400 even from an internal caller. Approve ignores
+    any reason (`None` is stored)."""
+    if approve:
+        return None
+    reason = (reason or "").strip()
+    if not reason:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A reason is required to reject")
+    return reason
+
+
+def _conflict(code: str, message: str, **extra: Any) -> HTTPException:
+    return HTTPException(
+        status.HTTP_409_CONFLICT, detail={"code": code, "message": message, **extra}
+    )
+
+
+def _is_unchanged(
+    title: str, content: str, mentions: list[dict[str, Any]] | None, base: Any
+) -> bool:
+    """Owner decisions 6/7 — "unchanged" means title, content AND the SET of
+    mentioned emails (`_mention_emails`) all equal `base`'s. Mention order is
+    irrelevant; whitespace is NOT normalized (a trailing-space change counts
+    as a change) — the same comparison the existing no-op rule uses."""
+    return (
+        title == base.title
+        and content == base.content
+        and _mention_emails(mentions) == _mention_emails(base.mentions)
+    )
+
+
+def resubmit_thread(
+    db: Session,
+    thread_id: int,
+    user: UserInfo,
+    title: str,
+    content: str,
+    mentions: list[MentionInput],
+    *,
+    access: ViewerAccess | None = None,
+) -> ThreadDetail:
+    """`POST /threads/{id}/resubmit` (plan §4.3) — the author reworks their
+    DECLINED thread. Fail-fast order (pinned by a test; plan §12.7): 404
+    missing → 403 no view → 403 not the author → 409 `not_rejected` → 409
+    `closed` (the author closed it — final, R1) → mention validation (400
+    over the cap) → 409 `unchanged_resubmission`.
+
+    Effects: the thread takes the new title/content/mentions,
+    `resubmission_count += 1`, `submitted_at = now` (the back of the
+    Pending queue, decision 14), and `reviewed_*` is CLEARED (landmine 3 —
+    the declined round's reviewer lives on in its `thread_submissions` row;
+    `last_decided_at` is untouched so grouped History keeps the thread).
+
+    An author who is NOW an editor of the widget (D5) publishes at once —
+    `create_thread_for_link`'s published branch: `approved`, v1 written
+    with them as publisher, mentions fanned out ONCE, and no decision round
+    (M5). Otherwise the thread is `pending` again and nobody is notified
+    (D6; mention fan-out stays at publication — landmine 10). `access=None`
+    is never an editor, so an internal caller always lands pending."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    _require_author(thread.author_email, user)
+
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    if thread.status != THREAD_STATUS_REJECTED:
+        db.rollback()
+        raise _conflict("not_rejected", "Only a declined thread can be resubmitted")
+    if thread.closed_at is not None:
+        conflict = _closed_conflict(thread.closed_kind, None)
+        db.rollback()
+        raise conflict
+
+    resolved = _validate_and_resolve_mentions(db, mentions, content, component=component)
+    # A rejected thread is frozen (PATCH is a 409), so its live columns ARE
+    # the declined snapshot.
+    if _is_unchanged(title, content, resolved, thread):
+        db.rollback()
+        raise _conflict("unchanged_resubmission", "Change the thread before resubmitting")
+
+    now = _utc_now()
+    thread.title = title
+    thread.content = content
+    thread.mentions = resolved
+    thread.resubmission_count = (thread.resubmission_count or 0) + 1
+    thread.submitted_at = now
+    thread.reviewed_by_email = None
+    thread.reviewed_by_name = None
+    thread.reviewed_at = None
+
+    is_editor = _is_component_editor(component, access)
+    if is_editor:
+        thread.status = THREAD_STATUS_APPROVED
+        _write_original_revision(db, thread, publisher=user, published_at=now)
+        _notify_mentions(
+            db,
+            resolved,
+            actor=user,
+            component_id=component.id,
+            thread_id=thread.id,
+            comment_id=None,
+            content=content,
+        )
+    else:
+        thread.status = THREAD_STATUS_PENDING
+
+    db.commit()
+    db.refresh(thread)
+    return _to_thread_detail(
+        thread,
+        _my_vote_for_thread(db, thread.id, user.email),
+        pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+        viewer_is_editor=is_editor,
+    )
+
+
+def _closed_conflict(closed_kind: str | None, closed_by_version: int | None) -> HTTPException:
+    """plan §12.7 — resubmitting a CLOSED item: 409 `closed`, with why
+    (`closed_kind`: 'author' | 'superseded') and, when superseded, which
+    live version closed it — the client's G4 copy depends on both."""
+    if closed_kind == CLOSED_KIND_SUPERSEDED:
+        message = "The thread was updated since this edit was declined"
+    else:
+        message = "This item was closed"
+    return _conflict(
+        "closed",
+        message,
+        closed_kind=closed_kind,
+        closed_by_version=closed_by_version,
+    )
+
+
+def close_rejected_thread(
+    db: Session, thread_id: int, user: UserInfo, *, access: ViewerAccess | None = None
+) -> None:
+    """`POST /threads/{id}/close` (plan §12.7, owner decision R1) — the
+    author CLOSES their declined thread: `closed_at = now`, `closed_kind =
+    'author'`. Final — nothing reopens it; it stays readable (read-only) and
+    moves to the inbox's `closed` list. Order: 404 → 403 view → 403 author
+    → (lock) → already closed → 204 (idempotent) → 409 `not_rejected`. The
+    admin hard delete (`delete_thread_by_id`) is unchanged (R6)."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    _require_author(thread.author_email, user)
+
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    if thread.closed_at is not None:
+        db.rollback()
+        return
+    if thread.status != THREAD_STATUS_REJECTED:
+        db.rollback()
+        raise _conflict("not_rejected", "Only a declined thread can be closed")
+    thread.closed_at = _utc_now()
+    thread.closed_kind = CLOSED_KIND_AUTHOR
+    db.commit()
+
+
+def _require_own_revision(
+    db: Session, thread_id: int, revision_id: int, user: UserInfo, access: ViewerAccess | None
+) -> tuple[ThreadV2, ComponentV2, ThreadRevisionV2]:
+    """Gates shared by the two revision writers below: 404 thread → 403 view
+    → 404 revision (absent or on another thread) → 403 not its submitter.
+    Then the locks, threads row FIRST. Returns the LOCKED rows."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    revision = (
+        db.query(ThreadRevisionV2)
+        .filter(ThreadRevisionV2.id == revision_id, ThreadRevisionV2.thread_id == thread_id)
+        .first()
+    )
+    if revision is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
+    _require_author(revision.submitted_by_email, user)
+
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    revision = (
+        db.query(ThreadRevisionV2)
+        .filter(ThreadRevisionV2.id == revision_id)
+        .with_for_update()
+        .first()
+    )
+    return thread, component, revision
+
+
+def _existing_rework(db: Session, revision: ThreadRevisionV2) -> ThreadRevisionV2 | None:
+    return (
+        db.query(ThreadRevisionV2)
+        .filter(ThreadRevisionV2.resubmission_of_id == revision.id)
+        .first()
+    )
+
+
+def _already_resubmitted(rework: ThreadRevisionV2) -> HTTPException:
+    """D4's 409 — carries the rework so the client can point at it."""
+    return _conflict(
+        "already_resubmitted",
+        "This declined edit was already reworked",
+        resubmission=_to_revision_summary(rework).model_dump(mode="json"),
+    )
+
+
+def resubmit_revision(
+    db: Session,
+    thread_id: int,
+    revision_id: int,
+    user: UserInfo,
+    title: str,
+    content: str,
+    mentions: list[MentionInput],
+    *,
+    overwrite: bool = False,
+    access: ViewerAccess | None = None,
+) -> ThreadUpdateResult:
+    """`POST /threads/{id}/revisions/{rid}/resubmit` (plan §4.4) — the
+    submitter reworks their DECLINED edit into a linked new revision
+    (owner decision 9): `resubmission_of_id` → the declined one,
+    `resubmission_number` = its number + 1; the declined row stays
+    `rejected`.
+
+    Order (plan §12.7): 404 thread → 403 view → 404 revision → 403 not the
+    submitter → (locks: threads, then revision) → 409 `not_rejected` (not
+    rejected, or not an author edit) → 409 `closed` (closed by the author,
+    or superseded by a newer live version — §12.4; `closed_kind` and
+    `closed_by_version` in the body) → 409
+    `already_resubmitted` (D4 — reworked once; the partial UNIQUE
+    `uq_thread_revisions_resubmission_of` is the race backstop) → mention
+    validation → 409 `unchanged_resubmission` vs the DECLINED snapshot
+    (landmine 9: the base is the declined revision, never "latest pending
+    else live") → 409 `no_change` vs the LIVE thread (D7).
+
+    Then the existing paths, with an explicit full snapshot: an editor
+    (D5) goes live through `_apply_editor_edit` (its 409
+    `earlier_revisions_pending` / `overwrite` rule included); anyone else is
+    staged by `_stage_thread_edit`. Returns `ThreadUpdateResult`, the PATCH
+    shape."""
+    thread, component, revision = _require_own_revision(db, thread_id, revision_id, user, access)
+    if revision.status != REVISION_STATUS_REJECTED or revision.origin != REVISION_ORIGIN_AUTHOR:
+        db.rollback()
+        raise _conflict("not_rejected", "Only a declined edit can be resubmitted")
+    if revision.closed_at is not None:
+        conflict = _closed_conflict(revision.closed_kind, revision.closed_by_version)
+        db.rollback()
+        raise conflict
+    rework = _existing_rework(db, revision)
+    if rework is not None:
+        conflict = _already_resubmitted(rework)
+        db.rollback()
+        raise conflict
+
+    resolved = _validate_and_resolve_mentions(db, mentions, content, component=component)
+    if _is_unchanged(title, content, resolved, revision):
+        db.rollback()
+        raise _conflict("unchanged_resubmission", "Change the edit before resubmitting")
+    if _is_unchanged(title, content, resolved, thread):
+        db.rollback()
+        raise _conflict("no_change", "This is already the published version of the thread")
+
+    try:
+        if _is_component_editor(component, access):
+            return _apply_editor_edit(
+                db, thread_id, component, user, title, content, None,
+                overwrite=overwrite, access=access,
+                resubmission_of=revision, resolved_mentions=resolved,
+            )
+        return _stage_thread_edit(
+            db, thread_id, component, user, title, content, None,
+            access=access, resubmission_of=revision, resolved_mentions=resolved,
+        )
+    except IntegrityError:
+        # A concurrent rework of the same declined edit won the partial
+        # UNIQUE (`FOR UPDATE` already serializes this on Postgres).
+        db.rollback()
+        rework = _existing_rework(db, revision)
+        if rework is None:
+            raise
+        raise _already_resubmitted(rework)
+
+
+def close_rejected_revision(
+    db: Session,
+    thread_id: int,
+    revision_id: int,
+    user: UserInfo,
+    *,
+    access: ViewerAccess | None = None,
+) -> None:
+    """`POST /threads/{id}/revisions/{rid}/close` (plan §12.7, R1) — the
+    submitter CLOSES their declined edit (`closed_kind = 'author'`). Final.
+    Gates as `resubmit_revision`. Order: … (locks) → already closed → 204
+    (idempotent, whatever the kind — an edit already superseded is just as
+    closed) → 409 `not_rejected` (anything but a declined author edit) →
+    409 `already_resubmitted` (reworked — it left the inbox already)."""
+    thread, component, revision = _require_own_revision(db, thread_id, revision_id, user, access)
+    if revision.closed_at is not None:
+        db.rollback()
+        return
+    if revision.status != REVISION_STATUS_REJECTED or revision.origin != REVISION_ORIGIN_AUTHOR:
+        db.rollback()
+        raise _conflict("not_rejected", "Only a declined edit can be closed")
+    rework = _existing_rework(db, revision)
+    if rework is not None:
+        conflict = _already_resubmitted(rework)
+        db.rollback()
+        raise conflict
+    revision.closed_at = _utc_now()
+    revision.closed_kind = CLOSED_KIND_AUTHOR
+    db.commit()
+
+
+def _own_declined_threads_query(db: Session, component_id: int, email: str):
+    """The caller's own declined threads on one widget, open AND closed —
+    the inbox splits them on `closed_at`."""
+    return db.query(ThreadV2).filter(
+        ThreadV2.component_id == component_id,
+        ThreadV2.author_email == _norm_email(email),
+        ThreadV2.status == THREAD_STATUS_REJECTED,
+    )
+
+
+def _own_declined_revisions_query(db: Session, component_id: int, email: str):
+    """The caller's own declined AUTHOR edits of this widget's threads that
+    were never reworked (a reworked one has left the inbox for good), open
+    AND closed — the inbox splits them on `closed_at`."""
+    return (
+        db.query(ThreadRevisionV2)
+        .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
+        .filter(
+            ThreadV2.component_id == component_id,
+            ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
+            ThreadRevisionV2.status == REVISION_STATUS_REJECTED,
+            ThreadRevisionV2.submitted_by_email == _norm_email(email),
+            _not_reworked(db),
+        )
+    )
+
+
+def _declined_threads_query(db: Session, component_id: int, email: str):
+    """The inbox's OPEN thread predicate (plan §4.7, §12.3): the caller's
+    own declined, not closed threads on one widget."""
+    return _own_declined_threads_query(db, component_id, email).filter(ThreadV2.closed_at.is_(None))
+
+
+def _declined_revisions_query(db: Session, component_id: int, email: str):
+    """The inbox's OPEN edit predicate (plan §4.7, §12.3): the caller's own
+    declined author edits of this widget's threads, not closed, not yet
+    reworked (no revision has `resubmission_of_id` = it)."""
+    return _own_declined_revisions_query(db, component_id, email).filter(
+        ThreadRevisionV2.closed_at.is_(None)
+    )
+
+
+def _declined_count(db: Session, component_id: int, email: str) -> int:
+    """`ThreadListResponse.declined_count` — the inbox's OPEN predicate as
+    two COUNTs; closed items never count (R5). Only ever called for the
+    caller's OWN email."""
+    return int(_declined_threads_query(db, component_id, email).count()) + int(
+        _declined_revisions_query(db, component_id, email).count()
+    )
+
+
+def list_declined_items(
+    db: Session,
+    link: str,
+    user: UserInfo | None,
+    *,
+    access: ViewerAccess | None = None,
+) -> DeclinedItemsResponse:
+    """`GET /threads/component/{link}/declined` (plan §4.7, amended §12.7) —
+    the caller's own declined items on one widget, in two lists:
+
+    - `items` — the OPEN ones that await their changes: declined threads
+      (reason = that thread's latest REJECTED round's, None for a
+      pre-feature decline — owner decision 12) and declined, not-yet-
+      reworked edits. Newest `declined_at` first (`threads.reviewed_at` for
+      a thread — still set while it is rejected; `thread_revisions.
+      reviewed_at` for an edit). Capped at `DECLINED_ITEMS_CAP` with
+      `truncated`.
+    - `closed` — the CLOSED ones (by the author, or an edit superseded by a
+      newer live version), read-only, newest `closed_at` first, capped at
+      `CLOSED_ITEMS_CAP` with `closed_truncated` (R5: only ever shown in
+      the Revisions view's "Closed (k)" section).
+
+    A reworked edit is in neither list. 404 (widget) → 403 (view). A
+    no-subject caller (`user=None`: anonymous / view-as-user) gets empty
+    lists."""
+    component = resolve_thread_widget_component(db, link)
+    _check_view_access(component, access)
+    if user is None:
+        return DeclinedItemsResponse()
+
+    items, truncated = _declined_items(
+        db,
+        _declined_threads_query(db, component.id, user.email)
+        .order_by(ThreadV2.reviewed_at.desc(), ThreadV2.id.desc())
+        .limit(DECLINED_ITEMS_CAP + 1)
+        .all(),
+        _declined_revisions_query(db, component.id, user.email)
+        .order_by(ThreadRevisionV2.reviewed_at.desc(), ThreadRevisionV2.id.desc())
+        .limit(DECLINED_ITEMS_CAP + 1)
+        .all(),
+        cap=DECLINED_ITEMS_CAP,
+        sort_attr="declined_at",
+    )
+    closed, closed_truncated = _declined_items(
+        db,
+        _own_declined_threads_query(db, component.id, user.email)
+        .filter(ThreadV2.closed_at.isnot(None))
+        .order_by(ThreadV2.closed_at.desc(), ThreadV2.id.desc())
+        .limit(CLOSED_ITEMS_CAP + 1)
+        .all(),
+        _own_declined_revisions_query(db, component.id, user.email)
+        .filter(ThreadRevisionV2.closed_at.isnot(None))
+        .order_by(ThreadRevisionV2.closed_at.desc(), ThreadRevisionV2.id.desc())
+        .limit(CLOSED_ITEMS_CAP + 1)
+        .all(),
+        cap=CLOSED_ITEMS_CAP,
+        sort_attr="closed_at",
+    )
+    return DeclinedItemsResponse(
+        items=items, truncated=truncated, closed=closed, closed_truncated=closed_truncated
+    )
+
+
+def _declined_items(
+    db: Session,
+    threads: list[ThreadV2],
+    revisions: list[ThreadRevisionV2],
+    *,
+    cap: int,
+    sort_attr: str,
+) -> tuple[list[DeclinedThreadItem | DeclinedEditItem], bool]:
+    """Build one inbox list from its two already-capped (`cap + 1`) halves:
+    merge, sort by `sort_attr` DESC (tie-break on id), cut to `cap`, and
+    report whether anything was cut."""
+    reasons: dict[int, str | None] = {}
+    if threads:
+        for row in (
+            db.query(ThreadSubmissionV2)
+            .filter(
+                ThreadSubmissionV2.thread_id.in_([t.id for t in threads]),
+                ThreadSubmissionV2.status == THREAD_STATUS_REJECTED,
+            )
+            .order_by(ThreadSubmissionV2.thread_id, ThreadSubmissionV2.round)
+            .all()
+        ):
+            reasons[row.thread_id] = row.reason  # ascending → the latest wins
+    live_titles: dict[int, str] = {}
+    if revisions:
+        live_titles = {
+            tid: title
+            for tid, title in db.query(ThreadV2.id, ThreadV2.title)
+            .filter(ThreadV2.id.in_({r.thread_id for r in revisions}))
+            .all()
+        }
+
+    items: list[DeclinedThreadItem | DeclinedEditItem] = [
+        DeclinedThreadItem(
+            thread_id=t.id,
+            title=t.title,
+            content_excerpt=generate_notification_excerpt(t.content),
+            resubmission_count=t.resubmission_count or 0,
+            reason=reasons.get(t.id),
+            declined_by_email=t.reviewed_by_email,
+            declined_by_name=t.reviewed_by_name,
+            declined_at=t.reviewed_at,
+            closed_at=t.closed_at,
+            closed_kind=t.closed_kind,
+        )
+        for t in threads
+    ] + [
+        DeclinedEditItem(
+            thread_id=r.thread_id,
+            revision_id=r.id,
+            version=r.version,
+            title=r.title,
+            content_excerpt=generate_notification_excerpt(r.content),
+            thread_title=live_titles.get(r.thread_id, ""),
+            resubmission_number=r.resubmission_number or 0,
+            reason=r.rejection_reason,
+            declined_by_email=r.reviewed_by_email,
+            declined_by_name=r.reviewed_by_name,
+            declined_at=r.reviewed_at,
+            closed_at=r.closed_at,
+            closed_kind=r.closed_kind,
+            closed_by_version=r.closed_by_version,
+        )
+        for r in revisions
+    ]
+    _epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+    def _key(item: DeclinedThreadItem | DeclinedEditItem):
+        instant = getattr(item, sort_attr)
+        return (
+            _as_utc(instant) if instant else _epoch,
+            item.revision_id if isinstance(item, DeclinedEditItem) else item.thread_id,
+        )
+
+    items.sort(key=_key, reverse=True)
+    return items[:cap], len(items) > cap
+
+
+def get_thread_submission_history(
+    db: Session,
+    thread_id: int,
+    user: UserInfo | None,
+    *,
+    access: ViewerAccess | None = None,
+) -> list[ThreadSubmissionRound]:
+    """`GET /threads/{id}/submission-history` (plan §4.6) — every decided
+    round, oldest first, with full snapshots, plus a SYNTHESIZED `pending`
+    round (round = `resubmission_count`, snapshot = the live columns,
+    `reviewed_*`/`reason` None) when the thread is pending.
+
+    403 (view) BEFORE 404. Then the author or a component editor
+    (`_can_see_thread_revisions` — D2, who may see a reason); anyone else
+    gets the 404 a nonexistent id gives. A CLOSED thread reads for its
+    author like any other (plan §12.7).
+
+    plan §12.8 G3: a resubmission the editor-author published themselves
+    (D5) wrote no round, so the timeline ends with a SYNTHESIZED
+    `published` round (snapshot = v1, reviewer = v1's publisher)."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    if not _can_see_thread_revisions(thread, component, user, access):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+
+    stored = (
+        db.query(ThreadSubmissionV2)
+        .filter(ThreadSubmissionV2.thread_id == thread.id)
+        .order_by(ThreadSubmissionV2.round.asc())
+        .all()
+    )
+    rows: list[Any] = list(stored)
+    if _is_self_published_resubmission(thread, stored):
+        v1 = (
+            db.query(ThreadRevisionV2)
+            .filter(ThreadRevisionV2.thread_id == thread.id, ThreadRevisionV2.version == 1)
+            .first()
+        )
+        if v1 is not None:
+            rows.append(_published_round(thread, v1))
+
+    rounds = [
+        ThreadSubmissionRound(
+            round=r.round,
+            status=r.status,
+            title=r.title,
+            content=r.content,
+            mentions=r.mentions or [],
+            reason=r.reason,
+            submitted_by_email=r.submitted_by_email,
+            submitted_by_name=r.submitted_by_name,
+            submitted_at=r.submitted_at,
+            reviewed_by_email=r.reviewed_by_email,
+            reviewed_by_name=r.reviewed_by_name,
+            reviewed_at=r.reviewed_at,
+        )
+        for r in rows
+    ]
+    if thread.status == THREAD_STATUS_PENDING:
+        rounds.append(
+            ThreadSubmissionRound(
+                round=thread.resubmission_count or 0,
+                status="pending",
+                title=thread.title,
+                content=thread.content,
+                mentions=thread.mentions or [],
+                reason=None,
+                submitted_by_email=thread.author_email,
+                submitted_by_name=thread.author_name,
+                submitted_at=thread.submitted_at or thread.created_at,
+            )
+        )
+    return rounds
+
+
+def get_revision_chain(
+    db: Session,
+    thread_id: int,
+    revision_id: int,
+    user: UserInfo | None,
+    *,
+    access: ViewerAccess | None = None,
+) -> list[ThreadRevisionDetail]:
+    """`GET /threads/{id}/revisions/{rid}/chain` (plan §5) — the rework
+    chain `revision_id` belongs to (every declined edit and its reworks,
+    via `resubmission_of_id`), oldest first, each with its reason. Same
+    gate as `get_thread_revision`. A chain is linear (D4: one rework per
+    declined edit), so this walks back to the root and then forward."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    if not _can_see_thread_revisions(thread, component, user, access):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
+
+    def _get(rid: int | None) -> ThreadRevisionV2 | None:
+        if rid is None:
+            return None
+        return (
+            db.query(ThreadRevisionV2)
+            .filter(ThreadRevisionV2.id == rid, ThreadRevisionV2.thread_id == thread_id)
+            .first()
+        )
+
+    current = _get(revision_id)
+    if current is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
+    chain = [current]
+    seen = {current.id}
+    back = _get(current.resubmission_of_id)
+    while back is not None and back.id not in seen:
+        chain.insert(0, back)
+        seen.add(back.id)
+        back = _get(back.resubmission_of_id)
+    forward = _existing_rework(db, current)
+    while forward is not None and forward.id not in seen:
+        chain.append(forward)
+        seen.add(forward.id)
+        forward = _existing_rework(db, forward)
+    return [_to_revision_detail(r) for r in chain]
+
+
+# ---------------------------------------------------------
 # Moderation (plan_thread_moderation_2026-09-18.md §4.2, §5.3, §5.7) —
 # approve/reject, the pending queue, the history list, and the sidebar's
 # polled summary. No edit-lock involvement anywhere here (plan §5.8): these
@@ -2258,6 +3295,7 @@ def decide_thread(
     user: UserInfo,
     *,
     approve: bool,
+    reason: str | None = None,
     access: ViewerAccess | None = None,
 ) -> ThreadModerationRow:
     """`POST /threads/{id}/approve` or `.../reject` — gated on `edit(n)`
@@ -2265,9 +3303,17 @@ def decide_thread(
     with delete — a root-tab editor with no admin role must be able to
     approve). `FOR UPDATE` serializes two editors deciding at once; the
     loser re-reads a non-pending row and gets the winner's decision back in
-    the 409 body."""
+    the 409 body.
+
+    plan_thread_reject_resubmit_2026-11-07.md §4.1: a reject REQUIRES
+    `reason` (the router validates `RejectRequest`; this asserts it too —
+    400). BOTH outcomes write one `thread_submissions` round — round =
+    `resubmission_count`, snapshot = what was decided — and stamp
+    `last_decided_at`; without the approve round grouped History would
+    lose approvals."""
     thread, component = _require_thread_and_component(db, thread_id)
     _require_component_editor(component, access)
+    reason = _require_reason(approve, reason)
 
     # Re-fetch under lock — plan §5.3's recipe, same shape as the vote/
     # comment-count recompute locks elsewhere in this module. The unlocked
@@ -2288,6 +3334,29 @@ def decide_thread(
     thread.reviewed_by_email = _norm_email(user.email)
     thread.reviewed_by_name = user.name
     thread.reviewed_at = _utc_now()
+    thread.last_decided_at = thread.reviewed_at
+
+    # plan_thread_reject_resubmit §2.2/§4.1 — the round log. Snapshot of
+    # WHAT WAS DECIDED (edits made while pending included), mentions as
+    # stored, never re-resolved. `uq_thread_submissions_thread_round` is the
+    # backstop; the FOR UPDATE above already serializes deciders.
+    db.add(
+        ThreadSubmissionV2(
+            thread_id=thread.id,
+            round=thread.resubmission_count or 0,
+            title=thread.title,
+            content=thread.content,
+            mentions=list(thread.mentions or []),
+            status=thread.status,
+            reason=None if approve else reason,
+            submitted_by_email=_norm_email(thread.author_email),
+            submitted_by_name=thread.author_name,
+            submitted_at=thread.submitted_at or thread.created_at,
+            reviewed_by_email=thread.reviewed_by_email,
+            reviewed_by_name=thread.reviewed_by_name,
+            reviewed_at=thread.reviewed_at,
+        )
+    )
 
     if approve:
         # plan_thread_edit_versioning amendment A3: publication writes the
@@ -2314,7 +3383,12 @@ def decide_thread(
     # mention fan-out so the two kinds of row land in the order the events
     # happened, and before the commit so it shares the transaction.
     _notify_thread_decision(
-        db, thread, reviewer=user, approved=approve, component_id=component.id
+        db,
+        thread,
+        reviewer=user,
+        approved=approve,
+        component_id=component.id,
+        reason=reason,
     )
 
     db.commit()
@@ -2330,6 +3404,7 @@ def decide_thread_revision(
     *,
     approve: bool,
     overwrite: bool = False,
+    reason: str | None = None,
     access: ViewerAccess | None = None,
 ) -> ThreadRevisionDetail:
     """`POST /threads/{id}/revisions/{rid}/approve` or `.../reject`
@@ -2347,9 +3422,20 @@ def decide_thread_revision(
     4); with `overwrite=True` they are marked `overwritten`, stamped with
     THIS decision's reviewer and instant. Reject touches only this one
     revision — never another revision, never the live content (owner
-    decision 6). `threads.status` never moves on either path."""
+    decision 6). `threads.status` never moves on either path.
+
+    plan_thread_reject_resubmit §12.4/§12.5: approving version K also
+    closes every OPEN declined edit below K as `superseded` (R2), behind
+    the SAME 409 (now also raised when only `declined_open` is non-empty)
+    and the same `overwrite` (R3); each closed edit's submitter gets a
+    `thread_edit_closed` bell with this reviewer as actor (R4).
+
+    plan_thread_reject_resubmit §4.1: a reject REQUIRES `reason` (the router
+    validates `RejectRequest`; this asserts it too — 400), stored on
+    `revision.rejection_reason` and used as the bell excerpt."""
     thread, component = _require_thread_and_component(db, thread_id)
     _require_component_editor(component, access)
+    reason = _require_reason(approve, reason)
 
     thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
     revision = (
@@ -2374,6 +3460,7 @@ def decide_thread_revision(
         )
 
     earlier: list[ThreadRevisionV2] = []
+    declined_open: list[ThreadRevisionV2] = []
     if approve:
         earlier = (
             db.query(ThreadRevisionV2)
@@ -2385,11 +3472,15 @@ def decide_thread_revision(
             .order_by(ThreadRevisionV2.version.asc())
             .all()
         )
-        if earlier and not overwrite:
+        # plan §12.4/§12.5 — the OPEN declined edits below this version,
+        # which going live will close as superseded. Not this revision's own
+        # source when it is a rework: that one is linked, so not open.
+        declined_open = _open_declined_edits_below(db, thread_id, revision.version)
+        if (earlier or declined_open) and not overwrite:
             # The warning modal's payload. The destructive path is opt-in
             # ON THE WIRE (`overwrite: true`), so no client — or future
             # script — overwrites by accident.
-            raise _earlier_revisions_conflict(earlier, revision)
+            raise _earlier_revisions_conflict(earlier, revision, declined_open)
 
     now = _utc_now()
     reviewer_email = _norm_email(user.email)
@@ -2414,11 +3505,24 @@ def decide_thread_revision(
         # Stamped for EVERY version that goes live, a mentions-only one
         # included (owner, 2026-09-23 — same rule as `_apply_editor_edit`).
         thread.edited_at = now
+        # plan §12.4 — R2: close the open declined edits this version
+        # supersedes; the reviewer is the publisher (bell actor).
+        _close_superseded(
+            db,
+            thread,
+            declined_open,
+            live_version=revision.version,
+            publisher=user,
+            component_id=component.id,
+            now=now,
+        )
 
     revision.status = REVISION_STATUS_APPROVED if approve else REVISION_STATUS_REJECTED
     revision.reviewed_by_email = reviewer_email
     revision.reviewed_by_name = user.name
     revision.reviewed_at = now
+    if not approve:
+        revision.rejection_reason = reason
 
     if approve:
         # plan §4.5 — the fan-out the pre-versioning PATCH ran inline moves
@@ -2438,7 +3542,13 @@ def decide_thread_revision(
     # plan §4.6 — tell the submitter, for BOTH outcomes. ONE call, for THIS
     # revision only: the `earlier` rows an overwrite displaced get no row.
     _notify_thread_edit_decision(
-        db, thread, revision, reviewer=user, approved=approve, component_id=component.id
+        db,
+        thread,
+        revision,
+        reviewer=user,
+        approved=approve,
+        component_id=component.id,
+        reason=reason,
     )
 
     db.commit()
@@ -2480,7 +3590,15 @@ def list_pending_threads(
     set (plan §5.2); an empty set is a `200` with an empty page, never a
     403 (a non-moderator deep-linking the management page sees an empty
     state, not an error). Oldest-first (FIFO) — the queue drains in the
-    order people waited, not newest-first like the widget's own list."""
+    order people waited, not newest-first like the widget's own list.
+
+    plan_thread_reject_resubmit §4.6 (owner decision 14): ordered and
+    keyset on `(submitted_at, id)`, not `(created_at, id)` — a resubmission
+    joins the BACK of the queue. The cursor keeps `_encode_cursor`'s format;
+    its timestamp is now `submitted_at` (landmine 4: a `created_at` cursor
+    from a page opened before deploy decodes to a valid-looking position —
+    harmless, one odd page). Rows carry `resubmission_count` and
+    `previous_rejection` (`_round_fields`, one batched query)."""
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
         return ThreadModerationListResponse(items=[], next_cursor=None)
@@ -2490,22 +3608,22 @@ def list_pending_threads(
         ThreadV2.status == THREAD_STATUS_PENDING,
     )
     if cursor:
-        after_created_at, after_id = _decode_cursor(cursor)
+        after_submitted_at, after_id = _decode_cursor(cursor)
         # Ascending order flips the keyset comparison to `>` (plan §4.3's
         # row-comparison rule, same shape as the comment list's oldest-first
         # pagination).
         query = query.filter(
-            tuple_(ThreadV2.created_at, ThreadV2.id) > (after_created_at, after_id)
+            tuple_(ThreadV2.submitted_at, ThreadV2.id) > (after_submitted_at, after_id)
         )
 
     rows = (
-        query.order_by(ThreadV2.created_at.asc(), ThreadV2.id.asc())
+        query.order_by(ThreadV2.submitted_at.asc(), ThreadV2.id.asc())
         .limit(THREADS_PAGE_SIZE + 1)
         .all()
     )
     has_more = len(rows) > THREADS_PAGE_SIZE
     page = rows[:THREADS_PAGE_SIZE]
-    next_cursor = _encode_cursor(page[-1].created_at, page[-1].id) if has_more and page else None
+    next_cursor = _encode_cursor(page[-1].submitted_at, page[-1].id) if has_more and page else None
 
     return ThreadModerationListResponse(items=_to_moderation_rows(db, page), next_cursor=next_cursor)
 
@@ -2521,18 +3639,26 @@ def list_thread_history(
     reviewers: list[str] | None = None,
     access: ViewerAccess | None = None,
 ) -> ThreadModerationListResponse:
-    """`GET /threads/moderation/history` — same scoping as the pending
-    queue. `reviewed_at IS NOT NULL` is the base filter (M5): a legacy or
-    editor-auto-approved thread was never explicitly decided and does not
-    appear here. Newest decision first.
+    """`GET /threads/moderation/history` — GROUPED BY THREAD
+    (plan_thread_reject_resubmit_2026-11-07.md §4.6, owner decision 13): one
+    row per thread, same scoping as the pending queue. Base set = threads
+    with `last_decided_at IS NOT NULL` (M5: a legacy or editor-auto-published
+    thread was never explicitly decided and does not appear). A thread that
+    was declined and resubmitted (pending again, `reviewed_*` cleared) is
+    STILL listed with its earlier decision. Newest `last_decided_at` first;
+    the cursor is `_encode_cursor(last_decided_at, id)`.
 
-    Optional filters (owner, 2026-09-24), all combinable — Revision
-    History's semantics (`list_revision_history`):
-    - `statuses` ⊆ approved/rejected (default both);
-    - `date_from` (inclusive) / `date_to` (exclusive) on the DECISION date,
-      `reviewed_at` — instants, so the client sends its own local-day bounds;
-    - `authors` = thread author emails, `reviewers` = decider emails (any-of,
-      case-insensitive).
+    Optional filters, all combinable, ANY-MATCH over the thread's decided
+    rounds (`thread_submissions`): a thread is listed if at least ONE of its
+    rounds satisfies every round-level filter at once —
+    - `statuses` ⊆ approved/rejected — the round's decision;
+    - `date_from` (inclusive) / `date_to` (exclusive) — the round's
+      `reviewed_at` (instants; the client sends its own local-day bounds);
+    - `reviewers` — the round's decider (any-of, case-insensitive).
+    `authors` is thread-level (the thread author; any-of). Each row's
+    `matched_rounds` names the rounds that satisfied the round-level filters
+    (every round when only `authors` is set), `[]` when unfiltered.
+
     The cursor only encodes the position; the caller must resend the same
     filters with it."""
     if statuses and any(
@@ -2544,38 +3670,62 @@ def list_thread_history(
     if not component_ids:
         return ThreadModerationListResponse(items=[], next_cursor=None)
 
+    round_predicates = []
+    if statuses:
+        round_predicates.append(ThreadSubmissionV2.status.in_(statuses))
+    if date_from is not None:
+        round_predicates.append(ThreadSubmissionV2.reviewed_at >= _as_utc(date_from))
+    if date_to is not None:
+        round_predicates.append(ThreadSubmissionV2.reviewed_at < _as_utc(date_to))
+    if reviewers:
+        round_predicates.append(
+            ThreadSubmissionV2.reviewed_by_email.in_({_norm_email(e) for e in reviewers})
+        )
+    filtered = bool(round_predicates or authors)
+
     query = db.query(ThreadV2).filter(
         ThreadV2.component_id.in_(component_ids),
-        ThreadV2.reviewed_at.isnot(None),
+        ThreadV2.last_decided_at.isnot(None),
     )
-    if statuses:
-        query = query.filter(ThreadV2.status.in_(statuses))
-    if date_from is not None:
-        query = query.filter(ThreadV2.reviewed_at >= _as_utc(date_from))
-    if date_to is not None:
-        query = query.filter(ThreadV2.reviewed_at < _as_utc(date_to))
+    if round_predicates:
+        # ANY-match: one round must satisfy ALL round-level filters together.
+        query = query.filter(
+            db.query(ThreadSubmissionV2.id)
+            .filter(ThreadSubmissionV2.thread_id == ThreadV2.id, *round_predicates)
+            .exists()
+        )
     if authors:
         query = query.filter(ThreadV2.author_email.in_({_norm_email(e) for e in authors}))
-    if reviewers:
-        query = query.filter(ThreadV2.reviewed_by_email.in_({_norm_email(e) for e in reviewers}))
     if cursor:
-        after_reviewed_at, after_id = _decode_cursor(cursor)
+        after_decided_at, after_id = _decode_cursor(cursor)
         query = query.filter(
-            tuple_(ThreadV2.reviewed_at, ThreadV2.id) < (after_reviewed_at, after_id)
+            tuple_(ThreadV2.last_decided_at, ThreadV2.id) < (after_decided_at, after_id)
         )
 
     rows = (
-        query.order_by(ThreadV2.reviewed_at.desc(), ThreadV2.id.desc())
+        query.order_by(ThreadV2.last_decided_at.desc(), ThreadV2.id.desc())
         .limit(THREADS_PAGE_SIZE + 1)
         .all()
     )
     has_more = len(rows) > THREADS_PAGE_SIZE
     page = rows[:THREADS_PAGE_SIZE]
     next_cursor = (
-        _encode_cursor(page[-1].reviewed_at, page[-1].id) if has_more and page else None
+        _encode_cursor(page[-1].last_decided_at, page[-1].id) if has_more and page else None
     )
 
-    return ThreadModerationListResponse(items=_to_moderation_rows(db, page), next_cursor=next_cursor)
+    matched: dict[int, list[int]] = {}
+    if filtered and page:
+        for thread_id, round_ in (
+            db.query(ThreadSubmissionV2.thread_id, ThreadSubmissionV2.round)
+            .filter(ThreadSubmissionV2.thread_id.in_([t.id for t in page]), *round_predicates)
+            .order_by(ThreadSubmissionV2.thread_id, ThreadSubmissionV2.round)
+            .all()
+        ):
+            matched.setdefault(thread_id, []).append(round_)
+
+    return ThreadModerationListResponse(
+        items=_to_moderation_rows(db, page, matched_rounds=matched), next_cursor=next_cursor
+    )
 
 
 def thread_history_facets(
@@ -2583,11 +3733,13 @@ def thread_history_facets(
 ) -> ThreadHistoryFacets:
     """`GET /threads/moderation/history/facets` — the History tab's two
     person-filter option lists (owner, 2026-09-24), `revision_history_facets`'
-    shape: the distinct authors and the distinct deciders of every DECIDED
-    thread (`reviewed_at IS NOT NULL`, the list's own base filter) in the
+    shape: the distinct submitters and the distinct deciders of every
+    DECIDED ROUND (`thread_submissions`, plan_thread_reject_resubmit §4.6 —
+    no longer `threads.reviewed_*`, which a resubmission clears) in the
     caller's moderated set, so a dropdown only offers people the caller can
-    actually find. Emails are stored normalized, so grouping by email is
-    grouping by person."""
+    actually find. A round's submitter is always the thread's author.
+    Emails are stored normalized, so grouping by email is grouping by
+    person."""
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
         return ThreadHistoryFacets()
@@ -2595,9 +3747,9 @@ def thread_history_facets(
     def _people(email_col, name_col) -> list[RevisionPerson]:
         rows = (
             db.query(email_col, func.max(name_col))
+            .join(ThreadV2, ThreadV2.id == ThreadSubmissionV2.thread_id)
             .filter(
                 ThreadV2.component_id.in_(component_ids),
-                ThreadV2.reviewed_at.isnot(None),
                 email_col.isnot(None),
             )
             .group_by(email_col)
@@ -2608,8 +3760,8 @@ def thread_history_facets(
         return people
 
     return ThreadHistoryFacets(
-        authors=_people(ThreadV2.author_email, ThreadV2.author_name),
-        reviewers=_people(ThreadV2.reviewed_by_email, ThreadV2.reviewed_by_name),
+        authors=_people(ThreadSubmissionV2.submitted_by_email, ThreadSubmissionV2.submitted_by_name),
+        reviewers=_people(ThreadSubmissionV2.reviewed_by_email, ThreadSubmissionV2.reviewed_by_name),
     )
 
 
@@ -3447,10 +4599,25 @@ def rekey_email(
 
     `mentions` entries whose `email` is `old_email` are rewritten wherever
     they appear, regardless of whose row the mention sits on. Returns counts
-    per table, for the script's report."""
+    per table, for the script's report.
+
+    plan_thread_reject_resubmit §4.9 (owner, 2026-11-07: "Also fix
+    thread_revisions"): also rewrites `thread_revisions.submitted_by_email`
+    / `reviewed_by_email` (a pre-existing gap since versioning) and
+    `thread_submissions.submitted_by_email` / `reviewed_by_email`, and
+    scans both tables' `mentions` snapshots. A row counts once per table
+    however many of its columns matched. `threads.reviewed_by_email` is
+    still not rewritten (pre-existing, out of this plan's scope)."""
     old_norm = _norm_email(old_email)
     new_norm = _norm_email(new_email)
-    counts = {"threads": 0, "thread_comments": 0, "notifications": 0, "mentions_rewritten": 0}
+    counts = {
+        "threads": 0,
+        "thread_comments": 0,
+        "notifications": 0,
+        "thread_revisions": 0,
+        "thread_submissions": 0,
+        "mentions_rewritten": 0,
+    }
 
     threads = (
         db.query(ThreadV2).filter(ThreadV2.author_email == old_norm).all()
@@ -3458,6 +4625,19 @@ def rekey_email(
     for thread in threads:
         thread.author_email = new_norm
         counts["threads"] += 1
+
+    for model, key in ((ThreadRevisionV2, "thread_revisions"), (ThreadSubmissionV2, "thread_submissions")):
+        rows = (
+            db.query(model)
+            .filter(or_(model.submitted_by_email == old_norm, model.reviewed_by_email == old_norm))
+            .all()
+        )
+        for row in rows:
+            if row.submitted_by_email == old_norm:
+                row.submitted_by_email = new_norm
+            if row.reviewed_by_email == old_norm:
+                row.reviewed_by_email = new_norm
+            counts[key] += 1
 
     comments = (
         db.query(ThreadCommentV2)
@@ -3498,7 +4678,7 @@ def rekey_email(
     # guessed at. Nothing in this codebase writes any other shape; the guard
     # is here so malformed data degrades to "not rewritten" instead of raising
     # halfway through a repair run.
-    for model in (ThreadV2, ThreadCommentV2):
+    for model in (ThreadV2, ThreadCommentV2, ThreadRevisionV2, ThreadSubmissionV2):
         rows = db.query(model).all()
         for row in rows:
             mentions = row.mentions or []

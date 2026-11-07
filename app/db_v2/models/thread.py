@@ -31,6 +31,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -148,6 +149,41 @@ class ThreadV2(BaseV2):
     # agree; `default` so the ORM sets it on insert without a refresh.
     version = Column(Integer, nullable=False, default=1, server_default=text("1"))
 
+    # plan_thread_reject_resubmit_2026-11-07.md §2.1.
+    # The latest submission instant: `created_at` at create, `now` on each
+    # resubmit. The Pending queue orders and keysets on it (owner decision
+    # 14 — a resubmission joins the back of the FIFO queue). The ORM default
+    # copies `created_at` from the same INSERT so a row built without it
+    # (every pre-feature test helper) still satisfies NOT NULL; the
+    # migration backfills existing rows the same way.
+    #
+    # `server_default` (plan §12.8 G1): rollback safety. Rolled back after
+    # the migration, the OLD create path INSERTs without this column, so the
+    # DB itself must fill it — the migration sets `DEFAULT now()` to match.
+    # New code still sets it explicitly.
+    submitted_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda ctx: ctx.get_current_parameters().get("created_at"),
+        server_default=func.now(),
+    )
+    # "Revision N" — how many times the author resubmitted after a decline
+    # (owner decision 8). 0 = the original submission.
+    resubmission_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    # The instant of this thread's latest EXPLICIT decision. Unlike
+    # `reviewed_at` (which now means "the decision behind the CURRENT status"
+    # and is cleared on resubmit — plan §11 landmine 3), this survives a
+    # resubmission: it is grouped History's base filter and sort key. NULL
+    # for a never-decided or editor-auto-published thread (M5).
+    last_decided_at = Column(DateTime(timezone=True), nullable=True)
+    # The author's "Close" of a declined thread (plan §12.3, owner decision
+    # R1 — replaced the soft-delete `author_deleted_at`). Final: nothing
+    # reopens it. Set together, only on a `rejected` row, and the kind is
+    # always 'author' on threads (ck_threads_closed_shape). A closed thread
+    # stays readable for its author; it just leaves the open inbox.
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_kind = Column(String(16), nullable=True)
+
     __table_args__ = (
         # (component_id, created_at DESC, id DESC) — the one query the list
         # endpoint runs (plan §3.1). The trailing `id` is not decorative: it
@@ -166,29 +202,40 @@ class ThreadV2(BaseV2):
             name="ck_threads_status",
         ),
         # The moderation queue: WHERE component_id IN (...) AND status =
-        # 'pending' ORDER BY created_at, id. PARTIAL — only pending rows, so
-        # it stays tiny however large the table grows (same reasoning as
-        # notifications' own unread-only index). sqlite_where mirrors
-        # postgresql_where so the SQLite test harness exercises the same
-        # shape the live Postgres index does.
+        # 'pending' ORDER BY submitted_at, id (plan_thread_reject_resubmit
+        # §2.1 — replaced ix_threads_pending_created_id, which ordered by
+        # created_at). PARTIAL — only pending rows, so it stays tiny however
+        # large the table grows (same reasoning as notifications' own
+        # unread-only index). sqlite_where mirrors postgresql_where so the
+        # SQLite test harness exercises the same shape the live Postgres
+        # index does.
         Index(
-            "ix_threads_pending_created_id",
+            "ix_threads_pending_submitted_id",
             "component_id",
-            "created_at",
+            "submitted_at",
             "id",
             postgresql_where=text("status = 'pending'"),
             sqlite_where=text("status = 'pending'"),
         ),
-        # History: WHERE reviewed_at IS NOT NULL ORDER BY reviewed_at DESC,
-        # id DESC. PARTIAL on reviewed rows only — a legacy or editor
-        # auto-approved thread never appears in history (M5) and never
-        # bloats this index either.
+        # Grouped History: WHERE last_decided_at IS NOT NULL ORDER BY
+        # last_decided_at DESC, id DESC (plan §4.6). PARTIAL on decided
+        # threads only — a legacy or editor auto-approved thread never
+        # appears in History (M5). Replaced ix_threads_reviewed_at_id, which
+        # a resubmission would have emptied (reviewed_at is cleared then).
         Index(
-            "ix_threads_reviewed_at_id",
-            reviewed_at.desc(),
+            "ix_threads_last_decided_id",
+            last_decided_at.desc(),
             id.desc(),
-            postgresql_where=text("reviewed_at IS NOT NULL"),
-            sqlite_where=text("reviewed_at IS NOT NULL"),
+            postgresql_where=text("last_decided_at IS NOT NULL"),
+            sqlite_where=text("last_decided_at IS NOT NULL"),
+        ),
+        # Only a declined thread can be closed, both columns move together,
+        # and a thread is only ever closed by its author (plan §12.3).
+        CheckConstraint(
+            "((closed_at IS NULL) = (closed_kind IS NULL)) "
+            "AND (closed_at IS NULL OR status = 'rejected') "
+            "AND (closed_kind IS NULL OR closed_kind = 'author')",
+            name="ck_threads_closed_shape",
         ),
     )
 
@@ -258,7 +305,49 @@ class ThreadRevisionV2(BaseV2):
     reviewed_by_name = Column(String(255), nullable=True)
     reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
+    # plan_thread_reject_resubmit_2026-11-07.md §2.3. The reviewer's reason
+    # for a decline (required by the API since this plan; NULL on every
+    # pre-feature decline — owner decision 12). Never editable (D1).
+    rejection_reason = Column(Text, nullable=True)
+    # The declined edit this one reworks (owner decision 9). SET NULL, not
+    # CASCADE: losing a link must never delete a revision.
+    resubmission_of_id = Column(
+        Integer,
+        ForeignKey("thread_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # "Revision N" of the rework chain: the declined one's number + 1.
+    resubmission_number = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    # A declined edit's "Close" (plan §12.3 — replaced the soft-delete
+    # `author_dismissed_at`). Final. `closed_kind` is 'author' (the author
+    # closed it) or 'superseded' (a newer version of the thread went live
+    # while it was open — §12.4; then `closed_by_version` is that version).
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_kind = Column(String(16), nullable=True)
+    closed_by_version = Column(Integer, nullable=True)
+
     __table_args__ = (
+        CheckConstraint(
+            "rejection_reason IS NULL OR status = 'rejected'",
+            name="ck_thread_revisions_reason_rejected",
+        ),
+        CheckConstraint(
+            "((closed_at IS NULL) = (closed_kind IS NULL)) "
+            "AND (closed_at IS NULL OR status = 'rejected') "
+            "AND (closed_kind IS NULL OR closed_kind IN ('author', 'superseded')) "
+            "AND ((closed_by_version IS NOT NULL) = "
+            "(closed_kind IS NOT NULL AND closed_kind = 'superseded'))",
+            name="ck_thread_revisions_closed_shape",
+        ),
+        # D4: a declined edit can be reworked ONCE. Also backs the inbox's
+        # "not yet reworked" anti-join.
+        Index(
+            "uq_thread_revisions_resubmission_of",
+            "resubmission_of_id",
+            unique=True,
+            postgresql_where=text("resubmission_of_id IS NOT NULL"),
+            sqlite_where=text("resubmission_of_id IS NOT NULL"),
+        ),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'overwritten')",
             name="ck_thread_revisions_status",
@@ -288,13 +377,81 @@ class ThreadRevisionV2(BaseV2):
             postgresql_where=text("status = 'pending'"),
             sqlite_where=text("status = 'pending'"),
         ),
-        # History's half, mirroring ix_threads_reviewed_at_id exactly.
+        # Revision History's ordering (WHERE reviewed_at IS NOT NULL ORDER BY
+        # reviewed_at DESC, id DESC). It once mirrored threads'
+        # ix_threads_reviewed_at_id, which plan_thread_reject_resubmit §2.1
+        # dropped; a revision's reviewed_at is never cleared, so this one
+        # stays.
         Index(
             "ix_thread_revisions_reviewed_at_id",
             reviewed_at.desc(),
             id.desc(),
             postgresql_where=text("reviewed_at IS NOT NULL"),
             sqlite_where=text("reviewed_at IS NOT NULL"),
+        ),
+    )
+
+
+class ThreadSubmissionV2(BaseV2):
+    """One EXPLICIT decision on a not-yet-published thread
+    (plan_thread_reject_resubmit_2026-11-07.md §2.2): a snapshot of what was
+    decided, plus the decision and its reason. Written in ``decide_thread``
+    for BOTH outcomes, at the moment of decision. The current pending round
+    is the ``threads`` row itself, never a row here. An editor-auto-published
+    thread (at create, or on an editor-author's resubmit — D5) has no rows
+    (M5: History shows explicit decisions only).
+
+    ``round`` is ``threads.resubmission_count`` at decision time: 0 = the
+    original submission, n = the n-th resubmission ("Revision n").
+
+    Same no-``relationship()`` / DB-cascade rule as every other table in
+    this module.
+    """
+
+    __tablename__ = "thread_submissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # No `index=True` — uq_thread_submissions_thread_round leads with it.
+    thread_id = Column(
+        Integer,
+        ForeignKey("threads.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    round = Column(Integer, nullable=False)
+
+    # Snapshot of WHAT WAS DECIDED — `mentions` as the thread stored it at
+    # that instant, never re-resolved.
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    mentions = Column(JSONB, nullable=False, default=list)
+
+    status = Column(String(16), nullable=False)
+    # Required by the API on reject; NULL on approve and on backfilled rows.
+    reason = Column(Text, nullable=True)
+
+    submitted_by_email = Column(String(320), nullable=False)
+    submitted_by_name = Column(String(255), nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=False)
+    reviewed_by_email = Column(String(320), nullable=False)
+    reviewed_by_name = Column(String(255), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('approved', 'rejected')",
+            name="ck_thread_submissions_status",
+        ),
+        CheckConstraint(
+            "reason IS NULL OR status = 'rejected'",
+            name="ck_thread_submissions_reason",
+        ),
+        # One decision per round; also every per-thread lookup.
+        Index("uq_thread_submissions_thread_round", "thread_id", "round", unique=True),
+        # Grouped History's date filter and the facets.
+        Index(
+            "ix_thread_submissions_reviewed_at_id",
+            reviewed_at.desc(),
+            id.desc(),
         ),
     )
 

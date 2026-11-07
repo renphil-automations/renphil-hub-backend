@@ -40,7 +40,7 @@ section; Threads Management's own shapes are unchanged.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -249,6 +249,14 @@ class ThreadSummary(BaseModel):
     # ancestor); every other caller gets 0, so a plain viewer never learns
     # that someone is editing a thread. Drives the widget row's indicator.
     pending_revision_count: int = 0
+    # plan_thread_reject_resubmit_2026-11-07.md §3 — "Revision N": how many
+    # times the author resubmitted this thread after a decline (0 = the
+    # original submission; owner decision 8).
+    resubmission_count: int = 0
+    # The latest submission instant: `created_at` until the first
+    # resubmission, then that resubmission's instant. The Pending queue
+    # orders by it (owner decision 14).
+    submitted_at: datetime
 
 
 # The revision lifecycle (plan_thread_edit_versioning_2026-09-22.md §1.1) —
@@ -291,6 +299,22 @@ class ThreadRevisionSummary(BaseModel):
     reviewed_at: datetime | None = None
     # generate_notification_excerpt, as ThreadSummary.content_excerpt does.
     content_excerpt: str = ""
+    # plan_thread_reject_resubmit_2026-11-07.md §3. The reviewer's reason
+    # for a decline — None on every non-rejected row and on a decline made
+    # before reasons existed (owner decision 12).
+    rejection_reason: str | None = None
+    # A rework of a declined edit (owner decision 9): the declined revision's
+    # id and version ("Resubmission of v5"), and this row's "Revision N" in
+    # the rework chain (the declined one's number + 1; 0 = not a rework).
+    resubmission_of_id: int | None = None
+    resubmission_of_version: int | None = None
+    resubmission_number: int = 0
+    # plan §12.3/§12.7 — a declined edit's Close (final). `closed_kind` is
+    # 'author' or 'superseded' (a newer version went live while it was open;
+    # `closed_by_version` = that version, set iff superseded).
+    closed_at: datetime | None = None
+    closed_kind: Literal["author", "superseded"] | None = None
+    closed_by_version: int | None = None
 
 
 class ThreadRevisionDetail(ThreadRevisionSummary):
@@ -306,6 +330,183 @@ class RevisionDecisionRequest(BaseModel):
     `earlier_revisions_pending`."""
 
     overwrite: bool = False
+
+
+# plan_thread_reject_resubmit_2026-11-07.md §3/D1 — a reason is plain text,
+# trimmed, 1..1000 code points, never markdown, never editable afterwards.
+MAX_REJECTION_REASON_LENGTH = 1000
+
+
+class RejectRequest(BaseModel):
+    """REQUIRED body of BOTH reject routes — `POST /threads/{id}/reject` and
+    `POST /threads/{id}/revisions/{rid}/reject` (owner decision 3). A
+    bodiless call is a 422, as is an empty / whitespace-only reason or one
+    over 1000 characters. Separate from `RevisionDecisionRequest` (the
+    approve route's optional `{overwrite}` body), which is unchanged."""
+
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def _check_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("A reason is required")
+        if len(value) > MAX_REJECTION_REASON_LENGTH:
+            raise ValueError(
+                f"Reason must be at most {MAX_REJECTION_REASON_LENGTH} characters"
+            )
+        return value
+
+
+class ThreadResubmitRequest(BaseModel):
+    """`POST /threads/{id}/resubmit` — a FULL snapshot, every field required
+    (the create body's shape, `mentions` included: an omitted array would be
+    ambiguous between "keep" and "clear"). Must differ from the declined
+    version in title, content or the set of mentioned emails, else 409
+    `unchanged_resubmission` (owner decisions 6/7)."""
+
+    title: str
+    content: str
+    mentions: list[MentionInput]
+
+    @field_validator("title")
+    @classmethod
+    def _check_title(cls, value: str) -> str:
+        return _validate_title(value)
+
+    @field_validator("content")
+    @classmethod
+    def _check_content(cls, value: str) -> str:
+        return _validate_content(value)
+
+
+class RevisionResubmitRequest(ThreadResubmitRequest):
+    """`POST /threads/{id}/revisions/{rid}/resubmit` — the rework of a
+    declined edit. `overwrite` is only read when the author has since become
+    an editor (D5: the rework goes live through the editor path, with its
+    409 `earlier_revisions_pending` / `overwrite` rule)."""
+
+    overwrite: bool = False
+
+
+# 'published' (plan §12.8 G3) is SYNTHESIZED, never stored: the final round
+# of a resubmission that an editor-author published themselves (D5), which
+# writes no decision row (M5).
+ThreadSubmissionStatus = Literal["pending", "approved", "rejected", "published"]
+
+
+class ThreadSubmissionRound(BaseModel):
+    """One round of a thread's submission timeline
+    (`GET /threads/{id}/submission-history`, plan §4.6): every decided round
+    from `thread_submissions`, oldest first, plus a SYNTHESIZED `pending`
+    round (from the live thread columns, `reviewed_*`/`reason` None) when
+    the thread is pending, or a SYNTHESIZED `published` round (snapshot = v1,
+    reviewer = v1's publisher) when an editor-author's resubmission went live
+    without a decision (plan §12.8 G3). `round` 0 is the original
+    submission, n the n-th resubmission ("Revision n"). `reason` is None on
+    an approval / publication and on a decline recorded before reasons
+    existed."""
+
+    round: int
+    status: ThreadSubmissionStatus
+    title: str
+    content: str
+    mentions: list[MentionEntry] = Field(default_factory=list)
+    reason: str | None = None
+    submitted_by_email: str
+    submitted_by_name: str | None = None
+    submitted_at: datetime
+    reviewed_by_email: str | None = None
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime | None = None
+
+
+class ThreadRoundDecision(BaseModel):
+    """A decided round without its snapshot — `ThreadModerationRow.
+    last_decision` on a grouped History card. `published` = the synthesized
+    G3 round (an editor-author's self-published resubmission, plan §12.8)."""
+
+    round: int
+    status: Literal["approved", "rejected", "published"]
+    reason: str | None = None
+    reviewed_by_email: str
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime
+
+
+class PreviousRejection(BaseModel):
+    """`ThreadModerationRow.previous_rejection` — the latest declined round
+    of a pending RESUBMISSION (pending + `resubmission_count > 0`), so the
+    Pending card can show "Previously declined by X: <reason>"."""
+
+    round: int
+    reason: str | None = None
+    reviewed_by_email: str
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime
+
+
+class DeclinedThreadItem(BaseModel):
+    """A declined NEW thread in its author's inbox."""
+
+    kind: Literal["thread"] = "thread"
+    thread_id: int
+    title: str
+    content_excerpt: str = ""
+    resubmission_count: int = 0
+    reason: str | None = None
+    declined_by_email: str | None = None
+    declined_by_name: str | None = None
+    declined_at: datetime | None = None
+    # plan §12.7 — set on items in `DeclinedItemsResponse.closed` only.
+    # Always 'author' for a thread.
+    closed_at: datetime | None = None
+    closed_kind: Literal["author"] | None = None
+
+
+class DeclinedEditItem(BaseModel):
+    """A declined EDIT of a published thread in its submitter's inbox.
+    `title`/`content_excerpt` are the declined revision's; `thread_title`
+    is the live thread's."""
+
+    kind: Literal["edit"] = "edit"
+    thread_id: int
+    revision_id: int
+    version: int
+    title: str
+    content_excerpt: str = ""
+    thread_title: str
+    resubmission_number: int = 0
+    reason: str | None = None
+    declined_by_email: str | None = None
+    declined_by_name: str | None = None
+    declined_at: datetime | None = None
+    # plan §12.7 — set on items in `DeclinedItemsResponse.closed` only.
+    closed_at: datetime | None = None
+    closed_kind: Literal["author", "superseded"] | None = None
+    closed_by_version: int | None = None
+
+
+DeclinedItem = Annotated[Union[DeclinedThreadItem, DeclinedEditItem], Field(discriminator="kind")]
+
+
+class DeclinedItemsResponse(BaseModel):
+    """`GET /threads/component/{link}/declined` — the caller's own declined
+    items on one widget (plan §4.7, amended §12.7).
+
+    `items`: the OPEN ones (declined, not reworked, not closed), newest
+    decline first, capped at `DECLINED_ITEMS_CAP` (100) with `truncated`.
+    `closed`: the CLOSED ones (by the author, or superseded by a newer live
+    version), newest `closed_at` first, capped at `CLOSED_ITEMS_CAP` (50)
+    with `closed_truncated` — read-only; never counted in
+    `declined_count`. Not paginated. Everything empty for a no-subject
+    caller."""
+
+    items: list[DeclinedItem] = Field(default_factory=list)
+    truncated: bool = False
+    closed: list[DeclinedItem] = Field(default_factory=list)
+    closed_truncated: bool = False
 
 
 class ThreadDetail(ThreadSummary):
@@ -362,6 +563,12 @@ class ThreadListResponse(BaseModel):
         description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
     )
     view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    # plan_thread_reject_resubmit §4.7 — how many of the CALLER'S OWN items
+    # on this widget await their changes (declined threads + declined,
+    # not-yet-reworked edits — OPEN only, closed ones never count, §12.7). Scoped
+    # server-side: 0 for every other caller and for no-subject callers.
+    # Drives the widget's "Revisions (N)" button through the existing poll.
+    declined_count: int = 0
 
 
 class ThreadModerationRow(ThreadSummary):
@@ -379,6 +586,21 @@ class ThreadModerationRow(ThreadSummary):
     component_link: str
     widget_title: str
     location_label: str
+    # plan_thread_reject_resubmit_2026-11-07.md §3/§4.6.
+    # The author's Close of a declined thread (plan §12.3) — History shows
+    # "Closed by author". `closed_kind` is always 'author' on threads.
+    closed_at: datetime | None = None
+    closed_kind: Literal["author"] | None = None
+    # Pending rows: the latest declined round, only for a pending
+    # RESUBMISSION (`resubmission_count > 0`); None otherwise.
+    previous_rejection: PreviousRejection | None = None
+    # History cards (grouped by thread, owner decision 13): the latest
+    # decided round, how many rounds were decided, and which round numbers
+    # satisfied the active filters (`[]` when unfiltered). Pending-queue
+    # rows and decide responses carry the same fields from the same rounds.
+    last_decision: ThreadRoundDecision | None = None
+    decision_count: int = 0
+    matched_rounds: list[int] = Field(default_factory=list)
 
 
 class ThreadRevisionModerationRow(ThreadRevisionSummary):
