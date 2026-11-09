@@ -10,7 +10,7 @@ def _fake_db():
     return SimpleNamespace(commit=MagicMock(), rollback=MagicMock())
 
 
-def test_nav_access_control_write_does_not_reindex_descendants(monkeypatch):
+def test_legacy_nav_access_metadata_does_not_trigger_search_refresh(monkeypatch):
     db = _fake_db()
     nav = SimpleNamespace(
         id=7,
@@ -33,8 +33,8 @@ def test_nav_access_control_write_does_not_reindex_descendants(monkeypatch):
         "get_nav_tab_by_document_id",
         lambda _db, _document_id: nav,
     )
-    reindex = MagicMock()
-    monkeypatch.setattr(nav_tab_service, "_nav_tab_component_search_updates", reindex)
+    refresh = MagicMock()
+    monkeypatch.setattr(nav_tab_service, "_nav_tab_component_search_updates", refresh)
 
     result = nav_tab_service.update_nav_tab_v2(
         db,
@@ -46,7 +46,7 @@ def test_nav_access_control_write_does_not_reindex_descendants(monkeypatch):
     assert result["access_control"] == new_access
     assert nav.access_control == new_access
     assert result["search_updates"] == []
-    reindex.assert_not_called()
+    refresh.assert_not_called()
     db.commit.assert_called_once()
     db.rollback.assert_not_called()
 

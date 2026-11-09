@@ -12,6 +12,8 @@ than ad-hoc validators.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, StrictBool, StrictStr
 
 from app.schemas.tab import CLEAN_TEXT_PATTERN, StrictRequestModel
@@ -157,6 +159,12 @@ class ScopeResponse(BaseModel):
     # assignment is hub-wide — the NARROWEST option — while "Any Scope"
     # reaches everyone on any scope, present or future.
     is_public: StrictBool = False
+
+    # What the Airtable sync made this scope from: 'cluster', 'program', or
+    # None for an ordinary Hub scope (plan_airtable_sync_v2_2026-10-21.md
+    # §4.1). Read-only: deliberately absent from both request bodies below.
+    # The graph view colours nodes by it.
+    type: Literal["cluster", "program"] | None = None
 
     # Always empty for a universal scope: it contains everything implicitly
     # and is barred from the edge table entirely (§5.5), so rendering it with

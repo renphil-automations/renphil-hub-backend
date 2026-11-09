@@ -819,8 +819,10 @@ async def release_locks_now_unauthorized(db: Session) -> list[LockNode]:
             continue
 
         if hub_user.id not in protected_by_hub_user_id:
+            # `model_construct`: a stored holder email can be malformed (a
+            # space), and `UserInfo`'s `EmailStr` would raise mid-sweep.
             synthetic = CurrentHubUser(
-                info=UserInfo(email=holder, name=hub_user.name or holder, roles=[]),
+                info=UserInfo.model_construct(email=holder, name=hub_user.name or holder, picture=None, roles=[]),
                 hub_user_id=hub_user.id,
                 email=holder,
             )

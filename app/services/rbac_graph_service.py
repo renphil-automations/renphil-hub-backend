@@ -1011,15 +1011,22 @@ def validate_scope_edge(db: Session, parent_scope_id: int, child_scope_id: int) 
         )
 
 
-def create_scope_edge(db: Session, parent_scope_id: int, child_scope_id: int) -> ScopeEdgeV2:
+def create_scope_edge(
+    db: Session, parent_scope_id: int, child_scope_id: int, *, source: str = "manual"
+) -> ScopeEdgeV2:
     """Lock, validate, insert. The lock is taken here rather than left to the
     caller so there is no way to reach ``validate_scope_edge`` unprotected on
-    the write path."""
+    the write path.
+
+    `source` is 'manual' for every admin path; only the Airtable sync passes
+    'airtable_sync' (plan_airtable_sync_v2_2026-10-21.md §3.3 C3). It is not
+    on any request body."""
     lock_scope_graph(db)
     validate_scope_edge(db, parent_scope_id, child_scope_id)
     edge = ScopeEdgeV2(
         parent_scope_id=parent_scope_id,
         child_scope_id=child_scope_id,
+        source=source,
         created_at=_utc_now(),
     )
     db.add(edge)

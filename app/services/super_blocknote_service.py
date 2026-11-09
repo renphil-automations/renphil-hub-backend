@@ -62,6 +62,7 @@ from app.services.content_link_registry import mark_component_links_deleted, syn
 from app.services.access_visibility_service import (
     NodeRef,
     ViewerAccess,
+    refreshed_viewer_access,
     require_edit,
     require_force_allowed,
 )
@@ -555,7 +556,10 @@ def create_sbn_node(
         sync_component_links(db, new_component)
 
         db.commit()
-        response = _format_sbn_summary(db, new_component)
+        # Same as gridstack_service.create_tab_v2's echo.
+        response = _format_sbn_summary(
+            db, new_component, access=refreshed_viewer_access(db, access)
+        )
         receipts = [{"component_id": new_component.id, "action": "upsert"}]
         if overview_component is not None:
             receipts.insert(

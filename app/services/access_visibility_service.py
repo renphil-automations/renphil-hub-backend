@@ -1705,6 +1705,9 @@ class ViewerAccess(NamedTuple):
 
     visibility: VisibilityResult | None
     full_access: bool
+    # Whose access this is — only so `refreshed_viewer_access` can recompute
+    # it after a create (the snapshot predates the new node).
+    hub_user_id: int | None = None
 
     def verdict(self, node: NodeRef | None) -> NodeVerdict:
         if self.full_access:
@@ -1758,11 +1761,29 @@ def resolve_viewer_access(
     endpoint in one page load.
     """
     if is_admin:
-        return ViewerAccess(visibility=None, full_access=True)
+        return ViewerAccess(visibility=None, full_access=True, hub_user_id=hub_user_id)
     return ViewerAccess(
         visibility=compute_visibility(db, hub_user_id, closures=closures),
         full_access=False,
+        hub_user_id=hub_user_id,
     )
+
+
+def refreshed_viewer_access(db: Session, access: ViewerAccess | None) -> ViewerAccess | None:
+    """``access`` recomputed against the tree as it stands NOW, for a create
+    route's response echo (plan_login_airtable_removal_2026-10-31.md Step 3).
+
+    The request's ``ViewerAccess`` is built before the insert, so its fold
+    has never seen the new node and would call it invisible. A Hub Admin's
+    answer cannot change mid-request, so ``full_access`` is reused as is;
+    ``None`` (an internal caller asking for no check) stays ``None``, and so
+    does an access with no ``hub_user_id`` — no triple beats a stale one.
+    """
+    if access is None or access.full_access:
+        return access
+    if access.hub_user_id is None:
+        return None
+    return resolve_viewer_access(db, access.hub_user_id, is_admin=False)
 
 
 def list_visible_nodes(visibility: VisibilityResult) -> list[dict]:

@@ -471,8 +471,8 @@ def create_hub_user_admin(
 ):
     """Owner decision, 2026-10-04: lets an admin add someone OUTSIDE the org
     email domains so they can sign in — `AuthService._enforce_login_allowed`
-    admits any email with a `hub_users` row (Airtable Access Control remains
-    a fallback until cutover). Org-domain emails are accepted too: they
+    admits any email with a `hub_users` row (the only way in for an external
+    email since 2026-10-31). Org-domain emails are accepted too: they
     could sign in anyway, and pre-registering them lets an admin assign
     roles before their first login."""
     try:

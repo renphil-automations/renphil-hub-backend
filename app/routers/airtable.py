@@ -87,9 +87,6 @@ from app.models.airtable import (
     FeedbackCreate,
     FeedbackRecord,
     AwardedOpportunityRecord,
-    AccessControlAssign,
-    AccessControlRecord,
-    AccessControlRevoke,
     CheckinReportingPeriodRecord,
     ClusterRecord,
     CountResponse,
@@ -1546,21 +1543,25 @@ def _airtable_component_visible_to(
     db: Session,
     link: str,
     email: str,
-    roles: list[str],
 ) -> ComponentV2 | None:
-    """Return the component for `link` only when `email`/`roles` can view it.
+    """Return the component for `link` only when `email` can view it.
 
     Rebuilt during the 2026-09-15 sandbox merge: the access_control_service
     engine this originally called (`can_view` over an `effective_ac` blob)
     was torn out on this branch for the granted_single_node/effective_pairs
     design — mirrors `_resolve_airtable_bundle_and_access`'s own
     is_hub_admin-or-granted_single_node shape, the same primitive this
-    file's other six routes already use. `email`/`roles` here are an
-    arbitrary verified Agent identity (see get_airtable_personal_context's
-    own docstring), not necessarily the caller's own JWT, so this resolves
+    file's other six routes already use. `email` here is an arbitrary
+    verified Agent identity (see get_airtable_personal_context's own
+    docstring), not necessarily the caller's own JWT, so this resolves
     hub_user_id itself rather than taking a CurrentHubUser — an identity
     with no hub_users row (never logged in) has no grants either way and
     fails closed to None, exactly like an unknown link does.
+
+    Both checks read Postgres on every call, so a revocation applies at once.
+    Role names are not an input: `is_hub_admin` ignores them, and the Airtable
+    lookup that used to supply them is gone
+    (plan_login_airtable_removal_2026-10-31.md).
     """
     bundle = get_airtable_component_bundle(db, link)
     if bundle is None:
@@ -1572,7 +1573,7 @@ def _airtable_component_visible_to(
 
     closures = _LazyRbacClosures(db)
     current = CurrentHubUser(
-        info=UserInfo(email=email, name="", picture=None, roles=list(roles or [])),
+        info=UserInfo(email=email, name="", picture=None, roles=[]),
         hub_user_id=hub_user.id,
         email=email,
     )
@@ -1624,12 +1625,6 @@ async def get_airtable_personal_context(
     """
 
     email = str(identity.get("email") or "").strip().lower()
-    # The signed context binds the user email to the trusted Agent, but roles
-    # inside it are a login-time JWT snapshot. Reload current Hub roles before
-    # any component visibility decision so revocations and All Scopes changes
-    # take effect immediately.
-    live_roles = await airtable_service.get_user_roles(email)
-    roles = [str(role).strip() for role in live_roles if str(role).strip()]
 
     links = await asyncio.to_thread(list_airtable_component_links, db)
     total_links = len(links)
@@ -1644,7 +1639,6 @@ async def get_airtable_personal_context(
             db,
             link,
             email,
-            roles,
         )
         if component is None:
             continue
@@ -4449,51 +4443,6 @@ async def _require_admin_dep(
 
 
 @router.get(
-    "/access-control",
-    response_model=list[AccessControlRecord],
-    dependencies=[Depends(_require_admin_dep)],
-    summary="List all Access Control records (admin only)",
-)
-@airtable_cache(table="ACCESS_CONTROL_TABLE")
-async def list_access_control(
-    airtable_service: AirtableService = Depends(get_airtable_service),
-):
-    return await airtable_service.list_access_control_records()
-
-
-@router.post(
-    "/access-control/assign",
-    response_model=AccessControlRecord,
-    summary="Upsert role(s) and/or permission(s) for a user email (admin only)",
-)
-@invalidates_cache(["list_access_control"])
-async def assign_access_control(
-    payload: AccessControlAssign = Body(...),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-    airtable_service: AirtableService = Depends(get_airtable_service),
-):
-    _require_admin(db, current)
-    return await airtable_service.upsert_access_control(payload)
-
-
-@router.post(
-    "/access-control/revoke",
-    response_model=AccessControlRecord,
-    summary="Remove role(s) and/or permission(s) for a user email (admin only)",
-)
-@invalidates_cache(["list_access_control"])
-async def revoke_access_control(
-    payload: AccessControlRevoke = Body(...),
-    current: CurrentHubUser = Depends(get_current_hub_user),
-    db: Session = Depends(get_db_v2),
-    airtable_service: AirtableService = Depends(get_airtable_service),
-):
-    _require_admin(db, current)
-    return await airtable_service.revoke_access_control(payload)
-
-
-@router.get(
     "/access-control/team-emails",
     response_model=list[str],
     summary="Unique Work Email values from the Teams table",
@@ -4538,7 +4487,7 @@ async def get_permissions(
     status_code=status.HTTP_201_CREATED,
     summary="Create a new Role (admin only)",
 )
-@invalidates_cache(["get_roles", "list_access_control"])
+@invalidates_cache(["get_roles"])
 async def create_role(
     payload: RoleCreate = Body(...),
     current: CurrentHubUser = Depends(get_current_hub_user),
@@ -4554,7 +4503,7 @@ async def create_role(
     response_model=Role,
     summary="Update a Role: name, scope, and/or permissions (admin only)",
 )
-@invalidates_cache(["get_roles", "list_access_control"])
+@invalidates_cache(["get_roles"])
 async def update_role(
     role_id: str = Path(..., description="Role record id."),
     payload: RoleUpdate = Body(...),
@@ -4571,7 +4520,7 @@ async def update_role(
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a Role (admin only)",
 )
-@invalidates_cache(["get_roles", "list_access_control"])
+@invalidates_cache(["get_roles"])
 async def delete_role(
     role_id: str = Path(..., description="Role record id."),
     current: CurrentHubUser = Depends(get_current_hub_user),

@@ -115,10 +115,39 @@ class ScopeV2(BaseV2):
     # unclearability too — `update_scope` writes only name/description.
     is_system = Column(Boolean, nullable=False, default=False)
 
+    # What the Airtable sync made this scope from
+    # (AI Docs/plan_airtable_sync_v2_2026-10-21.md §4.1): 'cluster' or
+    # 'program'. NULL is an ordinary Hub scope. Having children does NOT make
+    # a scope a cluster — an admin can nest any scopes by hand — so the
+    # frontend's graph colours read this, not the edge table.
+    #
+    # Written ONLY by the sync, when it creates or links a scope, and never
+    # flipped between the two values. Absent from both scope request bodies
+    # (StrictRequestModel, so sending it is a 422), same as is_universal.
+    type = Column(String(16), nullable=True)
+
+    # The Airtable "Record ID"/"Record Id" COLUMN of the cluster or program
+    # this scope mirrors (never the API id). Never set on the universal or
+    # public scope. A program row that IS a cluster (plan v2 C2) is an alias
+    # kept in airtable_sync_records, not here — one column, one id.
+    airtable_record_id = Column(String(32), nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
+        CheckConstraint(
+            "type IS NULL OR type IN ('cluster', 'program')",
+            name="ck_scopes_type",
+        ),
+        # Partial, both dialect predicates — see uq_scopes_single_universal.
+        Index(
+            "uq_scopes_airtable_record_id",
+            "airtable_record_id",
+            unique=True,
+            postgresql_where=text("airtable_record_id IS NOT NULL"),
+            sqlite_where=text("airtable_record_id IS NOT NULL"),
+        ),
         # At most one universal scope, enforced by the database rather than
         # by whoever writes the admin UI. A second one would make
         # "every scope" ambiguous and silently double every closure.
@@ -197,9 +226,18 @@ class ScopeEdgeV2(BaseV2):
         index=True,
     )
 
+    # Who made the edge: 'manual' (an admin) or 'airtable_sync' (a program
+    # placed under its cluster). The sync only ever adds or removes its own
+    # edges (plan_airtable_sync_v2_2026-10-21.md §3.3 C3).
+    source = Column(String(16), nullable=False, default="manual", server_default="manual")
+
     created_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
+        CheckConstraint(
+            "source IN ('manual', 'airtable_sync')",
+            name="ck_parent_child_scopes_source",
+        ),
         UniqueConstraint("parent_scope_id", "child_scope_id", name="uq_parent_child_scopes_pair"),
         # Catches a self-loop. Not redundant here the way it is on
         # parent_child_roles — this graph has no rank rule behind it, so this CHECK

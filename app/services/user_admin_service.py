@@ -199,7 +199,11 @@ def _holds_hub_admin_pair(db: Session, user: UserV2) -> bool:
 def _is_hub_admin(db: Session, user: UserV2) -> bool:
     """The same resolver every gate uses, for the "this person is a Hub
     Admin" line (owner, Q4). Local import: `app.dependencies` sits above
-    the services."""
+    the services.
+
+    `model_construct` skips `UserInfo`'s `EmailStr` check: a stored email
+    can be malformed (e.g. contains a space), and cleaning those up is one
+    of the reasons to delete a user, so the preview must not 500 on it."""
     from app.dependencies import CurrentHubUser, is_hub_admin
     from app.models.auth import UserInfo
 
@@ -207,7 +211,7 @@ def _is_hub_admin(db: Session, user: UserV2) -> bool:
     if not email:
         return False
     synthetic = CurrentHubUser(
-        info=UserInfo(email=email, name=user.name or email, roles=[]),
+        info=UserInfo.model_construct(email=email, name=user.name or email, picture=None, roles=[]),
         hub_user_id=user.id,
         email=email,
     )

@@ -129,7 +129,6 @@ class Settings(BaseSettings):
     AWARDED_OPPORTUNITIES_TABLE: str
     DELIVERABLES_TABLE: str
     # RenPhil Hub base
-    ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
     FEEDBACKS_TABLE: str
@@ -137,7 +136,6 @@ class Settings(BaseSettings):
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
     OFFICE_SPACES_TABLE: str
-    ACCESS_CONTROL_TABLE: str
     TEAMS_TABLE: str
     USERS_TABLE: str
     ROLES_TABLE: str
@@ -162,18 +160,8 @@ class Settings(BaseSettings):
     ORGANIZATION_INFO_TABLE: str | None = None
 
     # ── Field names ───────────────────────────────────────────────────
-    # Admins / Access Control
-    ADMINS_EMAIL_FIELD: str
-    ACCESS_CONTROL_USER_EMAIL_FIELD: str
-    ACCESS_CONTROL_ROLES_FIELD: str
-    ACCESS_CONTROL_PERMISSIONS_FIELD: str
-    ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str
-    ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
-    TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
     USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
@@ -196,16 +184,12 @@ class Settings(BaseSettings):
     USERS_MANAGER_FIELD: str
     USERS_TECH_STACK_SELECTIONS_FIELD: str
     USERS_HEADSHOT_FIELD: str
-    USERS_FOR_WEBSITE_FIELD: str
     # Roles / Permissions
     ROLES_NAME_FIELD: str
     ROLES_PERMISSIONS_FIELD: str
     ROLES_SCOPE_FIELD: str
     PERMISSIONS_NAME_FIELD: str
     PERMISSIONS_DESCRIPTION_FIELD: str
-
-    # Role auto-assigned to first-time authenticated users.
-    DEFAULT_MEMBER_ROLE: str = "Hub Member"
 
     # ── Fundraising (Total Moved & Deployed) fields ───────────────────
     AT_F_AMOUNT: str
@@ -243,8 +227,10 @@ class Settings(BaseSettings):
     AT_F_REVIEW_UNTIL: str
     AT_F_PERIOD: str
 
+    # Primary-key field name shared by every Airtable table looked up by ID.
+    AIRTABLE_ID_FIELD: str = "Id"
+
     # ── Announcements fields ──────────────────────────────────────────
-    AT_F_ANN_ID: str
     AT_F_ANN_TITLE: str
     AT_F_ANN_CONTENT: str
     AT_F_ANN_AUTHOR_EMAIL: str
@@ -268,7 +254,6 @@ class Settings(BaseSettings):
     AT_F_FEEDBACK_RESPONSE: str = "Response"
 
     # ── Tickets fields ────────────────────────────────────────────────
-    AT_F_TICKET_ID: str
     AT_F_TICKET_TITLE: str
     AT_F_TICKET_DESCRIPTION: str
     AT_F_TICKET_STATUS: str
@@ -283,7 +268,6 @@ class Settings(BaseSettings):
     AT_F_TICKET_PARENT_LINK: str
 
     # ── Grant Application Resources fields ────────────────────────────
-    AT_F_GAR_ID: str | None = None
     AT_F_GAR_DOCUMENT: str | None = None
     AT_F_GAR_DOCUMENT_URL: str | None = None
     AT_F_GAR_NOTES: str | None = None
@@ -291,7 +275,6 @@ class Settings(BaseSettings):
     AT_F_GAR_TABS: str | None = None
 
     # ── Finance Links fields ──────────────────────────────────────────
-    AT_F_FL_ID: str
     AT_F_FL_DOCUMENT: str
     AT_F_FL_DOCUMENT_URL: str
 
@@ -303,32 +286,7 @@ class Settings(BaseSettings):
     # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
 
-    # ── Meeting Cadence fields ────────────────────────────────────────
-    AT_F_MC_MEETING_TITLE: str
-    AT_F_MC_DESCRIPTION: str
-    AT_F_MC_ATTACHMENT_URL: str
-
-    # ── Useful Links fields ───────────────────────────────────────────
-    AT_F_UL_DOCUMENT: str
-    AT_F_UL_DOCUMENT_URL: str
-    AT_F_UL_DESCRIPTION: str
-
-    # ── HR & Benefits fields ──────────────────────────────────────────
-    AT_F_HR_DOCUMENT: str
-    AT_F_HR_DOCUMENT_URL: str
-    AT_F_HR_DESCRIPTION: str
-
-    # ── Onboarding fields ─────────────────────────────────────────────
-    AT_F_OB_DOCUMENT: str
-    AT_F_OB_DOCUMENT_URL: str
-    AT_F_OB_NOTES: str
-
-    # ── Onboarding Calls fields ───────────────────────────────────────
-    AT_F_OBC_DATE: str
-    AT_F_OBC_NOTES: str
-
     # ── Quick Links fields ────────────────────────────────────────────
-    AT_F_QL_ID: str
     AT_F_QL_ANCHOR_TEXT: str
     AT_F_QL_URL: str
     AT_F_QL_EMAIL: str
@@ -336,23 +294,19 @@ class Settings(BaseSettings):
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
     # ── Quick Actions fields ──────────────────────────────────────────
-    AT_F_QA_ID: str = "ID"
     AT_F_QA_ACTION: str
 
     # ── Partnerships Links fields ─────────────────────────────────────
-    AT_F_PL_ID: str
     AT_F_PL_TEXT: str
     AT_F_PL_LINK: str
     AT_F_PL_CATEGORY: str
     AT_F_PL_TYPE: str
 
     # ── Policy Links fields ───────────────────────────────────────────
-    AT_F_POL_ID: str | None = None
     AT_F_POL_TEXT: str | None = None
     AT_F_POL_URL: str | None = None
 
     # ── Events Quick Links fields ───────────────────────────────────
-    AT_F_EQL_ID: str | None = None
     AT_F_EQL_TITLE: str | None = None
     AT_F_EQL_ANCHOR_TEXT: str | None = None
     AT_F_EQL_TYPE: str | None = None
@@ -360,35 +314,30 @@ class Settings(BaseSettings):
     AT_F_EQL_EMAIL: str | None = None
 
     # ── Finance Quick Links fields ──────────────────────────────────
-    AT_F_FQL_ID: str | None = None
     AT_F_FQL_ANCHOR_TEXT: str | None = None
     AT_F_FQL_URL: str | None = None
     AT_F_FQL_ENTITY: str | None = None
     AT_F_FQL_TABS: str | None = None
 
     # ── Comms Quick Links fields ────────────────────────────────────
-    AT_F_CQL_ID: str = "ID"
     AT_F_CQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_CQL_TYPE: str = "Type"
     AT_F_CQL_URL: str = "URL"
     AT_F_CQL_EMAIL: str = "Email"
 
     # ── HR Quick Links fields ───────────────────────────────────────
-    AT_F_HRQL_ID: str = "ID"
     AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_HRQL_TYPE: str = "Type"
     AT_F_HRQL_URL: str = "URL"
     AT_F_HRQL_EMAIL: str = "Email"
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
-    AT_F_DDL_ID: str | None = None
     AT_F_DDL_ANCHOR_TEXT: str | None = None
     AT_F_DDL_URL: str | None = None
     AT_F_DDL_ENTITY: str | None = None
     AT_F_DDL_TABS: str | None = None
 
     # ── Board Member List fields ─────────────────────────────────────
-    AT_F_BM_ID: str | None = None
     AT_F_BM_TITLE: str | None = None
     AT_F_BM_FULL_NAME: str | None = None
     AT_F_BM_ROLE: str | None = None
@@ -397,7 +346,6 @@ class Settings(BaseSettings):
     AT_F_BM_ENTITY: str | None = None
     AT_F_BM_TABS: str | None = None
     # ── Organization Info fields ────────────────────────────────
-    AT_F_OI_ID: str | None = None
     AT_F_OI_TITLE: str | None = None
     AT_F_OI_CONTENT: str | None = None
     AT_F_OI_ENTITY: str | None = None
@@ -414,6 +362,54 @@ class Settings(BaseSettings):
     # Organization email domain (e.g. ``renphil.org``) used to construct
     # the ``assigned_by`` email from the Slack ``user_name`` field.
     ORG_DOMAIN: str | None = None
+
+    # ══════════════════════════════════════════════════════════════════
+    # Airtable → Hub sync (AI Docs/plan_airtable_sync_v2_2026-10-21.md)
+    # ══════════════════════════════════════════════════════════════════
+    # All in the RenPhil Hub base (RENPHIL_HUB_BASE_ID). Prefixed
+    # AIRTABLE_SYNC_ because CLUSTERS_TABLE above already names the Fund &
+    # Program base's clusters table. Optional so the app boots without them;
+    # the sync endpoints that need one report it missing.
+    AIRTABLE_SYNC_PROGRAM_ROLES_TABLE: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_DESIGNATION_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_EMPLOYEE_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAM_ROLES_PROGRAM_RECORD_ID_FIELD: str | None = None
+    # Cluster table
+    AIRTABLE_SYNC_CLUSTERS_TABLE: str | None = None
+    AIRTABLE_SYNC_CLUSTERS_NAME_FIELD: str | None = None
+    AIRTABLE_SYNC_CLUSTERS_RECORD_ID_FIELD: str | None = None
+    # "Public incl. Finance Dashboard" (the programs)
+    AIRTABLE_SYNC_PROGRAMS_TABLE: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_NAME_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_CLUSTER_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_PROGRAMS_CLUSTER_LINK_FIELD: str | None = None
+    # Users (USERS_TABLE): the fields the USERS_* settings above don't cover.
+    AIRTABLE_SYNC_USERS_RECORD_ID_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_IS_FELLOW_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_BIRTHDAY_OPT_OUT_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_POST_ON_WEBSITE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_NEW_HEADSHOT_BIO_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_ADD_TO_WEBSITE_DATE_FIELD: str | None = None
+    # The sync's own names for four fields whose shared USERS_* setting
+    # names a field Airtable doesn't have (owner, 2026-10-23). Blank → the
+    # shared setting is used.
+    AIRTABLE_SYNC_USERS_START_DATE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_END_DATE_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_OFFICE_LOCATION_FIELD: str | None = None
+    AIRTABLE_SYNC_USERS_TECH_STACK_FIELD: str | None = None
+
+    # ══════════════════════════════════════════════════════════════════
+    # Cloudflare R2: headshots copied by the Airtable sync (plan v2 §7)
+    # ══════════════════════════════════════════════════════════════════
+    # Optional: without them the sync skips the Headshot field (one warning
+    # per run). The two keys are secrets: never log or print them.
+    R2_ACCESS_KEY_ID: str | None = None
+    R2_SECRET_ACCESS_KEY: str | None = None
+    R2_BUCKET: str | None = None
+    R2_ENDPOINT_URL: str | None = None
+    R2_KEY_PREFIX: str | None = None  # e.g. "headshots/" (trailing slash)
+    R2_PUBLIC_BASE_URL: str | None = None  # e.g. "https://pub-….r2.dev"
 
     # ══════════════════════════════════════════════════════════════════
     # Gemini (Google Generative AI)
@@ -460,6 +456,10 @@ class Settings(BaseSettings):
     # Shared secret for POST /data/airtable/cache/refresh — same shape as
     # AGENT_SYNC_TOKEN below, sent as X-Sync-Token. Unset ⇒ 503.
     CACHE_REFRESH_TOKEN: str | None = None
+    # Shared secret for POST /v2/airtable-sync/tick (the Airtable → Hub
+    # sync's scheduler, called by the same cron), sent as X-Sync-Token.
+    # Unset ⇒ 503: no scheduled runs.
+    AIRTABLE_SYNC_TOKEN: str | None = None
     # A scheduled refresh will NOT re-walk a widget whose cached entry is
     # younger than this (plan_airtable_cache_scaling_2026-08-08.md §4.4).
     #
@@ -620,6 +620,39 @@ class Settings(BaseSettings):
     # Kept as text so a bad value can never stop the API from starting; it is
     # parsed by `product_analytics_service.parse_retention_days`.
     PRODUCT_ANALYTICS_RETENTION_DAYS: str = "365"
+    # Archive-before-delete for age-expired product analytics: a private
+    # Cloudflare R2 bucket reached through its S3-compatible endpoint
+    # (`https://<ANALYTICS_ARCHIVE_R2_ACCOUNT_ID>.r2.cloudflarestorage.com`). All four values are
+    # required by `scripts/archive_product_analytics.py` and validated there
+    # (`product_analytics_archive.R2Config.from_settings`); the API never reads
+    # them and never starts worse without them. Use an API token scoped to
+    # this one bucket with Object Read & Write only. Never log these values.
+    ANALYTICS_ARCHIVE_R2_ACCOUNT_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY: str = ""
+    ANALYTICS_ARCHIVE_R2_BUCKET_NAME: str = ""
+    # A SECOND token for `scripts/reconcile_product_analytics_archives.py`
+    # only. The reconciliation lists, reads and deletes STAGING objects and
+    # never writes; Cloudflare's token levels cannot exclude delete or list,
+    # so that restriction is in the code, not in the token — keep the two
+    # identities separate anyway. Leave empty on the API and on the writer's
+    # schedule.
+    ANALYTICS_ARCHIVE_R2_RECONCILE_ACCESS_KEY_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY: str = ""
+    # Key prefix inside the bucket; archives live under
+    # `<prefix>/<environment>/<events|engagements>/v<format>/...`.
+    PRODUCT_ANALYTICS_ARCHIVE_PREFIX: str = "hub-product-analytics"
+    # Per R2 operation, in seconds; validated by the archive commands.
+    PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS: str = "240"
+    # Dedicated scheduler credential; never expose it to the browser.
+    PRODUCT_ANALYTICS_ARCHIVE_TRIGGER_TOKEN: str = ""
+    # Whether archives carry the internal View As diagnostics
+    # (`view_as_role_key`, `view_as_scope_key`, `view_as_context`). Default
+    # `omit` (decided 2026-11-03): the real actor identity analytics needs is
+    # kept, the diagnostics are not, and once the live rows are deleted they
+    # cannot be restored. `include` must be set explicitly — see
+    # PRODUCT_ANALYTICS_ARCHIVE.md, "Privacy".
+    PRODUCT_ANALYTICS_ARCHIVE_VIEW_AS: str = "omit"
 
     @property
     def hub_environment(self) -> str:

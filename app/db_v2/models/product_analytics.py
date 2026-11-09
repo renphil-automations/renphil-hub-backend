@@ -7,7 +7,7 @@ the two are stored, counted and exported independently.
 
 from __future__ import annotations
 
-from sqlalchemy import JSON, BigInteger, Column, DateTime, Index, Integer, String
+from sqlalchemy import JSON, BigInteger, CheckConstraint, Column, DateTime, Index, Integer, String
 
 from app.db_v2.database import BaseV2
 
@@ -103,3 +103,61 @@ class HubProductEngagementV2(BaseV2):
         Index("ix_hub_product_engagements_nav_ended", "nav_tab_id", "ended_at"),
         Index("ix_hub_product_engagements_tab_ended", "tab_id", "ended_at"),
     )
+
+
+class HubProductAnalyticsArchiveV2(BaseV2):
+    """The archive registry: one row per archive object the retention job
+    has **committed** (see `product_analytics_archive`).
+
+    An object in the bucket is an archive only if its key is here. The row is
+    inserted in the same transaction that verified the object's bytes, held
+    the Hub rows its records depend on, and deleted those records from the
+    live tables; an upload that the job abandoned (deadline, connection loss,
+    crash, rollback) may still produce an object, but never a row here, and
+    anything that reads archives must start from this table, not from a
+    bucket listing. Contains no personal data: keys, counts, id ranges,
+    timestamps and digests.
+    """
+
+    __tablename__ = "hub_product_analytics_archives"
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    key = Column(String(512), nullable=False, unique=True)
+    environment = Column(String(16), nullable=False)
+    table_name = Column(String(32), nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    format_version = Column(Integer, nullable=False)
+    records = Column(Integer, nullable=False)
+    first_id = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
+    last_id = Column(BigInteger().with_variant(Integer, "sqlite"), nullable=False)
+    time_min = Column(DateTime(timezone=True), nullable=False)
+    time_max = Column(DateTime(timezone=True), nullable=False)
+    omitted_columns = Column(JSON, nullable=False, default=list)
+    registered_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_hub_product_analytics_archives_env_table", "environment", "table_name", "registered_at"),
+    )
+
+
+class HubProductAnalyticsArchiveIdentityV2(BaseV2):
+    """Exactly one row: the identity of this registry database, stamped as
+    metadata (`registry-id`) on every object the archive job uploads.
+
+    The singleton is enforced by the database: the primary key is the
+    constant 1 (`CHECK (singleton = 1)`), so concurrent first-time
+    initialisers conflict on the key and exactly one id wins; every caller
+    then reads that one row. `bucket`/`prefix` record the storage this
+    identity was first used with, so a cloned or restored database pointed at
+    other storage fails closed instead of silently claiming objects there.
+    The id never rotates on its own; see the runbook ("Registry identity")."""
+
+    __tablename__ = "hub_product_analytics_archive_identity"
+
+    singleton = Column(Integer, primary_key=True, default=1)
+    id = Column(String(36), nullable=False, unique=True)
+    bucket = Column(String(63), nullable=True)
+    prefix = Column(String(256), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (CheckConstraint("singleton = 1", name="ck_hub_product_analytics_archive_identity_singleton"),)

@@ -36,6 +36,7 @@ from app.services.access_visibility_service import (
     AccessDeniedError,
     NodeNotViewableError,
     ViewerAccess,
+    refreshed_viewer_access,
     require_edit,
     require_force_allowed,
     resolve_gridstack_node,
@@ -1921,7 +1922,11 @@ def create_tab_variant_v2(
 
         affected_component_ids = _component_ids_for_gridstack_tree(db, new_gridstack)
         db.commit()
-        response = _format_tab_summary(db, new_gridstack)
+        # Echo the real view/edit so the frontend never falls back to its
+        # legacy role check (plan_login_airtable_removal_2026-10-31.md Step 3).
+        response = _format_tab_summary(
+            db, new_gridstack, access=refreshed_viewer_access(db, access)
+        )
         response["search_updates"] = [
             {"component_id": component_id, "action": "upsert"}
             for component_id in affected_component_ids
@@ -2878,7 +2883,10 @@ def create_tab_v2(
 
         db.commit()
 
-        response = _format_tab_summary(db, new_gridstack)
+        # Same as create_tab_variant_v2's echo.
+        response = _format_tab_summary(
+            db, new_gridstack, access=refreshed_viewer_access(db, access)
+        )
         receipts: dict[int, str] = {
             created_gridstack_component.id: "upsert"
         }
