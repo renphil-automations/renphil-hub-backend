@@ -108,7 +108,10 @@ from app.schemas.thread import (
     PreviousRejection,
     RevisionPerson,
     ThreadDetail,
+    ThreadHistoryDecision,
     ThreadHistoryFacets,
+    ThreadHistoryListResponse,
+    ThreadHistoryRow,
     ThreadListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
@@ -1566,6 +1569,144 @@ def _pending_revision_summaries(
 # ---------------------------------------------------------
 
 
+def _resolve_widget_title(component: ComponentV2, preloaded_content: dict[int, Any]) -> str:
+    """A thread widget's display title: `PageContentV2.content["title"]`,
+    then `component.title`, then `"Discussion"` (see below)."""
+    title: str | None = None
+    if component.page_content_id is not None:
+        content = preloaded_content.get(component.page_content_id)
+        if isinstance(content, dict):
+            raw_title = content.get("title")
+            title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+    return title or component.title or "Discussion"
+
+
+def _widget_titles_for_component_ids(db: Session, component_ids: list[int]) -> dict[int, str]:
+    """`component_id -> widget title` for a whole moderated set, in two
+    queries and WITHOUT the location walk — History search matches widget
+    titles, which live in JSON, so it resolves them here and turns the hits
+    into a `component_id IN (...)` predicate."""
+    if not component_ids:
+        return {}
+    components = db.query(ComponentV2).filter(ComponentV2.id.in_(component_ids)).all()
+    page_content_ids = {c.page_content_id for c in components if c.page_content_id is not None}
+    preloaded: dict[int, Any] = {}
+    if page_content_ids:
+        preloaded = {
+            row.id: row.content
+            for row in db.query(PageContentV2).filter(PageContentV2.id.in_(page_content_ids))
+        }
+    return {c.id: _resolve_widget_title(c, preloaded) for c in components}
+
+
+def _history_search_predicate(db: Session, q: str, component_ids: list[int], title_columns: list[Any]):
+    """History search (2026-11-09): a case-insensitive substring of any of
+    `title_columns` OR of the widget title. `%`, `_` and `\\` in `q` are
+    literal. Returns None for a blank `q` (no filter)."""
+    needle = (q or "").strip()
+    if not needle:
+        return None
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+    predicates = [col.ilike(pattern, escape="\\") for col in title_columns]
+    folded = needle.casefold()
+    widget_hits = [
+        cid
+        for cid, title in _widget_titles_for_component_ids(db, component_ids).items()
+        if folded in title.casefold()
+    ]
+    if widget_hits:
+        predicates.append(ThreadV2.component_id.in_(widget_hits))
+    return or_(*predicates)
+
+
+HISTORY_GROUPS = ("thread", "widget")
+HISTORY_ORDERS = ("newest", "oldest")
+
+
+def _encode_keyset(values: list[Any]) -> str:
+    """Opaque cursor for a History page: the last row's sort key, datetimes
+    as ISO strings. Ungrouped = `(decided_at, id)` — the same wire format
+    `_encode_cursor` writes; grouped = `(group_at, group_id, decided_at, id)`."""
+    payload = json.dumps([v.isoformat() if isinstance(v, datetime) else v for v in values])
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_keyset(cursor: str, grouped: bool) -> tuple[Any, ...]:
+    """Inverse of `_encode_keyset`; a cursor from the other mode (or junk)
+    is a 400 — the caller must resend the same filters with its cursor."""
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        if grouped:
+            g_at, g_id, at, row_id = raw
+            return (_as_utc(datetime.fromisoformat(g_at)), int(g_id), _as_utc(datetime.fromisoformat(at)), int(row_id))
+        at, row_id = raw
+        return (_as_utc(datetime.fromisoformat(at)), int(row_id))
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor") from exc
+
+
+def _keyset_page(
+    db: Session,
+    base,
+    *,
+    decided_at,
+    row_id,
+    group_column,
+    order: str,
+    cursor: str | None,
+):
+    """One History page over `base` (an ORM query whose single entity is
+    the row model, already filtered). Sort: `decided_at, row_id`, newest or
+    oldest first. With `group_column`, rows of one group come out together
+    — groups sorted by their newest (or, oldest-first, their oldest)
+    decision under the SAME filters, then rows inside — so a group never
+    interleaves with another and may only continue on the next page.
+
+    Returns `(rows, group_sizes, next_cursor)`; `group_sizes[i]` is None
+    when ungrouped."""
+    newest = order != "oldest"
+    if group_column is not None:
+        agg = func.max(decided_at) if newest else func.min(decided_at)
+        groups = (
+            base.with_entities(
+                group_column.label("gk"), agg.label("g_at"), func.count(row_id).label("g_n")
+            )
+            .group_by(group_column)
+            .subquery()
+        )
+        query = base.join(groups, groups.c.gk == group_column).add_columns(
+            groups.c.g_at, groups.c.gk, groups.c.g_n
+        )
+        keys = (groups.c.g_at, groups.c.gk, decided_at, row_id)
+    else:
+        query = base
+        keys = (decided_at, row_id)
+
+    if cursor:
+        after = _decode_keyset(cursor, grouped=group_column is not None)
+        query = query.filter(tuple_(*keys) < after if newest else tuple_(*keys) > after)
+
+    query = query.order_by(*[k.desc() if newest else k.asc() for k in keys])
+    fetched = query.limit(THREADS_PAGE_SIZE + 1).all()
+    has_more = len(fetched) > THREADS_PAGE_SIZE
+    fetched = fetched[:THREADS_PAGE_SIZE]
+
+    if group_column is not None:
+        rows = [f[0] for f in fetched]
+        sizes = [int(f[3]) for f in fetched]
+        last_key = list(fetched[-1][1:3]) if fetched else []
+    else:
+        rows = list(fetched)
+        sizes = [None] * len(rows)
+        last_key = []
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = _encode_keyset(last_key + [getattr(last, "reviewed_at"), last.id])
+    return rows, sizes, next_cursor
+
+
 def _widget_title_and_location_for_components(
     db: Session, components: dict[int, ComponentV2]
 ) -> dict[int, tuple[str, str]]:
@@ -1617,16 +1758,7 @@ def _widget_title_and_location_for_components(
 
     result: dict[int, tuple[str, str]] = {}
     for component_id, component in components.items():
-        title: str | None = None
-        if component.page_content_id is not None:
-            content = preloaded_content.get(component.page_content_id)
-            if isinstance(content, dict):
-                raw_title = content.get("title")
-                title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
-        if not title:
-            title = component.title or None
-        if not title:
-            title = "Discussion"
+        title = _resolve_widget_title(component, preloaded_content)
 
         location_refs = [ref for ref in chains[component_id] if ref[0] in ("tab", "nav_tab")]
         # `walk_ancestors` is nearest-first; a location label reads root-first.
@@ -3637,95 +3769,128 @@ def list_thread_history(
     date_to: datetime | None = None,
     authors: list[str] | None = None,
     reviewers: list[str] | None = None,
+    types: list[str] | None = None,
+    q: str | None = None,
+    group: str | None = None,
+    order: str = "newest",
     access: ViewerAccess | None = None,
-) -> ThreadModerationListResponse:
-    """`GET /threads/moderation/history` — GROUPED BY THREAD
-    (plan_thread_reject_resubmit_2026-11-07.md §4.6, owner decision 13): one
-    row per thread, same scoping as the pending queue. Base set = threads
-    with `last_decided_at IS NOT NULL` (M5: a legacy or editor-auto-published
-    thread was never explicitly decided and does not appear). A thread that
-    was declined and resubmitted (pending again, `reviewed_*` cleared) is
-    STILL listed with its earlier decision. Newest `last_decided_at` first;
-    the cursor is `_encode_cursor(last_decided_at, id)`.
+) -> ThreadHistoryListResponse:
+    """`GET /threads/moderation/history` — ONE ROW PER DECISION (2026-11-09
+    history-table rework, replacing owner decision 13's one row per thread):
+    every stored `thread_submissions` round in the caller's moderated set,
+    newest decision first (`reviewed_at DESC, id DESC`). A thread declined
+    twice and then approved is three rows. The synthesized G3 `published`
+    round is not a decision and never appears (its v1 is in Revision
+    Management as an Original). A pending resubmission's earlier rounds stay
+    listed; the pending round itself is the Pending tab's.
 
-    Optional filters, all combinable, ANY-MATCH over the thread's decided
-    rounds (`thread_submissions`): a thread is listed if at least ONE of its
-    rounds satisfies every round-level filter at once —
-    - `statuses` ⊆ approved/rejected — the round's decision;
-    - `date_from` (inclusive) / `date_to` (exclusive) — the round's
-      `reviewed_at` (instants; the client sends its own local-day bounds);
-    - `reviewers` — the round's decider (any-of, case-insensitive).
-    `authors` is thread-level (the thread author; any-of). Each row's
-    `matched_rounds` names the rounds that satisfied the round-level filters
-    (every round when only `authors` is set), `[]` when unfiltered.
+    Optional filters, all combinable, each on the ROW (no any-match):
+    - `statuses` ⊆ approved/rejected — the decision;
+    - `types` ⊆ new/resubmission — round 0 vs round > 0;
+    - `date_from` (inclusive) / `date_to` (exclusive) — the decision instant;
+    - `authors` — the submitter (always the thread author), `reviewers` —
+      the decider (any-of, case-insensitive);
+    - `q` — substring of the decided title, the thread's current title, or
+      the widget title (`_history_search_predicate`).
+    `group` = thread | widget keeps each group's rows together
+    (`_keyset_page`) and sets `group_size`; `order` = newest | oldest.
 
     The cursor only encodes the position; the caller must resend the same
-    filters with it."""
+    filters, group and order with it."""
     if statuses and any(
         value not in (THREAD_STATUS_APPROVED, THREAD_STATUS_REJECTED) for value in statuses
     ):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid status filter")
+    if types and any(value not in ("new", "resubmission") for value in types):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid type filter")
+    if group is not None and group not in HISTORY_GROUPS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid group")
+    if order not in HISTORY_ORDERS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid order")
 
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
-        return ThreadModerationListResponse(items=[], next_cursor=None)
+        return ThreadHistoryListResponse(items=[], next_cursor=None)
 
-    round_predicates = []
+    base = (
+        db.query(ThreadSubmissionV2)
+        .join(ThreadV2, ThreadV2.id == ThreadSubmissionV2.thread_id)
+        .filter(ThreadV2.component_id.in_(component_ids))
+    )
     if statuses:
-        round_predicates.append(ThreadSubmissionV2.status.in_(statuses))
+        base = base.filter(ThreadSubmissionV2.status.in_(statuses))
+    if types and set(types) != {"new", "resubmission"}:
+        base = base.filter(
+            ThreadSubmissionV2.round == 0 if types[0] == "new" else ThreadSubmissionV2.round > 0
+        )
     if date_from is not None:
-        round_predicates.append(ThreadSubmissionV2.reviewed_at >= _as_utc(date_from))
+        base = base.filter(ThreadSubmissionV2.reviewed_at >= _as_utc(date_from))
     if date_to is not None:
-        round_predicates.append(ThreadSubmissionV2.reviewed_at < _as_utc(date_to))
+        base = base.filter(ThreadSubmissionV2.reviewed_at < _as_utc(date_to))
+    if authors:
+        base = base.filter(
+            ThreadSubmissionV2.submitted_by_email.in_({_norm_email(e) for e in authors})
+        )
     if reviewers:
-        round_predicates.append(
+        base = base.filter(
             ThreadSubmissionV2.reviewed_by_email.in_({_norm_email(e) for e in reviewers})
         )
-    filtered = bool(round_predicates or authors)
-
-    query = db.query(ThreadV2).filter(
-        ThreadV2.component_id.in_(component_ids),
-        ThreadV2.last_decided_at.isnot(None),
+    search = _history_search_predicate(
+        db, q or "", component_ids, [ThreadSubmissionV2.title, ThreadV2.title]
     )
-    if round_predicates:
-        # ANY-match: one round must satisfy ALL round-level filters together.
-        query = query.filter(
-            db.query(ThreadSubmissionV2.id)
-            .filter(ThreadSubmissionV2.thread_id == ThreadV2.id, *round_predicates)
-            .exists()
+    if search is not None:
+        base = base.filter(search)
+
+    group_column = None
+    if group == "thread":
+        group_column = ThreadSubmissionV2.thread_id
+    elif group == "widget":
+        group_column = ThreadV2.component_id
+
+    rounds, sizes, next_cursor = _keyset_page(
+        db,
+        base,
+        decided_at=ThreadSubmissionV2.reviewed_at,
+        row_id=ThreadSubmissionV2.id,
+        group_column=group_column,
+        order=order,
+        cursor=cursor,
+    )
+    if not rounds:
+        return ThreadHistoryListResponse(items=[], next_cursor=next_cursor)
+
+    # The page's distinct threads, in one batch, built exactly like the
+    # pending queue's rows (the review modal reads them).
+    thread_ids = list(dict.fromkeys(r.thread_id for r in rounds))
+    threads = {t.id: t for t in db.query(ThreadV2).filter(ThreadV2.id.in_(thread_ids)).all()}
+    thread_rows = {
+        row.id: row
+        for row in _to_moderation_rows(db, [threads[i] for i in thread_ids if i in threads])
+    }
+
+    items: list[ThreadHistoryRow] = []
+    for round_row, size in zip(rounds, sizes):
+        thread_row = thread_rows.get(round_row.thread_id)
+        if thread_row is None:
+            continue
+        items.append(
+            ThreadHistoryRow(
+                **thread_row.model_dump(),
+                decision=ThreadHistoryDecision(
+                    submission_id=round_row.id,
+                    round=round_row.round,
+                    status=round_row.status,
+                    title=round_row.title,
+                    reason=round_row.reason,
+                    submitted_at=round_row.submitted_at,
+                    reviewed_by_email=round_row.reviewed_by_email,
+                    reviewed_by_name=round_row.reviewed_by_name,
+                    reviewed_at=round_row.reviewed_at,
+                ),
+                group_size=size,
+            )
         )
-    if authors:
-        query = query.filter(ThreadV2.author_email.in_({_norm_email(e) for e in authors}))
-    if cursor:
-        after_decided_at, after_id = _decode_cursor(cursor)
-        query = query.filter(
-            tuple_(ThreadV2.last_decided_at, ThreadV2.id) < (after_decided_at, after_id)
-        )
-
-    rows = (
-        query.order_by(ThreadV2.last_decided_at.desc(), ThreadV2.id.desc())
-        .limit(THREADS_PAGE_SIZE + 1)
-        .all()
-    )
-    has_more = len(rows) > THREADS_PAGE_SIZE
-    page = rows[:THREADS_PAGE_SIZE]
-    next_cursor = (
-        _encode_cursor(page[-1].last_decided_at, page[-1].id) if has_more and page else None
-    )
-
-    matched: dict[int, list[int]] = {}
-    if filtered and page:
-        for thread_id, round_ in (
-            db.query(ThreadSubmissionV2.thread_id, ThreadSubmissionV2.round)
-            .filter(ThreadSubmissionV2.thread_id.in_([t.id for t in page]), *round_predicates)
-            .order_by(ThreadSubmissionV2.thread_id, ThreadSubmissionV2.round)
-            .all()
-        ):
-            matched.setdefault(thread_id, []).append(round_)
-
-    return ThreadModerationListResponse(
-        items=_to_moderation_rows(db, page, matched_rounds=matched), next_cursor=next_cursor
-    )
+    return ThreadHistoryListResponse(items=items, next_cursor=next_cursor)
 
 
 def thread_history_facets(
@@ -3973,6 +4138,9 @@ def list_revision_history(
     authors: list[str] | None = None,
     reviewers: list[str] | None = None,
     thread_ids: list[int] | None = None,
+    q: str | None = None,
+    group: str | None = None,
+    order: str = "newest",
     access: ViewerAccess | None = None,
 ) -> ThreadRevisionModerationListResponse:
     """`GET /threads/revision-moderation/history` — every NON-pending
@@ -3992,14 +4160,22 @@ def list_revision_history(
     - `thread_ids` = one or more threads' own version logs (phase C: the
       review modal asks whether an earlier edit of THIS thread was rejected,
       plan §7.4). Narrows within the moderated set, never widens it — an
-      unmoderated thread's id simply matches nothing.
+      unmoderated thread's id simply matches nothing;
+    - `q` (2026-11-09) — substring of the revision's title, the thread's
+      current title, or the widget title (`_history_search_predicate`).
+    `group` = thread | widget keeps each group's rows together
+    (`_keyset_page`) and sets `group_size`; `order` = newest | oldest.
     The cursor only encodes the position; the caller must resend the same
-    filters with it."""
+    filters, group and order with it."""
     statuses = list(statuses or REVISION_DECIDED_STATUSES)
     if any(value not in REVISION_DECIDED_STATUSES for value in statuses):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid status filter")
     if origins and any(value not in REVISION_ORIGINS for value in origins):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid origin filter")
+    if group is not None and group not in HISTORY_GROUPS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid group")
+    if order not in HISTORY_ORDERS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid order")
 
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
@@ -4025,25 +4201,33 @@ def list_revision_history(
         )
     if thread_ids:
         query = query.filter(ThreadRevisionV2.thread_id.in_(set(thread_ids)))
-    if cursor:
-        after_at, after_id = _decode_cursor(cursor)
-        query = query.filter(
-            tuple_(ThreadRevisionV2.reviewed_at, ThreadRevisionV2.id) < (after_at, after_id)
-        )
+    search = _history_search_predicate(
+        db, q or "", component_ids, [ThreadRevisionV2.title, ThreadV2.title]
+    )
+    if search is not None:
+        query = query.filter(search)
 
-    rows = (
-        query.order_by(ThreadRevisionV2.reviewed_at.desc(), ThreadRevisionV2.id.desc())
-        .limit(THREADS_PAGE_SIZE + 1)
-        .all()
+    group_column = None
+    if group == "thread":
+        group_column = ThreadRevisionV2.thread_id
+    elif group == "widget":
+        group_column = ThreadV2.component_id
+
+    page, sizes, next_cursor = _keyset_page(
+        db,
+        query,
+        decided_at=ThreadRevisionV2.reviewed_at,
+        row_id=ThreadRevisionV2.id,
+        group_column=group_column,
+        order=order,
+        cursor=cursor,
     )
-    has_more = len(rows) > THREADS_PAGE_SIZE
-    page = rows[:THREADS_PAGE_SIZE]
-    next_cursor = (
-        _encode_cursor(page[-1].reviewed_at, page[-1].id) if has_more and page else None
-    )
-    return ThreadRevisionModerationListResponse(
-        items=_to_revision_moderation_rows(db, page), next_cursor=next_cursor
-    )
+    items = _to_revision_moderation_rows(db, page)
+    if group_column is not None:
+        size_by_id = {r.id: s for r, s in zip(page, sizes)}
+        for item in items:
+            item.group_size = size_by_id.get(item.id)
+    return ThreadRevisionModerationListResponse(items=items, next_cursor=next_cursor)
 
 
 def revision_history_facets(

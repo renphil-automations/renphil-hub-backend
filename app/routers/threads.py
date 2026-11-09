@@ -113,6 +113,7 @@ from app.schemas.thread import (
     ThreadDetailViewAsResponse,
     ThreadHistoryFacets,
     ThreadListResponse,
+    ThreadHistoryListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
     ThreadModerationSummary,
@@ -358,8 +359,8 @@ async def list_pending_threads(
 
 @router.get(
     "/threads/moderation/history",
-    response_model=ThreadModerationListResponse,
-    summary="Threads the caller moderates that have an explicit decision, most recent first, filterable",
+    response_model=ThreadHistoryListResponse,
+    summary="Every explicit decision on a thread the caller moderates — one row per decision — filterable, searchable, groupable",
     responses={400: {"description": "Malformed cursor"}},
 )
 async def list_thread_history(
@@ -367,6 +368,16 @@ async def list_thread_history(
     status_filter: list[Literal["approved", "rejected"]] | None = Query(
         default=None, alias="status", description="Repeatable. Default: both."
     ),
+    type_filter: list[Literal["new", "resubmission"]] | None = Query(
+        default=None, alias="type", description="Round 0 (new) or a resubmission. Repeatable. Default: both."
+    ),
+    q: str | None = Query(
+        default=None, max_length=200, description="Substring of the decided title, current title or widget title."
+    ),
+    group: Literal["thread", "widget"] | None = Query(
+        default=None, description="Keep each thread's / widget's rows together."
+    ),
+    order: Literal["newest", "oldest"] = Query(default="newest"),
     date_from: datetime | None = Query(
         default=None, description="Decision instant, inclusive (ISO-8601; naive = UTC)."
     ),
@@ -387,6 +398,10 @@ async def list_thread_history(
         date_to=date_to,
         authors=author,
         reviewers=reviewer,
+        types=type_filter,
+        q=q,
+        group=group,
+        order=order,
         access=access,
     )
 
@@ -490,6 +505,13 @@ async def list_revision_history(
     thread_id: list[int] | None = Query(
         default=None, description="Thread id. Repeatable. Narrows within the moderated set."
     ),
+    q: str | None = Query(
+        default=None, max_length=200, description="Substring of the revision title, current title or widget title."
+    ),
+    group: Literal["thread", "widget"] | None = Query(
+        default=None, description="Keep each thread's / widget's rows together."
+    ),
+    order: Literal["newest", "oldest"] = Query(default="newest"),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
@@ -504,6 +526,9 @@ async def list_revision_history(
         authors=author,
         reviewers=reviewer,
         thread_ids=thread_id,
+        q=q,
+        group=group,
+        order=order,
         access=access,
     )
 

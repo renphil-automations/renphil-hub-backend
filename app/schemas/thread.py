@@ -622,6 +622,9 @@ class ThreadRevisionModerationRow(ThreadRevisionSummary):
     thread_title: str
     thread_version: int
     earlier_pending_count: int = 0
+    # History with `group=thread|widget` only: how many rows the whole group
+    # holds under the active filters (it may continue on the next page).
+    group_size: int | None = None
 
 
 class ThreadRevisionModerationListResponse(BaseModel):
@@ -687,6 +690,40 @@ class ThreadDetailViewAsResponse(ThreadDetail):
 
 class ThreadModerationListResponse(BaseModel):
     items: list[ThreadModerationRow] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ThreadHistoryDecision(BaseModel):
+    """The ONE decision a Threads Management History row stands for — a
+    stored `thread_submissions` round (2026-11-09 history-table rework:
+    one row per decision, replacing owner decision 13's one row per
+    thread). `title` is the snapshot that was decided; `round` 0 is the
+    original submission ("New thread"), n the n-th resubmission."""
+
+    submission_id: int
+    round: int
+    status: Literal["approved", "rejected"]
+    title: str
+    reason: str | None = None
+    submitted_at: datetime
+    reviewed_by_email: str
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime
+
+
+class ThreadHistoryRow(ThreadModerationRow):
+    """`GET /threads/moderation/history` row: the thread as it is NOW (the
+    inherited `ThreadModerationRow`, which the review modal reads) plus the
+    decision this row is about. Several rows can share one thread `id`, so
+    key rows on `decision.submission_id`."""
+
+    decision: ThreadHistoryDecision
+    # `group=thread|widget` only: rows in the whole group under the filters.
+    group_size: int | None = None
+
+
+class ThreadHistoryListResponse(BaseModel):
+    items: list[ThreadHistoryRow] = Field(default_factory=list)
     next_cursor: str | None = None
 
 
