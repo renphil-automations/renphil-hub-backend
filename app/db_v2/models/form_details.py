@@ -16,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    String,
     Text,
     UniqueConstraint,
     Uuid,
@@ -42,6 +43,9 @@ class FormDetailsV2(BaseV2):
     # Write-only: never returned by any endpoint.
     pat = Column(Text, nullable=False)
     requires_authentication = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The form builder's `authType`: "none" | "submission" | "user". NULL on
+    # rows saved before it was recorded.
+    authentication_type = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
