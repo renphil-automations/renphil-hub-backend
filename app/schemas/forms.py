@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator
 
 from app.schemas.tab import StrictRequestModel
+
+# The form builder's `authType` values (see `form_service.FORM_AUTH_TYPES`).
+FormAuthType = Literal["none", "submission", "user"]
 
 
 def _validate_http_url(value: str) -> str:
@@ -39,6 +42,10 @@ class FormEmbedInfoResponse(BaseModel):
     id: str
     embed_url: str
     requires_authentication: bool
+    authentication_type: FormAuthType | None = Field(
+        default=None,
+        description="The form builder's `authType`; null if it didn't report a known one.",
+    )
 
 
 class FormComponentEmbedResponse(BaseModel):
@@ -50,9 +57,11 @@ class FormComponentEmbedResponse(BaseModel):
     embed_url: str = Field(
         ...,
         description="URL to load in the iframe. When `requires_authentication` is true "
-        "it already carries the viewer's `token=<jwt>` query param.",
+        "and `authentication_type` is `user`, it already carries the viewer's "
+        "`token=<jwt>` query param.",
     )
     requires_authentication: bool
+    authentication_type: FormAuthType | None = None
     expires_in_seconds: int | None = Field(
         default=None,
         description="Token lifetime; null when no token was issued. Re-fetch to get a fresh one.",
@@ -71,9 +80,10 @@ class SaveFormComponentRequest(StrictRequestModel):
     `link` set and matching an existing component → update it. Otherwise a
     new `form` component is created on the gridstack named by `document_id`.
 
-    The form spec (`form_id`, `embed_url`, `requires_authentication`) is
-    replaced on every save. `title`/`description` are partial: omit to keep
-    the stored value on update.
+    The form spec (`form_id`, `embed_url`, `requires_authentication`,
+    `authentication_type`) is replaced on every save — send the values
+    `GET /forms/{form_id}` returned. `title`/`description` are partial: omit
+    to keep the stored value on update.
 
     `pat` is write-only (never returned, including by
     `GET /v2/tabs/{id}/content`): omit it, or send `null`/"", to keep the
@@ -92,6 +102,7 @@ class SaveFormComponentRequest(StrictRequestModel):
     form_id: StrictStr = Field(..., min_length=1, max_length=255)
     embed_url: StrictStr = Field(..., min_length=1, max_length=2048)
     requires_authentication: StrictBool = False
+    authentication_type: FormAuthType | None = None
     pat: StrictStr | None = Field(default=None, max_length=1024)
 
     x: float | None = None
@@ -120,6 +131,7 @@ class FormComponentSpec(BaseModel):
     form_id: str | None = None
     embed_url: str | None = None
     requires_authentication: bool = False
+    authentication_type: FormAuthType | None = None
 
 
 class FormComponentResponse(BaseModel):
