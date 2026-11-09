@@ -1439,6 +1439,36 @@ def _resubmission_of_version(revision: ThreadRevisionV2) -> int | None:
     )
 
 
+def _resubmission_root_version(revision: ThreadRevisionV2) -> int | None:
+    """The version of the FIRST edit in `revision`'s rework chain — walk
+    `resubmission_of_id` back until a row links to nothing — so every attempt
+    reads "v4 (Revision 2 of v2)". None for a row that is not a rework. One
+    PK read per step; chains are short (one link per resubmission) and
+    reworks rare, the same reasoning as `_resubmission_of_version`. A
+    dangling link (`ON DELETE SET NULL` already clears those; defensive
+    only) stops the walk at the last row found; a cycle is impossible
+    (each link points at an older row) but is guarded anyway."""
+    if revision.resubmission_of_id is None:
+        return None
+    session = object_session(revision)
+    if session is None:
+        return None
+    version: int | None = None
+    next_id: int | None = revision.resubmission_of_id
+    seen: set[int] = {revision.id}
+    while next_id is not None and next_id not in seen:
+        seen.add(next_id)
+        row = (
+            session.query(ThreadRevisionV2.version, ThreadRevisionV2.resubmission_of_id)
+            .filter(ThreadRevisionV2.id == next_id)
+            .first()
+        )
+        if row is None:
+            break
+        version, next_id = row
+    return version
+
+
 def _to_revision_summary(revision: ThreadRevisionV2) -> ThreadRevisionSummary:
     return ThreadRevisionSummary(
         id=revision.id,
@@ -1457,6 +1487,7 @@ def _to_revision_summary(revision: ThreadRevisionV2) -> ThreadRevisionSummary:
         rejection_reason=revision.rejection_reason,
         resubmission_of_id=revision.resubmission_of_id,
         resubmission_of_version=_resubmission_of_version(revision),
+        resubmission_root_version=_resubmission_root_version(revision),
         resubmission_number=revision.resubmission_number or 0,
         closed_at=revision.closed_at,
         closed_kind=revision.closed_kind,

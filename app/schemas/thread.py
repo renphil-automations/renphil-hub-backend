@@ -308,6 +308,10 @@ class ThreadRevisionSummary(BaseModel):
     # the rework chain (the declined one's number + 1; 0 = not a rework).
     resubmission_of_id: int | None = None
     resubmission_of_version: int | None = None
+    # 2026-11-09 relabel: the version of the chain's FIRST edit (the one no
+    # rework points back from), so every attempt reads "v4 (Revision 2 of
+    # v2)". None when this row is not a rework.
+    resubmission_root_version: int | None = None
     resubmission_number: int = 0
     # plan §12.3/§12.7 — a declined edit's Close (final). `closed_kind` is
     # 'author' or 'superseded' (a newer version went live while it was open;
