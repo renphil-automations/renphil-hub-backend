@@ -1,7 +1,8 @@
 """
 Embedded forms: the form-builder proxy (list forms / one form's embed info),
 the `form` component upsert, and resolving a form component's embed URL for
-the viewer (authenticated via the stored PAT when the form requires it).
+the viewer (authenticated via the stored PAT when the form requires `user`
+authentication).
 
 A form component's spec lives in its own `form_details` row (1:1 with the
 component, deleted with it by `ON DELETE CASCADE`), never in the component's
@@ -57,6 +58,11 @@ _GENERIC_UPSTREAM_DETAIL = (
     "The form-builder service couldn't complete this request. Please try again, "
     "or contact support if it keeps happening."
 )
+
+# The form builder's `authType` values. Only "user" needs a per-viewer token
+# minted via `authenticate_with_pat`; "none" and "submission" embed as-is.
+FORM_AUTH_TYPES = ("none", "submission", "user")
+USER_AUTH_TYPE = "user"
 
 
 class FormBuilderError(Exception):
@@ -152,8 +158,8 @@ async def list_forms(pat: str) -> list[dict[str, str]]:
 
 
 async def get_form_embed_info(pat: str, form_id: str) -> dict[str, Any]:
-    """One form's embed metadata: id, embed URL, and whether the embed needs
-    a per-user authentication token."""
+    """One form's embed metadata: id, embed URL, whether the embed needs
+    authentication, and the form builder's authentication type."""
     key = _require_pat(pat)
     fid = (form_id or "").strip()
     if not fid:
@@ -177,7 +183,30 @@ async def get_form_embed_info(pat: str, form_id: str) -> dict[str, Any]:
         "id": str(data.get("id") or fid),
         "embed_url": str(embed_url),
         "requires_authentication": bool(data.get("requiresAuthentication", False)),
+        "authentication_type": _auth_type_or_none(data.get("authType")),
     }
+
+
+def _auth_type_or_none(value: Any) -> str | None:
+    """The form builder's `authType`, normalised; None when absent or not
+    one of `FORM_AUTH_TYPES`."""
+    if not isinstance(value, str):
+        return None
+    auth_type = value.strip().lower()
+    if auth_type in FORM_AUTH_TYPES:
+        return auth_type
+    logger.warning("Form-builder returned an unknown authType %r", value)
+    return None
+
+
+def requires_user_token(requires_authentication: bool, authentication_type: str | None) -> bool:
+    """Whether viewing the form needs a per-user token from
+    `authenticate_with_pat`: only an authenticated form of type "user". A row
+    with no recorded type (saved before it was stored) keeps the old
+    behaviour of authenticating whenever `requires_authentication` is set."""
+    if not requires_authentication:
+        return False
+    return authentication_type is None or authentication_type == USER_AUTH_TYPE
 
 
 async def authenticate_with_pat(pat: str, form_id: str, user_email: str) -> dict[str, Any]:
@@ -261,6 +290,7 @@ class FormEmbedTarget:
     form_id: str
     embed_url: str
     requires_authentication: bool
+    authentication_type: str | None
     pat: str
 
 
@@ -295,24 +325,27 @@ def get_form_embed_target(
         form_id=str(details.form_id),
         embed_url=details.embed_url,
         requires_authentication=bool(details.requires_authentication),
+        authentication_type=details.authentication_type,
         pat=details.pat,
     )
 
 
 async def resolve_form_embed(target: FormEmbedTarget, user_email: str) -> dict[str, Any]:
-    """The embed info to hand the viewer. A form that doesn't require
-    authentication gets its stored embed URL as-is (no form-builder call); one
-    that does gets a per-user token, minted under the stored PAT for
-    `user_email`, appended to it."""
+    """The embed info to hand the viewer. Only a form that requires
+    authentication with type "user" calls the form builder: it gets a per-user
+    token, minted under the stored PAT for `user_email`, appended to its
+    embed URL. Every other form (no authentication, or type "none" /
+    "submission") gets its stored embed URL as-is."""
     result: dict[str, Any] = {
         "link": target.link,
         "form_id": target.form_id,
         "embed_url": target.embed_url,
         "requires_authentication": target.requires_authentication,
+        "authentication_type": target.authentication_type,
         "expires_in_seconds": None,
         "max_uses": None,
     }
-    if not target.requires_authentication:
+    if not requires_user_token(target.requires_authentication, target.authentication_type):
         return result
 
     auth = await authenticate_with_pat(target.pat, target.form_id, user_email)
@@ -335,6 +368,7 @@ def _form_details_view(details: FormDetailsV2 | None) -> dict[str, Any] | None:
         "form_id": str(details.form_id),
         "embed_url": details.embed_url,
         "requires_authentication": bool(details.requires_authentication),
+        "authentication_type": details.authentication_type,
     }
 
 def _form_component_view(
@@ -364,6 +398,7 @@ def save_form_component(
     form_id: str,
     embed_url: str,
     requires_authentication: bool,
+    authentication_type: str | None = None,
     pat: Any = _UNSET,
     title: Any = _UNSET,
     description: Any = _UNSET,
@@ -477,6 +512,7 @@ def save_form_component(
         details.form_id = form_uuid
         details.embed_url = embed_url
         details.requires_authentication = bool(requires_authentication)
+        details.authentication_type = authentication_type
         if new_pat:
             details.pat = new_pat
         details.updated_at = now
