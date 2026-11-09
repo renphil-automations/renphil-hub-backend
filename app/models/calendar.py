@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -67,6 +69,21 @@ class CalendarEvent(BaseModel):
     attending: bool = Field(
         description="Whether the requesting user is on the event's guest list."
     )
+
+
+class CalendarBatchEntry(BaseModel):
+    """The outcome for one id in a batch lookup."""
+
+    requested_id: str
+    status: Literal["ok", "expired", "unavailable", "error"] = Field(
+        description=(
+            "ok: see `event`. expired: it ended, with no future occurrence or "
+            "continuation. unavailable: deleted or cancelled. error: Google "
+            "failed for this id, see `detail`."
+        )
+    )
+    event: CalendarEvent | None = None
+    detail: str | None = None
 
 
 class AttendanceRequest(BaseModel):

@@ -5,6 +5,10 @@ All three endpoints act as the events account (GOOGLE_CALENDAR_ID) via the
 CalendarService. The RSVP endpoint takes the attendee identity strictly from
 the authenticated JWT, never from the request body, so a caller can only ever
 add or remove *themselves*.
+
+The routes are plain ``def`` so FastAPI runs them on worker threads: the Google
+client blocks, including while backing off from a rate limit, and on the event
+loop that would freeze every other Hub request.
 """
 
 from __future__ import annotations
@@ -20,11 +24,12 @@ from app.models.auth import UserInfo
 from app.models.calendar import (
     AttendanceRequest,
     AttendanceResponse,
+    CalendarBatchEntry,
     CalendarEvent,
     CalendarIndexEvent,
     CalendarSearchResult,
 )
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import MAX_BATCH_EVENTS, CalendarService
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +59,7 @@ def _require_agent_sync_token(
     response_model=list[CalendarSearchResult],
     summary="Search upcoming events by title (admin edit-time picker)",
 )
-async def search_events(
+def search_events(
     query: str = Query(..., description="Case-insensitive title substring."),
     _user: UserInfo = Depends(get_current_user),
     service: CalendarService = Depends(get_calendar_service),
@@ -68,7 +73,7 @@ async def search_events(
     response_model=CalendarEvent,
     summary="Resolve a stored event to its next occurrence",
 )
-async def get_event(
+def get_event(
     event_id: str = Query(..., description="Stored event / series master id."),
     user: UserInfo = Depends(get_current_user),
     service: CalendarService = Depends(get_calendar_service),
@@ -78,11 +83,32 @@ async def get_event(
 
 
 @router.get(
+    "/events",
+    response_model=list[CalendarBatchEntry],
+    summary="Resolve several stored events to their next occurrences",
+)
+def get_events(
+    ids: list[str] = Query(
+        ...,
+        max_length=MAX_BATCH_EVENTS,
+        description="Stored event / series master ids; repeat the parameter.",
+    ),
+    user: UserInfo = Depends(get_current_user),
+    service: CalendarService = Depends(get_calendar_service),
+):
+    """Return one entry per id, in request order, for the carousel.
+
+    One failing id never fails the request: it gets its own status.
+    """
+    return service.get_events(ids, user.email)
+
+
+@router.get(
     "/index-event",
     response_model=CalendarIndexEvent,
     include_in_schema=False,
 )
-async def get_index_event(
+def get_index_event(
     event_id: str = Query(..., description="Stored event / series master id."),
     _service_auth: None = Depends(_require_agent_sync_token),
     service: CalendarService = Depends(get_calendar_service),
@@ -96,7 +122,7 @@ async def get_index_event(
     response_model=AttendanceResponse,
     summary="Add or remove yourself from an event",
 )
-async def set_attendance(
+def set_attendance(
     event_id: str,
     body: AttendanceRequest,
     user: UserInfo = Depends(get_current_user),
