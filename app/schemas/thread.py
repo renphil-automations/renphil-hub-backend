@@ -257,6 +257,12 @@ class ThreadSummary(BaseModel):
     # resubmission, then that resubmission's instant. The Pending queue
     # orders by it (owner decision 14).
     submitted_at: datetime
+    # plan_thread_pending_edit_update_2026-11-10 §3.8 (U9) — bumped by each
+    # author edit of a PENDING thread that changes it. A reviewer echoes it
+    # back as `expected_edit_count` (approve/reject); a mismatch is 409
+    # `thread_changed`. Declared here so `ThreadDetail` and
+    # `ThreadModerationRow` both carry it; meaningless once published.
+    edit_count: int = 0
 
 
 # The revision lifecycle (plan_thread_edit_versioning_2026-09-22.md §1.1) —
@@ -319,6 +325,12 @@ class ThreadRevisionSummary(BaseModel):
     closed_at: datetime | None = None
     closed_kind: Literal["author", "superseded"] | None = None
     closed_by_version: int | None = None
+    # plan_thread_pending_edit_update_2026-11-10 §3.1/§3.4 — how many times
+    # the author updated this pending edit in place (the stale-check token:
+    # send it back as `expected_edit_count`), and when they last did
+    # (None = never updated since submit).
+    edit_count: int = 0
+    updated_at: datetime | None = None
 
 
 class ThreadRevisionDetail(ThreadRevisionSummary):
@@ -331,9 +343,24 @@ class RevisionDecisionRequest(BaseModel):
     the explicit, opt-in confirmation that approving this revision may mark
     earlier pending ones `overwritten` and unreachable (owner decision 4).
     Absent/false, an out-of-order approve is refused with 409
-    `earlier_revisions_pending`."""
+    `earlier_revisions_pending`.
+
+    `expected_edit_count` (plan_thread_pending_edit_update §3.3): the
+    revision's `edit_count` as the reviewer read it. A mismatch is 409
+    `revision_changed` (the author updated it meanwhile); None skips the
+    check (scripts, older clients)."""
 
     overwrite: bool = False
+    expected_edit_count: int | None = None
+
+
+class ThreadDecisionRequest(BaseModel):
+    """OPTIONAL body of `POST /threads/{id}/approve`
+    (plan_thread_pending_edit_update §3.8, U9): the pending thread's
+    `edit_count` as the reviewer read it. A mismatch is 409
+    `thread_changed`; None or no body skips the check."""
+
+    expected_edit_count: int | None = None
 
 
 # plan_thread_reject_resubmit_2026-11-07.md §3/D1 — a reason is plain text,
@@ -346,9 +373,15 @@ class RejectRequest(BaseModel):
     `POST /threads/{id}/revisions/{rid}/reject` (owner decision 3). A
     bodiless call is a 422, as is an empty / whitespace-only reason or one
     over 1000 characters. Separate from `RevisionDecisionRequest` (the
-    approve route's optional `{overwrite}` body), which is unchanged."""
+    approve route's optional `{overwrite}` body), which is unchanged.
+
+    `expected_edit_count` (plan_thread_pending_edit_update §3.3/§3.8): the
+    stale-check token — the revision's or pending thread's `edit_count` as
+    the reviewer read it. A mismatch is 409 `revision_changed` /
+    `thread_changed`; None skips the check."""
 
     reason: str
+    expected_edit_count: int | None = None
 
     @field_validator("reason")
     @classmethod
@@ -531,11 +564,20 @@ class ThreadDetail(ThreadSummary):
     needs it: its base is the latest pending revision for a non-editor (the
     staged path's base rule) but always the LIVE thread for an editor (the
     editor path publishes over live). Nothing about the caller's own
-    authority is secret to them, so it is not scoped."""
+    authority is secret to them, so it is not scoped.
+
+    `open_declined_revision` (plan_thread_pending_edit_update §3.6, U5) —
+    the caller's newest OPEN declined edit of this thread (rejected, not
+    closed, not reworked), filled ONLY when the caller is the thread's
+    author; None for everyone else. While it is set, a non-editor author
+    cannot create a new edit (PATCH → 409 `declined_edit_open`) — they
+    resubmit or close it first; updating an existing pending edit stays
+    allowed."""
 
     content: str
     pending_revisions: list[ThreadRevisionSummary] = Field(default_factory=list)
     viewer_is_editor: bool = False
+    open_declined_revision: ThreadRevisionSummary | None = None
 
 
 class ThreadUpdateResult(BaseModel):
@@ -552,7 +594,13 @@ class ThreadUpdateResult(BaseModel):
     A PATCH that changes nothing against its base writes nothing: vs the
     live thread it reads `applied=True, revision=None`; vs the author's
     latest pending revision it reads `applied=False, revision=<that existing
-    revision>` (owner-approved 2026-09-23)."""
+    revision>` (owner-approved 2026-09-23).
+
+    plan_thread_pending_edit_update_2026-11-10 (U1): a non-editor's save
+    while they already have a pending edit UPDATES that edit in place —
+    `applied=False` and `revision` is the SAME row (same id and version),
+    with `edit_count` one higher. Compare `edit_count` before and after to
+    tell "updated" from "nothing changed"."""
 
     applied: bool
     thread: ThreadDetail

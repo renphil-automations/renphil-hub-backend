@@ -107,6 +107,7 @@ from app.schemas.thread import (
     NotificationListResponse,
     RejectRequest,
     RevisionDecisionRequest,
+    ThreadDecisionRequest,
     RevisionResubmitRequest,
     ThreadCreateRequest,
     ThreadDetail,
@@ -582,17 +583,27 @@ async def get_revision_moderation_summary(
     summary="Approve a pending thread — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
-        409: {"description": "Thread has already been reviewed"},
+        409: {
+            "description": "Thread has already been reviewed, or `detail.code` is "
+            "`thread_changed` (`expected_edit_count` no longer matches)"
+        },
     },
 )
 async def approve_thread(
+    payload: ThreadDecisionRequest | None = None,
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.decide_thread, db, thread_id, user, approve=True, access=access
+        thread_service.decide_thread,
+        db,
+        thread_id,
+        user,
+        approve=True,
+        expected_edit_count=payload.expected_edit_count if payload is not None else None,
+        access=access,
     )
 
 
@@ -602,7 +613,10 @@ async def approve_thread(
     summary="Reject a pending thread, with a required reason — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
-        409: {"description": "Thread has already been reviewed"},
+        409: {
+            "description": "Thread has already been reviewed, or `detail.code` is "
+            "`thread_changed` (`expected_edit_count` no longer matches)"
+        },
         422: {"description": "Missing body, or `reason` empty/whitespace or over 1000 characters"},
     },
 )
@@ -620,6 +634,7 @@ async def reject_thread(
         user,
         approve=False,
         reason=payload.reason,
+        expected_edit_count=payload.expected_edit_count,
         access=access,
     )
 
@@ -743,7 +758,8 @@ async def get_thread_revision(
             "description": "`detail.code` is `already_decided` (the revision is no longer pending) "
             "or `earlier_revisions_pending` (older pending edits exist, and/or open declined "
             "edits below this version would be closed as superseded — `detail.earlier` / "
-            "`detail.declined_open` — and `overwrite` was not set)"
+            "`detail.declined_open` — and `overwrite` was not set) or `revision_changed` "
+            "(`expected_edit_count` no longer matches the edit)"
         },
     },
 )
@@ -764,6 +780,7 @@ async def approve_thread_revision(
         user,
         approve=True,
         overwrite=overwrite,
+        expected_edit_count=payload.expected_edit_count if payload is not None else None,
         access=access,
     )
 
@@ -775,7 +792,7 @@ async def approve_thread_revision(
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
         404: {"description": "No such revision on this thread"},
-        409: {"description": "`detail.code` is `already_decided`"},
+        409: {"description": "`detail.code` is `already_decided` or `revision_changed`"},
         422: {"description": "Missing body, or `reason` empty/whitespace or over 1000 characters"},
     },
 )
@@ -795,6 +812,7 @@ async def reject_thread_revision(
         user,
         approve=False,
         reason=payload.reason,
+        expected_edit_count=payload.expected_edit_count,
         access=access,
     )
 
@@ -808,8 +826,9 @@ async def reject_thread_revision(
         404: {"description": "No such revision on this thread"},
         409: {
             "description": "`detail.code` is `not_rejected`, `closed` (with `closed_kind` / "
-            "`closed_by_version`), `already_resubmitted`, `unchanged_resubmission`, "
-            "`no_change` or `earlier_revisions_pending`"
+            "`closed_by_version`), `already_resubmitted`, `pending_edit_exists` "
+            "(non-editor: the thread already has a pending author edit), "
+            "`unchanged_resubmission`, `no_change` or `earlier_revisions_pending`"
         },
     },
 )
@@ -915,7 +934,11 @@ async def get_thread(
             "description": "Thread was rejected and can no longer be edited; or (editor, "
             "`detail.code` = `earlier_revisions_pending`) the thread has pending author "
             "edits and/or open declined edits this would close (`detail.declined_open`) "
-            "and `overwrite` was not set"
+            "and `overwrite` was not set; or (non-editor) `declined_edit_open` (an open "
+            "declined edit blocks a NEW edit — resubmit or close it), `unchanged_resubmission` "
+            "(a pending rework, or a pending resubmitted thread, edited back to the declined "
+            "text) or `no_change` (a pending rework edited back to the live text). A save "
+            "while a pending edit exists updates that edit in place"
         },
     },
 )

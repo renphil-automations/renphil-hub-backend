@@ -183,6 +183,10 @@ class ThreadV2(BaseV2):
     # stays readable for its author; it just leaves the open inbox.
     closed_at = Column(DateTime(timezone=True), nullable=True)
     closed_kind = Column(String(16), nullable=True)
+    # plan_thread_pending_edit_update_2026-11-10 §3.8 (U9) — bumped by every
+    # author edit of a PENDING thread that actually changes it; the stale-
+    # check token `decide_thread` compares against `expected_edit_count`.
+    edit_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
     __table_args__ = (
         # (component_id, created_at DESC, id DESC) — the one query the list
@@ -259,7 +263,11 @@ class ThreadRevisionV2(BaseV2):
     two separate machines that share vocabulary and nothing else, and
     ``threads.status`` never moves while a revision is decided (plan §1.1).
     Many pending revisions per thread are legal (owner decision 1) — there
-    is NO "at most one pending" index.
+    is NO "at most one pending" index. Since plan_thread_pending_edit_update
+    _2026-11-10 (U1) an author's save while they have a pending edit UPDATES
+    that row in place (``edit_count += 1``, ``updated_at``), so new threads
+    hold at most one; threads from before keep their several until they
+    drain through review (§3.5).
 
     Same cascade rule as every other table in this module (see the module
     docstring): the FK's ``ON DELETE CASCADE`` removes a thread's revisions
@@ -325,6 +333,13 @@ class ThreadRevisionV2(BaseV2):
     closed_at = Column(DateTime(timezone=True), nullable=True)
     closed_kind = Column(String(16), nullable=True)
     closed_by_version = Column(Integer, nullable=True)
+    # plan_thread_pending_edit_update_2026-11-10 §3.1 — how many times the
+    # author updated this PENDING edit in place after submitting it (the
+    # stale-check token of `decide_thread_revision`), and when they last did
+    # (display only; NULL = never updated). `submitted_at` keeps the
+    # original submit time, so the queue order doesn't move.
+    edit_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    updated_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -388,6 +403,17 @@ class ThreadRevisionV2(BaseV2):
             id.desc(),
             postgresql_where=text("reviewed_at IS NOT NULL"),
             sqlite_where=text("reviewed_at IS NOT NULL"),
+        ),
+        # The author's cross-widget "My Revisions" inbox
+        # (plan_my_revisions_2026-11-10 §4.4): their own declined-or-pending
+        # author edits. PARTIAL, so it stays tiny. Created by
+        # scripts/migrate_thread_pending_edit_updates.py — the text must
+        # match the script's exactly.
+        Index(
+            "ix_thread_revisions_author_open",
+            "submitted_by_email",
+            postgresql_where=text("origin = 'author' AND status IN ('rejected', 'pending')"),
+            sqlite_where=text("origin = 'author' AND status IN ('rejected', 'pending')"),
         ),
     )
 

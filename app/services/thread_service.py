@@ -1397,6 +1397,24 @@ def _to_thread_summary(
         pending_revision_count=pending_revision_count,
         resubmission_count=thread.resubmission_count or 0,
         submitted_at=thread.submitted_at or thread.created_at,
+        edit_count=thread.edit_count or 0,
+    )
+
+
+def _open_declined_revision_of(
+    db: Session, thread_id: int, email: str
+) -> ThreadRevisionV2 | None:
+    """plan_thread_pending_edit_update §3.2 (U5) — `email`'s newest OPEN
+    declined edit of `thread_id` (`_open_declined_filter`), or None."""
+    return (
+        db.query(ThreadRevisionV2)
+        .filter(
+            ThreadRevisionV2.thread_id == thread_id,
+            ThreadRevisionV2.submitted_by_email == _norm_email(email),
+            _open_declined_filter(db),
+        )
+        .order_by(ThreadRevisionV2.version.desc())
+        .first()
     )
 
 
@@ -1406,13 +1424,26 @@ def _to_thread_detail(
     *,
     pending_revisions: list[ThreadRevisionSummary] | None = None,
     viewer_is_editor: bool = False,
+    viewer: UserInfo | None = None,
 ) -> ThreadDetail:
     """`pending_revisions` comes from the caller for the same reason as
     `_to_thread_summary`'s count (`_pending_revision_summaries`); the
     inherited `pending_revision_count` is its length, so the two can never
     disagree on one response. `viewer_is_editor` likewise needs `access`,
-    so every caller passes `_is_component_editor(component, access)`."""
+    so every caller passes `_is_component_editor(component, access)`.
+
+    `viewer` (plan_thread_pending_edit_update §3.6, U5): whose
+    `open_declined_revision` to fill — only when they are the thread's
+    author (one query through the row's own session); None for anyone
+    else, and when no viewer is passed."""
     pending_revisions = pending_revisions or []
+    open_declined: ThreadRevisionSummary | None = None
+    if viewer is not None and _norm_email(viewer.email) == _norm_email(thread.author_email):
+        session = object_session(thread)
+        if session is not None:
+            row = _open_declined_revision_of(session, thread.id, viewer.email)
+            if row is not None:
+                open_declined = _to_revision_summary(row)
     return ThreadDetail(
         **_to_thread_summary(
             thread, my_vote, pending_revision_count=len(pending_revisions)
@@ -1420,6 +1451,7 @@ def _to_thread_detail(
         content=thread.content,
         pending_revisions=pending_revisions,
         viewer_is_editor=viewer_is_editor,
+        open_declined_revision=open_declined,
     )
 
 
@@ -1492,6 +1524,8 @@ def _to_revision_summary(revision: ThreadRevisionV2) -> ThreadRevisionSummary:
         closed_at=revision.closed_at,
         closed_kind=revision.closed_kind,
         closed_by_version=revision.closed_by_version,
+        edit_count=revision.edit_count or 0,
+        updated_at=revision.updated_at,
     )
 
 
@@ -2206,7 +2240,7 @@ def get_thread_by_id(
         thread,
         my_vote,
         pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
-        viewer_is_editor=_is_component_editor(component, access),
+        viewer_is_editor=_is_component_editor(component, access), viewer=user,
     )
 
 
@@ -2276,15 +2310,57 @@ def update_thread_by_id(
     # token must occur in whatever the stored body ends up being, not
     # necessarily what this specific request's `content` field carried
     # (e.g. a title-only edit that also resends the same mentions).
+    #
+    # plan_thread_pending_edit_update §3.8/§3.10: lock the threads row — the
+    # `edit_count` bump below and `decide_thread`'s stale check serialize on
+    # it, and so does the U10 guard's read of the declined round.
+    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    effective_title = title if title is not None else thread.title
+    effective_content = content if content is not None else thread.content
     if mentions is not None:
-        effective_content = content if content is not None else thread.content
         # plan §5.4 — a PENDING thread's mentions are validated and stored
         # but NOT fanned out: nobody has read it yet, so there is no "newly
         # added" to notify — the whole stored array is notified once, at
         # approval time (`decide_thread`).
-        thread.mentions = _validate_and_resolve_mentions(
+        effective_mentions = _validate_and_resolve_mentions(
             db, mentions, effective_content, component=component
         )
+    else:
+        effective_mentions = list(thread.mentions or [])
+
+    # U10 — a pending RESUBMISSION may not be edited back to the text of the
+    # attempt it reworks (the directly reworked round only: round
+    # `resubmission_count - 1`; matching an older round is allowed — the
+    # same rule as `resubmit_thread`).
+    if (thread.resubmission_count or 0) > 0:
+        reworked = (
+            db.query(ThreadSubmissionV2)
+            .filter(
+                ThreadSubmissionV2.thread_id == thread.id,
+                ThreadSubmissionV2.round == thread.resubmission_count - 1,
+                # A round's status is the thread status it decided.
+                ThreadSubmissionV2.status == THREAD_STATUS_REJECTED,
+            )
+            .first()
+        )
+        if reworked is not None and _is_unchanged(
+            effective_title, effective_content, effective_mentions, reworked
+        ):
+            db.rollback()
+            raise _conflict(
+                "unchanged_resubmission",
+                "This is the text that was declined — change it before it goes back for review",
+            )
+
+    # U9 — the stale-check token moves on every REAL change (title, content
+    # or the set of mentioned emails), not on an unchanged resend: the
+    # composer sends every field on each save, and a no-op must not make a
+    # reviewer's decision fail as "changed while you were reviewing".
+    really_changed = not _is_unchanged(
+        effective_title, effective_content, effective_mentions, thread
+    )
+    if mentions is not None:
+        thread.mentions = effective_mentions
 
     # Only stamp "edited" when title/content were actually supplied to
     # change — an empty PATCH ({} — both omitted) must not show an "edited"
@@ -2300,6 +2376,8 @@ def update_thread_by_id(
         changed = True
     if changed:
         thread.edited_at = _utc_now()
+    if really_changed:
+        thread.edit_count = (thread.edit_count or 0) + 1
 
     db.commit()
     db.refresh(thread)
@@ -2310,7 +2388,7 @@ def update_thread_by_id(
             thread,
             my_vote,
             pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
-            viewer_is_editor=_is_component_editor(component, access),
+            viewer_is_editor=_is_component_editor(component, access), viewer=user,
         ),
         revision=None,
     )
@@ -2554,7 +2632,7 @@ def _apply_editor_edit(
                 thread,
                 _my_vote_for_thread(db, thread.id, user.email),
                 pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
-                viewer_is_editor=_is_component_editor(component, access),
+                viewer_is_editor=_is_component_editor(component, access), viewer=user,
             ),
             revision=None,
         )
@@ -2657,7 +2735,7 @@ def _apply_editor_edit(
             thread,
             _my_vote_for_thread(db, thread.id, user.email),
             pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
-            viewer_is_editor=_is_component_editor(component, access),
+            viewer_is_editor=_is_component_editor(component, access), viewer=user,
         ),
         revision=_to_revision_summary(revision),
     )
@@ -2690,7 +2768,16 @@ def _stage_thread_edit(
     (`resubmit_revision`) passes a full snapshot with already-resolved
     mentions, has already refused "unchanged vs declined" and "unchanged vs
     live", and the no-op branch (which compares against latest-pending/live)
-    is skipped. The new row carries the link."""
+    is skipped. The new row carries the link.
+
+    plan_thread_pending_edit_update_2026-11-10 (ordinary PATCH path only):
+    - a pending edit exists → it is UPDATED IN PLACE (`edit_count += 1`,
+      `updated_at = now`; U1–U3), the newest one on a legacy thread with
+      several (§3.5). A pending REWORK must still differ from the edit it
+      reworks (409 `unchanged_resubmission`) and from live (409
+      `no_change`) — U4. A plain edit may go back to live (U7).
+    - no pending edit → a new row, unless the author has an OPEN declined
+      edit of this thread: 409 `declined_edit_open` (U5)."""
     # Lock the THREADS row first — the same order `decide_thread_revision`
     # takes (threads, then revisions), so a submit and a decision on the
     # same thread can never deadlock on Postgres. This is also what
@@ -2703,6 +2790,10 @@ def _stage_thread_edit(
     # `content` keeps the title the author last PROPOSED, not the published
     # one. Every revision on a thread is its author's (`_require_author`
     # gates submission), so "the thread's latest pending" is "the author's".
+    #
+    # plan_thread_pending_edit_update §3.2 step 1: locked too (threads row
+    # first, then the revision — the decision path's order), so an in-place
+    # update and a decision on the same edit serialize.
     latest_pending = (
         db.query(ThreadRevisionV2)
         .filter(
@@ -2710,6 +2801,7 @@ def _stage_thread_edit(
             ThreadRevisionV2.status == REVISION_STATUS_PENDING,
         )
         .order_by(ThreadRevisionV2.version.desc())
+        .with_for_update()
         .first()
     )
     base = latest_pending if latest_pending is not None else thread
@@ -2741,7 +2833,7 @@ def _stage_thread_edit(
             thread,
             _my_vote_for_thread(db, thread.id, user.email),
             pending_revisions=pending_revisions,
-            viewer_is_editor=_is_component_editor(component, access),
+            viewer_is_editor=_is_component_editor(component, access), viewer=user,
         )
         if latest_pending is None:
             # Unchanged vs the LIVE thread — the same no-op a pre-versioning
@@ -2752,6 +2844,61 @@ def _stage_thread_edit(
         return ThreadUpdateResult(
             applied=False, thread=detail, revision=_to_revision_summary(latest_pending)
         )
+
+    if resubmission_of is None and latest_pending is not None:
+        # plan_thread_pending_edit_update §3.2 step 3 (U1–U3): UPDATE the
+        # pending edit in place — same row, version, status, `submitted_at`
+        # and link columns (a rework keeps its "Revision N", U2/U3).
+        if latest_pending.resubmission_of_id is not None:
+            # U4 — a rework must still differ from the edit it reworks (the
+            # DIRECTLY declined one only, as `resubmit_revision` checks) and
+            # from the live text. Codes/messages are `resubmit_revision`'s.
+            declined = (
+                db.query(ThreadRevisionV2)
+                .filter(ThreadRevisionV2.id == latest_pending.resubmission_of_id)
+                .first()
+            )
+            if declined is not None and _is_unchanged(new_title, new_content, new_mentions, declined):
+                db.rollback()
+                raise _conflict("unchanged_resubmission", "Change the edit before resubmitting")
+            if _is_unchanged(new_title, new_content, new_mentions, thread):
+                db.rollback()
+                raise _conflict("no_change", "This is already the published version of the thread")
+        # A PLAIN edit updated back to the live text stays pending (U7).
+        latest_pending.title = new_title
+        latest_pending.content = new_content
+        latest_pending.mentions = list(new_mentions)
+        latest_pending.edit_count = (latest_pending.edit_count or 0) + 1
+        latest_pending.updated_at = _utc_now()
+        db.commit()
+        db.refresh(latest_pending)
+        db.refresh(thread)
+        return ThreadUpdateResult(
+            applied=False,
+            thread=_to_thread_detail(
+                thread,
+                _my_vote_for_thread(db, thread.id, user.email),
+                pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
+                viewer_is_editor=_is_component_editor(component, access), viewer=user,
+            ),
+            revision=_to_revision_summary(latest_pending),
+        )
+
+    if resubmission_of is None:
+        # U5 (plan §3.2 step 2) — no pending edit, so this save would CREATE
+        # one: refused while the author has an OPEN declined edit on this
+        # thread. Under the threads-row lock, so a concurrent reject can't
+        # slip past it. A no-op never reaches here (it writes nothing).
+        open_declined = _open_declined_revision_of(db, thread.id, user.email)
+        if open_declined is not None:
+            conflict = _conflict(
+                "declined_edit_open",
+                f"Resubmit or close your declined edit (v{open_declined.version}) "
+                "before making a new one",
+                revision=_to_revision_summary(open_declined).model_dump(mode="json"),
+            )
+            db.rollback()
+            raise conflict
 
     # A pre-versioning thread gets its v1 first, so the history never
     # starts at v2 (a no-op after the migration's backfill).
@@ -2783,7 +2930,7 @@ def _stage_thread_edit(
             thread,
             _my_vote_for_thread(db, thread.id, user.email),
             pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
-            viewer_is_editor=_is_component_editor(component, access),
+            viewer_is_editor=_is_component_editor(component, access), viewer=user,
         ),
         revision=_to_revision_summary(revision),
     )
@@ -2934,7 +3081,7 @@ def resubmit_thread(
         thread,
         _my_vote_for_thread(db, thread.id, user.email),
         pending_revisions=_pending_revision_summaries(db, thread, component, user, access=access),
-        viewer_is_editor=is_editor,
+        viewer_is_editor=is_editor, viewer=user,
     )
 
 
@@ -3047,7 +3194,9 @@ def resubmit_revision(
     or superseded by a newer live version — §12.4; `closed_kind` and
     `closed_by_version` in the body) → 409
     `already_resubmitted` (D4 — reworked once; the partial UNIQUE
-    `uq_thread_revisions_resubmission_of` is the race backstop) → mention
+    `uq_thread_revisions_resubmission_of` is the race backstop) → 409
+    `pending_edit_exists` (non-editor only: the thread already has a pending
+    author edit — plan_thread_pending_edit_update §3.2) → mention
     validation → 409 `unchanged_resubmission` vs the DECLINED snapshot
     (landmine 9: the base is the declined revision, never "latest pending
     else live") → 409 `no_change` vs the LIVE thread (D7).
@@ -3070,6 +3219,30 @@ def resubmit_revision(
         conflict = _already_resubmitted(rework)
         db.rollback()
         raise conflict
+    # plan_thread_pending_edit_update §3.2 (U1/U5): the staged path must never
+    # create a SECOND pending edit. With U5 in place a pending edit next to an
+    # open declined one only comes from legacy data; the author can still
+    # close the declined edit. An editor-author's rework goes live instead
+    # (D5) and keeps its `earlier_revisions_pending` / `overwrite` rule.
+    if not _is_component_editor(component, access):
+        pending = (
+            db.query(ThreadRevisionV2)
+            .filter(
+                ThreadRevisionV2.thread_id == thread.id,
+                ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+                ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
+            )
+            .order_by(ThreadRevisionV2.version.desc())
+            .first()
+        )
+        if pending is not None:
+            conflict = _conflict(
+                "pending_edit_exists",
+                "You already have an edit awaiting review",
+                revision=_to_revision_summary(pending).model_dump(mode="json"),
+            )
+            db.rollback()
+            raise conflict
 
     resolved = _validate_and_resolve_mentions(db, mentions, content, component=component)
     if _is_unchanged(title, content, resolved, revision):
@@ -3459,6 +3632,7 @@ def decide_thread(
     *,
     approve: bool,
     reason: str | None = None,
+    expected_edit_count: int | None = None,
     access: ViewerAccess | None = None,
 ) -> ThreadModerationRow:
     """`POST /threads/{id}/approve` or `.../reject` — gated on `edit(n)`
@@ -3492,6 +3666,17 @@ def decide_thread(
                 "thread": _to_moderation_row(db, thread, component).model_dump(mode="json"),
             },
         )
+    # plan_thread_pending_edit_update §3.8 (U9) — the decision must apply to
+    # the text the reviewer read. Checked AFTER "already reviewed"; None
+    # (scripts, older clients) skips it. Nothing is written on a mismatch.
+    if expected_edit_count is not None and expected_edit_count != (thread.edit_count or 0):
+        conflict = _conflict(
+            "thread_changed",
+            "This thread changed while you were reviewing",
+            thread=_to_moderation_row(db, thread, component).model_dump(mode="json"),
+        )
+        db.rollback()
+        raise conflict
 
     thread.status = THREAD_STATUS_APPROVED if approve else THREAD_STATUS_REJECTED
     thread.reviewed_by_email = _norm_email(user.email)
@@ -3568,6 +3753,7 @@ def decide_thread_revision(
     approve: bool,
     overwrite: bool = False,
     reason: str | None = None,
+    expected_edit_count: int | None = None,
     access: ViewerAccess | None = None,
 ) -> ThreadRevisionDetail:
     """`POST /threads/{id}/revisions/{rid}/approve` or `.../reject`
@@ -3621,6 +3807,19 @@ def decide_thread_revision(
                 "revision": _to_revision_summary(revision).model_dump(mode="json"),
             },
         )
+    # plan_thread_pending_edit_update §3.3 — the author may have updated this
+    # edit in place since the reviewer opened it. Checked after
+    # `already_decided` and BEFORE the overwrite 409 (only the approved
+    # revision is checked: an overwritten earlier one is never applied).
+    # None skips it. Nothing is written on a mismatch.
+    if expected_edit_count is not None and expected_edit_count != (revision.edit_count or 0):
+        conflict = _conflict(
+            "revision_changed",
+            "This edit changed while you were reviewing",
+            revision=_to_revision_summary(revision).model_dump(mode="json"),
+        )
+        db.rollback()
+        raise conflict
 
     earlier: list[ThreadRevisionV2] = []
     declined_open: list[ThreadRevisionV2] = []
