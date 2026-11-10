@@ -308,6 +308,25 @@ def _require_thread_and_component(
     return thread, component
 
 
+def _lock_thread(db: Session, thread_id: int) -> ThreadV2 | None:
+    """Re-read the threads row `FOR UPDATE` and REFRESH the session's copy.
+
+    Callers have usually loaded `thread` already (unlocked, through
+    `_require_thread_and_component`). Without `populate_existing()` the ORM
+    hands back that same identity-mapped object with its PRE-lock values: a
+    decision that blocked on an author's in-flight PATCH would then check
+    the old `edit_count` (U9) / `status` and act on text nobody read.
+    Sessions here run `autoflush=False`, so call this before writing to the
+    row — a refresh discards unflushed changes."""
+    return (
+        db.query(ThreadV2)
+        .filter(ThreadV2.id == thread_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+
+
 def _require_comment_thread_and_component(
     db: Session, comment_id: int
 ) -> tuple[ThreadCommentV2, ThreadV2, ComponentV2]:
@@ -2314,7 +2333,7 @@ def update_thread_by_id(
     # plan_thread_pending_edit_update §3.8/§3.10: lock the threads row — the
     # `edit_count` bump below and `decide_thread`'s stale check serialize on
     # it, and so does the U10 guard's read of the declined round.
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     effective_title = title if title is not None else thread.title
     effective_content = content if content is not None else thread.content
     if mentions is not None:
@@ -2609,7 +2628,7 @@ def _apply_editor_edit(
     a full snapshot and the no-op branch below is skipped. The new row
     carries the link."""
     # Threads row first, then revisions — the order every writer here takes.
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
 
     new_title = title if title is not None else thread.title
     new_content = content if content is not None else thread.content
@@ -2783,7 +2802,7 @@ def _stage_thread_edit(
     # same thread can never deadlock on Postgres. This is also what
     # serializes the version allocation below; `uq_thread_revisions_thread_
     # version` is the hard backstop behind it.
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
 
     # Base for omitted fields = the author's latest PENDING revision if one
     # exists, else the live thread (plan §4.2 step 2) — a PATCH carrying only
@@ -2802,6 +2821,7 @@ def _stage_thread_edit(
         )
         .order_by(ThreadRevisionV2.version.desc())
         .with_for_update()
+        .populate_existing()  # see `_lock_thread`
         .first()
     )
     base = latest_pending if latest_pending is not None else thread
@@ -3033,7 +3053,7 @@ def resubmit_thread(
     _check_view_access(component, access)
     _require_author(thread.author_email, user)
 
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     if thread.status != THREAD_STATUS_REJECTED:
         db.rollback()
         raise _conflict("not_rejected", "Only a declined thread can be resubmitted")
@@ -3114,7 +3134,7 @@ def close_rejected_thread(
     _check_view_access(component, access)
     _require_author(thread.author_email, user)
 
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     if thread.closed_at is not None:
         db.rollback()
         return
@@ -3143,11 +3163,12 @@ def _require_own_revision(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Revision not found")
     _require_author(revision.submitted_by_email, user)
 
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     revision = (
         db.query(ThreadRevisionV2)
         .filter(ThreadRevisionV2.id == revision_id)
         .with_for_update()
+        .populate_existing()  # loaded unlocked above — see `_lock_thread`
         .first()
     )
     return thread, component, revision
@@ -3657,7 +3678,7 @@ def decide_thread(
     # `thread` above already proved the caller is an editor of the right
     # component; this second read is what makes the pending-check and the
     # write atomic against a concurrent decision on the same row.
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     if thread.status != THREAD_STATUS_PENDING:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -3786,11 +3807,12 @@ def decide_thread_revision(
     _require_component_editor(component, access)
     reason = _require_reason(approve, reason)
 
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     revision = (
         db.query(ThreadRevisionV2)
         .filter(ThreadRevisionV2.id == revision_id, ThreadRevisionV2.thread_id == thread_id)
         .with_for_update()
+        .populate_existing()  # the U9-style stale check reads it — see `_lock_thread`
         .first()
     )
     if revision is None:
@@ -4768,7 +4790,7 @@ def delete_comment_by_id(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Comment not found")
     thread_id = comment.thread_id
 
-    thread = db.query(ThreadV2).filter(ThreadV2.id == thread_id).with_for_update().first()
+    thread = _lock_thread(db, thread_id)
     # plan §4.1's table lists this route explicitly, though it's unreachable
     # in practice: a comment can only ever exist on a thread that was
     # approved at the time it was created (`_require_approved` on create).
