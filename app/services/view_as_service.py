@@ -602,7 +602,7 @@ def resolve_view_as_access(
 ) -> ViewerAccess:
     """The ``ViewerAccess`` a holder of exactly these pairs would get, plus
     the grants shared DIRECTLY with ``user_id`` when given — only ever the
-    caller themselves, when only pairs were given without ``anonymous``.
+    caller themselves, without ``anonymous`` (never a selected user).
 
     Pairs are expanded ONE AT A TIME and unioned afterwards — the same
     per-row rule ``effective_pairs`` applies to real assignments, so a role
