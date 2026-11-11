@@ -116,16 +116,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/data", tags=["Threads"])
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: `anonymous=true` with `view_as_user`, a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
 THREAD_VIEW_AS_RESPONSES = {
     400: {
-        "description": (
-            "`anonymous=true` combined with `view_as_user`, or View As: a malformed `view_as` pair, "
-            "an unknown key or user, or too many pairs"
-        )
+        "description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"
     },
     403: {"description": "Caller does not satisfy the widget's access control, or View As refused"},
 }
@@ -138,9 +135,8 @@ def _thread_subject(
     """Whose authorship, votes and authored edits the thread read endpoints
     report: the caller's, including a View As of role/scope pairs only, or
     nobody's (`None`) under `anonymous` or `view_as_user` — a selected user
-    is seen through their roles only, exactly like `anonymous`.
-    (`anonymous` with `view_as_user` never gets here: `get_view_as_selection`
-    refuses it with a 400.)"""
+    is seen through their roles only, exactly like `anonymous`, so the two
+    combined are the same as either alone."""
     if anonymous or (selection is not None and selection.user is not None):
         return None
     return user
