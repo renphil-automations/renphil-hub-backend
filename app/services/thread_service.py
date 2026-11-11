@@ -74,10 +74,11 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from collections.abc import Callable, Collection
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, func, or_, tuple_
+from sqlalchemy import and_, case, false, func, or_, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, object_session
 
@@ -103,8 +104,12 @@ from app.schemas.thread import (
     DeclinedThreadItem,
     MentionableUser,
     MentionInput,
+    MyRevisionsResponse,
+    MyRevisionsSummary,
     NotificationEntry,
     NotificationListResponse,
+    PendingEditItem,
+    PendingThreadItem,
     PreviousRejection,
     RevisionPerson,
     ThreadDetail,
@@ -132,6 +137,7 @@ from app.schemas.thread import (
 from app.services.access_visibility_service import (
     NodeRef,
     ViewerAccess,
+    granted_single_node,
     users_granted_on_node,
     walk_ancestors,
 )
@@ -1471,6 +1477,8 @@ def _to_thread_detail(
         pending_revisions=pending_revisions,
         viewer_is_editor=viewer_is_editor,
         open_declined_revision=open_declined,
+        closed_at=thread.closed_at,
+        closed_kind=thread.closed_kind,
     )
 
 
@@ -3325,45 +3333,85 @@ def close_rejected_revision(
     db.commit()
 
 
-def _own_declined_threads_query(db: Session, component_id: int, email: str):
-    """The caller's own declined threads on one widget, open AND closed —
-    the inbox splits them on `closed_at`."""
-    return db.query(ThreadV2).filter(
-        ThreadV2.component_id == component_id,
-        ThreadV2.author_email == _norm_email(email),
-        ThreadV2.status == THREAD_STATUS_REJECTED,
+def _component_filter(query, component_ids: Collection[int] | None):
+    """plan_my_revisions §4.2 — `None` = every widget (filter by author
+    only); otherwise `threads.component_id IN (...)`. An empty collection
+    matches nothing (an explicit FALSE, never an unfiltered query)."""
+    if component_ids is None:
+        return query
+    ids = list(component_ids)
+    if not ids:
+        return query.filter(false())
+    return query.filter(ThreadV2.component_id.in_(ids))
+
+
+def _own_declined_threads_query(db: Session, component_ids: Collection[int] | None, email: str):
+    """The caller's own declined threads on the given widgets (`None` =
+    all), open AND closed — the inbox splits them on `closed_at`."""
+    return _component_filter(
+        db.query(ThreadV2).filter(
+            ThreadV2.author_email == _norm_email(email),
+            ThreadV2.status == THREAD_STATUS_REJECTED,
+        ),
+        component_ids,
     )
 
 
-def _own_declined_revisions_query(db: Session, component_id: int, email: str):
-    """The caller's own declined AUTHOR edits of this widget's threads that
-    were never reworked (a reworked one has left the inbox for good), open
-    AND closed — the inbox splits them on `closed_at`."""
-    return (
+def _own_declined_revisions_query(db: Session, component_ids: Collection[int] | None, email: str):
+    """The caller's own declined AUTHOR edits of the given widgets' threads
+    (`None` = all) that were never reworked (a reworked one has left the
+    inbox for good), open AND closed — the inbox splits them on
+    `closed_at`."""
+    return _component_filter(
         db.query(ThreadRevisionV2)
         .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
         .filter(
-            ThreadV2.component_id == component_id,
             ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
             ThreadRevisionV2.status == REVISION_STATUS_REJECTED,
             ThreadRevisionV2.submitted_by_email == _norm_email(email),
             _not_reworked(db),
-        )
+        ),
+        component_ids,
     )
 
 
-def _declined_threads_query(db: Session, component_id: int, email: str):
+def _declined_threads_query(db: Session, component_ids: Collection[int] | None, email: str):
     """The inbox's OPEN thread predicate (plan §4.7, §12.3): the caller's
-    own declined, not closed threads on one widget."""
-    return _own_declined_threads_query(db, component_id, email).filter(ThreadV2.closed_at.is_(None))
+    own declined, not closed threads on the given widgets."""
+    return _own_declined_threads_query(db, component_ids, email).filter(ThreadV2.closed_at.is_(None))
 
 
-def _declined_revisions_query(db: Session, component_id: int, email: str):
+def _declined_revisions_query(db: Session, component_ids: Collection[int] | None, email: str):
     """The inbox's OPEN edit predicate (plan §4.7, §12.3): the caller's own
-    declined author edits of this widget's threads, not closed, not yet
+    declined author edits of the given widgets' threads, not closed, not yet
     reworked (no revision has `resubmission_of_id` = it)."""
-    return _own_declined_revisions_query(db, component_id, email).filter(
+    return _own_declined_revisions_query(db, component_ids, email).filter(
         ThreadRevisionV2.closed_at.is_(None)
+    )
+
+
+def _own_pending_threads_query(db: Session, component_ids: Collection[int] | None, email: str):
+    """plan_my_revisions M5 — the caller's own NEW threads awaiting review."""
+    return _component_filter(
+        db.query(ThreadV2).filter(
+            ThreadV2.author_email == _norm_email(email),
+            ThreadV2.status == THREAD_STATUS_PENDING,
+        ),
+        component_ids,
+    )
+
+
+def _own_pending_revisions_query(db: Session, component_ids: Collection[int] | None, email: str):
+    """plan_my_revisions M5 — the caller's own author EDITS awaiting review."""
+    return _component_filter(
+        db.query(ThreadRevisionV2)
+        .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
+        .filter(
+            ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+            ThreadRevisionV2.submitted_by_email == _norm_email(email),
+        ),
+        component_ids,
     )
 
 
@@ -3371,8 +3419,8 @@ def _declined_count(db: Session, component_id: int, email: str) -> int:
     """`ThreadListResponse.declined_count` — the inbox's OPEN predicate as
     two COUNTs; closed items never count (R5). Only ever called for the
     caller's OWN email."""
-    return int(_declined_threads_query(db, component_id, email).count()) + int(
-        _declined_revisions_query(db, component_id, email).count()
+    return int(_declined_threads_query(db, [component_id], email).count()) + int(
+        _declined_revisions_query(db, [component_id], email).count()
     )
 
 
@@ -3400,43 +3448,99 @@ def list_declined_items(
 
     A reworked edit is in neither list. 404 (widget) → 403 (view). A
     no-subject caller (`user=None`: anonymous / view-as-user) gets empty
-    lists."""
+    lists. Every item carries its widget's fields (plan_my_revisions §4.1 —
+    the same item shape as `/threads/me/revisions`)."""
     component = resolve_thread_widget_component(db, link)
     _check_view_access(component, access)
     if user is None:
         return DeclinedItemsResponse()
+    return _inbox_lists(db, [component.id], user.email, _widget_fields(db, [component.id]))
 
+
+# A widget's display fields on an inbox item: (link, title, location_label).
+_WidgetFields = dict[int, tuple[str, str, str | None]]
+
+
+def _widget_fields(db: Session, component_ids: Collection[int]) -> _WidgetFields:
+    """plan_my_revisions §4.2 step 4 — `component_id -> (link, widget_title,
+    location_label)` for every distinct widget, in ONE batched
+    `_widget_title_and_location_for_components` call."""
+    ids = list(set(component_ids))
+    if not ids:
+        return {}
+    components = {c.id: c for c in db.query(ComponentV2).filter(ComponentV2.id.in_(ids)).all()}
+    labels = _widget_title_and_location_for_components(db, components)
+    return {
+        cid: (components[cid].link or "", labels[cid][0], labels[cid][1] or None)
+        for cid in components
+    }
+
+
+def _inbox_lists(
+    db: Session,
+    component_ids: Collection[int] | None,
+    email: str,
+    widgets: _WidgetFields,
+) -> DeclinedItemsResponse:
+    """The two inbox lists (open + closed) over `component_ids` — shared by
+    the per-widget inbox and My Revisions."""
     items, truncated = _declined_items(
         db,
-        _declined_threads_query(db, component.id, user.email)
+        _declined_threads_query(db, component_ids, email)
         .order_by(ThreadV2.reviewed_at.desc(), ThreadV2.id.desc())
         .limit(DECLINED_ITEMS_CAP + 1)
         .all(),
-        _declined_revisions_query(db, component.id, user.email)
+        _declined_revisions_query(db, component_ids, email)
         .order_by(ThreadRevisionV2.reviewed_at.desc(), ThreadRevisionV2.id.desc())
         .limit(DECLINED_ITEMS_CAP + 1)
         .all(),
         cap=DECLINED_ITEMS_CAP,
         sort_attr="declined_at",
+        widgets=widgets,
     )
     closed, closed_truncated = _declined_items(
         db,
-        _own_declined_threads_query(db, component.id, user.email)
+        _own_declined_threads_query(db, component_ids, email)
         .filter(ThreadV2.closed_at.isnot(None))
         .order_by(ThreadV2.closed_at.desc(), ThreadV2.id.desc())
         .limit(CLOSED_ITEMS_CAP + 1)
         .all(),
-        _own_declined_revisions_query(db, component.id, user.email)
+        _own_declined_revisions_query(db, component_ids, email)
         .filter(ThreadRevisionV2.closed_at.isnot(None))
         .order_by(ThreadRevisionV2.closed_at.desc(), ThreadRevisionV2.id.desc())
         .limit(CLOSED_ITEMS_CAP + 1)
         .all(),
         cap=CLOSED_ITEMS_CAP,
         sort_attr="closed_at",
+        widgets=widgets,
     )
     return DeclinedItemsResponse(
         items=items, truncated=truncated, closed=closed, closed_truncated=closed_truncated
     )
+
+
+def _thread_meta(db: Session, thread_ids: Collection[int]) -> dict[int, tuple[str, int]]:
+    """`thread_id -> (live title, component_id)` in one query — an edit
+    item names its live thread and its widget."""
+    ids = list(set(thread_ids))
+    if not ids:
+        return {}
+    return {
+        tid: (title, cid)
+        for tid, title, cid in db.query(ThreadV2.id, ThreadV2.title, ThreadV2.component_id)
+        .filter(ThreadV2.id.in_(ids))
+        .all()
+    }
+
+
+def _widget_kwargs(widgets: _WidgetFields, component_id: int) -> dict[str, Any]:
+    link, title, location = widgets.get(component_id, ("", "", None))
+    return {
+        "component_id": component_id,
+        "component_link": link,
+        "widget_title": title,
+        "location_label": location,
+    }
 
 
 def _declined_items(
@@ -3446,10 +3550,13 @@ def _declined_items(
     *,
     cap: int,
     sort_attr: str,
+    widgets: _WidgetFields | None = None,
 ) -> tuple[list[DeclinedThreadItem | DeclinedEditItem], bool]:
     """Build one inbox list from its two already-capped (`cap + 1`) halves:
     merge, sort by `sort_attr` DESC (tie-break on id), cut to `cap`, and
-    report whether anything was cut."""
+    report whether anything was cut. `widgets` fills each item's widget
+    fields (plan_my_revisions §4.1)."""
+    widgets = widgets or {}
     reasons: dict[int, str | None] = {}
     if threads:
         for row in (
@@ -3462,14 +3569,7 @@ def _declined_items(
             .all()
         ):
             reasons[row.thread_id] = row.reason  # ascending → the latest wins
-    live_titles: dict[int, str] = {}
-    if revisions:
-        live_titles = {
-            tid: title
-            for tid, title in db.query(ThreadV2.id, ThreadV2.title)
-            .filter(ThreadV2.id.in_({r.thread_id for r in revisions}))
-            .all()
-        }
+    meta = _thread_meta(db, {r.thread_id for r in revisions})
 
     items: list[DeclinedThreadItem | DeclinedEditItem] = [
         DeclinedThreadItem(
@@ -3483,6 +3583,7 @@ def _declined_items(
             declined_at=t.reviewed_at,
             closed_at=t.closed_at,
             closed_kind=t.closed_kind,
+            **_widget_kwargs(widgets, t.component_id),
         )
         for t in threads
     ] + [
@@ -3492,7 +3593,7 @@ def _declined_items(
             version=r.version,
             title=r.title,
             content_excerpt=generate_notification_excerpt(r.content),
-            thread_title=live_titles.get(r.thread_id, ""),
+            thread_title=meta.get(r.thread_id, ("", 0))[0],
             resubmission_number=r.resubmission_number or 0,
             reason=r.rejection_reason,
             declined_by_email=r.reviewed_by_email,
@@ -3501,6 +3602,7 @@ def _declined_items(
             closed_at=r.closed_at,
             closed_kind=r.closed_kind,
             closed_by_version=r.closed_by_version,
+            **_widget_kwargs(widgets, meta.get(r.thread_id, ("", 0))[1]),
         )
         for r in revisions
     ]
@@ -3515,6 +3617,241 @@ def _declined_items(
 
     items.sort(key=_key, reverse=True)
     return items[:cap], len(items) > cap
+
+
+# ---------------------------------------------------------
+# My Revisions (plan_my_revisions_2026-11-10.md §4.2) — the author's
+# declined + pending items across EVERY thread widget, for the sidebar
+# section and its page. Polled (the summary) by every signed-in user, so:
+# - one cheap EXISTS by author email first (`ix_thread_revisions_author_open`
+#   + the `threads.author_email` index) — no rows, no RBAC work at all;
+# - then the per-widget view gate on the author's DISTINCT widgets only,
+#   via `granted_single_node` + ONE shared `RbacClosures` (the mention-
+#   directory pattern), never the whole-tree `get_viewer_access` fold
+#   (landmine 16). A Hub Admin short-circuits.
+# A widget the author can no longer view drops out of every list and count
+# (today's per-widget inbox 403s for it).
+# ---------------------------------------------------------
+
+PENDING_ITEMS_CAP = 100
+
+# `is_admin(closures)` — supplied by the router (`dependencies.is_hub_admin`
+# with the shared closures); a domain service must not import the FastAPI
+# dependency module.
+IsAdminFn = Callable[[RbacClosures], bool]
+
+
+def _has_my_revision_rows(db: Session, email: str) -> bool:
+    """The summary's short-circuit: does the author have ANY declined or
+    pending thread or author edit at all? Two indexed EXISTS probes."""
+    norm = _norm_email(email)
+    thread_exists = (
+        db.query(ThreadV2.id)
+        .filter(
+            ThreadV2.author_email == norm,
+            ThreadV2.status.in_([THREAD_STATUS_REJECTED, THREAD_STATUS_PENDING]),
+        )
+        .exists()
+    )
+    revision_exists = (
+        db.query(ThreadRevisionV2.id)
+        .filter(
+            ThreadRevisionV2.submitted_by_email == norm,
+            ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
+            ThreadRevisionV2.status.in_([REVISION_STATUS_REJECTED, REVISION_STATUS_PENDING]),
+        )
+        .exists()
+    )
+    return bool(db.query(or_(thread_exists, revision_exists)).scalar())
+
+
+def _my_revision_component_ids(db: Session, email: str) -> set[int]:
+    """Every DISTINCT widget the author has a declined or pending thread or
+    author edit on — the set the view gate runs over. Gating this whole set
+    BEFORE fetching (rather than the cap-limited rows after) keeps every cap
+    exact: a lost widget's rows can never crowd an allowed widget's out."""
+    norm = _norm_email(email)
+    ids = {
+        cid
+        for (cid,) in db.query(ThreadV2.component_id)
+        .filter(
+            ThreadV2.author_email == norm,
+            ThreadV2.status.in_([THREAD_STATUS_REJECTED, THREAD_STATUS_PENDING]),
+        )
+        .distinct()
+        .all()
+    }
+    ids.update(
+        cid
+        for (cid,) in db.query(ThreadV2.component_id)
+        .join(ThreadRevisionV2, ThreadRevisionV2.thread_id == ThreadV2.id)
+        .filter(
+            ThreadRevisionV2.submitted_by_email == norm,
+            ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR,
+            ThreadRevisionV2.status.in_([REVISION_STATUS_REJECTED, REVISION_STATUS_PENDING]),
+        )
+        .distinct()
+        .all()
+    )
+    return ids
+
+
+def _viewable_component_ids(
+    db: Session, component_ids: Collection[int], *, hub_user_id: int, is_admin: IsAdminFn
+) -> set[int]:
+    """plan_my_revisions §4.2 step 2 — the widgets in `component_ids` the
+    caller can still VIEW, by the same `is_granted` rule
+    `_check_view_access` applies (`granted_single_node` is its O(depth)
+    single-node twin). ONE `RbacClosures` for the admin check and every
+    widget; a Hub Admin keeps them all."""
+    closures = RbacClosures(db)
+    if is_admin(closures):
+        return set(component_ids)
+    return {
+        cid
+        for cid in sorted(component_ids)
+        if granted_single_node(db, hub_user_id, ("component", cid), is_admin=False, closures=closures)
+    }
+
+
+def _pending_items(
+    db: Session, component_ids: Collection[int], email: str, widgets: _WidgetFields
+) -> tuple[list[PendingThreadItem | PendingEditItem], bool]:
+    """plan_my_revisions M5 — the author's own pending threads and pending
+    author edits, newest submission first, capped at `PENDING_ITEMS_CAP`."""
+    threads = (
+        _own_pending_threads_query(db, component_ids, email)
+        .order_by(ThreadV2.submitted_at.desc(), ThreadV2.id.desc())
+        .limit(PENDING_ITEMS_CAP + 1)
+        .all()
+    )
+    revisions = (
+        _own_pending_revisions_query(db, component_ids, email)
+        .order_by(ThreadRevisionV2.submitted_at.desc(), ThreadRevisionV2.id.desc())
+        .limit(PENDING_ITEMS_CAP + 1)
+        .all()
+    )
+    meta = _thread_meta(db, {r.thread_id for r in revisions})
+    items: list[PendingThreadItem | PendingEditItem] = [
+        PendingThreadItem(
+            thread_id=t.id,
+            title=t.title,
+            content_excerpt=generate_notification_excerpt(t.content),
+            resubmission_count=t.resubmission_count or 0,
+            submitted_at=t.submitted_at or t.created_at,
+            edited_at=t.edited_at,
+            **_widget_kwargs(widgets, t.component_id),
+        )
+        for t in threads
+    ] + [
+        PendingEditItem(
+            thread_id=r.thread_id,
+            revision_id=r.id,
+            version=r.version,
+            title=r.title,
+            content_excerpt=generate_notification_excerpt(r.content),
+            thread_title=meta.get(r.thread_id, ("", 0))[0],
+            resubmission_number=r.resubmission_number or 0,
+            resubmission_of_version=_resubmission_of_version(r),
+            submitted_at=r.submitted_at,
+            updated_at=r.updated_at,
+            edit_count=r.edit_count or 0,
+            **_widget_kwargs(widgets, meta.get(r.thread_id, ("", 0))[1]),
+        )
+        for r in revisions
+    ]
+    _epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+    def _key(item: PendingThreadItem | PendingEditItem):
+        return (
+            _as_utc(item.submitted_at) if item.submitted_at else _epoch,
+            item.revision_id if isinstance(item, PendingEditItem) else item.thread_id,
+        )
+
+    items.sort(key=_key, reverse=True)
+    return items[:PENDING_ITEMS_CAP], len(items) > PENDING_ITEMS_CAP
+
+
+def list_my_declined_items(
+    db: Session,
+    user: UserInfo,
+    *,
+    hub_user_id: int,
+    is_admin: IsAdminFn,
+) -> MyRevisionsResponse:
+    """`GET /threads/me/revisions` (plan_my_revisions §4.2) — the caller's
+    own declined items (open + closed, the per-widget inbox's exact lists
+    and caps) and pending items (M5), across every thread widget they can
+    still view. The router answers View As / `anonymous` itself (empty,
+    `view_as: true`) and never reaches here for them."""
+    component_ids = _my_revision_component_ids(db, user.email)
+    if not component_ids:
+        return MyRevisionsResponse()
+    allowed = _viewable_component_ids(db, component_ids, hub_user_id=hub_user_id, is_admin=is_admin)
+    if not allowed:
+        return MyRevisionsResponse()
+    widgets = _widget_fields(db, allowed)
+    inbox = _inbox_lists(db, allowed, user.email, widgets)
+    pending, pending_truncated = _pending_items(db, allowed, user.email, widgets)
+    return MyRevisionsResponse(
+        **inbox.model_dump(),
+        pending=pending,
+        pending_truncated=pending_truncated,
+    )
+
+
+def _max_id(query, column) -> int:
+    value = query.with_entities(func.max(column)).scalar()
+    return int(value) if value is not None else 0
+
+
+def my_revisions_summary(
+    db: Session,
+    user: UserInfo,
+    *,
+    hub_user_id: int,
+    is_admin: IsAdminFn,
+) -> tuple[MyRevisionsSummary, str]:
+    """`GET /threads/me/revisions/summary` (plan_my_revisions §4.2). The
+    EXISTS short-circuit comes FIRST: an author with no rows (almost every
+    user on almost every poll) costs two indexed probes and no RBAC work.
+    Otherwise the same per-widget gate as the list, then COUNTs.
+
+    ETag `"{open}-{closed}-{pending}-{max_id_t}-{max_id_r}"` — every body
+    field is a function of the three counts, so the tag covers the body
+    (the `moderation_summary` discipline, followups §1); the max ids make a
+    decline-then-close that leaves the counts equal still change it."""
+    if not _has_my_revision_rows(db, user.email):
+        return MyRevisionsSummary(), '"0-0-0-0-0"'
+    component_ids = _my_revision_component_ids(db, user.email)
+    allowed = _viewable_component_ids(db, component_ids, hub_user_id=hub_user_id, is_admin=is_admin)
+    email = user.email
+    open_t = _declined_threads_query(db, allowed, email)
+    open_r = _declined_revisions_query(db, allowed, email)
+    closed_t = _own_declined_threads_query(db, allowed, email).filter(ThreadV2.closed_at.isnot(None))
+    closed_r = _own_declined_revisions_query(db, allowed, email).filter(
+        ThreadRevisionV2.closed_at.isnot(None)
+    )
+    pending_t = _own_pending_threads_query(db, allowed, email)
+    pending_r = _own_pending_revisions_query(db, allowed, email)
+    open_count = int(open_t.count()) + int(open_r.count())
+    closed_count = int(closed_t.count()) + int(closed_r.count())
+    pending_count = int(pending_t.count()) + int(pending_r.count())
+    max_t = max(_max_id(q, ThreadV2.id) for q in (open_t, closed_t, pending_t))
+    max_r = max(_max_id(q, ThreadRevisionV2.id) for q in (open_r, closed_r, pending_r))
+    summary = MyRevisionsSummary(
+        open_count=open_count,
+        closed_count=closed_count,
+        pending_count=pending_count,
+        has_any=(open_count + closed_count + pending_count) > 0,
+    )
+    return summary, f'"{open_count}-{closed_count}-{pending_count}-{max_t}-{max_r}"'
+
+
+def my_revisions_view_as_answer() -> tuple[MyRevisionsSummary, str]:
+    """M7 — the section is personal and View As is read-only: any View As
+    selection (pairs, a user) or `anonymous` gets the empty summary."""
+    return MyRevisionsSummary(view_as=True), '"0-0-0-0-0-va"'
 
 
 def get_thread_submission_history(

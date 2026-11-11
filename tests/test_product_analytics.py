@@ -1392,6 +1392,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             "/admin/access-control/root-access": "/admin/access-control/root-access",
             "/admin/jane-doe": "/admin/:segment",
             "/threads/management": "/threads/management",
+            "/threads/my-revisions": "/threads/my-revisions",
             "/threads/revisions": "/threads/revisions",
             "/dashboard/announcements/recJaneDoe": "/dashboard/announcements/:segment",
             "/": "/",
@@ -1510,6 +1511,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             _event("link.clicked", component_id="cmp-links", properties={}),
             _event("threads_management.tab_selected", target_id="history", properties={}),
             _event("revisions_management.tab_selected", target_id="pending", properties={}),
+            _event("my_revisions.tab_selected", target_id="closed", properties={"view": "closed"}),
         )
         self.assertEqual(stored, [
             ("navigation_tab.selected", None, "nav-doc-1"),
@@ -1524,6 +1526,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             ("link.clicked", "cmp-links", None),
             ("threads_management.tab_selected", None, "history"),
             ("revisions_management.tab_selected", None, "pending"),
+            ("my_revisions.tab_selected", None, "closed"),
         ])
 
     def test_modified_client_cannot_store_arbitrary_identifiers(self) -> None:
@@ -2407,7 +2410,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
 
 
 class CatalogTests(unittest.TestCase):
-    def test_catalog_covers_the_17_requested_actions_with_18_events(self) -> None:
+    def test_catalog_covers_the_18_requested_actions_with_19_events(self) -> None:
         requested = {
             1: {"navigation_tab.selected"}, 2: {"root_tab.selected"}, 3: {"view_tab.selected"},
             4: {"sub_tab.selected"}, 5: {"link.clicked"}, 6: {"blocknote_tab.selected"},
@@ -2418,11 +2421,13 @@ class CatalogTests(unittest.TestCase):
             14: {"resource_carousel.document_opened", "resource_carousel.scrolled"},
             15: {"threads_management.tab_selected"}, 16: {"revisions_management.tab_selected"},
             17: {"profile_menu.go_to_profile"},
+            # plan_my_revisions_2026-11-10.md §5.1 — the My Revisions tabs.
+            18: {"my_revisions.tab_selected"},
         }
         mapped = set().union(*requested.values())
-        self.assertEqual(len(requested), 17)
+        self.assertEqual(len(requested), 18)
         self.assertEqual(mapped, set(service.EVENT_CATALOG))
-        self.assertEqual(len(service.EVENT_CATALOG), 18)
+        self.assertEqual(len(service.EVENT_CATALOG), 19)
 
     def test_link_quick_action_and_carousel_events_are_distinct(self) -> None:
         kinds = {name: (e.component_type, e.action) for name, e in service.EVENT_CATALOG.items()}

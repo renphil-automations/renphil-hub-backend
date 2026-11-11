@@ -500,6 +500,12 @@ class DeclinedThreadItem(BaseModel):
     # Always 'author' for a thread.
     closed_at: datetime | None = None
     closed_kind: Literal["author"] | None = None
+    # plan_my_revisions §4.1 — the item's widget, on both endpoints (the
+    # cross-widget page names it on every row; one item shape for both).
+    component_id: int = 0
+    component_link: str = ""
+    widget_title: str = ""
+    location_label: str | None = None
 
 
 class DeclinedEditItem(BaseModel):
@@ -523,9 +529,61 @@ class DeclinedEditItem(BaseModel):
     closed_at: datetime | None = None
     closed_kind: Literal["author", "superseded"] | None = None
     closed_by_version: int | None = None
+    # plan_my_revisions §4.1 — see `DeclinedThreadItem`.
+    component_id: int = 0
+    component_link: str = ""
+    widget_title: str = ""
+    location_label: str | None = None
 
 
 DeclinedItem = Annotated[Union[DeclinedThreadItem, DeclinedEditItem], Field(discriminator="kind")]
+
+
+class PendingThreadItem(BaseModel):
+    """plan_my_revisions §4.2 (M5) — the caller's own NEW thread awaiting
+    review, read-only on the "Awaiting review" tab. `resubmission_count`
+    > 0 is a resubmission ("Revision N")."""
+
+    kind: Literal["thread"] = "thread"
+    thread_id: int
+    title: str
+    content_excerpt: str = ""
+    resubmission_count: int = 0
+    submitted_at: datetime | None = None
+    # The author's last in-place edit while pending (`threads.edited_at`).
+    edited_at: datetime | None = None
+    component_id: int = 0
+    component_link: str = ""
+    widget_title: str = ""
+    location_label: str | None = None
+
+
+class PendingEditItem(BaseModel):
+    """plan_my_revisions §4.2 (M5) — the caller's own EDIT awaiting review.
+    `title`/`content_excerpt` are the pending revision's (its CURRENT text —
+    it is updated in place, plan_thread_pending_edit_update U1);
+    `thread_title` is the live thread's. `updated_at`/`edit_count` move on
+    every in-place update ("Edited · time")."""
+
+    kind: Literal["edit"] = "edit"
+    thread_id: int
+    revision_id: int
+    version: int
+    title: str
+    content_excerpt: str = ""
+    thread_title: str
+    resubmission_number: int = 0
+    resubmission_of_version: int | None = None
+    submitted_at: datetime | None = None
+    updated_at: datetime | None = None
+    edit_count: int = 0
+    component_id: int = 0
+    component_link: str = ""
+    widget_title: str = ""
+    location_label: str | None = None
+
+
+PendingItem = Annotated[Union[PendingThreadItem, PendingEditItem], Field(discriminator="kind")]
 
 
 class DeclinedItemsResponse(BaseModel):
@@ -544,6 +602,33 @@ class DeclinedItemsResponse(BaseModel):
     truncated: bool = False
     closed: list[DeclinedItem] = Field(default_factory=list)
     closed_truncated: bool = False
+
+
+class MyRevisionsResponse(DeclinedItemsResponse):
+    """`GET /threads/me/revisions` (plan_my_revisions §4.2–4.3) — the same
+    two lists as the per-widget inbox, across EVERY thread widget the caller
+    can still view, plus `pending` (M5: their own threads and edits awaiting
+    review, newest submission first, capped at 100 with `pending_truncated`).
+    Items of a widget the caller can no longer view are neither listed nor
+    counted. Under any View As selection, or `anonymous`, everything is
+    empty and `view_as` is true (M7)."""
+
+    pending: list[PendingItem] = Field(default_factory=list)
+    pending_truncated: bool = False
+    view_as: bool = False
+
+
+class MyRevisionsSummary(BaseModel):
+    """`GET /threads/me/revisions/summary` (plan_my_revisions §4.1) — polled
+    every 60 s by every signed-in user; ETag'd like the moderation summary.
+    `open_count` is the sidebar badge; `has_any` decides whether the
+    sidebar item shows at all (M4)."""
+
+    open_count: int = 0
+    closed_count: int = 0
+    pending_count: int = 0
+    has_any: bool = False
+    view_as: bool = False
 
 
 class ThreadDetail(ThreadSummary):
@@ -572,12 +657,19 @@ class ThreadDetail(ThreadSummary):
     author; None for everyone else. While it is set, a non-editor author
     cannot create a new edit (PATCH → 409 `declined_edit_open`) — they
     resubmit or close it first; updating an existing pending edit stays
-    allowed."""
+    allowed.
+
+    `closed_at` / `closed_kind` (plan_my_revisions §5.4, phase B drift 1) —
+    the thread's own Close state: set only on a `rejected` thread its author
+    closed (`closed_kind` is then always 'author'). Only the author or an
+    editor can read a rejected thread at all, so nothing new is exposed."""
 
     content: str
     pending_revisions: list[ThreadRevisionSummary] = Field(default_factory=list)
     viewer_is_editor: bool = False
     open_declined_revision: ThreadRevisionSummary | None = None
+    closed_at: datetime | None = None
+    closed_kind: Literal["author"] | None = None
 
 
 class ThreadUpdateResult(BaseModel):

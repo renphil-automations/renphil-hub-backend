@@ -65,6 +65,7 @@ EVENT_CATALOG: dict[str, CatalogEntry] = {
     "resource_carousel.scrolled": CatalogEntry("resource_carousel", "scroll", "Resource Carousel previous/next arrow clicked"),
     "threads_management.tab_selected": CatalogEntry("threads_management", "select_tab", "Threads Management Pending/History tab selected"),
     "revisions_management.tab_selected": CatalogEntry("revisions_management", "select_tab", "Revisions Management Pending/History tab selected"),
+    "my_revisions.tab_selected": CatalogEntry("my_revisions", "select_tab", "My Revisions Needs changes/Awaiting review/Closed tab selected"),
     "profile_menu.go_to_profile": CatalogEntry("profile_menu", "go_to_profile", "Profile menu \"Go to profile\" clicked"),
 }
 
@@ -100,7 +101,7 @@ _ENUM_PROPERTIES: dict[str, frozenset[str]] = {
     "button_style": frozenset({"arrow", "button"}),
     "link_style": frozenset({"link", "button"}),
     "direction": frozenset({"previous", "next"}),
-    "view": frozenset({"pending", "history"}),
+    "view": frozenset({"pending", "history", "needs-changes", "awaiting", "closed"}),
 }
 _INT_PROPERTIES: dict[str, tuple[int, int]] = {"depth": (0, 20), "item_index": (0, 1000)}
 _BOOL_PROPERTIES = frozenset({"reselect"})
@@ -127,7 +128,7 @@ _STATIC_SECTIONS: dict[str, frozenset[str]] = {
     "knowledge": frozenset(),
     "my-access": frozenset(),
     "admin": frozenset({"llm", "bot-management", "access-control", "roles-and-scopes"}),
-    "threads": frozenset({"management", "revisions"}),
+    "threads": frozenset({"management", "revisions", "my-revisions"}),
     # The built-in Dashboard nav tab; anything below it is a title slug,
     # except the legacy announcements page.
     "dashboard": frozenset({"announcements"}),

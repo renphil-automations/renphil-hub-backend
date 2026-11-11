@@ -104,6 +104,8 @@ from app.schemas.thread import (
     CommentUpdateRequest,
     DeclinedItemsResponse,
     MentionableUser,
+    MyRevisionsResponse,
+    MyRevisionsSummary,
     NotificationListResponse,
     RejectRequest,
     RevisionDecisionRequest,
@@ -270,6 +272,90 @@ async def list_declined_items(
     return await asyncio.to_thread(
         thread_service.list_declined_items, db, link, subject, access=view_as_access.access
     )
+
+
+# ---------------------------------------------------------
+# My Revisions (plan_my_revisions_2026-11-10.md §4.3) — the author's
+# declined + pending items across every thread widget. Static `/threads/me/*`
+# paths, declared ABOVE `/threads/{thread_id}` (otherwise `me` binds as a
+# thread id and 422s — same convention as the moderation block).
+#
+# Gated like the mention directory, NOT with `Depends(get_viewer_access)`:
+# the summary is polled by every signed-in user, and the whole-tree fold is
+# ~2.4 s for a non-admin (landmine 16). `get_current_hub_user` + the View As
+# selection only; the service gates per widget with `granted_single_node`
+# and one shared `RbacClosures`, built only when the author has any rows.
+# Under ANY View As selection, or `anonymous`, both answer empty with
+# `view_as: true` (M7) — the section is personal, View As is read-only.
+# ---------------------------------------------------------
+
+
+def _admin_check(db: Session, current: CurrentHubUser):
+    return lambda closures: is_hub_admin(db, current, closures=closures)
+
+
+def _my_revisions_sync(db: Session, current: CurrentHubUser) -> MyRevisionsResponse:
+    return thread_service.list_my_declined_items(
+        db, current.info, hub_user_id=current.hub_user_id, is_admin=_admin_check(db, current)
+    )
+
+
+def _my_revisions_summary_sync(db: Session, current: CurrentHubUser) -> tuple[MyRevisionsSummary, str]:
+    return thread_service.my_revisions_summary(
+        db, current.info, hub_user_id=current.hub_user_id, is_admin=_admin_check(db, current)
+    )
+
+
+@router.get(
+    "/threads/me/revisions",
+    response_model=MyRevisionsResponse,
+    summary="The caller's own declined and pending threads and edits, across every thread widget (My Revisions)",
+    responses=VIEW_AS_ERROR_RESPONSES,
+)
+async def list_my_revisions(
+    anonymous: bool = Depends(get_view_as_anonymous),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
+):
+    """Open items newest decline first (cap 100, `truncated`), closed ones
+    newest close first (cap 50, `closed_truncated`), pending ones newest
+    submission first (cap 100, `pending_truncated`). A widget the caller can
+    no longer view drops out entirely."""
+    if anonymous or selection is not None:
+        return MyRevisionsResponse(view_as=True)
+    return await asyncio.to_thread(_my_revisions_sync, db, current)
+
+
+@router.get(
+    "/threads/me/revisions/summary",
+    response_model=MyRevisionsSummary,
+    summary="My Revisions counts for the sidebar item and badge (polled; ETag/304)",
+    responses=VIEW_AS_ERROR_RESPONSES,
+)
+async def get_my_revisions_summary(
+    request: Request,
+    response: Response,
+    anonymous: bool = Depends(get_view_as_anonymous),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
+):
+    if anonymous or selection is not None:
+        summary, etag = thread_service.my_revisions_view_as_answer()
+    else:
+        summary, etag = await asyncio.to_thread(_my_revisions_summary_sync, db, current)
+    # The `/threads/moderation/summary` shape: `no-store` on the 200 AND the
+    # 304, so the browser's URL-keyed HTTP cache never serves one user's
+    # body to the next (followups plan §1).
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
+    return summary
 
 
 # ---------------------------------------------------------
