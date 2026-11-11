@@ -5,7 +5,8 @@ Access reuses the existing checkers rather than re-deriving anything:
 
 * Component access (view / edit, direct or inherited from ancestors, through
   the caller's role/scope pairs or a grant shared with their email) is
-  ``ViewerAccess`` from ``dependencies.get_viewer_access``.
+  ``ViewerAccess`` from ``dependencies.get_viewer_access`` — or, with View As
+  parameters, the selected pairs' access from ``dependencies.get_view_as_access``.
 * "Admin on All Scopes" is ``dependencies.is_hub_admin`` (the ``hub_admin``
   role on the universal scope) — which is also what ``ViewerAccess.full_access``
   is set from.
@@ -26,7 +27,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import false, or_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
@@ -187,7 +188,7 @@ def _emails_by_user_id(db: Session, user_ids: Iterable[int | None]) -> dict[int,
 
 def serialize_task(
     task: TaskV2,
-    caller_id: int,
+    caller_id: int | None,
     assignee_ids: list[int],
     emails: dict[int, str | None],
     *,
@@ -263,20 +264,31 @@ def _require_component_view(db: Session, access: ViewerAccess, component_id: int
     return verdict
 
 
-def list_tasks(db: Session, component_id: int, *, caller_id: int, access: ViewerAccess) -> dict[str, Any]:
+def list_tasks(
+    db: Session, component_id: int, *, caller_id: int, access: ViewerAccess, anonymous: bool = False
+) -> dict[str, Any]:
     """Tasks of one Task Manager component.
 
     The caller needs at least view on the component (``_require_component_view``).
     Callers with edit on the component (Hub Admins included) get every task
     and can manage all of them; everyone else only the tasks they own or are
     assigned to.
+
+    ``anonymous`` (View As): nothing of the caller's own counts — no owned or
+    assigned tasks unless ``access`` already shows every task, ``is_owner`` /
+    ``is_assignee`` false. The permission flags still show what the roles and
+    scopes allow (a preview), even though task writes are refused in that mode.
     """
     verdict = _require_component_view(db, access, component_id)
     is_editor = bool(verdict.edit)
+    subject_id = None if anonymous else caller_id
     query = db.query(TaskV2).filter(TaskV2.component_id == component_id)
     if not is_editor:
-        assigned = db.query(TaskAssigneeV2.task_id).filter(TaskAssigneeV2.assignee_id == caller_id)
-        query = query.filter(or_(TaskV2.owner_id == caller_id, TaskV2.id.in_(assigned)))
+        if subject_id is None:
+            query = query.filter(false())
+        else:
+            assigned = db.query(TaskAssigneeV2.task_id).filter(TaskAssigneeV2.assignee_id == subject_id)
+            query = query.filter(or_(TaskV2.owner_id == subject_id, TaskV2.id.in_(assigned)))
     tasks = query.order_by(TaskV2.created_at.desc(), TaskV2.id.desc()).all()
 
     assignees = _assignee_ids_by_task(db, [t.id for t in tasks])
@@ -290,7 +302,7 @@ def list_tasks(db: Session, component_id: int, *, caller_id: int, access: Viewer
         "can_create_tasks": True,
         "tasks": [
             serialize_task(
-                t, caller_id, assignees[t.id], emails, can_manage=is_editor or t.owner_id == caller_id
+                t, subject_id, assignees[t.id], emails, can_manage=is_editor or t.owner_id == subject_id
             )
             for t in tasks
         ],

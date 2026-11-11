@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.view_as import VIEW_AS_FLAG_DESCRIPTION, VIEW_AS_USER_DESCRIPTION
+
 TaskStatus = Literal["Pending", "In Progress", "Blocked", "Closed"]
 NotificationCadence = Literal["always", "never", "on_status_change"]
 
@@ -22,6 +24,11 @@ _NOTIFY_CREATE_DELETE_DESCRIPTION = (
 class TaskAssignee(BaseModel):
     id: int = Field(..., description="users.id")
     email: str | None = None
+
+
+class _ViewAsEcho(BaseModel):
+    view_as: bool = Field(default=False, description=VIEW_AS_FLAG_DESCRIPTION)
+    view_as_user: str | None = Field(default=None, description=VIEW_AS_USER_DESCRIPTION)
 
 
 class TaskResponse(BaseModel):
@@ -54,7 +61,7 @@ class TaskResponse(BaseModel):
     )
 
 
-class ListTasksResponse(BaseModel):
+class ListTasksResponse(_ViewAsEcho):
     success: bool = True
     component_id: int
     can_view_all_tasks: bool = Field(
@@ -63,7 +70,9 @@ class ListTasksResponse(BaseModel):
         "and therefore sees every task; false when only their own / assigned tasks are returned.",
     )
     can_create_tasks: bool = Field(
-        ..., description="Always true: anyone who can see the Task Manager can create tasks in it."
+        ...,
+        description="Always true: anyone who can see the Task Manager can create tasks in it. In "
+        "anonymous View As mode this previews what the roles allow; the write itself is refused.",
     )
     tasks: list[TaskResponse]
 
@@ -101,7 +110,7 @@ class UpdateTaskRequest(BaseModel):
     status: TaskStatus | None = None
 
 
-class TaskMutationResponse(BaseModel):
+class TaskMutationResponse(_ViewAsEcho):
     success: bool = True
     task: TaskResponse
 
@@ -117,7 +126,7 @@ class DeleteTaskFailure(BaseModel):
     message: str
 
 
-class DeleteTasksResponse(BaseModel):
+class DeleteTasksResponse(_ViewAsEcho):
     success: bool = Field(..., description="True when every requested task was deleted.")
     deleted: list[int]
     failed: list[DeleteTaskFailure]

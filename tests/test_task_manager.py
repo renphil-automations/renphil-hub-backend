@@ -29,11 +29,17 @@ from app.db_v2.models.notification import NotificationV2  # noqa: E402
 from app.db_v2.models.tab import TabV2  # noqa: E402
 from app.db_v2.models.task import TaskAssigneeV2, TaskV2  # noqa: E402
 from app.db_v2.models.user import UserV2  # noqa: E402
-from app.dependencies import CurrentHubUser, get_current_hub_user, get_viewer_access  # noqa: E402
+from app.dependencies import (  # noqa: E402
+    CurrentHubUser,
+    ViewAsAccess,
+    get_current_hub_user,
+    get_view_as_access,
+    get_view_as_selection,
+)
 from app.main import app  # noqa: E402
 from app.models.auth import UserInfo  # noqa: E402
 from app.routers import task_manager as task_manager_router  # noqa: E402
-from app.services import gridstack_service, task_manager_service as svc  # noqa: E402
+from app.services import gridstack_service, task_manager_service as svc, view_as_service  # noqa: E402
 from app.services.access_visibility_service import (  # noqa: E402
     INVISIBLE,
     NodeVerdict,
@@ -44,6 +50,8 @@ NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 class _Access:
     """A stand-in `ViewerAccess`: `view` / `edit` / `granted` for every node."""
+
+    full_access = False
 
     def __init__(self, *, view=True, edit=False, granted=None):
         self.view, self.edit = view, edit
@@ -534,11 +542,11 @@ class TaskManagerRouterTests(_DbTestCase):
         app.dependency_overrides[get_current_hub_user] = lambda: CurrentHubUser(
             info=UserInfo(email=self.caller.work_email, name="x"), hub_user_id=self.caller.id, email=self.caller.work_email
         )
-        app.dependency_overrides[get_viewer_access] = lambda: self.access
+        app.dependency_overrides[get_view_as_access] = lambda: ViewAsAccess(access=self.access, view_as=False)
         self._perm_patch = patch.object(
             task_manager_router,
             "_task_permissions",
-            lambda db, current: (self.admin, lambda cid: cid in self.editor_of),
+            lambda db, current, selection=None: (self.admin, lambda cid: cid in self.editor_of),
         )
         self._perm_patch.start()
         self.client = TestClient(app)
@@ -603,6 +611,119 @@ class TaskManagerRouterTests(_DbTestCase):
             "/v2/task-manager/tasks", json={"component_id": self.tm.id, "title": "T", "assignees": ["ghost@renphil.org"]}
         )
         self.assertEqual((r.status_code, r.json()["detail"]["code"]), (404, "ASSIGNEE_NOT_FOUND"))
+
+
+class TaskManagerViewAsTests(_DbTestCase):
+    """View As on the four endpoints. `get_view_as_access` / the selection are
+    stubbed; `_task_permissions` and the anonymous refusal run for real."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mine = self._create(title="owned by owner", assignee_emails=[])["id"]
+        self.assigned = self._create(caller=self.other, title="for owner", assignee_emails=["owner@renphil.org"])["id"]
+        self.foreign = self._create(caller=self.other, title="other's", assignee_emails=[])["id"]
+        self.access = VIEWER
+        self.pairs_access = _Access(view=True, edit=False)
+        self.selection = view_as_service.ViewAsSelection(targets=[], user=None)
+        self.resolved_for: list[int | None] = []
+        self.fold_calls = 0
+
+        def view_as_access():
+            self.fold_calls += 1
+            return ViewAsAccess(access=self.access, view_as=True, view_as_user="sel@renphil.org")
+
+        def resolve(db, targets, *, user_id=None, closures=None):
+            self.resolved_for.append(user_id)
+            return self.pairs_access
+
+        app.dependency_overrides[get_db_v2] = lambda: self.db
+        app.dependency_overrides[get_current_hub_user] = lambda: CurrentHubUser(
+            info=UserInfo(email=self.owner.work_email, name="x"), hub_user_id=self.owner.id, email=self.owner.work_email
+        )
+        app.dependency_overrides[get_view_as_access] = view_as_access
+        app.dependency_overrides[get_view_as_selection] = lambda: self.selection
+        self._resolve_patch = patch.object(view_as_service, "resolve_view_as_access", resolve)
+        self._resolve_patch.start()
+        self.client = TestClient(app)
+
+    def tearDown(self) -> None:
+        self._resolve_patch.stop()
+        app.dependency_overrides.clear()
+        super().tearDown()
+
+    def _list(self, query=""):
+        r = self.client.get(f"/v2/task-manager/components/{self.tm.id}/tasks{query}")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_list_keeps_own_and_assigned_tasks_without_anonymous(self) -> None:
+        body = self._list("?view_as=r:s")
+        self.assertEqual({t["id"] for t in body["tasks"]}, {self.mine, self.assigned})
+        self.assertEqual((body["view_as"], body["view_as_user"], body["can_create_tasks"]), (True, "sel@renphil.org", True))
+        flags = {t["id"]: (t["is_owner"], t["is_assignee"], t["can_manage"]) for t in body["tasks"]}
+        self.assertEqual(flags, {self.mine: (True, False, True), self.assigned: (False, True, False)})
+
+    def test_anonymous_list_shows_only_what_the_roles_allow(self) -> None:
+        body = self._list("?view_as=r:s&anonymous=true")
+        self.assertEqual((body["tasks"], body["can_view_all_tasks"], body["can_create_tasks"]), ([], False, True))
+
+        self.access = EDITOR
+        body = self._list("?view_as=r:s&anonymous=true")
+        self.assertEqual({t["id"] for t in body["tasks"]}, {self.mine, self.assigned, self.foreign})
+        self.assertTrue(body["can_view_all_tasks"])
+        for task in body["tasks"]:
+            self.assertEqual(
+                (task["is_owner"], task["is_assignee"], task["can_manage"], task["can_edit_status"]),
+                (False, False, True, True),
+            )
+
+    def test_writes_are_refused_under_anonymous_before_any_access_check(self) -> None:
+        r = self.client.post(
+            "/v2/task-manager/tasks?anonymous=true", json={"component_id": self.tm.id, "title": "T"}
+        )
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "VIEW_AS_ANONYMOUS_READ_ONLY"))
+        r = self.client.patch(f"/v2/task-manager/tasks/{self.mine}?anonymous=true&view_as=r:s", json={"title": "x"})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "VIEW_AS_ANONYMOUS_READ_ONLY"))
+        r = self.client.request(
+            "DELETE", "/v2/task-manager/tasks?anonymous=true", json={"task_ids": [self.mine]}
+        )
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "VIEW_AS_ANONYMOUS_READ_ONLY"))
+        self.assertEqual((self.fold_calls, self.resolved_for), (0, []))
+        self.assertEqual(self.db.query(TaskV2).count(), 3)
+        self.assertEqual(self.db.get(TaskV2, self.mine).title, "owned by owner")
+
+    def test_create_follows_the_view_as_access_and_is_owned_by_the_caller(self) -> None:
+        r = self.client.post("/v2/task-manager/tasks", json={"component_id": self.tm.id, "title": "T"})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual((r.json()["task"]["owner_id"], r.json()["view_as"]), (self.owner.id, True))
+        self.access = _Access(view=False)
+        r = self.client.post("/v2/task-manager/tasks", json={"component_id": self.tm.id, "title": "T"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_update_and_delete_follow_the_selected_pairs_plus_own_tasks(self) -> None:
+        # The pairs give no edit: the caller's own task only.
+        r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "FORBIDDEN"))
+        r = self.client.patch(f"/v2/task-manager/tasks/{self.mine}", json={"title": "mine"})
+        self.assertEqual((r.status_code, r.json()["view_as"]), (200, True))
+        r = self.client.patch(f"/v2/task-manager/tasks/{self.assigned}", json={"status": "Closed"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.resolved_for, [self.owner.id] * 3)
+
+        # The pairs give edit on the Task Manager: any task.
+        self.pairs_access = EDITOR
+        r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
+        self.assertEqual((r.status_code, r.json()["task"]["can_manage"]), (200, True))
+        r = self.client.request("DELETE", "/v2/task-manager/tasks", json={"task_ids": [self.foreign]})
+        self.assertEqual((r.json()["deleted"], r.json()["view_as"]), ([self.foreign], True))
+
+    def test_without_view_as_the_callers_own_access_is_used(self) -> None:
+        self.selection = None
+        with patch.object(task_manager_router, "granted_single_node", return_value=False) as single:
+            r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(single.called)
+        self.assertEqual(self.resolved_for, [])
 
 
 if __name__ == "__main__":
