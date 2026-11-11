@@ -1642,8 +1642,8 @@ def list_threads_for_link(
     anonymous: bool = False,
 ) -> ThreadListResponse:
     """`user` is whose own pending/rejected threads, votes and authored
-    revisions show up — the caller normally, the selected user under
-    nobody (`None`) for `anonymous` or `view_as_user`, which therefore list
+    revisions show up — the caller, with or without View As pairs or a
+    selected user, or nobody (`None`) for `anonymous`, which therefore lists
     approved threads only with `my_vote` 0 (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
@@ -1790,8 +1790,8 @@ def get_thread_by_id(
     access to the widget at all keeps getting 403, never 404.
 
     `user` is whose authorship, vote and authored revisions count — the
-    caller normally (View As pairs included), and nobody (`None`) for
-    `anonymous` or `view_as_user`."""
+    caller, with or without View As pairs or a selected user, and nobody
+    (`None`) for `anonymous`."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
     # access to the widget at all must keep getting the existing 403, never
@@ -2644,7 +2644,7 @@ def moderation_summary(
 
     `view_as=True` means `access` was built from the View As parameters
     (`dependencies.get_view_as_access`): its only direct grants are the
-    caller's own, with pairs only and without `anonymous`. `view_as` and
+    caller's own, unless `anonymous`. `view_as` and
     `view_as_user` are echoed in the body and suffix the ETag
     (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
