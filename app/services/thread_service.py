@@ -78,7 +78,20 @@ from collections.abc import Callable, Collection
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, false, func, or_, tuple_
+from sqlalchemy import (
+    Integer,
+    String,
+    and_,
+    case,
+    false,
+    func,
+    literal_column,
+    not_,
+    or_,
+    select,
+    tuple_,
+    union_all,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, object_session
 
@@ -128,8 +141,13 @@ from app.schemas.thread import (
     ThreadRevisionModerationSummary,
     ThreadRevisionSummary,
     ThreadRoundDecision,
+    ThreadActivityFacets,
+    ThreadActivityListResponse,
+    ThreadActivityRow,
+    ThreadActivityWidget,
     ThreadSubmissionRound,
     ThreadSummary,
+    ThreadTimelineResponse,
     ThreadUpdateResult,
     ThreadWidgetCounts,
     VoteResponse,
@@ -1691,10 +1709,21 @@ def _widget_titles_for_component_ids(db: Session, component_ids: list[int]) -> d
     return {c.id: _resolve_widget_title(c, preloaded) for c in components}
 
 
-def _history_search_predicate(db: Session, q: str, component_ids: list[int], title_columns: list[Any]):
+def _history_search_predicate(
+    db: Session,
+    q: str,
+    component_ids: list[int],
+    title_columns: list[Any],
+    *,
+    component_column: Any = None,
+):
     """History search (2026-11-09): a case-insensitive substring of any of
     `title_columns` OR of the widget title. `%`, `_` and `\\` in `q` are
-    literal. Returns None for a blank `q` (no filter)."""
+    literal. Returns None for a blank `q` (no filter). `component_column`
+    is the row's widget id (default `ThreadV2.component_id`; Thread Review's
+    union passes its own labelled column)."""
+    if component_column is None:
+        component_column = ThreadV2.component_id
     needle = (q or "").strip()
     if not needle:
         return None
@@ -1708,7 +1737,7 @@ def _history_search_predicate(db: Session, q: str, component_ids: list[int], tit
         if folded in title.casefold()
     ]
     if widget_hits:
-        predicates.append(ThreadV2.component_id.in_(widget_hits))
+        predicates.append(component_column.in_(widget_hits))
     return or_(*predicates)
 
 
@@ -4304,8 +4333,60 @@ def get_thread_revision(
     return _to_revision_detail(revision)
 
 
+PENDING_ORDERS = ("oldest", "newest")
+
+
+def _encode_pending_cursor(order: str, at: datetime, row_id: int) -> str:
+    """A pending-queue cursor that names its order (plan_thread_review_merge
+    B1): `[order, at, id]`, so a cursor resent with the OTHER order is a 400
+    rather than a silently wrong page."""
+    return _encode_keyset([order, at, row_id])
+
+
+def _decode_pending_cursor(cursor: str, order: str, default_order: str) -> tuple[datetime, int]:
+    """Inverse of `_encode_pending_cursor`. A pre-B1 two-element cursor
+    (`_encode_cursor`'s `[at, id]`) still decodes, but only under the
+    route's DEFAULT order — the only order it could have come from."""
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        if len(raw) == 2:
+            cursor_order, (iso, row_id) = default_order, raw
+        else:
+            cursor_order, iso, row_id = raw
+        parsed = datetime.fromisoformat(iso)
+        row_id = int(row_id)
+    except Exception as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid cursor") from exc
+    if cursor_order != order:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cursor belongs to another order")
+    return parsed, row_id
+
+
+def _pending_page(query, at_column, id_column, *, order: str, default_order: str, cursor: str | None):
+    """One page of a pending queue, keyset `(submitted_at, id)` in `order`."""
+    if order not in PENDING_ORDERS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid order")
+    newest = order == "newest"
+    keys = tuple_(at_column, id_column)
+    if cursor:
+        after = _decode_pending_cursor(cursor, order, default_order)
+        query = query.filter(keys < after if newest else keys > after)
+    direction = (lambda c: c.desc()) if newest else (lambda c: c.asc())
+    rows = query.order_by(direction(at_column), direction(id_column)).limit(THREADS_PAGE_SIZE + 1).all()
+    has_more = len(rows) > THREADS_PAGE_SIZE
+    page = rows[:THREADS_PAGE_SIZE]
+    next_cursor = (
+        _encode_pending_cursor(order, page[-1].submitted_at, page[-1].id) if has_more and page else None
+    )
+    return page, next_cursor
+
+
 def list_pending_threads(
-    db: Session, cursor: str | None, *, access: ViewerAccess | None = None
+    db: Session,
+    cursor: str | None,
+    *,
+    order: str = "oldest",
+    access: ViewerAccess | None = None,
 ) -> ThreadModerationListResponse:
     """`GET /threads/moderation/pending` — scoped to the caller's moderated
     set (plan §5.2); an empty set is a `200` with an empty page, never a
@@ -4319,7 +4400,13 @@ def list_pending_threads(
     its timestamp is now `submitted_at` (landmine 4: a `created_at` cursor
     from a page opened before deploy decodes to a valid-looking position —
     harmless, one odd page). Rows carry `resubmission_count` and
-    `previous_rejection` (`_round_fields`, one batched query)."""
+    `previous_rejection` (`_round_fields`, one batched query).
+
+    plan_thread_review_merge B1: `order` = oldest (default, unchanged) |
+    newest, so Thread Review can merge this queue with the revision queue
+    in ONE order. The cursor names its order (`_encode_pending_cursor`)."""
+    if order not in PENDING_ORDERS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid order")
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
         return ThreadModerationListResponse(items=[], next_cursor=None)
@@ -4328,24 +4415,9 @@ def list_pending_threads(
         ThreadV2.component_id.in_(component_ids),
         ThreadV2.status == THREAD_STATUS_PENDING,
     )
-    if cursor:
-        after_submitted_at, after_id = _decode_cursor(cursor)
-        # Ascending order flips the keyset comparison to `>` (plan §4.3's
-        # row-comparison rule, same shape as the comment list's oldest-first
-        # pagination).
-        query = query.filter(
-            tuple_(ThreadV2.submitted_at, ThreadV2.id) > (after_submitted_at, after_id)
-        )
-
-    rows = (
-        query.order_by(ThreadV2.submitted_at.asc(), ThreadV2.id.asc())
-        .limit(THREADS_PAGE_SIZE + 1)
-        .all()
+    page, next_cursor = _pending_page(
+        query, ThreadV2.submitted_at, ThreadV2.id, order=order, default_order="oldest", cursor=cursor
     )
-    has_more = len(rows) > THREADS_PAGE_SIZE
-    page = rows[:THREADS_PAGE_SIZE]
-    next_cursor = _encode_cursor(page[-1].submitted_at, page[-1].id) if has_more and page else None
-
     return ThreadModerationListResponse(items=_to_moderation_rows(db, page), next_cursor=next_cursor)
 
 
@@ -4673,12 +4745,20 @@ def _to_revision_moderation_rows(
 
 
 def list_pending_revisions(
-    db: Session, cursor: str | None, *, access: ViewerAccess | None = None
+    db: Session,
+    cursor: str | None,
+    *,
+    order: str = "newest",
+    access: ViewerAccess | None = None,
 ) -> ThreadRevisionModerationListResponse:
     """`GET /threads/revision-moderation/pending` — every pending revision in
     the caller's moderated set, one row per revision (owner decision 5),
-    NEWEST submission first (amendment A4 — unlike the thread queue's
-    FIFO). An empty moderated set is a 200 with an empty page."""
+    NEWEST submission first by default (amendment A4 — unlike the thread
+    queue's FIFO). An empty moderated set is a 200 with an empty page.
+    plan_thread_review_merge B1: `order` = newest (default) | oldest, the
+    cursor naming its order exactly like `list_pending_threads`."""
+    if order not in PENDING_ORDERS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid order")
     component_ids = _moderated_component_ids(db, access)
     if not component_ids:
         return ThreadRevisionModerationListResponse(items=[], next_cursor=None)
@@ -4686,20 +4766,13 @@ def list_pending_revisions(
     query = _moderated_revisions_query(db, component_ids).filter(
         ThreadRevisionV2.status == REVISION_STATUS_PENDING
     )
-    if cursor:
-        after_at, after_id = _decode_cursor(cursor)
-        query = query.filter(
-            tuple_(ThreadRevisionV2.submitted_at, ThreadRevisionV2.id) < (after_at, after_id)
-        )
-    rows = (
-        query.order_by(ThreadRevisionV2.submitted_at.desc(), ThreadRevisionV2.id.desc())
-        .limit(THREADS_PAGE_SIZE + 1)
-        .all()
-    )
-    has_more = len(rows) > THREADS_PAGE_SIZE
-    page = rows[:THREADS_PAGE_SIZE]
-    next_cursor = (
-        _encode_cursor(page[-1].submitted_at, page[-1].id) if has_more and page else None
+    page, next_cursor = _pending_page(
+        query,
+        ThreadRevisionV2.submitted_at,
+        ThreadRevisionV2.id,
+        order=order,
+        default_order="newest",
+        cursor=cursor,
     )
     return ThreadRevisionModerationListResponse(
         items=_to_revision_moderation_rows(db, page), next_cursor=next_cursor
@@ -4852,6 +4925,592 @@ def revision_history_facets(
         authors=_people(ThreadRevisionV2.submitted_by_email, ThreadRevisionV2.submitted_by_name),
         reviewers=_people(ThreadRevisionV2.reviewed_by_email, ThreadRevisionV2.reviewed_by_name),
     )
+
+
+# ---------------------------------------------------------
+# Thread Review (plan_thread_review_merge_2026-11-11.md §5 B2/B3) — ONE
+# activity log over both decision tables. Source S = every stored
+# `thread_submissions` round (`list_thread_history`'s rows); source R = every
+# decided `thread_revisions` row (`list_revision_history`'s rows) MINUS the
+# v1 `original` of a thread that has an approved round: approving a new
+# thread writes both (`decide_thread` → `_write_original_revision`), and the
+# round is the row ("New thread · Revision k → published as v1"). A v1 with
+# no approved round (an editor's own post, a G3 self-publish) stays, as
+# "Published directly". Read-only; the existing `reviewed_at, id` indexes
+# cover both halves.
+# ---------------------------------------------------------
+
+ACTIVITY_KINDS = ("new", "resubmission", "edit", "editor_edit", "published_directly")
+ACTIVITY_OUTCOMES = ("approved", "rejected", "overwritten", "published_directly")
+ACTIVITY_OUTCOME_PUBLISHED_DIRECTLY = "published_directly"
+ACTIVITY_SOURCE_SUBMISSION = 0
+ACTIVITY_SOURCE_REVISION = 1
+THREAD_TIMELINE_CAP = 200
+
+
+def _sql_text(value: str):
+    """A constant string in the union's select lists, rendered INLINE
+    (`'edit'`) rather than as a bind parameter — Postgres cannot type an
+    untyped parameter in a UNION's select list. Only ever called with this
+    module's own constants."""
+    return literal_column(f"'{value}'", String)
+
+
+def _activity_union(db: Session, component_ids: Collection[int], *, thread_id: int | None = None):
+    """The deduplicated `UNION ALL`, as a subquery with uniform labelled
+    columns: `source_rank` (0 = submission, 1 = revision), `source_id`,
+    `thread_id`, `component_id`, `kind`, `outcome`, `title` (decided
+    snapshot), `thread_title` (now), `reason`, `submitted_by_*`,
+    `decided_by_*`, `decided_at`. Callers filter, sort and page on it."""
+    ids = list(component_ids)
+    s_kind = case(
+        (ThreadSubmissionV2.round == 0, _sql_text("new")), else_=_sql_text("resubmission")
+    )
+    submissions = (
+        select(
+            literal_column(str(ACTIVITY_SOURCE_SUBMISSION), Integer).label("source_rank"),
+            ThreadSubmissionV2.id.label("source_id"),
+            ThreadSubmissionV2.thread_id.label("thread_id"),
+            ThreadV2.component_id.label("component_id"),
+            s_kind.label("kind"),
+            ThreadSubmissionV2.status.label("outcome"),
+            ThreadSubmissionV2.title.label("title"),
+            ThreadV2.title.label("thread_title"),
+            ThreadSubmissionV2.reason.label("reason"),
+            ThreadSubmissionV2.submitted_by_email.label("submitted_by_email"),
+            ThreadSubmissionV2.submitted_by_name.label("submitted_by_name"),
+            ThreadSubmissionV2.reviewed_by_email.label("decided_by_email"),
+            ThreadSubmissionV2.reviewed_by_name.label("decided_by_name"),
+            ThreadSubmissionV2.reviewed_at.label("decided_at"),
+        )
+        .join(ThreadV2, ThreadV2.id == ThreadSubmissionV2.thread_id)
+        .where(ThreadV2.component_id.in_(ids))
+    )
+
+    approved_round = (
+        select(ThreadSubmissionV2.id)
+        .where(
+            ThreadSubmissionV2.thread_id == ThreadRevisionV2.thread_id,
+            ThreadSubmissionV2.status == THREAD_STATUS_APPROVED,
+        )
+        .exists()
+    )
+    r_kind = case(
+        (ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR, _sql_text("edit")),
+        (ThreadRevisionV2.origin == REVISION_ORIGIN_EDITOR, _sql_text("editor_edit")),
+        else_=_sql_text("published_directly"),
+    )
+    r_outcome = case(
+        (ThreadRevisionV2.origin == REVISION_ORIGIN_AUTHOR, ThreadRevisionV2.status),
+        else_=_sql_text(ACTIVITY_OUTCOME_PUBLISHED_DIRECTLY),
+    )
+    revisions = (
+        select(
+            literal_column(str(ACTIVITY_SOURCE_REVISION), Integer).label("source_rank"),
+            ThreadRevisionV2.id.label("source_id"),
+            ThreadRevisionV2.thread_id.label("thread_id"),
+            ThreadV2.component_id.label("component_id"),
+            r_kind.label("kind"),
+            r_outcome.label("outcome"),
+            ThreadRevisionV2.title.label("title"),
+            ThreadV2.title.label("thread_title"),
+            ThreadRevisionV2.rejection_reason.label("reason"),
+            ThreadRevisionV2.submitted_by_email.label("submitted_by_email"),
+            ThreadRevisionV2.submitted_by_name.label("submitted_by_name"),
+            ThreadRevisionV2.reviewed_by_email.label("decided_by_email"),
+            ThreadRevisionV2.reviewed_by_name.label("decided_by_name"),
+            ThreadRevisionV2.reviewed_at.label("decided_at"),
+        )
+        .join(ThreadV2, ThreadV2.id == ThreadRevisionV2.thread_id)
+        .where(
+            ThreadV2.component_id.in_(ids),
+            ThreadRevisionV2.status.in_(REVISION_DECIDED_STATUSES),
+            ThreadRevisionV2.reviewed_at.isnot(None),
+            # THE dedupe rule (plan B2).
+            not_(and_(ThreadRevisionV2.origin == REVISION_ORIGIN_ORIGINAL, approved_round)),
+        )
+    )
+    if thread_id is not None:
+        submissions = submissions.where(ThreadSubmissionV2.thread_id == thread_id)
+        revisions = revisions.where(ThreadRevisionV2.thread_id == thread_id)
+    return union_all(submissions, revisions).subquery("thread_activity")
+
+
+def _activity_filters(
+    db: Session,
+    union,
+    component_ids: list[int],
+    *,
+    kinds: list[str] | None,
+    outcomes: list[str] | None,
+    widgets: list[str] | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    authors: list[str] | None,
+    reviewers: list[str] | None,
+    q: str | None,
+) -> list[Any]:
+    """The WHERE list for the activity union — every filter on the ROW."""
+    where: list[Any] = []
+    if kinds:
+        where.append(union.c.kind.in_(list(dict.fromkeys(kinds))))
+    if outcomes:
+        where.append(union.c.outcome.in_(list(dict.fromkeys(outcomes))))
+    if widgets:
+        # Narrows within the moderated set, never widens it: an unknown or
+        # unmoderated link matches nothing (the `thread_ids` rule).
+        widget_ids = [
+            row[0]
+            for row in db.query(ComponentV2.id).filter(
+                ComponentV2.link.in_({w.strip() for w in widgets}),
+                ComponentV2.id.in_(component_ids),
+            )
+        ]
+        where.append(union.c.component_id.in_(widget_ids) if widget_ids else false())
+    if date_from is not None:
+        where.append(union.c.decided_at >= _as_utc(date_from))
+    if date_to is not None:
+        where.append(union.c.decided_at < _as_utc(date_to))
+    if authors:
+        where.append(union.c.submitted_by_email.in_({_norm_email(e) for e in authors}))
+    if reviewers:
+        where.append(union.c.decided_by_email.in_({_norm_email(e) for e in reviewers}))
+    search = _history_search_predicate(
+        db,
+        q or "",
+        component_ids,
+        [union.c.title, union.c.thread_title, union.c.reason],
+        component_column=union.c.component_id,
+    )
+    if search is not None:
+        where.append(search)
+    return where
+
+
+def _encode_activity_cursor(mode: str, order: str, values: list[Any]) -> str:
+    return _encode_keyset([mode, order, *values])
+
+
+def _decode_activity_cursor(cursor: str, mode: str, order: str) -> tuple[Any, ...]:
+    """`[mode, order, ...key]` — flat key `(decided_at, source_rank,
+    source_id)`, grouped `(g_at, gk, decided_at, source_rank, source_id)`.
+    A cursor from another mode (flat / thread / widget) or order, or junk,
+    is a 400: the caller must resend the filters, group and order it was
+    issued under."""
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        cursor_mode, cursor_order, *key = raw
+        if mode == "flat":
+            at, rank, row_id = key
+            values: tuple[Any, ...] = (_as_utc(datetime.fromisoformat(at)), int(rank), int(row_id))
+        else:
+            g_at, gk, at, rank, row_id = key
+            values = (
+                _as_utc(datetime.fromisoformat(g_at)),
+                int(gk),
+                _as_utc(datetime.fromisoformat(at)),
+                int(rank),
+                int(row_id),
+            )
+    except Exception as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid cursor") from exc
+    if (cursor_mode, cursor_order) != (mode, order):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid cursor")
+    return values
+
+
+def _activity_page(
+    db: Session,
+    union,
+    where: list[Any],
+    *,
+    group: str | None,
+    order: str,
+    cursor: str | None,
+):
+    """`_keyset_page`'s twin for the union (a Core subquery, not an ORM
+    entity). Sort `(decided_at, source_rank, source_id)` newest or oldest
+    first — `source_rank` keeps the key unique when a round and a revision
+    share an instant AND an id. Grouped, each group's rows come out
+    together: groups by their newest (oldest-first: oldest) decision under
+    the SAME filters. Returns `(records, group_sizes, next_cursor)`."""
+    newest = order != "oldest"
+    mode = group or "flat"
+    row_keys = (union.c.decided_at, union.c.source_rank, union.c.source_id)
+    if group is not None:
+        group_column = union.c.thread_id if group == "thread" else union.c.component_id
+        agg = func.max(union.c.decided_at) if newest else func.min(union.c.decided_at)
+        groups = (
+            select(
+                group_column.label("gk"), agg.label("g_at"), func.count().label("g_n")
+            )
+            .where(*where)
+            .group_by(group_column)
+            .subquery("thread_activity_groups")
+        )
+        stmt = select(union, groups.c.g_at, groups.c.gk, groups.c.g_n).select_from(
+            union.join(groups, groups.c.gk == group_column)
+        )
+        keys = (groups.c.g_at, groups.c.gk, *row_keys)
+    else:
+        stmt = select(union)
+        keys = row_keys
+    stmt = stmt.where(*where)
+    if cursor:
+        after = _decode_activity_cursor(cursor, mode, order)
+        stmt = stmt.where(tuple_(*keys) < after if newest else tuple_(*keys) > after)
+    stmt = stmt.order_by(*[k.desc() if newest else k.asc() for k in keys])
+    fetched = db.execute(stmt.limit(THREADS_PAGE_SIZE + 1)).all()
+    has_more = len(fetched) > THREADS_PAGE_SIZE
+    fetched = fetched[:THREADS_PAGE_SIZE]
+
+    sizes = [int(r.g_n) for r in fetched] if group is not None else [None] * len(fetched)
+    next_cursor = None
+    if has_more and fetched:
+        last = fetched[-1]
+        values = [last.decided_at, int(last.source_rank), int(last.source_id)]
+        if group is not None:
+            values = [last.g_at, int(last.gk), *values]
+        next_cursor = _encode_activity_cursor(mode, order, values)
+    return fetched, sizes, next_cursor
+
+
+def _can_open_in_hub(thread: ThreadV2, outcome: str) -> bool:
+    """plan B2 (fixes M6): only a row whose event put text live, on a
+    thread that is live now."""
+    return thread.status == THREAD_STATUS_APPROVED and outcome in (
+        REVISION_STATUS_APPROVED,
+        ACTIVITY_OUTCOME_PUBLISHED_DIRECTLY,
+    )
+
+
+def _activity_context(db: Session, thread_ids: Collection[int]):
+    """Threads, their components and widget labels for a set of activity
+    rows — one batch each (`_widget_title_and_location_for_components`)."""
+    threads = (
+        {t.id: t for t in db.query(ThreadV2).filter(ThreadV2.id.in_(set(thread_ids)))}
+        if thread_ids
+        else {}
+    )
+    component_ids = {t.component_id for t in threads.values()}
+    components = (
+        {c.id: c for c in db.query(ComponentV2).filter(ComponentV2.id.in_(component_ids))}
+        if component_ids
+        else {}
+    )
+    info = _widget_title_and_location_for_components(db, components)
+    return threads, components, info
+
+
+def _activity_base(thread: ThreadV2, component: ComponentV2, info: dict[int, tuple[str, str]]) -> dict[str, Any]:
+    widget_title, location_label = info.get(component.id, ("Discussion", ""))
+    return {
+        "thread_id": thread.id,
+        "thread_title": thread.title,
+        "thread_status": thread.status,
+        "thread_version": thread.version or 1,
+        "component_id": component.id,
+        "component_link": component.link,
+        "widget_title": widget_title,
+        "location_label": location_label,
+    }
+
+
+def _submission_activity_row(
+    sub: ThreadSubmissionV2, thread: ThreadV2, base: dict[str, Any], *, kind: str, outcome: str,
+    carries_close: bool, group_size: int | None = None,
+) -> ThreadActivityRow:
+    return ThreadActivityRow(
+        **base,
+        key=f"s{sub.id}",
+        source="submission",
+        source_id=sub.id,
+        kind=kind,
+        outcome=outcome,
+        round=sub.round,
+        title=sub.title,
+        submitted_by_email=sub.submitted_by_email,
+        submitted_by_name=sub.submitted_by_name,
+        submitted_at=sub.submitted_at,
+        decided_by_email=sub.reviewed_by_email,
+        decided_by_name=sub.reviewed_by_name,
+        decided_at=sub.reviewed_at,
+        reason=sub.reason,
+        closed_at=thread.closed_at if carries_close else None,
+        closed_kind=thread.closed_kind if carries_close else None,
+        published_as_v1=outcome == THREAD_STATUS_APPROVED,
+        can_open_in_hub=_can_open_in_hub(thread, outcome),
+        group_size=group_size,
+    )
+
+
+def _revision_activity_row(
+    rev: ThreadRevisionV2, thread: ThreadV2, base: dict[str, Any], *, kind: str, outcome: str,
+    group_size: int | None = None,
+) -> ThreadActivityRow:
+    pending = outcome == REVISION_STATUS_PENDING
+    return ThreadActivityRow(
+        **base,
+        key=f"r{rev.id}",
+        source="revision",
+        source_id=rev.id,
+        kind=kind,
+        outcome=outcome,
+        version=rev.version,
+        resubmission_number=rev.resubmission_number or 0,
+        resubmission_of_version=_resubmission_of_version(rev),
+        resubmission_root_version=_resubmission_root_version(rev),
+        title=rev.title,
+        submitted_by_email=rev.submitted_by_email,
+        submitted_by_name=rev.submitted_by_name,
+        submitted_at=rev.submitted_at,
+        decided_by_email=rev.reviewed_by_email,
+        decided_by_name=rev.reviewed_by_name,
+        decided_at=rev.reviewed_at,
+        reason=rev.rejection_reason,
+        closed_at=rev.closed_at,
+        closed_kind=rev.closed_kind,
+        closed_by_version=rev.closed_by_version,
+        can_open_in_hub=_can_open_in_hub(thread, outcome),
+        group_size=group_size,
+        edit_count=(rev.edit_count or 0) if pending else None,
+        updated_at=rev.updated_at if pending else None,
+    )
+
+
+def _hydrate_activity(db: Session, records: list[Any], sizes: list[int | None]) -> list[ThreadActivityRow]:
+    """Union records (one page, already ordered) -> `ThreadActivityRow`s.
+    `kind` / `outcome` come from the union itself, so the SQL and the row
+    can never disagree. Batched: one read per table plus the widget labels.
+    A submission row carries the thread's Close only on the thread's LAST
+    declined round (the round the author closed)."""
+    if not records:
+        return []
+    s_ids = [r.source_id for r in records if r.source_rank == ACTIVITY_SOURCE_SUBMISSION]
+    r_ids = [r.source_id for r in records if r.source_rank == ACTIVITY_SOURCE_REVISION]
+    subs = (
+        {s.id: s for s in db.query(ThreadSubmissionV2).filter(ThreadSubmissionV2.id.in_(s_ids))}
+        if s_ids
+        else {}
+    )
+    revs = (
+        {r.id: r for r in db.query(ThreadRevisionV2).filter(ThreadRevisionV2.id.in_(r_ids))}
+        if r_ids
+        else {}
+    )
+    threads, components, info = _activity_context(db, {r.thread_id for r in records})
+
+    closed_ids = [t.id for t in threads.values() if t.closed_at is not None]
+    last_declined: dict[int, int] = {}
+    if closed_ids and s_ids:
+        last_declined = {
+            thread_id: max_round
+            for thread_id, max_round in db.query(
+                ThreadSubmissionV2.thread_id, func.max(ThreadSubmissionV2.round)
+            )
+            .filter(
+                ThreadSubmissionV2.thread_id.in_(closed_ids),
+                ThreadSubmissionV2.status == THREAD_STATUS_REJECTED,
+            )
+            .group_by(ThreadSubmissionV2.thread_id)
+        }
+
+    items: list[ThreadActivityRow] = []
+    for record, size in zip(records, sizes):
+        thread = threads.get(record.thread_id)
+        component = components.get(thread.component_id) if thread is not None else None
+        if component is None:
+            continue  # FK cascade makes this unreachable; defensive only
+        base = _activity_base(thread, component, info)
+        if record.source_rank == ACTIVITY_SOURCE_SUBMISSION:
+            sub = subs.get(record.source_id)
+            if sub is None:
+                continue
+            items.append(
+                _submission_activity_row(
+                    sub, thread, base, kind=record.kind, outcome=record.outcome,
+                    carries_close=(
+                        sub.status == THREAD_STATUS_REJECTED
+                        and last_declined.get(thread.id) == sub.round
+                    ),
+                    group_size=size,
+                )
+            )
+        else:
+            rev = revs.get(record.source_id)
+            if rev is None:
+                continue
+            items.append(
+                _revision_activity_row(
+                    rev, thread, base, kind=record.kind, outcome=record.outcome, group_size=size
+                )
+            )
+    return items
+
+
+def list_thread_activity(
+    db: Session,
+    cursor: str | None,
+    *,
+    kinds: list[str] | None = None,
+    outcomes: list[str] | None = None,
+    widgets: list[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    authors: list[str] | None = None,
+    reviewers: list[str] | None = None,
+    q: str | None = None,
+    group: str | None = None,
+    order: str = "newest",
+    access: ViewerAccess | None = None,
+) -> ThreadActivityListResponse:
+    """`GET /threads/moderation/activity` (plan B2) — Thread Review's
+    History: one row per decision from BOTH tables, deduplicated
+    (`_activity_union`), over the caller's moderated set — the same
+    audience and gate as `list_thread_history` / `list_revision_history`.
+
+    Filters, all optional and combinable, each on the ROW: `kinds`,
+    `outcomes`, `widgets` (component links), `date_from` (inclusive) /
+    `date_to` (exclusive) on the decision instant, `authors` / `reviewers`
+    (any-of, case-insensitive), `q` — substring of the decided title, the
+    current title, the widget title OR the reason. `group` = thread |
+    widget, `order` = newest | oldest. The cursor names its mode and order;
+    resend the same filters with it."""
+    if kinds and any(k not in ACTIVITY_KINDS for k in kinds):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid kind filter")
+    if outcomes and any(o not in ACTIVITY_OUTCOMES for o in outcomes):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid outcome filter")
+    if group is not None and group not in HISTORY_GROUPS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid group")
+    if order not in HISTORY_ORDERS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid order")
+
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadActivityListResponse(items=[], next_cursor=None)
+
+    union = _activity_union(db, component_ids)
+    where = _activity_filters(
+        db, union, component_ids, kinds=kinds, outcomes=outcomes, widgets=widgets,
+        date_from=date_from, date_to=date_to, authors=authors, reviewers=reviewers, q=q,
+    )
+    records, sizes, next_cursor = _activity_page(
+        db, union, where, group=group, order=order, cursor=cursor
+    )
+    return ThreadActivityListResponse(
+        items=_hydrate_activity(db, records, sizes), next_cursor=next_cursor
+    )
+
+
+def thread_activity_facets(
+    db: Session, *, access: ViewerAccess | None = None
+) -> ThreadActivityFacets:
+    """`GET /threads/moderation/activity/facets` — the distinct authors,
+    deciders and widgets of the DEDUPLICATED activity union in the caller's
+    moderated set (a kept v1's publisher is a decider; a dropped v1's is
+    not, unless they decided something else). People sorted by name then
+    email; widgets by title, location, link."""
+    component_ids = _moderated_component_ids(db, access)
+    if not component_ids:
+        return ThreadActivityFacets()
+    union = _activity_union(db, component_ids)
+
+    def _people(email_col, name_col) -> list[RevisionPerson]:
+        rows = db.execute(
+            select(email_col, func.max(name_col)).where(email_col.isnot(None)).group_by(email_col)
+        ).all()
+        people = [RevisionPerson(email=email, name=name) for email, name in rows]
+        people.sort(key=lambda p: ((p.name or p.email).casefold(), p.email))
+        return people
+
+    used = [row[0] for row in db.execute(select(union.c.component_id).distinct()).all()]
+    components = (
+        {c.id: c for c in db.query(ComponentV2).filter(ComponentV2.id.in_(used))} if used else {}
+    )
+    info = _widget_title_and_location_for_components(db, components)
+    widgets = [
+        ThreadActivityWidget(
+            component_link=c.link,
+            widget_title=info.get(c.id, ("Discussion", ""))[0],
+            location_label=info.get(c.id, ("Discussion", ""))[1],
+        )
+        for c in components.values()
+    ]
+    widgets.sort(key=lambda w: (w.widget_title.casefold(), w.location_label.casefold(), w.component_link))
+    return ThreadActivityFacets(
+        authors=_people(union.c.submitted_by_email, union.c.submitted_by_name),
+        reviewers=_people(union.c.decided_by_email, union.c.decided_by_name),
+        widgets=widgets,
+    )
+
+
+def get_thread_timeline(
+    db: Session, thread_id: int, *, access: ViewerAccess | None = None
+) -> ThreadTimelineResponse:
+    """`GET /threads/{id}/timeline` (plan B3) — the reviewer drawer's
+    lifecycle: every activity row of ONE thread (the same deduplicated
+    union), oldest first, then its pending entries — the pending round
+    (synthesized, `outcome='pending'`, `edit_count` = the thread's, and
+    `updated_at` = `edited_at` when the pending text was edited after it was
+    submitted) and every pending author edit by version (`edit_count`,
+    `updated_at`). No bodies: the drawer reads text through
+    `submission-history` / `revisions/{rid}`.
+
+    Unpaged, capped at `THREAD_TIMELINE_CAP` decided rows — the NEWEST
+    ones, with `truncated`. Gate: 404 (no thread) → 403 (no view) → 404
+    unless the caller is an editor of the thread's widget — the reviewer's
+    drawer; the author-side timeline is out of scope."""
+    thread, component = _require_thread_and_component(db, thread_id)
+    _check_view_access(component, access)
+    if not _is_component_editor(component, access):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+
+    union = _activity_union(db, [component.id], thread_id=thread.id)
+    keys = (union.c.decided_at, union.c.source_rank, union.c.source_id)
+    records = db.execute(
+        select(union).order_by(*[k.desc() for k in keys]).limit(THREAD_TIMELINE_CAP + 1)
+    ).all()
+    truncated = len(records) > THREAD_TIMELINE_CAP
+    records = list(reversed(records[:THREAD_TIMELINE_CAP]))
+    items = _hydrate_activity(db, records, [None] * len(records))
+
+    info = _widget_title_and_location_for_components(db, {component.id: component})
+    base = _activity_base(thread, component, info)
+    if thread.status == THREAD_STATUS_PENDING:
+        submitted_at = thread.submitted_at or thread.created_at
+        edited_after = (
+            thread.edited_at is not None
+            and submitted_at is not None
+            and _as_utc(thread.edited_at) > _as_utc(submitted_at)
+        )
+        count = thread.resubmission_count or 0
+        items.append(
+            ThreadActivityRow(
+                **base,
+                key=f"sp{thread.id}",
+                source="submission",
+                source_id=None,
+                kind="resubmission" if count > 0 else "new",
+                outcome="pending",
+                round=count,
+                title=thread.title,
+                submitted_by_email=_norm_email(thread.author_email),
+                submitted_by_name=thread.author_name,
+                submitted_at=submitted_at,
+                edit_count=thread.edit_count or 0,
+                updated_at=thread.edited_at if edited_after else None,
+            )
+        )
+    for rev in (
+        db.query(ThreadRevisionV2)
+        .filter(
+            ThreadRevisionV2.thread_id == thread.id,
+            ThreadRevisionV2.status == REVISION_STATUS_PENDING,
+        )
+        .order_by(ThreadRevisionV2.version.asc())
+    ):
+        items.append(_revision_activity_row(rev, thread, base, kind="edit", outcome="pending"))
+    return ThreadTimelineResponse(thread_id=thread.id, items=items, truncated=truncated)
 
 
 def revision_moderation_summary(

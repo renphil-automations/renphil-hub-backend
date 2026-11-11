@@ -111,6 +111,8 @@ from app.schemas.thread import (
     RevisionDecisionRequest,
     ThreadDecisionRequest,
     RevisionResubmitRequest,
+    ThreadActivityFacets,
+    ThreadActivityListResponse,
     ThreadCreateRequest,
     ThreadDetail,
     ThreadDetailViewAsResponse,
@@ -126,6 +128,7 @@ from app.schemas.thread import (
     ThreadRevisionModerationSummary,
     ThreadResubmitRequest,
     ThreadSubmissionRound,
+    ThreadTimelineResponse,
     ThreadUpdateRequest,
     ThreadUpdateResult,
     ThreadWidgetCounts,
@@ -437,11 +440,16 @@ async def create_thread(
     summary="The caller's pending-thread moderation queue, oldest first",
 )
 async def list_pending_threads(
-    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; it names its order."),
+    order: Literal["oldest", "newest"] = Query(
+        default="oldest", description="Submission order. A cursor issued under the other order is a 400."
+    ),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.list_pending_threads, db, cursor, access=access)
+    return await asyncio.to_thread(
+        thread_service.list_pending_threads, db, cursor, order=order, access=access
+    )
 
 
 @router.get(
@@ -505,6 +513,76 @@ async def get_thread_history_facets(
     return await asyncio.to_thread(thread_service.thread_history_facets, db, access=access)
 
 
+# plan_thread_review_merge_2026-11-11.md §5 B2 — Thread Review's History:
+# both decision tables in one deduplicated log. Static, so declared here
+# with the other `/threads/moderation/*` routes, above `/threads/{thread_id}`.
+@router.get(
+    "/threads/moderation/activity",
+    response_model=ThreadActivityListResponse,
+    summary="Every decision on threads and edits the caller moderates — one row per decision — filterable, searchable, groupable",
+    responses={400: {"description": "Malformed cursor, or a cursor from another group / order"}},
+)
+async def list_thread_activity(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; resend the same filters, group and order."),
+    kind: list[Literal["new", "resubmission", "edit", "editor_edit", "published_directly"]] | None = Query(
+        default=None, description="Repeatable. Default: all five."
+    ),
+    outcome: list[Literal["approved", "rejected", "overwritten", "published_directly"]] | None = Query(
+        default=None, description="Repeatable. Default: all four."
+    ),
+    widget: list[str] | None = Query(
+        default=None, description="Widget `component_link`. Repeatable. Narrows within the moderated set."
+    ),
+    q: str | None = Query(
+        default=None,
+        max_length=200,
+        description="Substring of the decided title, current title, widget title or reason.",
+    ),
+    group: Literal["thread", "widget"] | None = Query(
+        default=None, description="Keep each thread's / widget's rows together."
+    ),
+    order: Literal["newest", "oldest"] = Query(default="newest"),
+    date_from: datetime | None = Query(
+        default=None, description="Decision instant, inclusive (ISO-8601; naive = UTC)."
+    ),
+    date_to: datetime | None = Query(
+        default=None, description="Decision instant, exclusive (ISO-8601; naive = UTC)."
+    ),
+    author: list[str] | None = Query(default=None, description="Submitter email. Repeatable."),
+    reviewer: list[str] | None = Query(default=None, description="Decider email. Repeatable."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.list_thread_activity,
+        db,
+        cursor,
+        kinds=kind,
+        outcomes=outcome,
+        widgets=widget,
+        date_from=date_from,
+        date_to=date_to,
+        authors=author,
+        reviewers=reviewer,
+        q=q,
+        group=group,
+        order=order,
+        access=access,
+    )
+
+
+@router.get(
+    "/threads/moderation/activity/facets",
+    response_model=ThreadActivityFacets,
+    summary="Thread Review History's author, reviewer and widget filter options",
+)
+async def get_thread_activity_facets(
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.thread_activity_facets, db, access=access)
+
+
 @router.get(
     "/threads/moderation/summary",
     response_model=ThreadModerationSummary,
@@ -560,11 +638,16 @@ async def get_moderation_summary(
     summary="Pending thread revisions the caller can decide, newest first",
 )
 async def list_pending_revisions(
-    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; it names its order."),
+    order: Literal["oldest", "newest"] = Query(
+        default="newest", description="Submission order. A cursor issued under the other order is a 400."
+    ),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.list_pending_revisions, db, cursor, access=access)
+    return await asyncio.to_thread(
+        thread_service.list_pending_revisions, db, cursor, order=order, access=access
+    )
 
 
 @router.get(
@@ -801,6 +884,23 @@ async def get_thread_submission_history(
     return await asyncio.to_thread(
         thread_service.get_thread_submission_history, db, thread_id, user, access=access
     )
+
+
+@router.get(
+    "/threads/{thread_id}/timeline",
+    response_model=ThreadTimelineResponse,
+    summary="One thread's whole lifecycle — every decision plus its pending items — editors of its widget",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "Thread not found, or caller is not an editor of its widget"},
+    },
+)
+async def get_thread_timeline(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.get_thread_timeline, db, thread_id, access=access)
 
 
 # ---------------------------------------------------------

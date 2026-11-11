@@ -871,6 +871,95 @@ class ThreadHistoryListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+# plan_thread_review_merge_2026-11-11.md §5 B2/B3 — Thread Review's ONE
+# activity row: a stored `thread_submissions` round ("s<id>") or a decided
+# `thread_revisions` row ("r<id>"), with the v1 `original` of a thread that
+# has an approved round dropped (the same event as that round).
+ThreadActivityKind = Literal["new", "resubmission", "edit", "editor_edit", "published_directly"]
+ThreadActivityOutcome = Literal["approved", "rejected", "overwritten", "published_directly"]
+
+
+class ThreadActivityRow(BaseModel):
+    """One Thread Review History row (`GET /threads/moderation/activity`) or
+    one lifecycle entry (`GET /threads/{id}/timeline`).
+
+    - `kind`: `new` (round 0) / `resubmission` (round > 0) for a
+      submission; `edit` (author), `editor_edit`, `published_directly`
+      (a kept v1 `original`) for a revision.
+    - `outcome`: the decision. Editor edits and kept originals read
+      `published_directly` (nobody reviewed them). Timeline only: `pending`.
+    - `title` is the DECIDED snapshot's; `thread_title` / `thread_status` /
+      `thread_version` are the thread NOW.
+    - `closed_*`: a submission row carries the thread's Close only on its
+      LAST declined round; a revision row carries its own.
+    - `edit_count` / `updated_at`: pending timeline entries only."""
+
+    key: str
+    source: Literal["submission", "revision"]
+    source_id: int | None = None
+    thread_id: int
+    kind: ThreadActivityKind
+    outcome: Literal["approved", "rejected", "overwritten", "published_directly", "pending"]
+    round: int | None = None
+    version: int | None = None
+    resubmission_number: int = 0
+    resubmission_of_version: int | None = None
+    resubmission_root_version: int | None = None
+    title: str
+    thread_title: str
+    thread_status: str
+    thread_version: int
+    component_id: int
+    component_link: str
+    widget_title: str
+    location_label: str
+    submitted_by_email: str
+    submitted_by_name: str | None = None
+    submitted_at: datetime | None = None
+    decided_by_email: str | None = None
+    decided_by_name: str | None = None
+    decided_at: datetime | None = None
+    reason: str | None = None
+    closed_at: datetime | None = None
+    closed_kind: Literal["author", "superseded"] | None = None
+    closed_by_version: int | None = None
+    published_as_v1: bool = False
+    can_open_in_hub: bool = False
+    group_size: int | None = None
+    edit_count: int | None = None
+    updated_at: datetime | None = None
+
+
+class ThreadActivityListResponse(BaseModel):
+    items: list[ThreadActivityRow] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ThreadActivityWidget(BaseModel):
+    component_link: str
+    widget_title: str
+    location_label: str
+
+
+class ThreadActivityFacets(BaseModel):
+    """`GET /threads/moderation/activity/facets` — the distinct authors,
+    deciders and widgets of the caller's deduplicated activity rows."""
+
+    authors: list[RevisionPerson] = Field(default_factory=list)
+    reviewers: list[RevisionPerson] = Field(default_factory=list)
+    widgets: list[ThreadActivityWidget] = Field(default_factory=list)
+
+
+class ThreadTimelineResponse(BaseModel):
+    """`GET /threads/{id}/timeline` — every activity row of one thread,
+    oldest first (the NEWEST `THREAD_TIMELINE_CAP` when `truncated`), then
+    its pending entries (the pending round, pending edits by version)."""
+
+    thread_id: int
+    items: list[ThreadActivityRow] = Field(default_factory=list)
+    truncated: bool = False
+
+
 class ThreadModerationSummary(BaseModel):
     """`GET /threads/moderation/summary` (plan §4.2, §5.7) — polled like the
     notification bell; the router pairs this with an ETag for the same
