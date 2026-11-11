@@ -39,6 +39,7 @@ from app.schemas.task_manager import (
 from app.services import task_manager_service, view_as_service
 from app.services.access_visibility_service import granted_single_node
 from app.services.rbac_graph_service import RbacClosures
+from app.services.resource_grant_service import GrantMatch
 
 router = APIRouter(prefix="/v2/task-manager", tags=["Task Manager"])
 
@@ -78,19 +79,29 @@ def _task_permissions(
     current: CurrentHubUser,
     selection: view_as_service.ViewAsSelection | None = None,
 ) -> tuple[bool, task_manager_service.ComponentEditCheck]:
-    """``(is Admin on All Scopes, component_id -> has edit on it)``.
+    """``(is Admin on All Scopes, component_id -> has edit on it)``, sharing
+    one closure snapshot. The edit check is the single-node fast path (no
+    whole-tree build), only run when owner/admin doesn't already decide.
 
-    Without View As: the caller's own access, sharing one closure snapshot;
-    the edit check is the single-node fast path (no whole-tree build), only
-    run when owner/admin doesn't already decide. With View As: the selected
-    pairs' access plus the caller's direct shares — the same access the View
-    As reads use (``get_view_as_access``), built once for the request."""
-    if selection is not None:
-        access = view_as_service.resolve_view_as_access(db, selection.targets, user_id=current.hub_user_id)
-        return access.full_access, lambda component_id: access.verdict(("component", component_id)).edit
-
+    With View As, both follow the selected pairs instead of the caller's own
+    assignments, plus the caller's direct shares (task writes never run under
+    ``anonymous``). Their grants are looked up once, on the first edit check."""
     closures = RbacClosures(db)
-    admin = is_hub_admin(db, current, closures=closures)
+    if selection is None:
+        admin = is_hub_admin(db, current, closures=closures)
+    else:
+        admin = view_as_service.any_pair_is_hub_admin(db, selection.targets, closures=closures)
+    view_as_grants: list[list[GrantMatch]] = []
+
+    def _grants() -> list[GrantMatch] | None:
+        """``None`` lets ``granted_single_node`` find the caller's own grants."""
+        if selection is None:
+            return None
+        if not view_as_grants:
+            view_as_grants.append(
+                view_as_service.view_as_grants(db, selection.targets, user_id=current.hub_user_id, closures=closures)
+            )
+        return view_as_grants[0]
 
     def can_edit_component(component_id: int) -> bool:
         return granted_single_node(
@@ -100,6 +111,7 @@ def _task_permissions(
             is_admin=admin,
             closures=closures,
             edit_only=True,
+            grants=_grants(),
         )
 
     return admin, can_edit_component

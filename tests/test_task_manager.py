@@ -25,7 +25,10 @@ def _compile_jsonb_for_sqlite(_type, _compiler, **_kwargs):
 from app.db_v2.database import BaseV2, get_db_v2  # noqa: E402
 from app.db_v2.models.component import ComponentV2  # noqa: E402
 from app.db_v2.models.gridstack import GridstackV2  # noqa: E402
+from app.db_v2.models.hub import HubV2  # noqa: E402
+from app.db_v2.models.nav_tab import NavTabV2  # noqa: E402
 from app.db_v2.models.notification import NotificationV2  # noqa: E402
+from app.db_v2.models.resource_grant import LEVEL_EDIT, LEVEL_VIEW  # noqa: E402
 from app.db_v2.models.tab import TabV2  # noqa: E402
 from app.db_v2.models.task import TaskAssigneeV2, TaskV2  # noqa: E402
 from app.db_v2.models.user import UserV2  # noqa: E402
@@ -40,10 +43,13 @@ from app.main import app  # noqa: E402
 from app.models.auth import UserInfo  # noqa: E402
 from app.routers import task_manager as task_manager_router  # noqa: E402
 from app.services import gridstack_service, task_manager_service as svc, view_as_service  # noqa: E402
+from app.services import access_visibility_service  # noqa: E402
 from app.services.access_visibility_service import (  # noqa: E402
     INVISIBLE,
     NodeVerdict,
+    granted_single_node,
 )
+from app.services.resource_grant_service import GrantMatch  # noqa: E402
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -76,9 +82,18 @@ class _DbTestCase(unittest.TestCase):
         event.listen(engine, "connect", lambda conn, _rec: conn.execute("PRAGMA foreign_keys=ON"))
         BaseV2.metadata.create_all(engine)
         self.db = sessionmaker(bind=engine)()
-        tab = TabV2(document_id="tab", title="Tab", order=0, access_control={}, locked=False, locked_by="")
+        # A rooted chain (hub → nav tab → tab → grid → components), so the
+        # single-node walk reaches the hub.
+        self.db.add(HubV2(document_id="hub"))
+        nav_tab = NavTabV2(slug="nav", title="Nav", order=0, protected=False)
+        self.db.add(nav_tab)
+        self.db.flush()
+        tab = TabV2(
+            document_id="tab", title="Tab", order=0, access_control={}, locked=False, locked_by="", nav_tab_id=nav_tab.id
+        )
         self.db.add(tab)
         self.db.flush()
+        self.tab = tab
         self.grid = GridstackV2(document_id="tab", name="Tab", settings={}, position=0, parent_id=None, parent_tab_id=tab.id)
         self.db.add(self.grid)
         self.db.flush()
@@ -614,8 +629,9 @@ class TaskManagerRouterTests(_DbTestCase):
 
 
 class TaskManagerViewAsTests(_DbTestCase):
-    """View As on the four endpoints. `get_view_as_access` / the selection are
-    stubbed; `_task_permissions` and the anonymous refusal run for real."""
+    """View As on the four endpoints. `get_view_as_access` / the selection /
+    the adopted pairs' grants are stubbed; `_task_permissions`, the
+    single-node walk and the anonymous refusal run for real."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -623,7 +639,7 @@ class TaskManagerViewAsTests(_DbTestCase):
         self.assigned = self._create(caller=self.other, title="for owner", assignee_emails=["owner@renphil.org"])["id"]
         self.foreign = self._create(caller=self.other, title="other's", assignee_emails=[])["id"]
         self.access = VIEWER
-        self.pairs_access = _Access(view=True, edit=False)
+        self.pairs_grants: list[GrantMatch] = []
         self.selection = view_as_service.ViewAsSelection(targets=[], user=None)
         self.resolved_for: list[int | None] = []
         self.fold_calls = 0
@@ -632,9 +648,9 @@ class TaskManagerViewAsTests(_DbTestCase):
             self.fold_calls += 1
             return ViewAsAccess(access=self.access, view_as=True, view_as_user="sel@renphil.org")
 
-        def resolve(db, targets, *, user_id=None, closures=None):
+        def grants(db, targets, *, user_id, closures):
             self.resolved_for.append(user_id)
-            return self.pairs_access
+            return self.pairs_grants
 
         app.dependency_overrides[get_db_v2] = lambda: self.db
         app.dependency_overrides[get_current_hub_user] = lambda: CurrentHubUser(
@@ -642,12 +658,12 @@ class TaskManagerViewAsTests(_DbTestCase):
         )
         app.dependency_overrides[get_view_as_access] = view_as_access
         app.dependency_overrides[get_view_as_selection] = lambda: self.selection
-        self._resolve_patch = patch.object(view_as_service, "resolve_view_as_access", resolve)
-        self._resolve_patch.start()
+        self._grants_patch = patch.object(view_as_service, "view_as_grants", grants)
+        self._grants_patch.start()
         self.client = TestClient(app)
 
     def tearDown(self) -> None:
-        self._resolve_patch.stop()
+        self._grants_patch.stop()
         app.dependency_overrides.clear()
         super().tearDown()
 
@@ -701,29 +717,52 @@ class TaskManagerViewAsTests(_DbTestCase):
         self.assertEqual(r.status_code, 404)
 
     def test_update_and_delete_follow_the_selected_pairs_plus_own_tasks(self) -> None:
-        # The pairs give no edit: the caller's own task only.
+        # The pairs give view only: the caller's own task, or status as an assignee.
+        self.pairs_grants = [GrantMatch(1, "tab", self.tab.id, LEVEL_VIEW)]
         r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
         self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "FORBIDDEN"))
         r = self.client.patch(f"/v2/task-manager/tasks/{self.mine}", json={"title": "mine"})
         self.assertEqual((r.status_code, r.json()["view_as"]), (200, True))
         r = self.client.patch(f"/v2/task-manager/tasks/{self.assigned}", json={"status": "Closed"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self.resolved_for, [self.owner.id] * 3)
+        # Looked up only when owner/admin didn't decide, with the caller's direct shares.
+        self.assertEqual(self.resolved_for, [self.owner.id] * 2)
 
-        # The pairs give edit on the Task Manager: any task.
-        self.pairs_access = EDITOR
+        # The pairs give edit on an ancestor of the Task Manager: any task.
+        self.pairs_grants = [GrantMatch(1, "tab", self.tab.id, LEVEL_EDIT)]
         r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
         self.assertEqual((r.status_code, r.json()["task"]["can_manage"]), (200, True))
         r = self.client.request("DELETE", "/v2/task-manager/tasks", json={"task_ids": [self.foreign]})
         self.assertEqual((r.json()["deleted"], r.json()["view_as"]), ([self.foreign], True))
+        # Writes never build the whole-tree View As access.
+        self.assertEqual(self.fold_calls, 0)
 
     def test_without_view_as_the_callers_own_access_is_used(self) -> None:
         self.selection = None
         with patch.object(task_manager_router, "granted_single_node", return_value=False) as single:
             r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
         self.assertEqual(r.status_code, 403)
-        self.assertTrue(single.called)
+        self.assertIsNone(single.call_args.kwargs["grants"])
         self.assertEqual(self.resolved_for, [])
+
+
+class GrantedSingleNodeGrantsTests(_DbTestCase):
+    """`granted_single_node(grants=...)` walks the given grants instead of the
+    user's own."""
+
+    def _granted(self, grants, *, edit_only=True):
+        return granted_single_node(
+            self.db, 0, ("component", self.tm.id), is_admin=False, edit_only=edit_only, grants=grants
+        )
+
+    def test_given_grants_replace_the_users_own(self) -> None:
+        with patch.object(access_visibility_service, "matching_grants", side_effect=AssertionError("not called")):
+            self.assertTrue(self._granted([GrantMatch(1, "tab", self.tab.id, LEVEL_EDIT)]))
+            self.assertTrue(self._granted([GrantMatch(1, "component", self.tm.id, LEVEL_EDIT)]))
+            self.assertFalse(self._granted([GrantMatch(1, "tab", self.tab.id, LEVEL_VIEW)]))
+            self.assertTrue(self._granted([GrantMatch(1, "tab", self.tab.id, LEVEL_VIEW)], edit_only=False))
+            self.assertFalse(self._granted([GrantMatch(1, "component", self.note.id, LEVEL_EDIT)]))
+            self.assertFalse(self._granted([]))
 
 
 if __name__ == "__main__":
