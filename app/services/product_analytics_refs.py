@@ -87,6 +87,7 @@ ID_RULES: dict[str, IdRule] = {
     "threads_management.tab_selected": IdRule(target="view_code"),
     "revisions_management.tab_selected": IdRule(target="view_code"),
     "my_revisions.tab_selected": IdRule(target="view_code"),
+    "thread_review.tab_selected": IdRule(target="view_code"),
     "profile_menu.go_to_profile": IdRule(),
 }
 
