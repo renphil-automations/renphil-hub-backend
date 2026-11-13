@@ -40,5 +40,4 @@ app/db_v2/models/__init__.py
 .env.before-*
 
 data/
-
-Scripts/
+scripts/sbn_migration_manifests
