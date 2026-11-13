@@ -65,6 +65,10 @@ EVENT_CATALOG: dict[str, CatalogEntry] = {
     "resource_carousel.scrolled": CatalogEntry("resource_carousel", "scroll", "Resource Carousel previous/next arrow clicked"),
     "threads_management.tab_selected": CatalogEntry("threads_management", "select_tab", "Threads Management Pending/History tab selected"),
     "revisions_management.tab_selected": CatalogEntry("revisions_management", "select_tab", "Revisions Management Pending/History tab selected"),
+    "my_revisions.tab_selected": CatalogEntry("my_revisions", "select_tab", "My Revisions Needs changes/Awaiting review/Closed tab selected"),
+    # plan_thread_review_merge_2026-11-11 R6: replaces threads_management /
+    # revisions_management (no longer emitted; kept so stored rows resolve).
+    "thread_review.tab_selected": CatalogEntry("thread_review", "select_tab", "Thread Review Pending/History tab selected"),
     "profile_menu.go_to_profile": CatalogEntry("profile_menu", "go_to_profile", "Profile menu \"Go to profile\" clicked"),
 }
 
@@ -100,7 +104,9 @@ _ENUM_PROPERTIES: dict[str, frozenset[str]] = {
     "button_style": frozenset({"arrow", "button"}),
     "link_style": frozenset({"link", "button"}),
     "direction": frozenset({"previous", "next"}),
-    "view": frozenset({"pending", "history"}),
+    "view": frozenset({"pending", "history", "needs-changes", "awaiting", "closed"}),
+    # Thread Review's Pending kind chip at the time of the click (R6).
+    "kind": frozenset({"all", "new", "edit"}),
 }
 _INT_PROPERTIES: dict[str, tuple[int, int]] = {"depth": (0, 20), "item_index": (0, 1000)}
 _BOOL_PROPERTIES = frozenset({"reselect"})
@@ -127,7 +133,9 @@ _STATIC_SECTIONS: dict[str, frozenset[str]] = {
     "knowledge": frozenset(),
     "my-access": frozenset(),
     "admin": frozenset({"llm", "bot-management", "access-control", "roles-and-scopes"}),
-    "threads": frozenset({"management", "revisions"}),
+    # `management` / `revisions` only redirect to `review` now (Thread
+    # Review merge); kept so a stray visit still templates readably.
+    "threads": frozenset({"management", "revisions", "my-revisions", "review"}),
     # The built-in Dashboard nav tab; anything below it is a title slug,
     # except the legacy announcements page.
     "dashboard": frozenset({"announcements"}),

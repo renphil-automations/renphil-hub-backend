@@ -26,6 +26,23 @@ by analogy with delete (landmine 8). The static `/threads/moderation/*`
 routes (`pending`, `history` + facets, `summary`) are declared ABOVE
 `/threads/{thread_id}`, same convention as the mention directory above.
 
+REJECTION REASONS + RESUBMISSION (plan_thread_reject_resubmit_2026-11-07.md
+§5). Both reject routes REQUIRE a `RejectRequest` body (`{reason}`, trimmed,
+1..1000) — a bodiless reject is a 422. The pending queue orders by
+`submitted_at` (a resubmission joins the back); History is grouped by
+thread, with any-match filters over its decided rounds. The thread's AUTHOR
+may `POST /threads/{id}/resubmit` (changed text only — 409
+`unchanged_resubmission`; 409 `closed` once closed) or `.../close` (final,
+no reopen — plan §12) a declined thread; `GET /threads/{id}/submission-
+history` is its round timeline (author or editor);
+`GET /threads/component/{link}/declined` is the author's inbox (`items` =
+open, `closed` = closed). The revision twins
+(`.../revisions/{rid}/resubmit|close|chain`) do the same for a declined edit
+(a rework is a linked new revision). A declined edit also closes itself
+(`superseded`) when a newer version of its thread goes live; the publisher
+confirms through the `earlier_revisions_pending` 409 (`declined_open`) and
+`overwrite: true`, and the edit's author gets a `thread_edit_closed` bell.
+
 THREAD VERSIONING (plan_thread_edit_versioning_2026-09-22.md, phase A, with
 the 2026-09-23 amendments). Every published version of a thread is a
 revision. A non-editor author's PATCH of an approved thread is staged as a
@@ -74,6 +91,7 @@ from app.dependencies import (
     get_current_user,
     get_view_as_access,
     get_view_as_anonymous,
+    get_view_as_selection,
     get_viewer_access,
     is_hub_admin,
 )
@@ -84,14 +102,23 @@ from app.schemas.thread import (
     CommentListResponse,
     CommentSummary,
     CommentUpdateRequest,
+    DeclinedItemsResponse,
     MentionableUser,
+    MyRevisionsResponse,
+    MyRevisionsSummary,
     NotificationListResponse,
+    RejectRequest,
     RevisionDecisionRequest,
+    ThreadDecisionRequest,
+    RevisionResubmitRequest,
+    ThreadActivityFacets,
+    ThreadActivityListResponse,
     ThreadCreateRequest,
     ThreadDetail,
     ThreadDetailViewAsResponse,
     ThreadHistoryFacets,
     ThreadListResponse,
+    ThreadHistoryListResponse,
     ThreadModerationListResponse,
     ThreadModerationRow,
     ThreadModerationSummary,
@@ -99,6 +126,9 @@ from app.schemas.thread import (
     ThreadRevisionHistoryFacets,
     ThreadRevisionModerationListResponse,
     ThreadRevisionModerationSummary,
+    ThreadResubmitRequest,
+    ThreadSubmissionRound,
+    ThreadTimelineResponse,
     ThreadUpdateRequest,
     ThreadUpdateResult,
     ThreadWidgetCounts,
@@ -106,7 +136,7 @@ from app.schemas.thread import (
     VoteRequest,
     VoteResponse,
 )
-from app.services import thread_service
+from app.services import thread_service, view_as_service
 from app.services.access_visibility_service import ViewerAccess, granted_single_node
 from app.services.rbac_graph_service import RbacClosures
 
@@ -212,6 +242,113 @@ async def get_thread_widget_counts(
     return await asyncio.to_thread(thread_service.thread_widget_counts, db, link, access=access)
 
 
+@router.get(
+    "/threads/component/{link}/declined",
+    response_model=DeclinedItemsResponse,
+    summary="The caller's own declined items on one widget (reject/resubmit plan §4.7)",
+    responses=THREAD_VIEW_AS_RESPONSES,
+)
+async def list_declined_items(
+    link: str = Path(..., description="The thread widget component's stable `link`."),
+    anonymous: bool = Depends(get_view_as_anonymous),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
+):
+    """The author's "Revisions" inbox: declined threads and declined,
+    not-yet-reworked edits, newest decline first, capped at 100 with
+    `truncated`. Empty for a no-subject caller (`anonymous`), the same
+    subject rule as the widget list."""
+    subject = _thread_subject(user, anonymous)
+    return await asyncio.to_thread(
+        thread_service.list_declined_items, db, link, subject, access=view_as_access.access
+    )
+
+
+# ---------------------------------------------------------
+# My Revisions (plan_my_revisions_2026-11-10.md §4.3) — the author's
+# declined + pending items across every thread widget. Static `/threads/me/*`
+# paths, declared ABOVE `/threads/{thread_id}` (otherwise `me` binds as a
+# thread id and 422s — same convention as the moderation block).
+#
+# Gated like the mention directory, NOT with `Depends(get_viewer_access)`:
+# the summary is polled by every signed-in user, and the whole-tree fold is
+# ~2.4 s for a non-admin (landmine 16). `get_current_hub_user` + the View As
+# selection only; the service gates per widget with `granted_single_node`
+# and one shared `RbacClosures`, built only when the author has any rows.
+# Under ANY View As selection, or `anonymous`, both answer empty with
+# `view_as: true` (M7) — the section is personal, View As is read-only.
+# ---------------------------------------------------------
+
+
+def _admin_check(db: Session, current: CurrentHubUser):
+    return lambda closures: is_hub_admin(db, current, closures=closures)
+
+
+def _my_revisions_sync(db: Session, current: CurrentHubUser) -> MyRevisionsResponse:
+    return thread_service.list_my_declined_items(
+        db, current.info, hub_user_id=current.hub_user_id, is_admin=_admin_check(db, current)
+    )
+
+
+def _my_revisions_summary_sync(db: Session, current: CurrentHubUser) -> tuple[MyRevisionsSummary, str]:
+    return thread_service.my_revisions_summary(
+        db, current.info, hub_user_id=current.hub_user_id, is_admin=_admin_check(db, current)
+    )
+
+
+@router.get(
+    "/threads/me/revisions",
+    response_model=MyRevisionsResponse,
+    summary="The caller's own declined and pending threads and edits, across every thread widget (My Revisions)",
+    responses=VIEW_AS_ERROR_RESPONSES,
+)
+async def list_my_revisions(
+    anonymous: bool = Depends(get_view_as_anonymous),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
+):
+    """Open items newest decline first (cap 100, `truncated`), closed ones
+    newest close first (cap 50, `closed_truncated`), pending ones newest
+    submission first (cap 100, `pending_truncated`). A widget the caller can
+    no longer view drops out entirely."""
+    if anonymous or selection is not None:
+        return MyRevisionsResponse(view_as=True)
+    return await asyncio.to_thread(_my_revisions_sync, db, current)
+
+
+@router.get(
+    "/threads/me/revisions/summary",
+    response_model=MyRevisionsSummary,
+    summary="My Revisions counts for the sidebar item and badge (polled; ETag/304)",
+    responses=VIEW_AS_ERROR_RESPONSES,
+)
+async def get_my_revisions_summary(
+    request: Request,
+    response: Response,
+    anonymous: bool = Depends(get_view_as_anonymous),
+    db: Session = Depends(get_db_v2),
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
+):
+    if anonymous or selection is not None:
+        summary, etag = thread_service.my_revisions_view_as_answer()
+    else:
+        summary, etag = await asyncio.to_thread(_my_revisions_summary_sync, db, current)
+    # The `/threads/moderation/summary` shape: `no-store` on the 200 AND the
+    # 304, so the browser's URL-keyed HTTP cache never serves one user's
+    # body to the next (followups plan §1).
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={"ETag": etag, "Cache-Control": "no-store"},
+        )
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-store"
+    return summary
+
+
 # ---------------------------------------------------------
 # Threads
 # ---------------------------------------------------------
@@ -290,17 +427,22 @@ async def create_thread(
     summary="The caller's pending-thread moderation queue, oldest first",
 )
 async def list_pending_threads(
-    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; it names its order."),
+    order: Literal["oldest", "newest"] = Query(
+        default="oldest", description="Submission order. A cursor issued under the other order is a 400."
+    ),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.list_pending_threads, db, cursor, access=access)
+    return await asyncio.to_thread(
+        thread_service.list_pending_threads, db, cursor, order=order, access=access
+    )
 
 
 @router.get(
     "/threads/moderation/history",
-    response_model=ThreadModerationListResponse,
-    summary="Threads the caller moderates that have an explicit decision, most recent first, filterable",
+    response_model=ThreadHistoryListResponse,
+    summary="Every explicit decision on a thread the caller moderates — one row per decision — filterable, searchable, groupable",
     responses={400: {"description": "Malformed cursor"}},
 )
 async def list_thread_history(
@@ -308,6 +450,16 @@ async def list_thread_history(
     status_filter: list[Literal["approved", "rejected"]] | None = Query(
         default=None, alias="status", description="Repeatable. Default: both."
     ),
+    type_filter: list[Literal["new", "resubmission"]] | None = Query(
+        default=None, alias="type", description="Round 0 (new) or a resubmission. Repeatable. Default: both."
+    ),
+    q: str | None = Query(
+        default=None, max_length=200, description="Substring of the decided title, current title or widget title."
+    ),
+    group: Literal["thread", "widget"] | None = Query(
+        default=None, description="Keep each thread's / widget's rows together."
+    ),
+    order: Literal["newest", "oldest"] = Query(default="newest"),
     date_from: datetime | None = Query(
         default=None, description="Decision instant, inclusive (ISO-8601; naive = UTC)."
     ),
@@ -328,6 +480,10 @@ async def list_thread_history(
         date_to=date_to,
         authors=author,
         reviewers=reviewer,
+        types=type_filter,
+        q=q,
+        group=group,
+        order=order,
         access=access,
     )
 
@@ -342,6 +498,76 @@ async def get_thread_history_facets(
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(thread_service.thread_history_facets, db, access=access)
+
+
+# plan_thread_review_merge_2026-11-11.md §5 B2 — Thread Review's History:
+# both decision tables in one deduplicated log. Static, so declared here
+# with the other `/threads/moderation/*` routes, above `/threads/{thread_id}`.
+@router.get(
+    "/threads/moderation/activity",
+    response_model=ThreadActivityListResponse,
+    summary="Every decision on threads and edits the caller moderates — one row per decision — filterable, searchable, groupable",
+    responses={400: {"description": "Malformed cursor, or a cursor from another group / order"}},
+)
+async def list_thread_activity(
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; resend the same filters, group and order."),
+    kind: list[Literal["new", "resubmission", "edit", "editor_edit", "published_directly"]] | None = Query(
+        default=None, description="Repeatable. Default: all five."
+    ),
+    outcome: list[Literal["approved", "rejected", "overwritten", "published_directly"]] | None = Query(
+        default=None, description="Repeatable. Default: all four."
+    ),
+    widget: list[str] | None = Query(
+        default=None, description="Widget `component_link`. Repeatable. Narrows within the moderated set."
+    ),
+    q: str | None = Query(
+        default=None,
+        max_length=200,
+        description="Substring of the decided title, current title, widget title or reason.",
+    ),
+    group: Literal["thread", "widget"] | None = Query(
+        default=None, description="Keep each thread's / widget's rows together."
+    ),
+    order: Literal["newest", "oldest"] = Query(default="newest"),
+    date_from: datetime | None = Query(
+        default=None, description="Decision instant, inclusive (ISO-8601; naive = UTC)."
+    ),
+    date_to: datetime | None = Query(
+        default=None, description="Decision instant, exclusive (ISO-8601; naive = UTC)."
+    ),
+    author: list[str] | None = Query(default=None, description="Submitter email. Repeatable."),
+    reviewer: list[str] | None = Query(default=None, description="Decider email. Repeatable."),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.list_thread_activity,
+        db,
+        cursor,
+        kinds=kind,
+        outcomes=outcome,
+        widgets=widget,
+        date_from=date_from,
+        date_to=date_to,
+        authors=author,
+        reviewers=reviewer,
+        q=q,
+        group=group,
+        order=order,
+        access=access,
+    )
+
+
+@router.get(
+    "/threads/moderation/activity/facets",
+    response_model=ThreadActivityFacets,
+    summary="Thread Review History's author, reviewer and widget filter options",
+)
+async def get_thread_activity_facets(
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.thread_activity_facets, db, access=access)
 
 
 @router.get(
@@ -399,11 +625,16 @@ async def get_moderation_summary(
     summary="Pending thread revisions the caller can decide, newest first",
 )
 async def list_pending_revisions(
-    cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    cursor: str | None = Query(default=None, description="Opaque next-page cursor; it names its order."),
+    order: Literal["oldest", "newest"] = Query(
+        default="newest", description="Submission order. A cursor issued under the other order is a 400."
+    ),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
-    return await asyncio.to_thread(thread_service.list_pending_revisions, db, cursor, access=access)
+    return await asyncio.to_thread(
+        thread_service.list_pending_revisions, db, cursor, order=order, access=access
+    )
 
 
 @router.get(
@@ -431,6 +662,13 @@ async def list_revision_history(
     thread_id: list[int] | None = Query(
         default=None, description="Thread id. Repeatable. Narrows within the moderated set."
     ),
+    q: str | None = Query(
+        default=None, max_length=200, description="Substring of the revision title, current title or widget title."
+    ),
+    group: Literal["thread", "widget"] | None = Query(
+        default=None, description="Keep each thread's / widget's rows together."
+    ),
+    order: Literal["newest", "oldest"] = Query(default="newest"),
     db: Session = Depends(get_db_v2),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
@@ -445,6 +683,9 @@ async def list_revision_history(
         authors=author,
         reviewers=reviewer,
         thread_ids=thread_id,
+        q=q,
+        group=group,
+        order=order,
         access=access,
     )
 
@@ -498,38 +739,155 @@ async def get_revision_moderation_summary(
     summary="Approve a pending thread — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
-        409: {"description": "Thread has already been reviewed"},
+        409: {
+            "description": "Thread has already been reviewed, or `detail.code` is "
+            "`thread_changed` (`expected_edit_count` no longer matches)"
+        },
     },
 )
 async def approve_thread(
+    payload: ThreadDecisionRequest | None = None,
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.decide_thread, db, thread_id, user, approve=True, access=access
+        thread_service.decide_thread,
+        db,
+        thread_id,
+        user,
+        approve=True,
+        expected_edit_count=payload.expected_edit_count if payload is not None else None,
+        access=access,
     )
 
 
 @router.post(
     "/threads/{thread_id}/reject",
     response_model=ThreadModerationRow,
-    summary="Reject a pending thread — an editor of its widget or any ancestor",
+    summary="Reject a pending thread, with a required reason — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
-        409: {"description": "Thread has already been reviewed"},
+        409: {
+            "description": "Thread has already been reviewed, or `detail.code` is "
+            "`thread_changed` (`expected_edit_count` no longer matches)"
+        },
+        422: {"description": "Missing body, or `reason` empty/whitespace or over 1000 characters"},
     },
 )
 async def reject_thread(
+    payload: RejectRequest,
     thread_id: int = Path(...),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
     access: ViewerAccess = Depends(get_viewer_access),
 ):
     return await asyncio.to_thread(
-        thread_service.decide_thread, db, thread_id, user, approve=False, access=access
+        thread_service.decide_thread,
+        db,
+        thread_id,
+        user,
+        approve=False,
+        reason=payload.reason,
+        expected_edit_count=payload.expected_edit_count,
+        access=access,
     )
+
+
+# ---------------------------------------------------------
+# Author rework of a declined thread
+# (plan_thread_reject_resubmit_2026-11-07.md §4.3, §4.5, §4.6). Author-only;
+# the gates live in the service.
+# ---------------------------------------------------------
+
+
+@router.post(
+    "/threads/{thread_id}/resubmit",
+    response_model=ThreadDetail,
+    summary="Resubmit your own declined thread with changes",
+    responses={
+        403: {"description": "No access to the widget, or caller is not the thread's author"},
+        404: {"description": "Thread not found"},
+        409: {"description": "`detail.code` is `not_rejected`, `closed` or `unchanged_resubmission`"},
+    },
+)
+async def resubmit_thread(
+    payload: ThreadResubmitRequest,
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.resubmit_thread,
+        db,
+        thread_id,
+        user,
+        payload.title,
+        payload.content,
+        payload.mentions,
+        access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/close",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Close your own declined thread (final; it stays readable under Closed)",
+    responses={
+        403: {"description": "No access to the widget, or caller is not the thread's author"},
+        404: {"description": "Thread not found"},
+        409: {"description": "`detail.code` is `not_rejected`"},
+    },
+)
+async def close_thread(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    await asyncio.to_thread(
+        thread_service.close_rejected_thread, db, thread_id, user, access=access
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/threads/{thread_id}/submission-history",
+    response_model=list[ThreadSubmissionRound],
+    summary="Every decided submission round of a thread, plus the pending one — author or editor",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "Thread not found, or caller may not see it"},
+    },
+)
+async def get_thread_submission_history(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.get_thread_submission_history, db, thread_id, user, access=access
+    )
+
+
+@router.get(
+    "/threads/{thread_id}/timeline",
+    response_model=ThreadTimelineResponse,
+    summary="One thread's whole lifecycle — every decision plus its pending items — editors of its widget",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "Thread not found, or caller is not an editor of its widget"},
+    },
+)
+async def get_thread_timeline(
+    thread_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(thread_service.get_thread_timeline, db, thread_id, access=access)
 
 
 # ---------------------------------------------------------
@@ -571,7 +929,10 @@ async def get_thread_revision(
         404: {"description": "No such revision on this thread"},
         409: {
             "description": "`detail.code` is `already_decided` (the revision is no longer pending) "
-            "or `earlier_revisions_pending` (older pending edits exist and `overwrite` was not set)"
+            "or `earlier_revisions_pending` (older pending edits exist, and/or open declined "
+            "edits below this version would be closed as superseded — `detail.earlier` / "
+            "`detail.declined_open` — and `overwrite` was not set) or `revision_changed` "
+            "(`expected_edit_count` no longer matches the edit)"
         },
     },
 )
@@ -592,6 +953,7 @@ async def approve_thread_revision(
         user,
         approve=True,
         overwrite=overwrite,
+        expected_edit_count=payload.expected_edit_count if payload is not None else None,
         access=access,
     )
 
@@ -599,14 +961,16 @@ async def approve_thread_revision(
 @router.post(
     "/threads/{thread_id}/revisions/{revision_id}/reject",
     response_model=ThreadRevisionDetail,
-    summary="Reject a staged edit — an editor of its widget or any ancestor",
+    summary="Reject a staged edit, with a required reason — an editor of its widget or any ancestor",
     responses={
         403: {"description": "Caller is not an editor of this discussion"},
         404: {"description": "No such revision on this thread"},
-        409: {"description": "`detail.code` is `already_decided`"},
+        409: {"description": "`detail.code` is `already_decided` or `revision_changed`"},
+        422: {"description": "Missing body, or `reason` empty/whitespace or over 1000 characters"},
     },
 )
 async def reject_thread_revision(
+    payload: RejectRequest,
     thread_id: int = Path(...),
     revision_id: int = Path(...),
     db: Session = Depends(get_db_v2),
@@ -620,7 +984,90 @@ async def reject_thread_revision(
         revision_id,
         user,
         approve=False,
+        reason=payload.reason,
+        expected_edit_count=payload.expected_edit_count,
         access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/revisions/{revision_id}/resubmit",
+    response_model=ThreadUpdateResult,
+    summary="Rework your own declined edit into a linked new revision",
+    responses={
+        403: {"description": "No access to the widget, or caller did not submit this edit"},
+        404: {"description": "No such revision on this thread"},
+        409: {
+            "description": "`detail.code` is `not_rejected`, `closed` (with `closed_kind` / "
+            "`closed_by_version`), `already_resubmitted`, `pending_edit_exists` "
+            "(non-editor: the thread already has a pending author edit), "
+            "`unchanged_resubmission`, `no_change` or `earlier_revisions_pending`"
+        },
+    },
+)
+async def resubmit_thread_revision(
+    payload: RevisionResubmitRequest,
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.resubmit_revision,
+        db,
+        thread_id,
+        revision_id,
+        user,
+        payload.title,
+        payload.content,
+        payload.mentions,
+        overwrite=payload.overwrite,
+        access=access,
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/revisions/{revision_id}/close",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Close your own declined edit (final; it stays readable under Closed)",
+    responses={
+        403: {"description": "No access to the widget, or caller did not submit this edit"},
+        404: {"description": "No such revision on this thread"},
+        409: {"description": "`detail.code` is `not_rejected` or `already_resubmitted`"},
+    },
+)
+async def close_thread_revision(
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    await asyncio.to_thread(
+        thread_service.close_rejected_revision, db, thread_id, revision_id, user, access=access
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/threads/{thread_id}/revisions/{revision_id}/chain",
+    response_model=list[ThreadRevisionDetail],
+    summary="The rework chain a revision belongs to, oldest first — author or editor",
+    responses={
+        403: {"description": "Caller does not satisfy the widget's access control"},
+        404: {"description": "No such revision on this thread, or caller may not see it"},
+    },
+)
+async def get_thread_revision_chain(
+    thread_id: int = Path(...),
+    revision_id: int = Path(...),
+    db: Session = Depends(get_db_v2),
+    user: UserInfo = Depends(get_current_user),
+    access: ViewerAccess = Depends(get_viewer_access),
+):
+    return await asyncio.to_thread(
+        thread_service.get_revision_chain, db, thread_id, revision_id, user, access=access
     )
 
 
@@ -658,7 +1105,12 @@ async def get_thread(
         409: {
             "description": "Thread was rejected and can no longer be edited; or (editor, "
             "`detail.code` = `earlier_revisions_pending`) the thread has pending author "
-            "edits and `overwrite` was not set"
+            "edits and/or open declined edits this would close (`detail.declined_open`) "
+            "and `overwrite` was not set; or (non-editor) `declined_edit_open` (an open "
+            "declined edit blocks a NEW edit — resubmit or close it), `unchanged_resubmission` "
+            "(a pending rework, or a pending resubmitted thread, edited back to the declined "
+            "text) or `no_change` (a pending rework edited back to the live text). A save "
+            "while a pending edit exists updates that edit in place"
         },
     },
 )

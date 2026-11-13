@@ -1392,7 +1392,9 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             "/admin/access-control/root-access": "/admin/access-control/root-access",
             "/admin/jane-doe": "/admin/:segment",
             "/threads/management": "/threads/management",
+            "/threads/my-revisions": "/threads/my-revisions",
             "/threads/revisions": "/threads/revisions",
+            "/threads/review": "/threads/review",
             "/dashboard/announcements/recJaneDoe": "/dashboard/announcements/:segment",
             "/": "/",
             # Already-templated input from the browser is stable.
@@ -1510,6 +1512,8 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             _event("link.clicked", component_id="cmp-links", properties={}),
             _event("threads_management.tab_selected", target_id="history", properties={}),
             _event("revisions_management.tab_selected", target_id="pending", properties={}),
+            _event("my_revisions.tab_selected", target_id="closed", properties={"view": "closed"}),
+            _event("thread_review.tab_selected", target_id="history", properties={"view": "history", "kind": "edit"}),
         )
         self.assertEqual(stored, [
             ("navigation_tab.selected", None, "nav-doc-1"),
@@ -1524,6 +1528,8 @@ class ProductAnalyticsApiTests(unittest.TestCase):
             ("link.clicked", "cmp-links", None),
             ("threads_management.tab_selected", None, "history"),
             ("revisions_management.tab_selected", None, "pending"),
+            ("my_revisions.tab_selected", None, "closed"),
+            ("thread_review.tab_selected", None, "history"),
         ])
 
     def test_modified_client_cannot_store_arbitrary_identifiers(self) -> None:
@@ -1546,6 +1552,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
                 _event("detail_card.details_opened", component_id=value, target_id=value),
                 _event("link.clicked", component_id=value, target_id=value, properties={}),
                 _event("threads_management.tab_selected", target_id=value, properties={}),
+                _event("thread_review.tab_selected", target_id=value, properties={}),
                 _event("profile_menu.go_to_profile", component_id=value, target_id=value, properties={}),
             ]
         for start in range(0, len(events), service.MAX_BATCH):
@@ -1916,14 +1923,14 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self._ingest(_event(properties={
             "tab_kind": "variant", "reselect": True, "depth": 2, "item_index": 3,
             "view": "history", "direction": "next", "button_style": "arrow", "link_style": "button",
-            "destination_kind": "email",
-            "depth_bad": 1, "reselect_str": "yes", "full_url": "https://x.test/?a=1", "document_body": "text",
+            "destination_kind": "email", "kind": "new",
+            "depth_bad": 1, "kind_bad": "everything", "reselect_str": "yes", "full_url": "https://x.test/?a=1", "document_body": "text",
         }))
         (row,) = self._rows()
         self.assertEqual(row.properties, {
             "tab_kind": "variant", "reselect": True, "depth": 2, "item_index": 3,
             "view": "history", "direction": "next", "button_style": "arrow", "link_style": "button",
-            "destination_kind": "email",
+            "destination_kind": "email", "kind": "new",
         })
 
     # ── Rate limiting (shared Upstash limiter, fail-open) ────────────────
@@ -2407,7 +2414,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
 
 
 class CatalogTests(unittest.TestCase):
-    def test_catalog_covers_the_17_requested_actions_with_18_events(self) -> None:
+    def test_catalog_covers_the_19_requested_actions_with_20_events(self) -> None:
         requested = {
             1: {"navigation_tab.selected"}, 2: {"root_tab.selected"}, 3: {"view_tab.selected"},
             4: {"sub_tab.selected"}, 5: {"link.clicked"}, 6: {"blocknote_tab.selected"},
@@ -2418,11 +2425,15 @@ class CatalogTests(unittest.TestCase):
             14: {"resource_carousel.document_opened", "resource_carousel.scrolled"},
             15: {"threads_management.tab_selected"}, 16: {"revisions_management.tab_selected"},
             17: {"profile_menu.go_to_profile"},
+            # plan_my_revisions_2026-11-10.md §5.1 — the My Revisions tabs.
+            18: {"my_revisions.tab_selected"},
+            # plan_thread_review_merge_2026-11-11 R6 — the merged page's tabs.
+            19: {"thread_review.tab_selected"},
         }
         mapped = set().union(*requested.values())
-        self.assertEqual(len(requested), 17)
+        self.assertEqual(len(requested), 19)
         self.assertEqual(mapped, set(service.EVENT_CATALOG))
-        self.assertEqual(len(service.EVENT_CATALOG), 18)
+        self.assertEqual(len(service.EVENT_CATALOG), 20)
 
     def test_link_quick_action_and_carousel_events_are_distinct(self) -> None:
         kinds = {name: (e.component_type, e.action) for name, e in service.EVENT_CATALOG.items()}

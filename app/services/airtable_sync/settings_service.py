@@ -25,7 +25,7 @@ from app.db_v2.models.airtable_sync import (
     AirtableSyncSettingsV2,
 )
 from app.db_v2.models.role import RoleV2
-from app.db_v2.models.user import UserV2
+from app.db_v2.models.user import AIRTABLE_SYNC_NOTIFICATION_DEFAULT_MODE, UserV2
 from app.services.rbac_assignment_service import HUB_ADMIN_ROLE_KEY
 
 SETTINGS_ROW_ID = 1
@@ -148,14 +148,16 @@ def update_settings(
 # ---------------------------------------------------------
 
 
-def get_notifications_enabled(db: Session, user_id: int) -> bool:
-    return db.get(UserV2, user_id).airtable_sync_notifications_enabled is not False
+def get_notifications_mode(db: Session, user_id: int) -> str:
+    """The caller's mode; NULL (never chose) reads as the default, unstored."""
+    mode = db.get(UserV2, user_id).airtable_sync_notifications_mode
+    return AIRTABLE_SYNC_NOTIFICATION_DEFAULT_MODE if mode is None else mode
 
 
-def set_notifications_enabled(db: Session, user_id: int, enabled: bool) -> bool:
-    db.get(UserV2, user_id).airtable_sync_notifications_enabled = enabled
+def set_notifications_mode(db: Session, user_id: int, mode: str) -> str:
+    db.get(UserV2, user_id).airtable_sync_notifications_mode = mode
     db.flush()
-    return enabled
+    return mode
 
 
 # ---------------------------------------------------------

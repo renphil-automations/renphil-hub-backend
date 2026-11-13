@@ -75,18 +75,30 @@ class ThreadListAnonymousTests(unittest.TestCase):
         app.dependency_overrides.clear()
         self.db.close()
 
-    def _titles(self, params=None) -> set[str]:
+    def _list(self, params=None) -> dict:
         response = self.client.get("/data/threads/component/widget", params=params or {})
         self.assertEqual(response.status_code, 200, response.text)
-        return {item["title"] for item in response.json()["items"]}
+        return response.json()
 
-    def test_default_includes_own_pending_and_rejected(self) -> None:
-        expected = {"me-approved", "me-pending", "me-rejected", "other-approved"}
-        self.assertEqual(self._titles(), expected)
-        self.assertEqual(self._titles({"anonymous": "false"}), expected)
+    def _titles(self, params=None) -> set[str]:
+        return {item["title"] for item in self._list(params)["items"]}
+
+    @staticmethod
+    def _own_counts(body: dict) -> tuple[int, int]:
+        return body["pending_count"], body["declined_count"]
+
+    def test_default_lists_approved_only_and_counts_own_pending_and_rejected(self) -> None:
+        # 2026-11-13: the caller's own pending/rejected threads are no longer
+        # listed; the widget shows them as banner counts instead.
+        for params in (None, {"anonymous": "false"}):
+            body = self._list(params)
+            self.assertEqual({item["title"] for item in body["items"]}, {"me-approved", "other-approved"})
+            self.assertEqual(self._own_counts(body), (1, 1))
 
     def test_anonymous_returns_approved_only(self) -> None:
-        self.assertEqual(self._titles({"anonymous": "true"}), {"me-approved", "other-approved"})
+        body = self._list({"anonymous": "true"})
+        self.assertEqual({item["title"] for item in body["items"]}, {"me-approved", "other-approved"})
+        self.assertEqual(self._own_counts(body), (0, 0))
 
     def test_anonymous_must_be_a_boolean(self) -> None:
         response = self.client.get("/data/threads/component/widget", params={"anonymous": "maybe"})
