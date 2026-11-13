@@ -26,6 +26,7 @@ def test_legacy_nav_access_metadata_does_not_trigger_search_refresh(monkeypatch)
         locked_by=None,
         locked_at=None,
     )
+    new_access = {"viewers": {"example": ["User"]}, "admins": {}}
 
     monkeypatch.setattr(
         nav_tab_service,
@@ -38,10 +39,12 @@ def test_legacy_nav_access_metadata_does_not_trigger_search_refresh(monkeypatch)
     result = nav_tab_service.update_nav_tab_v2(
         db,
         "nav-v2",
-        access_control={"viewers": {}, "admins": {}},
+        access_control=new_access,
     )
 
     assert result is not None
+    assert result["access_control"] == new_access
+    assert nav.access_control == new_access
     assert result["search_updates"] == []
     refresh.assert_not_called()
     db.commit.assert_called_once()
