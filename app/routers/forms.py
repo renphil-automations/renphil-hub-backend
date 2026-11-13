@@ -6,7 +6,8 @@ Embedded forms router.
   stays out of access logs). The PAT is used for that one call and not stored.
 * `PUT /forms/component` — upsert a `form` component's settings.
 * `GET /forms/component/{link}/embed` — the embed URL to render one form
-  component, with a per-viewer token when the form requires authentication.
+  component, with a per-viewer token when the form requires `user`
+  authentication.
 """
 
 from __future__ import annotations
@@ -135,6 +136,7 @@ def save_form_component(
             form_id=body.form_id,
             embed_url=body.embed_url,
             requires_authentication=body.requires_authentication,
+            authentication_type=body.authentication_type,
             layout={"x": body.x, "y": body.y, "w": body.w, "h": body.h},
             access=access,
             session=session,
@@ -157,8 +159,11 @@ def save_form_component(
     description="""
 Looks up the form component by its `link` in `form_details`.
 
-* `requires_authentication: false` — returns the stored `embed_url` as-is.
-* `requires_authentication: true` — calls the form builder's
+* `requires_authentication: false`, or `true` with `authentication_type`
+  `none` / `submission` — returns the stored `embed_url` as-is (no
+  form-builder call).
+* `requires_authentication: true` with `authentication_type: user` — calls
+  the form builder's
   `POST /api/authenticate_with_pat` with the stored PAT, the form id and the
   signed-in user's email (from the JWT), and returns `embed_url` with
   `token=<jwt>` appended. The token is per-viewer and short-lived

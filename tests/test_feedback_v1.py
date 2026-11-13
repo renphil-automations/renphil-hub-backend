@@ -22,11 +22,25 @@ class _FakeFeedbackTable:
         }
 
 
+def _feedback_service(table: _FakeFeedbackTable) -> AirtableService:
+    service = AirtableService.__new__(AirtableService)
+    service._feedbacks_table = lambda: table
+    # Model aliases and Airtable field names must describe the same fields.
+    # Use explicit, distinct names so tests do not depend on deployment env.
+    service._F_FEEDBACK_FROM = "From"
+    service._F_FEEDBACK_MESSAGE = "Message"
+    service._F_FEEDBACK_SOURCE = "Source"
+    service._F_FEEDBACK_IMPRESSION = "Impression"
+    service._F_FEEDBACK_MESSAGE_ID = "Message ID"
+    service._F_FEEDBACK_QUERY = "Query"
+    service._F_FEEDBACK_RESPONSE = "Response"
+    return service
+
+
 class FeedbackV1Tests(unittest.TestCase):
     def test_message_feedback_maps_v1_fields_and_uses_authenticated_email(self) -> None:
         table = _FakeFeedbackTable()
-        service = AirtableService.__new__(AirtableService)
-        service._feedbacks_table = lambda: table
+        service = _feedback_service(table)
 
         payload = FeedbackCreate(
             from_email="spoofed@example.org",
@@ -68,8 +82,7 @@ class FeedbackV1Tests(unittest.TestCase):
 
     def test_legacy_feedback_remains_supported(self) -> None:
         table = _FakeFeedbackTable()
-        service = AirtableService.__new__(AirtableService)
-        service._feedbacks_table = lambda: table
+        service = _feedback_service(table)
 
         payload = FeedbackCreate(
             from_email="legacy@example.org",

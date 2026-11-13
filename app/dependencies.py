@@ -528,7 +528,8 @@ class ViewAsAccess:
 VIEW_AS_USER_DESCRIPTION = (
     "View As: email of a user to see the hub as, through their role/scope assignments only "
     "(content shared directly with them is not included, and their own threads, votes and "
-    "pending edits are not marked as theirs). Combines with `view_as` pairs. "
+    "pending edits are not shown as theirs). Combines with `view_as` pairs. The caller's own "
+    "direct shares, threads, votes and pending edits still count unless `anonymous=true`. "
     "Pick from `GET /v2/view-as/users`."
 )
 
@@ -590,7 +591,7 @@ async def get_view_as_anonymous(
             "When true, nothing of the caller's own is included: no content shared directly with "
             "their email, and on the thread endpoints no own pending/rejected threads, no own "
             "votes (`my_vote` 0; vote counts stay exact) and no own pending edits. Works with or "
-            "without `view_as` pairs. Cannot be combined with `view_as_user`."
+            "without `view_as` pairs and `view_as_user`."
         ),
     ),
 ) -> bool:
@@ -616,7 +617,7 @@ async def get_view_as_selection(
     """Parse and verify the View As parameters. ``None`` when neither was
     sent (blank values are ignored); the verified selection when everything
     passes; 400/403 listing every blocking item otherwise. ``anonymous``
-    with ``view_as_user`` is a 400 (``view_as_user_with_anonymous``).
+    combines with both.
 
     Runs AFTER ``get_current_hub_user``, so authentication and first-login
     provisioning are never skipped. Endpoints that gate content on the hub
@@ -629,17 +630,6 @@ async def get_view_as_selection(
         if anonymous:
             logger.info("Anonymous view requested by %s (own assignments, no direct shares)", current.email)
         return None
-
-    if anonymous and user_email is not None:
-        logger.warning("View As refused for %s: anonymous=true with view_as_user=%r", current.email, user_email)
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "view_as_user_with_anonymous",
-                "message": "anonymous=true cannot be combined with view_as_user.",
-                "view_as_user": user_email,
-            },
-        )
 
     return _verify_view_as(db, current, values, user_email, anonymous=anonymous)
 
@@ -655,10 +645,10 @@ async def get_view_as_access(
     combined access with them (see ``get_view_as_selection``).
 
     Content shared DIRECTLY with a person counts only for the caller, and
-    only without ``anonymous`` or ``view_as_user``: a selected user is seen
-    through their role/scope assignments alone, never their direct shares.
-    A Hub Admin keeps full access under ``anonymous`` (direct shares add
-    nothing to it)."""
+    only without ``anonymous`` — with or without View As pairs or a
+    selected user. A selected user's own direct shares never count: they are
+    seen through their role/scope assignments alone. A Hub Admin keeps full
+    access under ``anonymous`` (direct shares add nothing to it)."""
     if selection is None:
         if not anonymous:
             return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
@@ -669,10 +659,7 @@ async def get_view_as_access(
             access = view_as_service.resolve_access_without_direct_grants(db, current.hub_user_id, closures=closures)
         return ViewAsAccess(access=access, view_as=False)
 
-    if selection.user is not None or anonymous:
-        direct_grants_user_id = None
-    else:
-        direct_grants_user_id = current.hub_user_id
+    direct_grants_user_id = None if anonymous else current.hub_user_id
     access = view_as_service.resolve_view_as_access(db, selection.targets, user_id=direct_grants_user_id)
     return ViewAsAccess(access=access, view_as=True, view_as_user=selection.user_email)
 

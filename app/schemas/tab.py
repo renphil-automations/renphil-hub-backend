@@ -819,3 +819,20 @@ class MoveTabToNavTabRequest(StrictRequestModel):
         max_length=255,
         pattern=CLEAN_DOCUMENT_ID_PATTERN,
     )
+
+
+class ComponentAccessUser(BaseModel):
+    id: int
+    first_name: str | None = None
+    last_name: str | None = None
+    name: str
+    work_email: str | None = None
+    alias_email: str | None = None
+    personal_email: str | None = None
+    access_level: Literal["view", "edit"]
+
+
+class ComponentAccessUsersResponse(BaseModel):
+    success: bool = True
+    component_id: int
+    users: list[ComponentAccessUser]

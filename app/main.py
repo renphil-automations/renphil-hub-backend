@@ -33,11 +33,14 @@ from app.routers import (
     locks_v2,
     nav_tabs,
     product_analytics,
+    hub_feedback,
+    product_analytics_archive_trigger,
     rbac,
     rbac_assignments,
     resource_grants,
     super_blocknote_v2,
     tabs_v2,
+    task_manager,
     threads,
     view_as,
 )
@@ -109,6 +112,8 @@ def create_app() -> FastAPI:
     app.include_router(dify.router, prefix=api_prefix)
     app.include_router(bot_management.router, prefix=api_prefix)
     app.include_router(product_analytics.router, prefix=api_prefix)
+    app.include_router(hub_feedback.router, prefix=api_prefix)
+    app.include_router(product_analytics_archive_trigger.router, prefix=api_prefix)
     app.include_router(airtable.router, prefix=api_prefix)
     app.include_router(agent_access.router, prefix=api_prefix)
     app.include_router(calendar.router, prefix=api_prefix)
@@ -125,6 +130,7 @@ def create_app() -> FastAPI:
     app.include_router(resource_grants.router, prefix=api_prefix)
     app.include_router(bookmarks.router, prefix=api_prefix)
     app.include_router(forms.router, prefix=api_prefix)
+    app.include_router(task_manager.router, prefix=api_prefix)
     app.include_router(view_as.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────

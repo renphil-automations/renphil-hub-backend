@@ -162,7 +162,6 @@ class Settings(BaseSettings):
     # ── Field names ───────────────────────────────────────────────────
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
-    TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
     USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
@@ -185,7 +184,6 @@ class Settings(BaseSettings):
     USERS_MANAGER_FIELD: str
     USERS_TECH_STACK_SELECTIONS_FIELD: str
     USERS_HEADSHOT_FIELD: str
-    USERS_FOR_WEBSITE_FIELD: str
     # Roles / Permissions
     ROLES_NAME_FIELD: str
     ROLES_PERMISSIONS_FIELD: str
@@ -229,8 +227,10 @@ class Settings(BaseSettings):
     AT_F_REVIEW_UNTIL: str
     AT_F_PERIOD: str
 
+    # Primary-key field name shared by every Airtable table looked up by ID.
+    AIRTABLE_ID_FIELD: str = "Id"
+
     # ── Announcements fields ──────────────────────────────────────────
-    AT_F_ANN_ID: str
     AT_F_ANN_TITLE: str
     AT_F_ANN_CONTENT: str
     AT_F_ANN_AUTHOR_EMAIL: str
@@ -254,7 +254,6 @@ class Settings(BaseSettings):
     AT_F_FEEDBACK_RESPONSE: str = "Response"
 
     # ── Tickets fields ────────────────────────────────────────────────
-    AT_F_TICKET_ID: str
     AT_F_TICKET_TITLE: str
     AT_F_TICKET_DESCRIPTION: str
     AT_F_TICKET_STATUS: str
@@ -269,7 +268,6 @@ class Settings(BaseSettings):
     AT_F_TICKET_PARENT_LINK: str
 
     # ── Grant Application Resources fields ────────────────────────────
-    AT_F_GAR_ID: str | None = None
     AT_F_GAR_DOCUMENT: str | None = None
     AT_F_GAR_DOCUMENT_URL: str | None = None
     AT_F_GAR_NOTES: str | None = None
@@ -277,7 +275,6 @@ class Settings(BaseSettings):
     AT_F_GAR_TABS: str | None = None
 
     # ── Finance Links fields ──────────────────────────────────────────
-    AT_F_FL_ID: str
     AT_F_FL_DOCUMENT: str
     AT_F_FL_DOCUMENT_URL: str
 
@@ -289,32 +286,7 @@ class Settings(BaseSettings):
     # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
 
-    # ── Meeting Cadence fields ────────────────────────────────────────
-    AT_F_MC_MEETING_TITLE: str
-    AT_F_MC_DESCRIPTION: str
-    AT_F_MC_ATTACHMENT_URL: str
-
-    # ── Useful Links fields ───────────────────────────────────────────
-    AT_F_UL_DOCUMENT: str
-    AT_F_UL_DOCUMENT_URL: str
-    AT_F_UL_DESCRIPTION: str
-
-    # ── HR & Benefits fields ──────────────────────────────────────────
-    AT_F_HR_DOCUMENT: str
-    AT_F_HR_DOCUMENT_URL: str
-    AT_F_HR_DESCRIPTION: str
-
-    # ── Onboarding fields ─────────────────────────────────────────────
-    AT_F_OB_DOCUMENT: str
-    AT_F_OB_DOCUMENT_URL: str
-    AT_F_OB_NOTES: str
-
-    # ── Onboarding Calls fields ───────────────────────────────────────
-    AT_F_OBC_DATE: str
-    AT_F_OBC_NOTES: str
-
     # ── Quick Links fields ────────────────────────────────────────────
-    AT_F_QL_ID: str
     AT_F_QL_ANCHOR_TEXT: str
     AT_F_QL_URL: str
     AT_F_QL_EMAIL: str
@@ -322,23 +294,19 @@ class Settings(BaseSettings):
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
     # ── Quick Actions fields ──────────────────────────────────────────
-    AT_F_QA_ID: str = "ID"
     AT_F_QA_ACTION: str
 
     # ── Partnerships Links fields ─────────────────────────────────────
-    AT_F_PL_ID: str
     AT_F_PL_TEXT: str
     AT_F_PL_LINK: str
     AT_F_PL_CATEGORY: str
     AT_F_PL_TYPE: str
 
     # ── Policy Links fields ───────────────────────────────────────────
-    AT_F_POL_ID: str | None = None
     AT_F_POL_TEXT: str | None = None
     AT_F_POL_URL: str | None = None
 
     # ── Events Quick Links fields ───────────────────────────────────
-    AT_F_EQL_ID: str | None = None
     AT_F_EQL_TITLE: str | None = None
     AT_F_EQL_ANCHOR_TEXT: str | None = None
     AT_F_EQL_TYPE: str | None = None
@@ -346,35 +314,30 @@ class Settings(BaseSettings):
     AT_F_EQL_EMAIL: str | None = None
 
     # ── Finance Quick Links fields ──────────────────────────────────
-    AT_F_FQL_ID: str | None = None
     AT_F_FQL_ANCHOR_TEXT: str | None = None
     AT_F_FQL_URL: str | None = None
     AT_F_FQL_ENTITY: str | None = None
     AT_F_FQL_TABS: str | None = None
 
     # ── Comms Quick Links fields ────────────────────────────────────
-    AT_F_CQL_ID: str = "ID"
     AT_F_CQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_CQL_TYPE: str = "Type"
     AT_F_CQL_URL: str = "URL"
     AT_F_CQL_EMAIL: str = "Email"
 
     # ── HR Quick Links fields ───────────────────────────────────────
-    AT_F_HRQL_ID: str = "ID"
     AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_HRQL_TYPE: str = "Type"
     AT_F_HRQL_URL: str = "URL"
     AT_F_HRQL_EMAIL: str = "Email"
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
-    AT_F_DDL_ID: str | None = None
     AT_F_DDL_ANCHOR_TEXT: str | None = None
     AT_F_DDL_URL: str | None = None
     AT_F_DDL_ENTITY: str | None = None
     AT_F_DDL_TABS: str | None = None
 
     # ── Board Member List fields ─────────────────────────────────────
-    AT_F_BM_ID: str | None = None
     AT_F_BM_TITLE: str | None = None
     AT_F_BM_FULL_NAME: str | None = None
     AT_F_BM_ROLE: str | None = None
@@ -383,7 +346,6 @@ class Settings(BaseSettings):
     AT_F_BM_ENTITY: str | None = None
     AT_F_BM_TABS: str | None = None
     # ── Organization Info fields ────────────────────────────────
-    AT_F_OI_ID: str | None = None
     AT_F_OI_TITLE: str | None = None
     AT_F_OI_CONTENT: str | None = None
     AT_F_OI_ENTITY: str | None = None
@@ -658,6 +620,39 @@ class Settings(BaseSettings):
     # Kept as text so a bad value can never stop the API from starting; it is
     # parsed by `product_analytics_service.parse_retention_days`.
     PRODUCT_ANALYTICS_RETENTION_DAYS: str = "365"
+    # Archive-before-delete for age-expired product analytics: a private
+    # Cloudflare R2 bucket reached through its S3-compatible endpoint
+    # (`https://<ANALYTICS_ARCHIVE_R2_ACCOUNT_ID>.r2.cloudflarestorage.com`). All four values are
+    # required by `scripts/archive_product_analytics.py` and validated there
+    # (`product_analytics_archive.R2Config.from_settings`); the API never reads
+    # them and never starts worse without them. Use an API token scoped to
+    # this one bucket with Object Read & Write only. Never log these values.
+    ANALYTICS_ARCHIVE_R2_ACCOUNT_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_ACCESS_KEY_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_SECRET_ACCESS_KEY: str = ""
+    ANALYTICS_ARCHIVE_R2_BUCKET_NAME: str = ""
+    # A SECOND token for `scripts/reconcile_product_analytics_archives.py`
+    # only. The reconciliation lists, reads and deletes STAGING objects and
+    # never writes; Cloudflare's token levels cannot exclude delete or list,
+    # so that restriction is in the code, not in the token — keep the two
+    # identities separate anyway. Leave empty on the API and on the writer's
+    # schedule.
+    ANALYTICS_ARCHIVE_R2_RECONCILE_ACCESS_KEY_ID: str = ""
+    ANALYTICS_ARCHIVE_R2_RECONCILE_SECRET_ACCESS_KEY: str = ""
+    # Key prefix inside the bucket; archives live under
+    # `<prefix>/<environment>/<events|engagements>/v<format>/...`.
+    PRODUCT_ANALYTICS_ARCHIVE_PREFIX: str = "hub-product-analytics"
+    # Per R2 operation, in seconds; validated by the archive commands.
+    PRODUCT_ANALYTICS_ARCHIVE_STORAGE_TIMEOUT_SECONDS: str = "240"
+    # Dedicated scheduler credential; never expose it to the browser.
+    PRODUCT_ANALYTICS_ARCHIVE_TRIGGER_TOKEN: str = ""
+    # Whether archives carry the internal View As diagnostics
+    # (`view_as_role_key`, `view_as_scope_key`, `view_as_context`). Default
+    # `omit` (decided 2026-11-03): the real actor identity analytics needs is
+    # kept, the diagnostics are not, and once the live rows are deleted they
+    # cannot be restored. `include` must be set explicitly — see
+    # PRODUCT_ANALYTICS_ARCHIVE.md, "Privacy".
+    PRODUCT_ANALYTICS_ARCHIVE_VIEW_AS: str = "omit"
 
     @property
     def hub_environment(self) -> str:

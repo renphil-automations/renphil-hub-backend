@@ -41,7 +41,7 @@ from app.services.rbac_graph_service import (
     held_assignments,
     hub_admin_target_ids,
 )
-from app.services.resource_grant_service import grants_matching_pairs
+from app.services.resource_grant_service import GrantMatch, grants_matching_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -593,6 +593,30 @@ def held_closures_for(targets: list[ViewAsTarget], *, closures: RbacClosures) ->
     ]
 
 
+def view_as_grants(
+    db: Session,
+    targets: list[ViewAsTarget],
+    *,
+    user_id: int | None,
+    closures: RbacClosures,
+) -> list[GrantMatch]:
+    """The grants a holder of exactly these pairs reaches, plus the grants
+    shared DIRECTLY with ``user_id`` when given — only ever the caller
+    themselves, never a selected user.
+
+    Pairs are expanded ONE AT A TIME and unioned afterwards — the same
+    per-row rule ``effective_pairs`` applies to real assignments, so a role
+    from one pair is never combined with a scope from another. The seed set
+    for both the whole-tree fold (``resolve_view_as_access``) and the
+    single-node walk (``granted_single_node(grants=...)``)."""
+    pairs: set[tuple[int, int]] = set()
+    for held in held_closures_for(targets, closures=closures):
+        for role_id in held.role_ids:
+            for scope_id in held.scope_ids:
+                pairs.add((role_id, scope_id))
+    return grants_matching_pairs(db, pairs=pairs, user_id=user_id)
+
+
 def resolve_view_as_access(
     db: Session,
     targets: list[ViewAsTarget],
@@ -601,12 +625,8 @@ def resolve_view_as_access(
     closures: RbacClosures | None = None,
 ) -> ViewerAccess:
     """The ``ViewerAccess`` a holder of exactly these pairs would get, plus
-    the grants shared DIRECTLY with ``user_id`` when given — only ever the
-    caller themselves, when only pairs were given without ``anonymous``.
-
-    Pairs are expanded ONE AT A TIME and unioned afterwards — the same
-    per-row rule ``effective_pairs`` applies to real assignments, so a role
-    from one pair is never combined with a scope from another.
+    the grants shared DIRECTLY with ``user_id`` when given (see
+    ``view_as_grants``).
 
     ``full_access`` follows ``any_pair_is_hub_admin``.
     """
@@ -615,12 +635,7 @@ def resolve_view_as_access(
     if any_pair_is_hub_admin(db, targets, closures=graph):
         return ViewerAccess(visibility=None, full_access=True)
 
-    pairs: set[tuple[int, int]] = set()
-    for held in held_closures_for(targets, closures=graph):
-        for role_id in held.role_ids:
-            for scope_id in held.scope_ids:
-                pairs.add((role_id, scope_id))
-    seeds = grants_matching_pairs(db, pairs=pairs, user_id=user_id)
+    seeds = view_as_grants(db, targets, user_id=user_id, closures=graph)
     return ViewerAccess(visibility=fold(build_node_tree(db), seeds), full_access=False)
 
 

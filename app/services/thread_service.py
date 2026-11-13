@@ -514,7 +514,7 @@ def _can_see_thread_revisions(
 
 def derive_mention_token(name: str) -> str:
     """plan §5.5: the person's name with everything that isn't a Unicode
-    letter or digit removed — `Roy Abdelnour` -> `RoyAbdelnour`. Keeps
+    letter or digit removed — `John Doe` -> `JohnDoe`. Keeps
     accented letters as-is (no transliteration); drops apostrophes, hyphens,
     periods and spaces, which is what makes the result a single "word" the
     caret regex (frontend) and the word-boundary check (`_token_occurs_in_content`
@@ -528,7 +528,7 @@ def _token_occurs_in_content(content: str, token: str) -> bool:
     """plan §5.3 check 2 — "the token ... occurs in content, as `@<token>`
     at a word boundary." The trailing negative lookahead is the boundary:
     without it, a token that is a PREFIX of a longer run of letters/digits
-    (`@RoyAbdelnour` inside `@RoyAbdelnourite`) would count as a match.
+    (`@JohnDoe` inside `@JohnDoite`) would count as a match.
     `\\w` under Python's default Unicode `re` matches non-ASCII letters
     too, so this holds for the 3 of 148 eligible names with accented
     characters (plan D13's own note) without any extra handling."""
@@ -2108,9 +2108,10 @@ def list_threads_for_link(
     anonymous: bool = False,
 ) -> ThreadListResponse:
     """Approved threads only. `user` is whose votes, authored-revision
-    counts and own declined / pending COUNTS are computed — the caller
-    normally, nobody (`None`) for `anonymous` or `view_as_user`, which
-    therefore get `my_vote` 0 and zero counts (vote counts stay exact)."""
+    counts and own declined / pending COUNTS are computed — the caller,
+    with or without View As pairs or a selected user, or nobody (`None`)
+    for `anonymous`, which therefore gets `my_vote` 0 and zero counts
+    (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
@@ -2280,8 +2281,8 @@ def get_thread_by_id(
     access to the widget at all keeps getting 403, never 404.
 
     `user` is whose authorship, vote and authored revisions count — the
-    caller normally (View As pairs included), and nobody (`None`) for
-    `anonymous` or `view_as_user`.
+    caller, with or without View As pairs or a selected user, and nobody
+    (`None`) for `anonymous`.
 
     plan_thread_reject_resubmit §12.7: a CLOSED declined thread is NOT a
     404 for its author (that was the superseded soft-delete rule) — it
@@ -4628,7 +4629,7 @@ def moderation_summary(
 
     `view_as=True` means `access` was built from the View As parameters
     (`dependencies.get_view_as_access`): its only direct grants are the
-    caller's own, with pairs only and without `anonymous`. `view_as` and
+    caller's own, unless `anonymous`. `view_as` and
     `view_as_user` are echoed in the body and suffix the ETag
     (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)

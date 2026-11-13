@@ -10,6 +10,7 @@ Production-grade FastAPI backend for the Renaissance Philanthropy Hub.
 | **Google Drive** | `/drive` | List / retrieve files from a shared Drive folder |
 | **Dify.ai Chat** | `/dify` | Proxy chat queries to Dify.ai and return responses |
 | **Embedded forms** | `/forms` | Proxy the form-builder service (list forms / embed info), save `form` component settings, and resolve a form component's embed URL (per-user token when required) |
+| **Task Manager** | `/v2/task-manager` | List / create / update / delete the tasks (`tasks` table) linked to a `task_manager` component |
 | **Health** | `/health` | Simple liveness check |
 
 ## Project structure
