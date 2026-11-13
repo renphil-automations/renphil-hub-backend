@@ -713,6 +713,12 @@ class ThreadListResponse(BaseModel):
     # server-side: 0 for every other caller and for no-subject callers.
     # Drives the widget's "Revisions (N)" button through the existing poll.
     declined_count: int = 0
+    # 2026-11-13 — the caller's OWN items on this widget awaiting review.
+    # They no longer appear in `items` (approved threads only); the widget
+    # shows these two counts in its banner instead, and the author updates
+    # them from My Revisions. Same scoping as `declined_count`.
+    pending_count: int = 0
+    pending_edit_count: int = 0
 
 
 class ThreadModerationRow(ThreadSummary):

@@ -2107,20 +2107,21 @@ def list_threads_for_link(
     access: ViewerAccess | None = None,
     anonymous: bool = False,
 ) -> ThreadListResponse:
-    """`user` is whose own pending/rejected threads, votes and authored
-    revisions show up — the caller normally, the selected user under
-    nobody (`None`) for `anonymous` or `view_as_user`, which therefore list
-    approved threads only with `my_vote` 0 (vote counts stay exact)."""
+    """Approved threads only. `user` is whose votes, authored-revision
+    counts and own declined / pending COUNTS are computed — the caller
+    normally, nobody (`None`) for `anonymous` or `view_as_user`, which
+    therefore get `my_vote` 0 and zero counts (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread widget not found")
     _check_view_access(component, access)
 
-    # plan §5.5 — every approved thread, plus the CALLER'S OWN pending ones
-    # (an author sees their own awaiting-review threads with a status
-    # badge; nobody else's pending rows appear in the widget's list at
-    # all). `anonymous=True` drops that second arm, so the list is exactly
-    # what any other viewer would get: approved only.
+    # Approved threads only, for every caller (2026-11-13, owner request —
+    # narrowing plan §5.5): the author's OWN pending threads no longer show
+    # in the widget's list with a status badge. They are counted in
+    # `pending_count` (and their pending edits in `pending_edit_count`) for
+    # the widget's banner, and live on My Revisions → Awaiting review,
+    # where the author updates them.
     #
     # plan_thread_reject_resubmit_2026-11-07.md §4.2 (owner decision 5)
     # DELIBERATELY narrows 2a's M3 rule: the author's REJECTED threads no
@@ -2129,16 +2130,9 @@ def list_threads_for_link(
     # thread is always rejected (ck_threads_closed_shape), so this list
     # never needs to filter on `closed_at` — closed items never appear in
     # the threads list (owner decision R5).
-    visible_status = ThreadV2.status == THREAD_STATUS_APPROVED
-    if not anonymous and user is not None:
-        visible_status = or_(
-            visible_status,
-            and_(
-                ThreadV2.author_email == _norm_email(user.email),
-                ThreadV2.status == THREAD_STATUS_PENDING,
-            ),
-        )
-    query = db.query(ThreadV2).filter(ThreadV2.component_id == component.id, visible_status)
+    query = db.query(ThreadV2).filter(
+        ThreadV2.component_id == component.id, ThreadV2.status == THREAD_STATUS_APPROVED
+    )
     if cursor:
         after_created_at, after_id = _decode_cursor(cursor)
         # A row comparison, not two ANDed predicates (plan §4.3, finding
@@ -2174,10 +2168,22 @@ def list_threads_for_link(
     # this widget (two cheap COUNTs, the inbox's exact predicate). 0 for a
     # no-subject caller (`anonymous` / view-as with no user).
     declined_count = 0
+    pending_count = 0
+    pending_edit_count = 0
     if not anonymous and user is not None:
         declined_count = _declined_count(db, component.id, user.email)
+        pending_count = int(_own_pending_threads_query(db, [component.id], user.email).count())
+        pending_edit_count = int(
+            _own_pending_revisions_query(db, [component.id], user.email).count()
+        )
 
-    return ThreadListResponse(items=items, next_cursor=next_cursor, declined_count=declined_count)
+    return ThreadListResponse(
+        items=items,
+        next_cursor=next_cursor,
+        declined_count=declined_count,
+        pending_count=pending_count,
+        pending_edit_count=pending_edit_count,
+    )
 
 
 def create_thread_for_link(
