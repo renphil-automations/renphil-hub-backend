@@ -193,6 +193,15 @@ to `Pending`. `assignees` is a list of emails; each must match a user
 `notify_on_create_and_delete` to true; when the latter is true, each assignee
 gets a "You've been assigned …" notification.
 
+`mode`:
+* `group_task` (default with 2+ assignees): one task shared by all assignees —
+  a status change is seen by all of them. Refused (422 `INVALID_TASK_MODE`)
+  with fewer than 2 assignees.
+* `individual_task` (default with 0 or 1 assignee): with N > 1 assignees, N
+  independent tasks are created, one per assignee.
+
+`tasks` lists every created task, in assignee order.
+
 **View As** (`view_as` pairs, `view_as_user`): the selected pairs (plus content
 shared directly with the caller) must be able to view the component. The task
 is still owned by the caller. Refused with 403 `VIEW_AS_ANONYMOUS_READ_ONLY`
@@ -203,7 +212,7 @@ when `anonymous=true`.
         400: {"description": f"The component is not a Task Manager component, or {_VIEW_AS_400}"},
         403: {"description": f"The component is visible but its content isn't shared with you, or {_VIEW_AS_403}"},
         404: {"description": "Component not found / not visible, or an assignee email not found"},
-        422: {"description": "Invalid body (e.g. empty title, unsupported status)"},
+        422: {"description": "Invalid body (e.g. empty title, unsupported status, `group_task` with < 2 assignees)"},
     },
 )
 def create_task(
@@ -213,7 +222,7 @@ def create_task(
     db: Session = Depends(get_db_v2),
 ) -> TaskMutationResponse:
     try:
-        task = task_manager_service.create_task(
+        tasks = task_manager_service.create_task(
             db,
             caller_id=current.hub_user_id,
             access=view_as_access.access,
@@ -226,11 +235,12 @@ def create_task(
             editable_via_webhook=body.editable_via_webhook,
             notification_cadence=body.notification_cadence,
             notify_on_create_and_delete=body.notify_on_create_and_delete,
+            mode=body.mode,
         )
     except task_manager_service.TaskManagerError as e:
         raise _to_http(e)
     return TaskMutationResponse(
-        success=True, task=task, view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
+        success=True, tasks=tasks, view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
     )
 
 
@@ -249,23 +259,35 @@ Partial update — only the fields present in the body change.
 * `status` (`Pending`, `In Progress`, `Blocked`, `Closed`): the same people, or
   an assignee when `editable_by_assignee` is true. Sets
   `status_last_updated_at` / `status_last_updated_by`.
+* `mode` (`group_task`, `individual_task`): only the task owner, an editor of
+  the task's Task Manager, or an Admin on All Scopes may change it (sending the
+  current mode is a no-op anyone may do).
+  * Omitted: the task keeps its mode. A `group_task` left with fewer than 2
+    assignees is refused (422 `INVALID_TASK_MODE`); an `individual_task` given
+    N > 1 assignees is split (below).
+  * `group_task` with fewer than 2 assignees: 422 `INVALID_TASK_MODE`.
+  * `individual_task` on a task left with N > 1 assignees splits it: this task
+    keeps one assignee (one it already had, if any) and N-1 copies of it (after
+    this update, same owner) are created, one per other assignee.
 
-Timestamps only move when a value actually changes.
+Timestamps only move when a value actually changes. `tasks` lists the updated
+task first, then any copies created by a split.
 
 Notifications (to the owner and assignees, never the caller), following the
 task's settings after the update:
 * assignees added/removed → the added/removed users and the owner, when
-  `notify_on_create_and_delete` is true;
+  `notify_on_create_and_delete` is true (assignees moved onto a split copy
+  were already assigned and aren't notified);
 * title/description/editable flags → owner + assignees, when cadence is `always`;
 * status → owner + assignees, when cadence is `always` or `on_status_change`;
-* the two notification settings themselves → none.
+* the two notification settings and `mode` themselves → none.
 """ + _VIEW_AS_WRITE_DOC,
     dependencies=[Depends(_refuse_anonymous)],
     responses={
         400: {"description": f"No updatable field was provided, or {_VIEW_AS_400}"},
         403: {"description": f"Not allowed to make this change, or {_VIEW_AS_403}"},
         404: {"description": "Task not found, or an assignee email not found"},
-        422: {"description": "Invalid body (e.g. empty title, unsupported status)"},
+        422: {"description": "Invalid body (e.g. empty title, unsupported status, `group_task` with < 2 assignees)"},
     },
 )
 def update_task(
@@ -279,7 +301,7 @@ def update_task(
     changes = {field: getattr(body, field) for field in body.model_fields_set}
     is_admin, can_edit_component = _task_permissions(db, current, selection)
     try:
-        task = task_manager_service.update_task(
+        tasks = task_manager_service.update_task(
             db,
             task_id,
             caller_id=current.hub_user_id,
@@ -289,7 +311,7 @@ def update_task(
         )
     except task_manager_service.TaskManagerError as e:
         raise _to_http(e)
-    return TaskMutationResponse(success=True, task=task, **_view_as_echo(selection))
+    return TaskMutationResponse(success=True, tasks=tasks, **_view_as_echo(selection))
 
 
 @router.delete(

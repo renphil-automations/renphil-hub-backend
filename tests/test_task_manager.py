@@ -114,16 +114,24 @@ class _DbTestCase(unittest.TestCase):
         self.db.flush()
         return user
 
-    def _create(self, *, caller=None, access=EDITOR, **overrides):
+    def _create_all(self, *, caller=None, access=EDITOR, **overrides):
         kwargs = dict(component_id=self.tm.id, title="Do it", assignee_emails=["assignee@renphil.org"])
         kwargs.update(overrides)
         return svc.create_task(self.db, caller_id=(caller or self.owner).id, access=access, **kwargs)
 
-    def _update(self, task_id, caller, changes, is_admin=False, editor_of=()):
+    def _create(self, **kwargs):
+        (task,) = self._create_all(**kwargs)
+        return task
+
+    def _update_all(self, task_id, caller, changes, is_admin=False, editor_of=()):
         return svc.update_task(
             self.db, task_id, caller_id=caller.id, is_admin=is_admin,
             can_edit_component=lambda cid: cid in editor_of, changes=changes,
         )
+
+    def _update(self, task_id, caller, changes, is_admin=False, editor_of=()):
+        (task,) = self._update_all(task_id, caller, changes, is_admin=is_admin, editor_of=editor_of)
+        return task
 
     def _delete(self, ids, caller, is_admin=False, editor_of=()):
         return svc.delete_tasks(
@@ -242,7 +250,7 @@ class UpdateTaskTests(_DbTestCase):
             self.task_id,
             self.owner,
             {"title": "New", "description": None, "assignees": ["other@renphil.org", "assignee@renphil.org"],
-             "editable_via_webhook": True},
+             "editable_via_webhook": True, "mode": "group_task"},
         )
         self.assertEqual(updated["title"], "New")
         self.assertIsNone(updated["description"])
@@ -252,7 +260,9 @@ class UpdateTaskTests(_DbTestCase):
         self.assertEqual(updated["status_last_updated_at"], self.task["status_last_updated_at"])
         self.assertEqual(self.db.query(TaskAssigneeV2).count(), 2)
 
-        replaced = self._update(self.task_id, self.owner, {"assignees": ["other@renphil.org"]})
+        replaced = self._update(
+            self.task_id, self.owner, {"assignees": ["other@renphil.org"], "mode": "individual_task"}
+        )
         self.assertEqual(self._assignee_ids(replaced), [self.other.id])
         for clear in ([], None):
             self.assertEqual(self._update(self.task_id, self.owner, {"assignees": clear})["assignees"], [])
@@ -285,7 +295,9 @@ class UpdateTaskTests(_DbTestCase):
         self.assertEqual(updated["last_updated_at"], self.task["last_updated_at"])
 
     def test_any_assignee_status_depends_on_editable_by_assignee(self) -> None:
-        self._update(self.task_id, self.owner, {"assignees": ["assignee@renphil.org", "other@renphil.org"]})
+        self._update(
+            self.task_id, self.owner, {"assignees": ["assignee@renphil.org", "other@renphil.org"], "mode": "group_task"}
+        )
         updated = self._update(self.task_id, self.other, {"status": "Blocked"})
         self.assertEqual(updated["status"], "Blocked")
         self.assertEqual(updated["status_last_updated_by"], self.other.id)
@@ -320,6 +332,166 @@ class UpdateTaskTests(_DbTestCase):
         self.assertEqual(
             [r.assignee_id for r in self.db.query(TaskAssigneeV2).all()], [self.assignee.id]
         )
+
+
+class TaskModeTests(_DbTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.third = self._user("third@renphil.org")
+        self.db.commit()
+
+    def _notes(self):
+        rows = self.db.query(NotificationV2).order_by(NotificationV2.id).all()
+        self.db.query(NotificationV2).delete()
+        self.db.commit()
+        return [(n.recipient_email.split("@")[0], n.type) for n in rows]
+
+    def _links(self):
+        return sorted((r.task_id, r.assignee_id) for r in self.db.query(TaskAssigneeV2).all())
+
+    def test_create_defaults_mode_from_assignee_count(self) -> None:
+        both = ["assignee@renphil.org", "other@renphil.org"]
+        self.assertEqual(self._create(assignee_emails=both)["mode"], "group_task")
+        self.assertEqual(self._create()["mode"], "individual_task")
+        self.assertEqual(self._create(assignee_emails=[])["mode"], "individual_task")
+        self.assertEqual(self._create(mode="individual_task")["mode"], "individual_task")
+
+    def test_create_group_needs_two_assignees(self) -> None:
+        for emails in (["assignee@renphil.org"], []):
+            with self.subTest(emails=emails):
+                with self.assertRaises(svc.TaskManagerError) as ctx:
+                    self._create(assignee_emails=emails, mode="group_task")
+                self.assertEqual((ctx.exception.status_code, ctx.exception.code), (422, "INVALID_TASK_MODE"))
+        self.assertEqual(self.db.query(TaskV2).count(), 0)
+
+    def test_create_individual_makes_one_task_per_assignee(self) -> None:
+        tasks = self._create_all(
+            assignee_emails=["assignee@renphil.org", "other@renphil.org", "third@renphil.org"],
+            mode="individual_task", status="Blocked",
+        )
+        self.assertEqual([self._assignee_ids(t) for t in tasks], [[self.assignee.id], [self.other.id], [self.third.id]])
+        self.assertEqual(len({t["id"] for t in tasks}), 3)
+        self.assertEqual(
+            {(t["title"], t["status"], t["owner_id"], t["mode"]) for t in tasks},
+            {("Do it", "Blocked", self.owner.id, "individual_task")},
+        )
+        self.assertEqual(self._notes(), [("assignee", "task_assigned"), ("other", "task_assigned"), ("third", "task_assigned")])
+        # Statuses are independent.
+        self._update(tasks[0]["id"], self.assignee, {"status": "Closed"})
+        self.db.expire_all()
+        self.assertEqual([self.db.get(TaskV2, t["id"]).status for t in tasks], ["Closed", "Blocked", "Blocked"])
+
+    def test_group_task_cannot_drop_below_two_assignees(self) -> None:
+        task = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+        for changes in (
+            {"assignees": ["other@renphil.org"]},
+            {"assignees": []},
+            {"assignees": ["other@renphil.org"], "mode": "group_task"},
+            {"mode": None},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(svc.TaskManagerError) as ctx:
+                    self._update(task["id"], self.owner, changes)
+                self.assertEqual((ctx.exception.status_code, ctx.exception.code), (422, "INVALID_TASK_MODE"))
+        self.assertEqual(self._links(), [(task["id"], self.assignee.id), (task["id"], self.other.id)])
+        reduced = self._update(task["id"], self.owner, {"assignees": ["other@renphil.org"], "mode": "individual_task"})
+        self.assertEqual((reduced["mode"], self._assignee_ids(reduced)), ("individual_task", [self.other.id]))
+
+    def test_individual_task_given_more_assignees_stays_individual_and_splits(self) -> None:
+        task = self._create()
+        tasks = self._update_all(task["id"], self.owner, {"assignees": ["other@renphil.org", "assignee@renphil.org"]})
+        self.assertEqual([t["id"] == task["id"] for t in tasks], [True, False])
+        self.assertEqual({t["mode"] for t in tasks}, {"individual_task"})
+        # The original keeps the assignee it already had; the newcomer gets a copy.
+        self.assertEqual([self._assignee_ids(t) for t in tasks], [[self.assignee.id], [self.other.id]])
+        # An empty individual task given 2 assignees splits too.
+        empty = self._create(assignee_emails=[])
+        tasks = self._update_all(empty["id"], self.owner, {"assignees": ["other@renphil.org", "third@renphil.org"]})
+        self.assertEqual([self._assignee_ids(t) for t in tasks], [[self.other.id], [self.third.id]])
+        # Only an explicit `group_task` turns it into a shared task.
+        merged = self._update(
+            empty["id"], self.owner, {"assignees": ["other@renphil.org", "third@renphil.org"], "mode": "group_task"}
+        )
+        self.assertEqual((merged["mode"], self._assignee_ids(merged)), ("group_task", [self.other.id, self.third.id]))
+
+    def test_update_to_individual_splits_the_task(self) -> None:
+        task = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+        self._notes()
+        tasks = self._update_all(
+            task["id"], self.owner,
+            {"mode": "individual_task", "status": "Blocked", "title": "Split",
+             "assignees": ["third@renphil.org", "other@renphil.org", "assignee@renphil.org"]},
+        )
+        # The original keeps the first requested assignee it already had; copies follow in request order.
+        self.assertEqual(tasks[0]["id"], task["id"])
+        self.assertEqual([self._assignee_ids(t) for t in tasks], [[self.other.id], [self.third.id], [self.assignee.id]])
+        self.assertEqual(
+            {(t["title"], t["status"], t["owner_id"], t["mode"], t["component_id"]) for t in tasks},
+            {("Split", "Blocked", self.owner.id, "individual_task", self.tm.id)},
+        )
+        self.assertEqual(self.db.query(TaskV2).count(), 3)
+        self.assertEqual(
+            self._notes(),
+            [
+                ("third", "task_assigned"),
+                ("third", "task_updated"), ("other", "task_updated"), ("assignee", "task_updated"),
+                ("third", "task_status_changed"), ("other", "task_status_changed"), ("assignee", "task_status_changed"),
+            ],
+        )
+
+    def test_mode_only_split_and_noop(self) -> None:
+        task = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+        same = self._update_all(task["id"], self.owner, {"mode": "group_task"})
+        self.assertEqual([t["id"] for t in same], [task["id"]])
+        self.assertEqual(same[0]["last_updated_at"], task["last_updated_at"])
+        tasks = self._update_all(task["id"], self.owner, {"mode": "individual_task"})
+        self.assertEqual([self._assignee_ids(t) for t in tasks], [[self.assignee.id], [self.other.id]])
+        self.assertNotEqual(tasks[1]["id"], task["id"])
+
+    def test_only_owner_admin_or_component_editor_can_change_the_mode(self) -> None:
+        task = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+        updated = self._update(task["id"], self.assignee, {"status": "Closed", "mode": "group_task"})
+        self.assertEqual(updated["status"], "Closed")
+        for caller in (self.assignee, self.third):
+            with self.subTest(caller=caller.work_email):
+                with self.assertRaises(svc.TaskManagerError) as ctx:
+                    self._update(task["id"], caller, {"mode": "individual_task"})
+                self.assertEqual((ctx.exception.status_code, ctx.exception.code), (403, "FORBIDDEN"))
+                self.assertIn("mode", ctx.exception.message)
+        self.assertEqual(self.db.query(TaskV2).count(), 1)
+        for kwargs in ({"is_admin": True}, {"editor_of": {self.tm.id}}):
+            with self.subTest(**kwargs):
+                group = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+                tasks = self._update_all(group["id"], self.third, {"mode": "individual_task"}, **kwargs)
+                self.assertEqual(len(tasks), 2)
+        tasks = self._update_all(task["id"], self.owner, {"mode": "individual_task"})
+        self.assertEqual(len(tasks), 2)
+
+    def test_mode_change_never_notifies(self) -> None:
+        task = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+        self.assertEqual(task["notification_cadence"], "always")
+        self._notes()
+        self._update_all(task["id"], self.third, {"mode": "individual_task"}, editor_of={self.tm.id})
+        self.assertEqual(self._notes(), [])
+        # Moving to a group (with the same people) doesn't either.
+        single = self._create(assignee_emails=["assignee@renphil.org"])
+        self._notes()
+        self._update(single["id"], self.owner, {"mode": "group_task", "assignees": ["assignee@renphil.org", "other@renphil.org"]})
+        # `other` is newly assigned to this task: that (not the mode) is notified.
+        self.assertEqual(self._notes(), [("other", "task_assigned")])
+
+    def test_null_mode_is_derived_and_status_updates_never_split(self) -> None:
+        group = self._create(assignee_emails=["assignee@renphil.org", "other@renphil.org"])
+        single = self._create()
+        self.db.query(TaskV2).update({TaskV2.mode: None})
+        self.db.commit()
+        listed = svc.list_tasks(self.db, self.tm.id, caller_id=self.owner.id, access=EDITOR)["tasks"]
+        self.assertEqual({t["id"]: t["mode"] for t in listed}, {group["id"]: "group_task", single["id"]: "individual_task"})
+        # Inconsistent stored data (individual with 2 assignees) isn't touched by a status change.
+        self.db.query(TaskV2).filter(TaskV2.id == group["id"]).update({TaskV2.mode: "individual_task"})
+        self.db.commit()
+        self._update(group["id"], self.assignee, {"status": "Closed"})
+        self.assertEqual(self.db.query(TaskV2).count(), 2)
 
 
 class DeleteTasksTests(_DbTestCase):
@@ -493,7 +665,7 @@ class TaskNotificationTests(_DbTestCase):
                 ("owner", "task_assignees_changed", "Third assigned Third to the task Do it and unassigned Other from it"),
             ],
         )
-        self._update(task_id, self.owner, {"assignees": ["other@renphil.org"]})
+        self._update(task_id, self.owner, {"assignees": ["other@renphil.org"], "mode": "individual_task"})
         self.assertEqual(
             self._notes(),
             [
@@ -578,7 +750,7 @@ class TaskManagerRouterTests(_DbTestCase):
                   "status": "Blocked"},
         )
         self.assertEqual(r.status_code, 201, r.text)
-        task = r.json()["task"]
+        task = r.json()["tasks"][0]
         self.assertEqual((task["status"], task["is_owner"], task["is_assignee"]), ("Blocked", True, False))
         self.assertEqual([a["email"] for a in task["assignees"]], ["assignee@renphil.org", "other@renphil.org"])
 
@@ -589,7 +761,7 @@ class TaskManagerRouterTests(_DbTestCase):
         self.caller = self.assignee
         r = self.client.patch(f"/v2/task-manager/tasks/{task['id']}", json={"status": "Closed"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["task"]["status_last_updated_by"], self.assignee.id)
+        self.assertEqual(r.json()["tasks"][0]["status_last_updated_by"], self.assignee.id)
         r = self.client.patch(f"/v2/task-manager/tasks/{task['id']}", json={"title": "x"})
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json()["detail"]["code"], "FORBIDDEN")
@@ -600,10 +772,31 @@ class TaskManagerRouterTests(_DbTestCase):
 
         # A component editor manages a task they neither own nor are assigned to.
         self.editor_of = {self.tm.id}
-        r = self.client.patch(f"/v2/task-manager/tasks/{task['id']}", json={"assignees": []})
-        self.assertEqual((r.status_code, r.json()["task"]["assignees"]), (200, []))
+        r = self.client.patch(
+            f"/v2/task-manager/tasks/{task['id']}", json={"assignees": [], "mode": "individual_task"}
+        )
+        self.assertEqual((r.status_code, r.json()["tasks"][0]["assignees"]), (200, []))
         r = self.client.request("DELETE", "/v2/task-manager/tasks", json={"task_ids": [task["id"]]})
         self.assertEqual((r.json()["success"], r.json()["deleted"]), (True, [task["id"]]))
+
+    def test_mode_over_http(self) -> None:
+        body = {"component_id": self.tm.id, "title": "T", "assignees": ["assignee@renphil.org", "other@renphil.org"]}
+        r = self.client.post("/v2/task-manager/tasks", json={**body, "mode": "individual_task"})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(
+            [(t["mode"], [a["email"] for a in t["assignees"]]) for t in r.json()["tasks"]],
+            [("individual_task", ["assignee@renphil.org"]), ("individual_task", ["other@renphil.org"])],
+        )
+        r = self.client.post("/v2/task-manager/tasks", json={**body, "assignees": ["assignee@renphil.org"], "mode": "group_task"})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "INVALID_TASK_MODE"))
+        r = self.client.post("/v2/task-manager/tasks", json={**body, "mode": "team"})
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post("/v2/task-manager/tasks", json=body)
+        (group,) = r.json()["tasks"]
+        self.assertEqual(group["mode"], "group_task")
+        r = self.client.patch(f"/v2/task-manager/tasks/{group['id']}", json={"mode": "individual_task"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([t["id"] == group["id"] for t in r.json()["tasks"]], [True, False])
 
     def test_error_statuses(self) -> None:
         self.access = VIEWER
@@ -711,7 +904,7 @@ class TaskManagerViewAsTests(_DbTestCase):
     def test_create_follows_the_view_as_access_and_is_owned_by_the_caller(self) -> None:
         r = self.client.post("/v2/task-manager/tasks", json={"component_id": self.tm.id, "title": "T"})
         self.assertEqual(r.status_code, 201, r.text)
-        self.assertEqual((r.json()["task"]["owner_id"], r.json()["view_as"]), (self.owner.id, True))
+        self.assertEqual((r.json()["tasks"][0]["owner_id"], r.json()["view_as"]), (self.owner.id, True))
         self.access = _Access(view=False)
         r = self.client.post("/v2/task-manager/tasks", json={"component_id": self.tm.id, "title": "T"})
         self.assertEqual(r.status_code, 404)
@@ -731,7 +924,7 @@ class TaskManagerViewAsTests(_DbTestCase):
         # The pairs give edit on an ancestor of the Task Manager: any task.
         self.pairs_grants = [GrantMatch(1, "tab", self.tab.id, LEVEL_EDIT)]
         r = self.client.patch(f"/v2/task-manager/tasks/{self.foreign}", json={"title": "x"})
-        self.assertEqual((r.status_code, r.json()["task"]["can_manage"]), (200, True))
+        self.assertEqual((r.status_code, r.json()["tasks"][0]["can_manage"]), (200, True))
         r = self.client.request("DELETE", "/v2/task-manager/tasks", json={"task_ids": [self.foreign]})
         self.assertEqual((r.json()["deleted"], r.json()["view_as"]), ([self.foreign], True))
         # Writes never build the whole-tree View As access.

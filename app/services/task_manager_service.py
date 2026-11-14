@@ -17,6 +17,11 @@ component. Its assignees may change its status only, and only when
 ``editable_by_assignee`` is true. Assignees are many-per-task, stored in
 ``task_assignee_relationship``.
 
+A task's ``mode`` is ``group_task`` (one row shared by 2+ assignees, so a
+status change is seen by all of them) or ``individual_task`` (at most one
+assignee). Asking for ``individual_task`` with N > 1 assignees produces N
+independent tasks, one per assignee, as if each had been created separately.
+
 Service functions raise ``TaskManagerError`` (carrying the HTTP status) or the
 access service's ``AccessDeniedError``; the router maps both.
 """
@@ -41,6 +46,11 @@ TASK_MANAGER_WIDGET_TYPE = "task_manager"
 
 TASK_STATUSES = ("Pending", "In Progress", "Blocked", "Closed")
 DEFAULT_TASK_STATUS = "Pending"
+
+TASK_MODE_GROUP = "group_task"
+TASK_MODE_INDIVIDUAL = "individual_task"
+TASK_MODES = (TASK_MODE_GROUP, TASK_MODE_INDIVIDUAL)
+MIN_GROUP_ASSIGNEES = 2
 
 # Fields only a task manager (owner, Admin on All Scopes, component editor) may change.
 CONTENT_FIELDS = (
@@ -149,6 +159,30 @@ def _validate_title(title: str | None) -> str:
     return cleaned
 
 
+def _default_mode(assignee_count: int) -> str:
+    return TASK_MODE_GROUP if assignee_count >= MIN_GROUP_ASSIGNEES else TASK_MODE_INDIVIDUAL
+
+
+def mode_of(task: TaskV2, assignee_ids: list[int]) -> str:
+    """The task's stored mode; a NULL one is derived from its assignee count."""
+    return task.mode or _default_mode(len(assignee_ids))
+
+
+def _validate_mode(mode: str | None, assignee_count: int) -> str:
+    if mode not in TASK_MODES:
+        raise TaskManagerError(
+            422, f"Invalid mode {mode!r}. Supported values: {', '.join(TASK_MODES)}", "INVALID_TASK_MODE"
+        )
+    if mode == TASK_MODE_GROUP and assignee_count < MIN_GROUP_ASSIGNEES:
+        raise TaskManagerError(
+            422,
+            f"A {TASK_MODE_GROUP} needs at least {MIN_GROUP_ASSIGNEES} assignees; "
+            f"use {TASK_MODE_INDIVIDUAL} for a task with {assignee_count}",
+            "INVALID_TASK_MODE",
+        )
+    return mode
+
+
 def _assignee_ids_by_task(db: Session, task_ids: Iterable[int]) -> dict[int, list[int]]:
     ids = set(task_ids)
     result: dict[int, list[int]] = {tid: [] for tid in ids}
@@ -213,6 +247,7 @@ def serialize_task(
         "editable_via_webhook": task.editable_via_webhook,
         "notification_cadence": cadence_of(task),
         "notify_on_create_and_delete": task.notify_on_create_and_delete,
+        "mode": mode_of(task, assignee_ids),
         "is_owner": task.owner_id == caller_id,
         "is_assignee": is_assignee,
         "can_manage": can_manage,
@@ -328,45 +363,62 @@ def create_task(
     editable_via_webhook: bool = False,
     notification_cadence: str | None = None,
     notify_on_create_and_delete: bool = True,
-) -> dict[str, Any]:
+    mode: str | None = None,
+) -> list[dict[str, Any]]:
     """Create a task owned by the caller, with any number of assignees.
     Requires view on the component (``_require_component_view``). Each
-    assignee is notified when ``notify_on_create_and_delete`` is true."""
+    assignee is notified when ``notify_on_create_and_delete`` is true.
+
+    ``mode`` defaults to ``group_task`` with 2+ assignees and
+    ``individual_task`` otherwise; ``group_task`` with fewer than 2 is refused.
+    ``individual_task`` with N > 1 assignees creates N tasks, one per assignee.
+    Returns every created task, in assignee order."""
     _require_component_view(db, access, component_id)
 
     title = _validate_title(title)
     status = _validate_status(status or DEFAULT_TASK_STATUS)
     assignee_ids = _resolve_assignee_ids(db, assignee_emails)
     cadence = _validate_cadence(notification_cadence or "always")
+    mode = _default_mode(len(assignee_ids)) if mode is None else _validate_mode(mode, len(assignee_ids))
+    if mode == TASK_MODE_INDIVIDUAL and len(assignee_ids) > 1:
+        assignee_sets = [[uid] for uid in assignee_ids]
+    else:
+        assignee_sets = [assignee_ids]
 
     now = _utc_now()
-    task = TaskV2(
-        title=title,
-        description=description,
-        status=status,
-        owner_id=caller_id,
-        component_id=component_id,
-        created_at=now,
-        last_updated_at=now,
-        status_last_updated_at=now,
-        last_updated_by=caller_id,
-        status_last_updated_by=caller_id,
-        editable_by_assignee=editable_by_assignee,
-        editable_via_webhook=editable_via_webhook,
-        notification_cadence=cadence,
-        notify_on_create_and_delete=notify_on_create_and_delete,
-    )
+    tasks: list[TaskV2] = []
     try:
-        db.add(task)
-        db.flush()
-        _set_assignees(db, task.id, [], assignee_ids)
-        TaskNotifier(db, caller_id).assignees_changed(task, added=assignee_ids, removed=[])
+        notifier = TaskNotifier(db, caller_id)
+        for task_assignees in assignee_sets:
+            task = TaskV2(
+                title=title,
+                description=description,
+                status=status,
+                owner_id=caller_id,
+                component_id=component_id,
+                created_at=now,
+                last_updated_at=now,
+                status_last_updated_at=now,
+                last_updated_by=caller_id,
+                status_last_updated_by=caller_id,
+                editable_by_assignee=editable_by_assignee,
+                editable_via_webhook=editable_via_webhook,
+                notification_cadence=cadence,
+                notify_on_create_and_delete=notify_on_create_and_delete,
+                mode=mode,
+            )
+            db.add(task)
+            db.flush()
+            _set_assignees(db, task.id, [], task_assignees)
+            notifier.assignees_changed(task, added=task_assignees, removed=[])
+            tasks.append(task)
         db.commit()
     except Exception:
         db.rollback()
         raise
-    db.refresh(task)
-    return _serialize_one(db, task, caller_id, can_manage=True)
+    for task in tasks:
+        db.refresh(task)
+    return [_serialize_one(db, task, caller_id, can_manage=True) for task in tasks]
 
 
 # ---------------------------------------------------------
@@ -382,7 +434,7 @@ def update_task(
     is_admin: bool,
     can_edit_component: ComponentEditCheck,
     changes: dict[str, Any],
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     """Apply ``changes`` (only the keys the client actually sent).
 
     * Content fields (``CONTENT_FIELDS``; ``assignees`` replaces the whole
@@ -391,11 +443,20 @@ def update_task(
     * ``status``: the same people, or an assignee when the task's
       ``editable_by_assignee`` is true. Bumps ``status_last_updated_at`` /
       ``status_last_updated_by``.
+    * ``mode``: only the task owner, Admin on All Scopes, or an editor of the
+      task's component may change it (sending the current mode is a no-op
+      anyone may do). When omitted, the task keeps its mode: a
+      ``group_task`` left with fewer than 2 assignees is refused, and an
+      ``individual_task`` given N > 1 assignees is split. A split keeps one
+      assignee on the task (one it already had, if any) and creates N-1
+      copies of it (after this update), one per other assignee, owned by the
+      same owner. A mode change alone never notifies anyone; added/removed
+      assignees, detail and status changes notify as usual.
 
     Everything is validated before anything is written. Timestamps only move
     when a value actually changes. Notifications (``task_notification_service``)
     follow the task's settings AFTER this update, and are written in the same
-    commit.
+    commit. Returns the updated task, then any copies, in assignee order.
     """
     task = db.query(TaskV2).filter(TaskV2.id == task_id).first()
     if task is None:
@@ -403,10 +464,12 @@ def update_task(
 
     content_changes = {k: v for k, v in changes.items() if k in CONTENT_FIELDS}
     status_change = "status" in changes
-    if not content_changes and not status_change:
+    mode_requested = "mode" in changes
+    if not content_changes and not status_change and not mode_requested:
         raise TaskManagerError(400, "No updatable fields were provided", "NO_CHANGES")
 
     current_assignees = _assignee_ids_by_task(db, [task.id])[task.id]
+    current_mode = mode_of(task, current_assignees)
     can_manage = _can_manage(task, caller_id, is_admin, can_edit_component)
     is_assignee = caller_id in current_assignees
 
@@ -415,6 +478,13 @@ def update_task(
             403,
             "Only the task owner, an editor of this Task Manager or an Admin on All Scopes "
             "can edit this task's details",
+            "FORBIDDEN",
+        )
+    if mode_requested and changes["mode"] != current_mode and not can_manage:
+        raise TaskManagerError(
+            403,
+            "Only the task owner, an editor of this Task Manager or an Admin on All Scopes "
+            "can change this task's mode",
             "FORBIDDEN",
         )
     if status_change and not can_manage:
@@ -446,6 +516,21 @@ def update_task(
         _resolve_assignee_ids(db, content_changes["assignees"]) if "assignees" in content_changes else None
     )
     new_status = _validate_status(changes["status"]) if status_change else None
+    final_assignees = current_assignees if wanted_assignees is None else wanted_assignees
+    mode_in_play = mode_requested or wanted_assignees is not None
+    if not mode_in_play:
+        new_mode = current_mode
+    else:
+        new_mode = _validate_mode(changes["mode"] if mode_requested else current_mode, len(final_assignees))
+
+    split = mode_in_play and new_mode == TASK_MODE_INDIVIDUAL and len(final_assignees) > 1
+    if split:
+        keeper = next((uid for uid in final_assignees if uid in current_assignees), final_assignees[0])
+        kept_assignees = [keeper]
+        copy_assignees = [uid for uid in final_assignees if uid != keeper]
+    else:
+        kept_assignees = final_assignees
+        copy_assignees = []
 
     try:
         now = _utc_now()
@@ -455,10 +540,13 @@ def update_task(
             if current != value:
                 setattr(task, field, value)
                 changed_fields.add(field)
-        assignees_after = current_assignees
-        if wanted_assignees is not None and _set_assignees(db, task.id, current_assignees, wanted_assignees):
+        if task.mode != new_mode:
+            # Storing a NULL task's derived mode alone is not a change.
+            task.mode = new_mode
+            if new_mode != current_mode:
+                changed_fields.add("mode")
+        if _set_assignees(db, task.id, current_assignees, kept_assignees):
             changed_fields.add("assignees")
-            assignees_after = wanted_assignees
         if changed_fields:
             task.last_updated_at = now
             task.last_updated_by = caller_id
@@ -468,23 +556,51 @@ def update_task(
             task.status_last_updated_at = now
             task.status_last_updated_by = caller_id
 
-        notifier = TaskNotifier(db, caller_id)
-        if "assignees" in changed_fields:
-            notifier.assignees_changed(
-                task,
-                added=[uid for uid in assignees_after if uid not in current_assignees],
-                removed=[uid for uid in current_assignees if uid not in assignees_after],
+        copies: list[TaskV2] = []
+        for uid in copy_assignees:
+            copy = TaskV2(
+                title=task.title,
+                description=task.description,
+                status=task.status,
+                owner_id=task.owner_id,
+                component_id=task.component_id,
+                created_at=now,
+                last_updated_at=now,
+                last_updated_by=caller_id,
+                status_last_updated_at=task.status_last_updated_at,
+                status_last_updated_by=task.status_last_updated_by,
+                editable_by_assignee=task.editable_by_assignee,
+                editable_via_webhook=task.editable_via_webhook,
+                notification_cadence=task.notification_cadence,
+                notify_on_create_and_delete=task.notify_on_create_and_delete,
+                mode=TASK_MODE_INDIVIDUAL,
             )
+            db.add(copy)
+            db.flush()
+            _set_assignees(db, copy.id, [], [uid])
+            copies.append(copy)
+
+        # One notification per person, sent through the original task: those
+        # moved onto a copy were already assigned and aren't told twice. The
+        # mode itself never notifies (it isn't a DETAIL_FIELD).
+        notifier = TaskNotifier(db, caller_id)
+        notifier.assignees_changed(
+            task,
+            added=[uid for uid in final_assignees if uid not in current_assignees],
+            removed=[uid for uid in current_assignees if uid not in final_assignees],
+        )
         if changed_fields & set(DETAIL_FIELDS):
-            notifier.details_changed(task, assignees_after)
+            notifier.details_changed(task, final_assignees)
         if status_changed:
-            notifier.status_changed(task, assignees_after)
+            notifier.status_changed(task, final_assignees)
         db.commit()
     except Exception:
         db.rollback()
         raise
     db.refresh(task)
-    return _serialize_one(db, task, caller_id, can_manage=can_manage)
+    for copy in copies:
+        db.refresh(copy)
+    return [_serialize_one(db, t, caller_id, can_manage=can_manage) for t in (task, *copies)]
 
 
 # ---------------------------------------------------------
