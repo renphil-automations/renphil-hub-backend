@@ -1,0 +1,612 @@
+{
+  "records": [
+    {
+      "id": "rec0x8KokXBOnhShf",
+      "createdTime": "2026-10-27T17:50:34.000Z",
+      "fields": {
+        "Date & Time": "2026-10-27T17:50:34.000Z",
+        "From": "phoebe@renphil.org",
+        "Message": "can you please fix the spacing in the office spaces section?",
+        "Source": "Hub",
+        "Id": 51
+      }
+    },
+    {
+      "id": "rec2kcBNKaWXS08Fw",
+      "createdTime": "2026-08-20T08:46:12.000Z",
+      "fields": {
+        "Date & Time": "2026-08-20T08:46:12.000Z",
+        "Query": "What is an RFP?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Other\n\nbetter to start with renphil knowledge",
+        "Message ID": "msg_640dfaaefdc74c05b4db2c244382d511",
+        "Response": "An **RFP** stands for **Request for Proposal**. \n\nIn general business, it is a formal document issued by an organization to solicit bids from potential vendors or contractors for a desired product, service, or project. In the context of philanthropy and grantmaking, an RFP is an invitation issued by a funder asking nonprofits, researchers, or other organizations to submit project proposals for potential funding. A philanthropic RFP typically outlines the funder's objectives, the scope of the desired work, eligibility requirements, the application process, and evaluation criteria.\n\n**At RenPhil**, the RFP is a key part of Phase 1 of the grantmaking process (Proposal & Selection). When creating an RFP, you should follow these specific internal guidelines:\n* **Format:** Create a branded RFP saved as a PDF, along with an application form.\n* **Required Fields:** The application must collect the organization's name, registration number (where applicable), and country of registration; the leader's full legal name, country of citizenship, and country of residence; proposed impact metrics; and a proposed budget and use of funds.\n* **Feedback:** You must share the RFP and application with the Studio Lead and the wider team for feedback at least one week before distribution.\n* **Privacy:** Be sure to include a privacy policy in your materials.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 24
+      }
+    },
+    {
+      "id": "rec2sh5OV5eiwN0DM",
+      "createdTime": "2026-10-21T16:37:04.000Z",
+      "fields": {
+        "Date & Time": "2026-10-21T16:37:04.000Z",
+        "Query": "Who is RenPhil's principal scientist?",
+        "From": "ralph@renphil.org",
+        "Message": "Incorrect answer",
+        "Message ID": "msg_e5e71c223aa84d4394a68d9c9ac8866b",
+        "Response": "I could not verify from the available authorized RenPhil sources whether RenPhil has a position titled \"principal scientist\" or who holds such a role.\n\nI searched RenPhil's internal records across multiple sources—including staff directories, organizational records, and role documentation—and found no evidence of a \"principal scientist\" position or a person designated in that role. The person lookup tool returned no matching record, Airtable staff records contained no results for that title, and Hub searches returned only general hiring and management policies rather than organizational structure or current staff rosters.\n\nIf you're looking for a specific scientific or research leadership role at RenPhil, I'd be happy to help if you can provide additional context—such as a program name, an alternative title, or the area of work you're interested in. That would help me locate the right person or role more effectively.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 48
+      }
+    },
+    {
+      "id": "rec4Pj9zReRT3SBlG",
+      "createdTime": "2026-08-13T15:27:53.000Z",
+      "fields": {
+        "Resolved - Sandbox": true,
+        "Resolved - Prod": true,
+        "Date & Time": "2026-08-13T15:27:53.000Z",
+        "From": "alex.araki@renphil.org",
+        "Message": "do we need the \"main view\" tab showing up? I see it in the Funds and Program page",
+        "Source": "Hub",
+        "Id": 15
+      }
+    },
+    {
+      "id": "rec5NU3D7yKDrx6Uz",
+      "createdTime": "2026-10-02T10:42:59.000Z",
+      "fields": {
+        "Date & Time": "2026-10-02T10:42:59.000Z",
+        "From": "catherine.ember@renphil.org",
+        "Message": "should update comms boilerplates with latest funds and funding numbers",
+        "Source": "Hub",
+        "Id": 44
+      }
+    },
+    {
+      "id": "rec5yD9BemWmOLBe3",
+      "createdTime": "2026-10-21T15:17:20.000Z",
+      "fields": {
+        "Date & Time": "2026-10-21T15:17:20.000Z",
+        "Query": "Who is an AI expert at RenPhil?",
+        "From": "ralph@renphil.org",
+        "Message": "Missing information",
+        "Message ID": "msg_65b7a6f339ba45379e174fca9510927e",
+        "Response": "RenPhil has two staff members with documented AI expertise:\n\n1. **Aakarsh Bengani** – Analyst, Studio program. His scope of work includes building software tools, systems, and AI tools that support RenPhil's mission; sourcing and diligencing philanthropic funding opportunities aligned to AI safety; and supporting existing programs focused on AI for Science, including the Open Source for Science Fund and AI for Science Datasets.\n\n2. **Fahd Husain** – Director of the AI Lab. He serves as the technical director of RenPhil's AI Lab and is a relevant contact for building it out as a self-sustaining fund, with R&D work in high-impact spaces such as science, climate, and philanthropy.\n\nBoth are current staff members (Aakarsh is Active; Fahd is Onboarding).",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 47
+      }
+    },
+    {
+      "id": "rec6p9jkHXafJ9vN7",
+      "createdTime": "2026-09-08T16:00:12.000Z",
+      "fields": {
+        "Date & Time": "2026-09-08T16:00:12.000Z",
+        "Query": "what's the mission of RenPhil?",
+        "From": "christian.beddawi@renphil.org",
+        "Message": "Missing information",
+        "Message ID": "msg_8dfcab088ae1499084b3e3afae21ce1c",
+        "Response": "RenPhil’s mission is **“to fuel a 21st-century renaissance by increasing the ambition of philanthropists, scientists and innovators.”**",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 33
+      }
+    },
+    {
+      "id": "rec7PTXSLKQSuREi1",
+      "createdTime": "2026-09-08T00:55:50.000Z",
+      "fields": {
+        "Date & Time": "2026-09-08T00:55:50.000Z",
+        "Query": "What does this id represent?",
+        "From": "christian.beddawi@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_76f170290ac94306af872bce5e9b3632",
+        "Response": "The EIN / Tax ID 99-1953380 represents Renaissance Philanthropy US' Employer Identification Number.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 32
+      }
+    },
+    {
+      "id": "recA89HeLev3plmwA",
+      "createdTime": "2026-10-07T00:58:46.000Z",
+      "fields": {
+        "Date & Time": "2026-10-07T00:58:46.000Z",
+        "Query": "how do I request approval? Is there a link?",
+        "From": "ralph@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_7f9a5e8c39264f80a87d5bbe49dc3a17",
+        "Response": "Yes, there is a form and a documented process for requesting approval for external work at Renaissance Philanthropy.\n\n**The Process:**\nRenaissance employees must request approval to engage in outside work. When assessing these opportunities, Renaissance leadership evaluates requests based on three main principles:\n\n1. **Distinct** – Is this work that Renaissance Philanthropy should reasonably be doing under the RenPhil brand, or is it in the organization's usual scope of work?\n2. **Conflict of Interest** – Could there be undue influence or appearance of bias on RenPhil decisions? (For example, is the client a grant recipient or possible grant recipient of your program?)\n3. **Disclosures** – Is the client a current or possible partner of Renaissance Philanthropy? (Disclosures may be needed)\n\nRenaissance leadership retains the right to reject requests, but the organization aims to be flexible in allowing external work as long as it doesn't interfere with your job responsibilities and aligns with these principles.\n\n**The Form & Link:**\nFill in the **External Work Request** form to submit your request:\n**https://airtable.com/appQddFdiH3O1gXsw/pagAB7lXJWLhDZe7U/form**\n\nSubmit your request to Renaissance leadership for review and approval.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 45
+      }
+    },
+    {
+      "id": "recCOkiH6QJDQjnRf",
+      "createdTime": "2026-08-31T17:40:18.000Z",
+      "fields": {
+        "Date & Time": "2026-08-31T17:40:18.000Z",
+        "From": "phoebe@renphil.org",
+        "Message": "i tried to delete the US Benefits page, but it's still there. For Robyn, it now shows a lock on that page. How do I delete it? Also there's a lock for me on the \"How to Hire\" page but there's no lock on that page for Robyn. What does that mean and how do we resolve? - Phoebe",
+        "Source": "Hub",
+        "Id": 29
+      }
+    },
+    {
+      "id": "recCbpYuoPbfqlPoo",
+      "createdTime": "2026-08-07T19:21:27.000Z",
+      "fields": {
+        "Date & Time": "2026-08-07T19:21:27.000Z",
+        "From": "max@renphil.org",
+        "Message": "Under quick links, would love a link to latest RenPhil two-pager // latest approved text for funder docs.",
+        "Source": "Hub",
+        "Id": 9
+      }
+    },
+    {
+      "id": "recE734Lt1HFhrL25",
+      "createdTime": "2026-10-26T21:34:31.000Z",
+      "fields": {
+        "Date & Time": "2026-10-26T21:34:31.000Z",
+        "From": "max@renphil.org",
+        "Message": "we should add new SF office to dashboard!",
+        "Source": "Hub",
+        "Id": 50
+      }
+    },
+    {
+      "id": "recELHVUd8mK6U6fv",
+      "createdTime": "2026-08-19T14:39:26.000Z",
+      "fields": {
+        "Date & Time": "2026-08-19T14:39:26.000Z",
+        "Query": "What is an RFP?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_534e2267f61046b2aa7288d96abeaea8",
+        "Response": "An RFP stands for **Request for Proposal**. It is a document that an organization issues to solicit proposals from potential suppliers for a specific project, service, or product. RFPs typically outline the project scope, objectives, technical requirements, desired outcomes, timelines, and evaluation criteria to facilitate a competitive bidding process and an informed decision.\n\nAt RenPhil, RFPs are used in **Phase 1: Proposal & Selection** of the grantmaking process. RenPhil creates a branded RFP (saved as a PDF) and an application form. The application must collect specific information, including:\n\n*   Organization name, registration number (where applicable), and country of registration.\n*   Leader’s full legal name, country of citizenship, and country of residence.\n*   Proposed impact metrics.\n*   Proposed budget and use of funds.\n\nThe RFP and application should be shared with the Studio Lead and wider team for feedback at least one week before distribution, and must include a privacy policy. Grantees are selected using a rubric or other documented decision process, ensuring each subgrant has a clear rationale, furthers RenPhil's mission, matches program goals, and passes all due diligence checks.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 21
+      }
+    },
+    {
+      "id": "recJpkO2j9oODad6d",
+      "createdTime": "2026-08-11T10:04:23.000Z",
+      "fields": {
+        "Date & Time": "2026-08-11T10:04:23.000Z",
+        "From": "catherine.ember@renphil.org",
+        "Message": "The search function could be improved. I was trying to find the policy for fare class for flights and it didn't pop up in search. It was hard to find in policy index > travel > fare class.",
+        "Source": "Hub",
+        "Id": 10
+      }
+    },
+    {
+      "id": "recNQ9OWTBdn7r5IK",
+      "createdTime": "2026-10-01T17:32:34.000Z",
+      "fields": {
+        "Date & Time": "2026-10-01T17:32:34.000Z",
+        "Query": "how to play soccer",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Too slow",
+        "Message ID": "msg_c29e7eca4dd3494d8c88ee37a2379352",
+        "Response": "# How to Play Soccer\n\n## Basic Objective\nTwo teams of 11 players try to move a ball into the opposing team's goal to score points. The team with the most goals wins.\n\n## Key Rules\n\n**Playing the Ball**\n- Use your feet, legs, chest, or head (not hands/arms, except the goalkeeper)\n- The goalkeeper can use hands within their penalty area\n\n**Starting Play**\n- Kick-off from center field to begin each half\n- After a goal, the opposing team kicks off\n\n**Scoring**\n- 1 point for getting the ball fully across the goal line into the net\n- Match is typically 90 minutes (two 45-minute halves)\n\n**Common Fouls**\n- Handball (except goalkeeper)\n- Tripping, pushing, or excessive contact\n- Offside (being ahead of defenders when the ball is played to you)\n\n**Restarts**\n- **Throw-in**: Ball goes out on sideline\n- **Corner kick**: Ball goes out on goal line (defending team)\n- **Goal kick**: Ball goes out on goal line (attacking team)\n\n## Positions\n- Goalkeeper, defenders, midfielders, forwards\n- Formations vary (e.g., 4-4-2, 3-5-2)\n\n## Getting Started\nPractice ball control, passing, shooting, and positioning. Most communities offer recreational leagues for all ages and skill levels.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 43
+      }
+    },
+    {
+      "id": "recOvfbKbtKyqVDeS",
+      "createdTime": "2026-09-01T11:30:51.000Z",
+      "fields": {
+        "Date & Time": "2026-09-01T11:30:51.000Z",
+        "Query": "can I make a grant to a corporate entity",
+        "From": "christen@renphil.org",
+        "Message": "Incorrect answer\n\nRenPhil CAN make grants to corporate entities, though we need to limit the usage of grants to charitable purposes only. Fill in a grant request form for next steps.",
+        "Message ID": "msg_70b060f6314a48bd99266ef3eb50aede",
+        "Response": "I am sorry, but I could not verify from the available authorized RenPhil sources whether you can make a grant to a corporate entity. The internal search for this information encountered a temporary issue. Generally, charitable grants are made to organizations recognized as tax-exempt public charities or their international equivalents, as the primary purpose of a charitable grant is to support public benefit activities, and the grantor often seeks tax deductibility. Making a direct charitable grant to a for-profit corporate entity is typically not possible for tax-deductible purposes, as their primary goal is profit generation, not charitable mission. However, there are some exceptions:\n\n*   **Program-Related Investments (PRIs):** Private foundations may make PRIs to for-profit entities. These are not traditional grants but rather loans, equity investments, or other financing where the primary purpose is charitable, and profit generation is not a significant goal.\n*   **Contracts for Services:** A non-profit organization might contract with a for-profit corporate entity for specific services or goods, which is a business transaction, not a charitable grant.\n*   **Fiscal Sponsorship:** A for-profit entity might partner with a qualified non-profit fiscal sponsor. In such cases, the grant would go to the non-profit fiscal sponsor, which then manages the project and disburses funds as per an agreement.\n\nFor specific guidance on eligibility, it is always best to consult the guidelines of the particular grant-making organization or relevant tax regulations.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 30
+      }
+    },
+    {
+      "id": "recPErVWQLhxmDL8O",
+      "createdTime": "2026-11-13T13:14:32.000Z",
+      "fields": {
+        "Date & Time": "2026-11-13T13:14:32.000Z",
+        "From": "ronit@renphil.org",
+        "Message": "Privacy policy link doesn't work on legal",
+        "Source": "Hub",
+        "Id": 53
+      }
+    },
+    {
+      "id": "recQEy8raI4MKtCiz",
+      "createdTime": "2026-08-31T17:31:55.000Z",
+      "fields": {
+        "Date & Time": "2026-08-31T17:31:55.000Z",
+        "From": "phoebe@renphil.org",
+        "Message": "i'm trying to click on the decision matrix that i search in the search bar, but it just reloads the home page. please lmk how to navigate to decision matrix page",
+        "Source": "Hub",
+        "Id": 28
+      }
+    },
+    {
+      "id": "recSToFnbRZr0viNs",
+      "createdTime": "2026-08-13T15:22:46.000Z",
+      "fields": {
+        "Date & Time": "2026-08-13T15:22:46.000Z",
+        "From": "zack.li@renphil.org",
+        "Message": "Would it be possible to support an MCP? I can also roll my own, by crawling / computer use, but I'd love for my agents to be able to work directly with the Hub content.\n\nA different example, I work with a computing cluster by just pointing my agents at their docs repo: https://gitlab.com/NERSC/nersc.gitlab.io\n\nAlso I've used a startup before that has an unusual MCP setup for computing (*purely agents*): https://givemeanode.com/",
+        "Source": "Hub",
+        "Id": 14
+      }
+    },
+    {
+      "id": "recSqJqDM0xVPlbuW",
+      "createdTime": "2026-09-25T17:14:37.000Z",
+      "fields": {
+        "Date & Time": "2026-09-25T17:14:37.000Z",
+        "From": "catherine.ember@renphil.org",
+        "Message": "The UK benefits document says info on travel reimbursements can be found in the  \"Travel & Reimbursement Policy\" but that policy isn't anywhere on the hub.",
+        "Source": "Hub",
+        "Id": 41
+      }
+    },
+    {
+      "id": "recU8ucojsavEdLsW",
+      "createdTime": "2026-08-17T18:39:05.000Z",
+      "fields": {
+        "Date & Time": "2026-08-17T18:39:05.000Z",
+        "From": "max@renphil.org",
+        "Message": "Can we get a card with key org legal info? ie: tax exemption docs, official legal address, etc.",
+        "Source": "Hub",
+        "Id": 17
+      }
+    },
+    {
+      "id": "recUctwsnF7FYRj2k",
+      "createdTime": "2026-08-19T12:22:07.000Z",
+      "fields": {
+        "Date & Time": "2026-08-19T12:22:07.000Z",
+        "Query": "Feedback V1 controlled E2E write test",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_feedback_e2e_87f5ba02d02040afaec48e95ff8deca4",
+        "Response": "Synthetic assistant response used only to verify the feedback write path.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 18
+      }
+    },
+    {
+      "id": "recUjxds9ldLswn9b",
+      "createdTime": "2026-08-19T14:43:20.000Z",
+      "fields": {
+        "Date & Time": "2026-08-19T14:43:20.000Z",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Feedback V1 legacy compatibility test 2026-08-19",
+        "Id": 22
+      }
+    },
+    {
+      "id": "recVMq2X0qTveES16",
+      "createdTime": "2026-08-27T23:38:58.000Z",
+      "fields": {
+        "Date & Time": "2026-08-27T23:38:58.000Z",
+        "From": "phoebe@renphil.org",
+        "Message": "hello! it's phoebe -- i just typed \"security training\" in the search bar. it populates \"cybersecurity\" page, when i go to click on it, it just reloads the home page",
+        "Source": "Hub",
+        "Id": 27
+      }
+    },
+    {
+      "id": "recWluTDj1PZraugz",
+      "createdTime": "2026-08-19T13:53:43.000Z",
+      "fields": {
+        "Date & Time": "2026-08-19T13:53:43.000Z",
+        "Query": "What is an RFP?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Didn't search enough\n\ni prefer it to use the renphil knowledge",
+        "Message ID": "msg_8c63127a91354a519cadf66bd90e7abc",
+        "Response": "An RFP stands for **Request for Proposal**.\n\nIt is a document that an organization (such as a company, government agency, or non-profit) issues to solicit bids or proposals from potential suppliers for a specific project, service, or product.\n\nRFPs typically outline:\n*   The scope of the project or service needed.\n*   Detailed requirements and specifications.\n*   Evaluation criteria for proposals.\n*   Submission deadlines and instructions.\n*   Terms and conditions.\n\nThe purpose of an RFP is to allow the issuing organization to compare various solutions, approaches, and costs from multiple vendors to make an informed decision on who to contract with.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 19
+      }
+    },
+    {
+      "id": "recX393q0ARAmTGoQ",
+      "createdTime": "2026-08-07T17:24:06.000Z",
+      "fields": {
+        "Resolved - Sandbox": true,
+        "Resolved - Prod": true,
+        "Date & Time": "2026-08-07T17:24:06.000Z",
+        "From": "max@renphil.org",
+        "Message": "Hi! Tried to save new personal email address, and received this error:\n\nAirtable API error: ('403 Client Error: Forbidden for url: https://api.airtable.com/v0/appSh6OwO3ZMAkuVE/tbl537cgZO1xCBOQs/rec3chHvyshxivWWz', '{\\'type\\': \\'INVALID_PERMISSIONS\\', \\'message\\': \\'Edits to synced field \"Personal Email\" (fld07H3fS5SiVkJ3R) are not allowed from this origin\\'}')",
+        "Source": "Hub",
+        "Id": 8
+      }
+    },
+    {
+      "id": "recYDIhzmPMil5tJN",
+      "createdTime": "2026-09-16T13:22:52.000Z",
+      "fields": {
+        "Date & Time": "2026-09-16T13:22:52.000Z",
+        "Query": "where can i find the list of venues that i can host an event for renphil in it ?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_365d7bd80217467b8f7b917da16d3e09",
+        "Response": "You can find the list of venues available for hosting RenPhil events in the Hub's **Venue Selection** resource. This is a live list of venues that RenPhil has explored for events.\n\nIf you'd like to access the venue list or suggest additional venues to be included, you can reach out to **Meg**.\n\nWhen selecting a venue, consider:\n- **Accessibility** – Does the venue have appropriate accessibility accommodations (lift, elevator, ramps, etc.)?\n- **Flexibility** – Does the venue accommodate variations in guest count?\n- **Backdrop** – How well does the venue align with your event's theme and desired atmosphere?\n- **AV Needs** – Does the venue have capability for screen sharing and amplified sound if needed?\n\nThe Hub also notes that booking timelines are important: aim for at least 3 weeks minimum for events of 50 people or less, at least 1 month for larger events, and ideally 2–3 months ahead when possible, since venues and hotel blocks book up quickly.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 36
+      }
+    },
+    {
+      "id": "recZILe3XcSUfJvzi",
+      "createdTime": "2026-09-16T13:33:46.000Z",
+      "fields": {
+        "Date & Time": "2026-09-16T13:33:46.000Z",
+        "Query": "tell me more about the table of Awarded Opportunities",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_b7ec852e6b1a4b7eb9c7b9c9f18dc105",
+        "Response": "The **Awarded Opportunities table** is a core component of the Renaissance Philanthropy Hub that tracks details about funds, their statuses, and amounts for opportunities that have reached the \"Awarded\" stage.\n\n## Table Structure and Fields\n\nThe table is organized with the following fields:\n\n- **Opportunity Name** – The identifier for the specific funding opportunity\n- **Funding Type** – Categorizes the opportunity (e.g., Scoping, Anchor, Additional)\n- **Account Name** – The funder or account associated with the opportunity\n- **Close Date** – The deadline or target completion date\n- **Stage** – The current status in the fundraising process (all records shown are in \"Awarded\" stage)\n- **Fund Name** – A reference identifier linking to the fund record\n\n## Current Content\n\nThe table contains multiple awarded opportunities spanning various funders and initiatives. Sample records include opportunities from major foundations (Alfred P. Sloan Foundation, Arnold Ventures, Astera Institute, Bezos Family Foundation) and individual donors, with close dates ranging across 2025 and 2026. Each record tracks the funding type, associated account, and fund reference.\n\n## How It Fits Into RenPhil's Processes\n\nThe Awarded Opportunities table is part of the broader **Fundraising Process** framework. According to RenPhil's documented opportunity stages, \"Awarded\" represents the point at which Renaissance Philanthropy has officially received a grant letter but funds are not yet disbursed. \n\nWhen opportunities reach the Awarded stage, the **Partnerships Team, Finance Team, and grants@renphil.org** are the key teams involved in managing the next steps and communications.\n\nThis table serves as a central reference for tracking which funding opportunities have been formally awarded and their associated details, enabling the organization to monitor fund status and manage post-award processes.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 39
+      }
+    },
+    {
+      "id": "reca6SRqWebRvfOAf",
+      "createdTime": "2026-08-21T16:21:19.000Z",
+      "fields": {
+        "Date & Time": "2026-08-21T16:21:19.000Z",
+        "From": "mal.graham@renphil.org",
+        "Message": "Hi! When I search for something and a list appears, if I click what seems to be a link on the list, it doens't take me anywhere. E.g., typed \"yubi\" in the search bar, didn't hit enter, drop down with a bunch of things mentioned, clicked on the cybersecurity page i wanted, was just directed back to home.",
+        "Source": "Hub",
+        "Id": 26
+      }
+    },
+    {
+      "id": "recbTg85ZncZBmj17",
+      "createdTime": "2026-09-03T00:53:37.000Z",
+      "fields": {
+        "Date & Time": "2026-09-03T00:53:37.000Z",
+        "From": "zach@renphil.org",
+        "Message": "FYI, still no profile for me: \"User with Work Email 'zach@renphil.org' not found.\"",
+        "Source": "Hub",
+        "Id": 31
+      }
+    },
+    {
+      "id": "recbvqbyVqTJFgNG7",
+      "createdTime": "2026-08-11T21:13:08.000Z",
+      "fields": {
+        "Date & Time": "2026-08-11T21:13:08.000Z",
+        "From": "zach@renphil.org",
+        "Message": "Bug report: \"User with Work Email 'zach@renphil.org' not found.\" at hub.renphil.org/profile",
+        "Source": "Hub",
+        "Id": 12
+      }
+    },
+    {
+      "id": "recc0hlTRTMyWNgEN",
+      "createdTime": "2026-08-14T13:10:44.000Z",
+      "fields": {
+        "Resolved - Sandbox": true,
+        "Resolved - Prod": true,
+        "Date & Time": "2026-08-14T13:10:44.000Z",
+        "From": "mei.chen@renphil.org",
+        "Message": "the search bar doesn't work!",
+        "Source": "Hub",
+        "Id": 16
+      }
+    },
+    {
+      "id": "reccYQ5uaCVJbrzM7",
+      "createdTime": "2026-10-26T13:28:31.000Z",
+      "fields": {
+        "Date & Time": "2026-10-26T13:28:31.000Z",
+        "From": "jackson.dillard@renphil.org",
+        "Message": "Are details on when offices are closed available?",
+        "Source": "Hub",
+        "Id": 49
+      }
+    },
+    {
+      "id": "recd5QDooja5hIkYA",
+      "createdTime": "2026-09-08T16:01:37.000Z",
+      "fields": {
+        "Date & Time": "2026-09-08T16:01:37.000Z",
+        "Query": "what is our ein",
+        "From": "christen@renphil.org",
+        "Message": "Didn't search enough\n\nanswer is avail on hub",
+        "Message ID": "msg_db0328b6b64d4b75808214430e5e4e06",
+        "Response": "An Employer Identification Number (EIN) is a unique nine-digit number assigned by the Internal Revenue Service (IRS) to identify business entities operating in the United States for tax and administrative purposes. \n\nTo find Renaissance Philanthropy's specific EIN, please consult internal records or the internal knowledge tool, as I cannot access or provide internal company data.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 34
+      }
+    },
+    {
+      "id": "recdhlxWdR1lbHAO5",
+      "createdTime": "2026-09-08T16:06:07.000Z",
+      "fields": {
+        "Date & Time": "2026-09-08T16:06:07.000Z",
+        "Query": "can i give a grant to a for-profit",
+        "From": "christen@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_b6c564d05578476b9ecb993d36a89d70",
+        "Response": "Yes, you can give a grant to a for-profit organization, but it requires strict oversight to ensure the funds are used for the public good rather than private gain.\n\nUnder general IRS regulations, philanthropic entities can legally make grants to for-profits provided the funds are used exclusively for a qualifying charitable, educational, or scientific purpose. This typically requires the granting organization to exercise \"expenditure responsibility,\" a legally required oversight process that involves pre-grant inquiries, specific written agreements, and detailed reporting on how the funds are spent.\n\nAt Renaissance Philanthropy, for-profits fall under the category of non-501(c)(3) organizations. RenPhil's internal guidance states that while grants to US 501(c)(3)s are inherently safer, grants to non-501(c)(3)s are permitted if they include more rigorous budgeting and reporting to demonstrate the charitable use of funds. For these subgrantees, RenPhil must:\n*   Oversee and document the use of funds to confirm they were spent only for the agreed purpose.\n*   Collect full reports from the grantee detailing exactly how the funds were spent.\n*   Report these expenditures to the IRS.\n\nAdditionally, RenPhil's guidance advises considering whether a grant or a contract for services is the appropriate mechanism for your situation. A grant is the right choice when there is no expectation of return except reporting and impact outcomes, and the grantee will own the intellectual property (IP). However, if you expect specific deliverables in exchange for the funds and RenPhil needs to own the IP, a contract for services should be used instead.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 35
+      }
+    },
+    {
+      "id": "recdwlGCsfTQspNsF",
+      "createdTime": "2026-08-19T19:02:32.000Z",
+      "fields": {
+        "Date & Time": "2026-08-19T19:02:32.000Z",
+        "From": "phoebe@renphil.org",
+        "Message": "On the HR tab, under HR Policies, I'm trying to delete the \"US Benefits\" page but it's not deleting. Does it take time or did I do something wrong?\nOn the main HR tab, at the top it links to a folder called \"Benefits 2026\" - could you please change the link out language to \"Open folder\" instead of \"Open document\" - it links out to a google drive folder. I don't know how to change it from \"Open document\"\nWhen I search for UK Benefits nothing comes up because the information is within that benefits 2026 tab. Can we manipulate the search so that when you search \"us benefits\" \"benefits\" or \"uk benefits\" it links you to the main HR tab?",
+        "Source": "Hub",
+        "Id": 23
+      }
+    },
+    {
+      "id": "rech3DXm4EumWo6H0",
+      "createdTime": "2026-08-19T14:24:07.000Z",
+      "fields": {
+        "Date & Time": "2026-08-19T14:24:07.000Z",
+        "Query": "how to apply for a grant at renphil",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Wrong or irrelevant source",
+        "Message ID": "msg_e6e6be43d28e47b197415511e16f38fd",
+        "Response": "To apply for a grant at Renaissance Philanthropy (RenPhil), the general process involves several steps and key contacts. When applying, RenPhil should be listed as the grantee, and if awarded, funds will be received by RenPhil and earmarked for your program or fund.\n\nFor assistance with applying for grants, you can contact Julia Hidu, Senior Manager, Partnerships (julia.hidu@renphil.org), or Ronit Kanwar, Managing Director, Head of Strategy & Partnerships (ronit.kanwar@renphil.org).\n\nHere is an outline of the application process:\n\n1.  **Review Previous Applications:** Before starting a new proposal, review any previous applications submitted to that organization.\n2.  **Create and Finalize Budget:** Develop or finalize your budget and have Allison Kucinski review it. A well-constructed budget is critical, and RenPhil provides a budget tool or template if you need help creating one.\n3.  **Finalize Application Materials:** Prepare all necessary application documents.\n4.  **Obtain Sign-Off:** At least 72 hours before the application is due, get sign-off on your application materials. This involves sharing everything via email with grants@renphil.org, Ronit Kanwar, and Kumar Garg. This step is important due to signing thresholds if the grant is awarded.\n5.  **Submit Application:** Submit your grant application.\n6.  **Share Submitted Application:** Once submitted, share your grant application with Julia Hidu to help build RenPhil's grant application library.\n7.  **Grant Status Communications:** If you receive any emails regarding the status of the grant, please CC grants@renphil.org to facilitate the grant agreement and fund reception.\n8.  **Grant Agreement Review:** If a grant agreement needs to be signed, have the funder send it to Allison Kucinski. Legal counsel, Noel Fleming, will also need to review the grant agreement before it is signed. The communications team will review the grant agreement to understand how funder information can be used.\n\nThroughout the fundraising process, different teams should be involved:\n\n*   **Engagement Stage:** Once you are actively engaging with a prospect on funding options, it is important to bring in or inform a member of the Partnerships Team.\n*   **Applying Stage:** When formal paperwork or a grant application is in progress, the Partnerships Team, Finance Team, and grants@renphil.org should be CC'd on any communications.",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 20
+      }
+    },
+    {
+      "id": "rechSbC4O400ipSEC",
+      "createdTime": "2026-09-18T17:45:50.000Z",
+      "fields": {
+        "Date & Time": "2026-09-18T17:45:50.000Z",
+        "From": "catherine.ember@renphil.org",
+        "Message": "the link to the general onboarding guide doesnt work",
+        "Source": "Hub",
+        "Id": 40
+      }
+    },
+    {
+      "id": "recmTSutqvU1F41kE",
+      "createdTime": "2026-09-16T13:27:07.000Z",
+      "fields": {
+        "Date & Time": "2026-09-16T13:27:07.000Z",
+        "Query": "can you tell me more about the earning per region graph ?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_d8241b3561944ec5815b026d0a47037e",
+        "Response": "The **Earning per Region** graph is a bar chart in the Hub that displays earnings aggregated by geographic location. Here are the key details:\n\n**Chart Structure:**\n- **Type:** Bar chart\n- **Grouping:** By Location\n- **Aggregation:** Sum of Earnings\n\n**Current Data:**\nThe graph shows earnings across three regions:\n- **UK:** 45,000\n- **LEB:** 35,000\n- **USA:** 20,000\n\nThis visualization allows you to compare total earnings performance across your different geographic regions at a glance. The graph is maintained within the Hub system as part of your dashboard components.\n\nIf you need to understand how this data is calculated, who updates it, or how to interpret specific regional performance, I'd recommend checking with the team member responsible for your Hub analytics or data management.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 38
+      }
+    },
+    {
+      "id": "recpx7qEewjnSU7TF",
+      "createdTime": "2026-08-11T10:05:15.000Z",
+      "fields": {
+        "Resolved - Sandbox": true,
+        "Resolved - Prod": true,
+        "Date & Time": "2026-08-11T10:05:15.000Z",
+        "From": "catherine.ember@renphil.org",
+        "Message": "Under \"policy index\" the \"travel and meetings policy\" takes you back to \"Finance\" and opens in a new tab. I'm not clear on if this is intentional or not.",
+        "Source": "Hub",
+        "Id": 11
+      }
+    },
+    {
+      "id": "recqAKE7644jGfL5i",
+      "createdTime": "2026-10-01T16:36:55.000Z",
+      "fields": {
+        "Date & Time": "2026-10-01T16:36:55.000Z",
+        "Query": "how to play soccer",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Other\n\ntest",
+        "Message ID": "msg_ef92ee9cb9054bd9a50647c70b016dbf",
+        "Response": "# How to Play Soccer\n\n## Basic Objective\nTwo teams of 11 players compete to move a ball into the opposing team's goal. The team with the most goals wins.\n\n## Key Rules\n\n**Playing the Ball**\n- Use your feet, chest, head, or thighs to control and pass the ball\n- Only the goalkeeper can use hands (within their penalty area)\n- Throw-ins are used to restart play from the sideline\n\n**Fouls & Penalties**\n- Direct free kicks awarded for contact fouls (pushing, tripping, etc.)\n- Indirect free kicks for technical fouls (offside, dangerous play)\n- Penalty kicks from 12 yards if fouls occur in the penalty area\n\n**Offside**\n- A player is offside if they're closer to the opponent's goal line than both the ball and two opposing players when the ball is played to them\n\n## Field Positions\n\n- **Goalkeeper**: Defends the goal\n- **Defenders**: Protect the goal area\n- **Midfielders**: Link defense and attack\n- **Forwards**: Primary scorers\n\n## Match Duration\n- 90 minutes total (two 45-minute halves)\n- Professional matches may have injury time added\n\n## Getting Started\n- Wear appropriate footwear and shin guards\n- Practice ball control, passing, and shooting\n- Join a local league or recreational team",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 42
+      }
+    },
+    {
+      "id": "recrT2ERhGtc3ejUQ",
+      "createdTime": "2026-10-07T01:02:46.000Z",
+      "fields": {
+        "Date & Time": "2026-10-07T01:02:46.000Z",
+        "Query": "What about our travel & Reimbursement Policy?",
+        "From": "ralph@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_639a9c780e0e4bbcab2041f882fb6e7c",
+        "Response": "Renaissance Philanthropy has a comprehensive Travel and Meetings Policy that covers all aspects of business travel and expense reimbursement. Here's what you need to know:\n\n**Pre-Approval & Authorization**\nAll trips must be pre-approved by your manager before you book or make any purchases. Any expenses that deviate from policy require approval from one of the founders.\n\n**Corporate Credit Cards**\nRenaissance uses Ramp (US) and Pleo (UK) as corporate credit card providers. Full-time and part-time employees receive virtual corporate cards with monthly limits. All charges require receipts.\n\n**Expense Submission Deadlines**\n- Submit expenses within **30 days** of completing your trip (preferred)\n- Renaissance reserves the right to decline reimbursement for expenses not submitted within **45 days**\n- Expenses should be coded weekly, or by the 5th day of the following month\n- Credit cards will be automatically frozen if there are incomplete expenses 60 days or older\n\n**Meals & Entertainment**\n- **Daily meal limit**: $100 per person per day (or local currency equivalent) for breakfast, lunch, and dinner combined\n- **Entertainment for grantees/partners**: Up to $100 per person per outing\n- Entertainment anticipated to exceed $1,000 USD requires pre-approval from the CEO or President\n\n**Hotel Standards**\n- Target 4-star business hotels where possible\n- Maximum nightly rate: $300\n- Book the lowest available rate when 4-star options aren't available\n\n**Ground Transportation**\n- **Car rentals**: Must be justified as a business necessity and pre-approved by your manager. Rent the least expensive car type that meets your needs.\n- **Personal vehicles**: Reimbursed at the official local standard mileage rate for actual miles/kilometers driven to and from business sites\n- Use rental cars only when other transportation is unavailable, impractical, or more costly\n\n**Other Reimbursable Travel Expenses**\n- International cell phone travel plans (up to $20/day or local equivalent)\n- In-flight internet on flights over 1.5 hours (up to $30 USD)\n- Toll costs for rental cars\n\n**Receipt & Documentation Requirements**\nReceipts must clearly show the vendor, date, itemized goods/services, and total amount. For expenses without receipts, you must submit a receipt affidavit in Ramp or Pleo with detailed memo information explaining the business purpose.\n\n**Reimbursement Process**\n- **US employees**: Use Ramp\n- **UK employees**: Use Pleo\n- **Consultants**: Include reimbursable expenses on separate lines of invoices to finance@renphil.org with receipts attached, or submit through Ramp/Pleo (contact finance@renphil.org for access)\n\n**Non-Reimbursable Expenses**\nParking tickets, ATM fees, delinquency fees, and excess baggage charges are not reimbursed.\n\nFor specific questions about your situation, contact your manager or the finance team at finance@renphil.org.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 46
+      }
+    },
+    {
+      "id": "recritm6pnU5QYamF",
+      "createdTime": "2026-08-20T08:46:19.000Z",
+      "fields": {
+        "Date & Time": "2026-08-20T08:46:19.000Z",
+        "Query": "What's a good press release?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Other\n\nbetter to start with renphil knowledge",
+        "Message ID": "msg_7943881a8abb4f288cd99440e5d8524f",
+        "Response": "A good press release effectively communicates a newsworthy event to the media in a clear, professional, and concise manner. Generally, it follows the \"inverted pyramid\" structure—placing the most critical information at the very beginning so journalists can immediately grasp the story's value—and uses an objective, journalistic tone.\n\nWhen drafting a press release for Renaissance Philanthropy, you should follow this specific structure and set of guidelines:\n\n*   **Headline:** Keep it short and sharp—no more than two lines. Remember, it’s a headline, not a title.\n*   **Release Information:** Clearly state whether it is \"FOR IMMEDIATE RELEASE\" or \"EMBARGOED UNTIL\" (be sure to keep timezones in mind when deciding the embargo time and date).\n*   **Dateline & Opening Paragraph:** Start with the city of release, month, date, and year. The opening paragraph should be a summary that is as newsy as possible, leading with the most compelling point. Make it action-oriented, avoid starting with \"The,\" and leave Renaissance out of it for now.\n*   **Second Paragraph:** This is where you introduce Renaissance Philanthropy, the author, the expert, or the person who brings credibility to the news from the first paragraph. Include as many relevant points as possible here.\n*   **Additional Paragraphs:** Add quotes and any further information journalists need to understand the news in context.\n*   **Length & End Mark:** Ideally, keep the release to one page. Conclude with the word \"Ends\" (though you should remove this for web posting).\n*   **Media Contact:** Direct inquiries to media@renphil.org.\n*   **Boilerplate:** Include the standard Renaissance Philanthropy paragraph at the bottom:\n    > \"Renaissance Philanthropy is a nonprofit organization with a mission to fuel a 21st-century renaissance by increasing the ambition of philanthropists, scientists and innovators. The organization designs time-bound, thesis-driven funds led by field experts and inspires talent to take action through playbooks and communities. In the first two years, Renaissance Philanthropy catalyzed $533M in philanthropic funding for science, technology, and innovation, launching 22 time-bound, thesis-driven, philanthropic funds and programs addressing global challenges.\"",
+        "Impression": "Dislike",
+        "Source": "Bot",
+        "Id": 25
+      }
+    },
+    {
+      "id": "recsKxHmGAnz8tdlg",
+      "createdTime": "2026-09-16T13:22:55.000Z",
+      "fields": {
+        "Date & Time": "2026-09-16T13:22:55.000Z",
+        "Query": "they said there is a live list on airtable can you give the link to it ?",
+        "From": "charbel.younes@renphil.org",
+        "Message": "Helpful",
+        "Message ID": "msg_4ac369b33bac43358010e6f3097de327",
+        "Response": "Yes! The live Airtable list of approved venues for RenPhil events is here:\n\n**https://airtable.com/app7WI7BcFaIWv3NW/shrXdDPxeZyacym77**\n\nThis is labeled \"Find a venue\" in the Events Quick Links. The list includes venues that RenPhil has explored for events. If you'd like to suggest additional venues to be included, you can reach out to Meg at Meg.dimartino@renphil.org.",
+        "Impression": "Like",
+        "Source": "Bot",
+        "Id": 37
+      }
+    },
+    {
+      "id": "recu1g0ytNprBP8Lp",
+      "createdTime": "2026-08-04T20:03:50.000Z",
+      "fields": {
+        "Date & Time": "2026-08-04T20:03:50.000Z",
+        "From": "ralph@renphil.org",
+        "Message": "I like this Hub (Ralph test)",
+        "Source": "Hub",
+        "Id": 7
+      }
+    },
+    {
+      "id": "recwAFFP9aKHqROOm",
+      "createdTime": "2026-08-13T15:19:15.000Z",
+      "fields": {
+        "Date & Time": "2026-08-13T15:19:15.000Z",
+        "From": "alex.araki@renphil.org",
+        "Message": "Close date sorting isnt working?",
+        "Source": "Hub",
+        "Id": 13
+      }
+    },
+    {
+      "id": "recwLImBpAZQzAWYo",
+      "createdTime": "2026-11-06T15:37:10.000Z",
+      "fields": {
+        "Date & Time": "2026-11-06T15:37:10.000Z",
+        "From": "mal.graham@renphil.org",
+        "Message": "I get an access denied note when I click on these two links in the General legal section: Legal Training on 501c3 Status, Public Support Test Guide",
+        "Source": "Hub",
+        "Id": 52
+      }
+    }
+  ]
+}

@@ -6,7 +6,9 @@ tab-subtree delete refuse it up front — see
 ``task_manager_service.assert_no_linked_tasks``).
 
 Assignees live in ``task_assignee_relationship`` (many per task; both FKs
-``ON DELETE CASCADE``, so deleting a task or a user drops the links).
+``ON DELETE CASCADE``, so deleting a task or a user drops the links). A
+``group_task`` (2+ assignees) shares one row, status included, between all
+of them; an ``individual_task`` has at most one assignee.
 
 No ORM ``relationship()`` — same rule as every other ``db_v2`` model.
 """
@@ -55,6 +57,9 @@ class TaskV2(BaseV2):
     # 'always' | 'never' | 'on_status_change'; NULL is treated as 'always'.
     notification_cadence = Column(String, nullable=True, default="always", server_default=text("'always'"))
     notify_on_create_and_delete = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    # 'group_task' | 'individual_task'; NULL is derived from the assignee count
+    # (more than one → 'group_task').
+    mode = Column(String, nullable=True)
 
     __table_args__ = (
         Index(
