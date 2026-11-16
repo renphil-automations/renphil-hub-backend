@@ -1,8 +1,10 @@
 """The ``form_details`` table — one row per embedded-form component.
 
-Holds the form-builder spec for a ``form`` component (1:1 via the unique
+Holds the form-builder settings for a ``form`` component (1:1 via the unique
 ``component_id``). Deleted with its component by the database
-(``ON DELETE CASCADE``).
+(``ON DELETE CASCADE``). The form's embed URL and authentication settings
+aren't stored: they're fetched from the form builder on every load so changes
+there are reflected automatically.
 
 No ORM ``relationship()`` — same rule as every other ``db_v2`` model.
 Constraints are declared here so ``create_all`` in tests reproduces them.
@@ -16,7 +18,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
-    String,
     Text,
     UniqueConstraint,
     Uuid,
@@ -33,22 +34,19 @@ class FormDetailsV2(BaseV2):
     id = Column(Integer, primary_key=True)
     component_id = Column(
         Integer,
-        ForeignKey("components.id", ondelete="CASCADE"),
+        ForeignKey("components.id", ondelete="CASCADE", name="component_id_constraint"),
         nullable=False,
     )
     form_id = Column(Uuid, nullable=False)
-    embed_url = Column(Text, nullable=False)
     # The form-builder PAT, needed server-side for runtime form-builder calls
     # (so stored retrievable, not hashed — same as the Airtable widget PAT).
     # Write-only: never returned by any endpoint.
     pat = Column(Text, nullable=False)
-    requires_authentication = Column(Boolean, nullable=False, default=False, server_default=text("false"))
-    # The form builder's `authType`: "none" | "submission" | "user". NULL on
-    # rows saved before it was recorded.
-    authentication_type = Column(String, nullable=True)
+    # Appended to a non-public form's embed URL as `hide_back_button=true|false`.
+    hide_back_button = Column(Boolean, nullable=True, default=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint("component_id", name="form_details_component_id_key"),
+        UniqueConstraint("component_id", name="unique_component_id_constraint"),
     )

@@ -112,13 +112,24 @@ class FormBuilderProxyTests(unittest.TestCase):
 
         def handler(request):
             seen["path"] = request.url.raw_path.decode()
-            return httpx.Response(200, json={"id": "a/b", "embedUrl": "https://forms.example.org/e/1", "requiresAuthentication": True})
+            return httpx.Response(
+                200,
+                json={"id": "a/b", "embedUrl": "https://forms.example.org/e/1", "requiresAuthentication": True, "authType": "User"},
+            )
 
         p1, p2 = self._patch(handler)
         with p1, p2:
             info = _run(form_service.get_form_embed_info("pat", "a/b"))
         self.assertEqual(seen["path"], "/api/forms/a%2Fb?sourceUi=hub")
-        self.assertEqual(info, {"id": "a/b", "embed_url": "https://forms.example.org/e/1", "requires_authentication": True})
+        self.assertEqual(
+            info,
+            {
+                "id": "a/b",
+                "embed_url": "https://forms.example.org/e/1",
+                "requires_authentication": True,
+                "authentication_type": "user",
+            },
+        )
 
     def test_embed_info_rejects_unavailable_form(self) -> None:
         for body in ({"id": "f1", "unavailable": True, "embedUrl": "https://x"}, {"id": "f1"}):
@@ -161,8 +172,6 @@ class SaveFormComponentServiceTests(_DbTestCase):
             link=None,
             document_id="tab",
             form_id=FORM_1,
-            embed_url="https://forms.example.org/e/1",
-            requires_authentication=True,
             pat="pat_original",
         )
         kwargs.update(overrides)
@@ -176,11 +185,7 @@ class SaveFormComponentServiceTests(_DbTestCase):
         self.assertEqual(view["type"], "form")
         self.assertEqual(view["document_id"], "tab")
         self.assertEqual((view["x"], view["y"], view["w"], view["h"]), (2, 3, 4, 6))
-        self.assertEqual(view["form"]["form_id"], FORM_1)
-        self.assertEqual(
-            view["form"],
-            {"form_id": FORM_1, "embed_url": "https://forms.example.org/e/1", "requires_authentication": True},
-        )
+        self.assertEqual(view["form"], {"form_id": FORM_1, "hide_back_button": False})
         self.assertEqual(created["search_updates"], [{"component_id": view["id"], "action": "upsert"}])
 
         row = self.db.query(ComponentV2).filter(ComponentV2.link == view["link"]).one()
@@ -188,11 +193,12 @@ class SaveFormComponentServiceTests(_DbTestCase):
         details = self._details(view["link"])
         self.assertEqual(details.form_id, uuid.UUID(FORM_1))
         self.assertEqual(details.pat, "pat_original")
+        self.assertFalse(details.hide_back_button)
         page = self.db.query(PageContentV2).filter(PageContentV2.id == row.page_content_id).one()
         self.assertEqual(page.content, {})
 
-        # Update: title omitted (kept), PAT omitted (kept), spec replaced.
-        updated = self._save(link=view["link"], document_id=None, form_id=FORM_2, requires_authentication=False, pat=_UNSET)
+        # Update: title omitted (kept), PAT omitted (kept), form id replaced.
+        updated = self._save(link=view["link"], document_id=None, form_id=FORM_2, pat=_UNSET)
 
         self.assertFalse(updated["created"])
         self.assertEqual(updated["component"]["id"], view["id"])
@@ -200,16 +206,29 @@ class SaveFormComponentServiceTests(_DbTestCase):
         self.db.expire_all()
         details = self._details(view["link"])
         self.assertEqual(details.form_id, uuid.UUID(FORM_2))
-        self.assertFalse(details.requires_authentication)
         self.assertEqual(details.pat, "pat_original")
         self.assertEqual(self.db.query(ComponentV2).count(), 1)
         self.assertEqual(self.db.query(FormDetailsV2).count(), 1)
 
     def test_form_only_update_emits_no_search_update(self) -> None:
         link = self._save()["component"]["link"]
-        again = self._save(link=link, embed_url="https://forms.example.org/e/2")
+        again = self._save(link=link, hide_back_button=True)
         self.assertEqual(again["search_updates"], [])
-        self.assertEqual(again["component"]["form"]["embed_url"], "https://forms.example.org/e/2")
+        self.assertTrue(again["component"]["form"]["hide_back_button"])
+
+    def test_hide_back_button_kept_unless_sent(self) -> None:
+        link = self._save(hide_back_button=True)["component"]["link"]
+        self.assertTrue(self._details(link).hide_back_button)
+
+        for keep in (_UNSET, None):
+            result = self._save(link=link, hide_back_button=keep)
+            self.assertTrue(result["component"]["form"]["hide_back_button"])
+            self.db.expire_all()
+            self.assertTrue(self._details(link).hide_back_button)
+
+        self._save(link=link, hide_back_button=False)
+        self.db.expire_all()
+        self.assertFalse(self._details(link).hide_back_button)
 
     def test_update_of_form_component_without_details_row_creates_it(self) -> None:
         bare = ComponentV2(link="bare", type="form", props={}, gridstack_id=self.grid.id)
@@ -220,8 +239,9 @@ class SaveFormComponentServiceTests(_DbTestCase):
         self.assertEqual(self.db.query(FormDetailsV2).count(), 0)
         result = self._save(link="bare")
         self.assertFalse(result["created"])
-        self.assertEqual(self._details("bare").embed_url, "https://forms.example.org/e/1")
+        self.assertEqual(self._details("bare").form_id, uuid.UUID(FORM_1))
         self.assertEqual(self._details("bare").pat, "pat_original")
+        self.assertFalse(self._details("bare").hide_back_button)
 
     def test_pat_required_on_create_and_kept_unless_sent(self) -> None:
         for missing in (_UNSET, None, "  "):
@@ -234,7 +254,7 @@ class SaveFormComponentServiceTests(_DbTestCase):
         self.assertNotIn("pat_original", json.dumps(result, default=str))
 
         for keep in (_UNSET, None, ""):
-            self._save(link=link, pat=keep, embed_url="https://forms.example.org/e/9")
+            self._save(link=link, pat=keep, form_id=FORM_2)
             self.db.expire_all()
             self.assertEqual(self._details(link).pat, "pat_original")
 
@@ -332,7 +352,13 @@ class FormsRouterTests(_DbTestCase):
         self.assertEqual(listed.json(), {"success": True, "forms": [{"id": "f1", "title": "Intake"}]})
         self.assertEqual(
             info.json(),
-            {"success": True, "id": "f1", "embed_url": "https://forms.example.org/e/1", "requires_authentication": False},
+            {
+                "success": True,
+                "id": "f1",
+                "embed_url": "https://forms.example.org/e/1",
+                "requires_authentication": False,
+                "authentication_type": None,
+            },
         )
         self.assertEqual(rejected.status_code, 422)
         self.assertEqual(rejected.json()["detail"], "The form-builder service rejected the PAT.")
@@ -355,29 +381,32 @@ class FormsRouterTests(_DbTestCase):
             "document_id": "tab",
             "title": "Intake",
             "form_id": FORM_1,
-            "embed_url": "https://forms.example.org/e/1",
-            "requires_authentication": True,
             "pat": "pat_secret_value",
+            "hide_back_button": True,
         }
         resp = self.client.put("/forms/component", json=body)
         self.assertEqual(resp.status_code, 200, resp.text)
         data = resp.json()
         self.assertTrue(data["created"])
         self.assertNotIn("pat_secret_value", resp.text)
-        self.assertNotIn("pat", data["component"]["form"])
+        self.assertEqual(data["component"]["form"], {"form_id": FORM_1, "hide_back_button": True})
 
-        update = self.client.put(
-            "/forms/component",
-            json={"link": data["component"]["link"], "form_id": FORM_1, "embed_url": "https://forms.example.org/e/2"},
-        )
+        link = data["component"]["link"]
+        update = self.client.put("/forms/component", json={"link": link, "form_id": FORM_2})
         self.assertEqual(update.status_code, 200, update.text)
         self.assertFalse(update.json()["created"])
-        self.assertEqual(update.json()["component"]["form"]["embed_url"], "https://forms.example.org/e/2")
+        self.assertEqual(update.json()["component"]["form"], {"form_id": FORM_2, "hide_back_button": True})
         self.db.expire_all()
-        self.assertEqual(self._details(data["component"]["link"]).pat, "pat_secret_value")
+        self.assertEqual(self._details(link).pat, "pat_secret_value")
+        self.assertTrue(self._details(link).hide_back_button)
+
+        cleared = self.client.put("/forms/component", json={"link": link, "form_id": FORM_2, "hide_back_button": False})
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.db.expire_all()
+        self.assertFalse(self._details(link).hide_back_button)
 
     def test_save_validation_errors(self) -> None:
-        base = {"form_id": FORM_1, "embed_url": "https://forms.example.org/e/1", "pat": "p"}
+        base = {"form_id": FORM_1, "pat": "p"}
         self.assertEqual(self.client.put("/forms/component", json=base).status_code, 400)
         no_pat = {k: v for k, v in base.items() if k != "pat"}
         missing_pat = self.client.put("/forms/component", json={**no_pat, "document_id": "tab"})
@@ -385,22 +414,29 @@ class FormsRouterTests(_DbTestCase):
         self.assertIn("pat is required", missing_pat.json()["detail"])
         self.assertEqual(self.client.put("/forms/component", json={**base, "document_id": "missing"}).status_code, 404)
         self.assertEqual(
-            self.client.put("/forms/component", json={**base, "document_id": "tab", "embed_url": "javascript:alert(1)"}).status_code,
+            self.client.put("/forms/component", json={**base, "document_id": "tab", "form_id": "f1"}).status_code,
             422,
         )
         self.assertEqual(
-            self.client.put("/forms/component", json={**base, "document_id": "tab", "form_id": "f1"}).status_code,
+            self.client.put("/forms/component", json={**base, "document_id": "tab", "hide_back_button": "yes"}).status_code,
             422,
         )
         self.assertEqual(
             self.client.put("/forms/component", json={**base, "document_id": "tab", "type": "airtable"}).status_code,
             422,
         )
-        for retired in ({"webhook_url": "https://hub.example.org/wh"}, {"webhook_token": "x"}):
+        for retired in (
+            {"webhook_url": "https://hub.example.org/wh"},
+            {"webhook_token": "x"},
+            {"embed_url": "https://forms.example.org/e/1"},
+            {"requires_authentication": True},
+            {"authentication_type": "user"},
+        ):
             self.assertEqual(
                 self.client.put("/forms/component", json={**base, "document_id": "tab", **retired}).status_code,
                 422,
             )
+        self.assertEqual(self.db.query(FormDetailsV2).count(), 0)
 
 
 class CanvasContentTests(_DbTestCase):
@@ -413,9 +449,8 @@ class CanvasContentTests(_DbTestCase):
             link=None,
             document_id="tab",
             form_id=FORM_1,
-            embed_url="https://forms.example.org/e/1",
-            requires_authentication=True,
             pat="pat_secret_value",
+            hide_back_button=True,
             title="Intake",
         )["component"]["link"]
         self.form = self.db.query(ComponentV2).filter(ComponentV2.link == self.form_link).one()
@@ -431,7 +466,7 @@ class CanvasContentTests(_DbTestCase):
         self.assertNotIn("form", entry)
         dumped = json.dumps(content, default=str)
         self.assertNotIn("pat_secret_value", dumped)
-        self.assertNotIn("forms.example.org", dumped)
+        self.assertNotIn("hide_back_button", dumped)
 
     def test_canvas_save_round_trip_keeps_form_details(self) -> None:
         content = self._content()
@@ -440,7 +475,8 @@ class CanvasContentTests(_DbTestCase):
 
         self.db.expire_all()
         details = self._details(self.form_link)
-        self.assertEqual(details.embed_url, "https://forms.example.org/e/1")
+        self.assertEqual(details.form_id, uuid.UUID(FORM_1))
+        self.assertTrue(details.hide_back_button)
         self.assertEqual(details.pat, "pat_secret_value")
         self.assertEqual(self.db.query(ComponentV2).filter(ComponentV2.link == self.form_link).one().title, "Renamed")
 
@@ -449,9 +485,16 @@ class _EmbedTestCase(_DbTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.calls = []
+        self.form_status = 200
+        self.form_body = {
+            "id": FORM_1,
+            "embedUrl": "https://forms.example.org/e/1?theme=dark%20blue",
+            "requiresAuthentication": False,
+            "authType": "none",
+        }
         self.auth_status = 200
         self.auth_body = {
-            "token": "eyJhbGciOi.payload.sig",
+            "token": "jwt.abc-123_",
             "formId": FORM_1,
             "userEmail": "viewer@renphil.org",
             "requiresAuthentication": True,
@@ -461,6 +504,8 @@ class _EmbedTestCase(_DbTestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             self.calls.append(request)
+            if request.method == "GET":
+                return httpx.Response(self.form_status, json=self.form_body)
             return httpx.Response(self.auth_status, json=self.auth_body)
 
         self._patches = [
@@ -475,16 +520,25 @@ class _EmbedTestCase(_DbTestCase):
             p.stop()
         super().tearDown()
 
-    def _form(self, *, requires_authentication: bool, embed_url: str = "https://forms.example.org/e/1?theme=dark%20blue") -> str:
+    def _form(self, *, hide_back_button: bool | None = None) -> str:
         return form_service.save_form_component(
             self.db,
             link=None,
             document_id="tab",
             form_id=FORM_1,
-            embed_url=embed_url,
-            requires_authentication=requires_authentication,
             pat="pat_secret_value",
+            hide_back_button=hide_back_button,
         )["component"]["link"]
+
+    def _set_auth(self, requires_authentication: bool, auth_type: str | None, embed_url: str | None = None) -> None:
+        self.form_body = {**self.form_body, "requiresAuthentication": requires_authentication, "authType": auth_type}
+        if embed_url is not None:
+            self.form_body["embedUrl"] = embed_url
+
+    def _assert_form_lookup(self, request: httpx.Request) -> None:
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(str(request.url), f"https://forms.example.org/api/forms/{FORM_1}?sourceUi=hub")
+        self.assertEqual(request.headers.get("x-pat"), "pat_secret_value")
 
 
 class FormEmbedServiceTests(_EmbedTestCase):
@@ -492,39 +546,88 @@ class FormEmbedServiceTests(_EmbedTestCase):
         target = form_service.get_form_embed_target(self.db, link, access=access)
         return _run(form_service.resolve_form_embed(target, "viewer@renphil.org"))
 
-    def test_public_form_returns_stored_url_without_calling_form_builder(self) -> None:
-        link = self._form(requires_authentication=False)
+    def test_public_form_returns_form_builder_url_as_is(self) -> None:
+        link = self._form(hide_back_button=True)
+        for requires_authentication, auth_type in ((False, None), (False, "user"), (True, "none")):
+            self.calls.clear()
+            self._set_auth(requires_authentication, auth_type)
+            with self.subTest(requires_authentication=requires_authentication, auth_type=auth_type):
+                result = self._resolve(link)
+                self.assertEqual(
+                    result,
+                    {
+                        "link": link,
+                        "form_id": FORM_1,
+                        "embed_url": "https://forms.example.org/e/1?theme=dark%20blue",
+                        "requires_authentication": requires_authentication,
+                        "authentication_type": auth_type,
+                        "hide_back_button": True,
+                        "expires_in_seconds": None,
+                        "max_uses": None,
+                    },
+                )
+                (request,) = self.calls
+                self._assert_form_lookup(request)
+
+    def test_submission_form_appends_hide_back_button_without_token(self) -> None:
+        self._set_auth(True, "submission")
+        for stored, expected in ((None, "false"), (True, "true")):
+            self.calls.clear()
+            link = self._form(hide_back_button=stored)
+            with self.subTest(stored=stored):
+                result = self._resolve(link)
+                self.assertEqual(
+                    result["embed_url"],
+                    f"https://forms.example.org/e/1?theme=dark%20blue&hide_back_button={expected}",
+                )
+                self.assertEqual(result["authentication_type"], "submission")
+                self.assertIsNone(result["expires_in_seconds"])
+                (request,) = self.calls
+                self._assert_form_lookup(request)
+
+    def test_user_form_appends_hide_back_button_and_token(self) -> None:
+        self._set_auth(True, "user")
+        link = self._form(hide_back_button=True)
         result = self._resolve(link)
+
         self.assertEqual(
-            result,
-            {
-                "link": link,
-                "form_id": FORM_1,
-                "embed_url": "https://forms.example.org/e/1?theme=dark%20blue",
-                "requires_authentication": False,
-                "expires_in_seconds": None,
-                "max_uses": None,
-            },
+            result["embed_url"],
+            "https://forms.example.org/e/1?theme=dark%20blue&hide_back_button=true&token=jwt.abc-123_",
         )
-        self.assertEqual(self.calls, [])
-
-    def test_authenticated_form_appends_token(self) -> None:
-        link = self._form(requires_authentication=True)
-        result = self._resolve(link)
-
-        self.assertEqual(result["embed_url"], "https://forms.example.org/e/1?theme=dark%20blue&token=eyJhbGciOi.payload.sig")
         self.assertEqual((result["expires_in_seconds"], result["max_uses"]), (3600, 100))
         self.assertTrue(result["requires_authentication"])
+        self.assertEqual(result["authentication_type"], "user")
 
-        (request,) = self.calls
-        self.assertEqual(request.method, "POST")
-        self.assertEqual(str(request.url), "https://forms.example.org/api/authenticate_with_pat")
+        lookup, auth = self.calls
+        self._assert_form_lookup(lookup)
+        self.assertEqual(auth.method, "POST")
+        self.assertEqual(str(auth.url), "https://forms.example.org/api/authenticate_with_pat")
         self.assertEqual(
-            json.loads(request.content),
+            json.loads(auth.content),
             {"pat": "pat_secret_value", "formId": FORM_1, "userEmail": "viewer@renphil.org", "sourceUi": "hub"},
         )
 
-    def test_with_embed_token_handles_query_shapes(self) -> None:
+    def test_unknown_auth_type_still_authenticates(self) -> None:
+        self._set_auth(True, None)
+        link = self._form()
+        result = self._resolve(link)
+        self.assertEqual(
+            result["embed_url"],
+            "https://forms.example.org/e/1?theme=dark%20blue&hide_back_button=false&token=jwt.abc-123_",
+        )
+        self.assertEqual(len(self.calls), 2)
+
+    def test_form_builder_changes_are_reflected_on_every_load(self) -> None:
+        link = self._form(hide_back_button=True)
+        self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/1?theme=dark%20blue")
+
+        self._set_auth(True, "submission", embed_url="https://forms.example.org/e/2")
+        self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/2?hide_back_button=true")
+
+        self._set_auth(False, None)
+        self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/2")
+
+    def test_with_query_param_handles_query_shapes(self) -> None:
         cases = {
             "https://f.example.org/e/1": "https://f.example.org/e/1?token=t.k-n_",
             "https://f.example.org/e/1?a=1": "https://f.example.org/e/1?a=1&token=t.k-n_",
@@ -532,9 +635,30 @@ class FormEmbedServiceTests(_EmbedTestCase):
         }
         for url, expected in cases.items():
             self.assertEqual(form_service.with_embed_token(url, "t.k-n_"), expected)
+        self.assertEqual(
+            form_service.with_query_param("https://f.example.org/e/1?hide_back_button=true&a=1", "hide_back_button", "false"),
+            "https://f.example.org/e/1?a=1&hide_back_button=false",
+        )
 
-    def test_form_builder_errors_are_mapped(self) -> None:
-        link = self._form(requires_authentication=True)
+    def test_form_lookup_errors_are_mapped(self) -> None:
+        link = self._form()
+        cases = [
+            (403, {"error": "nope"}, 422, "rejected the PAT"),
+            (404, {"error": "Form not found"}, 422, "Form not found"),
+            (500, {"error": "boom"}, 502, "couldn't complete"),
+            (200, {"id": FORM_1, "unavailable": True}, 422, "isn't available"),
+        ]
+        for status, body, expected_status, expected_detail in cases:
+            self.form_status, self.form_body = status, body
+            with self.subTest(status=status, body=body):
+                with self.assertRaises(form_service.FormBuilderError) as ctx:
+                    self._resolve(link)
+                self.assertEqual(ctx.exception.status_code, expected_status)
+                self.assertIn(expected_detail, ctx.exception.detail)
+
+    def test_authentication_errors_are_mapped(self) -> None:
+        self._set_auth(True, "user")
+        link = self._form()
         cases = [
             (400, {"error": "userEmail is required — this form identifies each respondent."}, 422, "userEmail is required"),
             (403, {"error": "This PAT is not granted access to this form"}, 422, "no longer has access"),
@@ -552,7 +676,7 @@ class FormEmbedServiceTests(_EmbedTestCase):
                 self.assertIn(expected_detail, ctx.exception.detail)
 
     def test_lookup_404s(self) -> None:
-        link = self._form(requires_authentication=False)
+        link = self._form()
         self.db.add_all([
             ComponentV2(link="note", type="block_note", props={}, gridstack_id=self.grid.id),
             ComponentV2(link="bare", type="form", props={}, gridstack_id=self.grid.id),
@@ -586,7 +710,8 @@ class FormEmbedRouterTests(_EmbedTestCase):
         super().tearDown()
 
     def test_authenticated_embed_uses_jwt_email_and_never_returns_pat(self) -> None:
-        link = self._form(requires_authentication=True, embed_url="https://forms.example.org/e/1")
+        self._set_auth(True, "user", embed_url="https://forms.example.org/e/1")
+        link = self._form(hide_back_button=True)
         resp = self.client.get(f"/forms/component/{link}/embed")
 
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -596,22 +721,30 @@ class FormEmbedRouterTests(_EmbedTestCase):
                 "success": True,
                 "link": link,
                 "form_id": FORM_1,
-                "embed_url": "https://forms.example.org/e/1?token=eyJhbGciOi.payload.sig",
+                "embed_url": "https://forms.example.org/e/1?hide_back_button=true&token=jwt.abc-123_",
                 "requires_authentication": True,
+                "authentication_type": "user",
+                "hide_back_button": True,
                 "expires_in_seconds": 3600,
                 "max_uses": 100,
             },
         )
         self.assertEqual(resp.headers.get("cache-control"), "no-store")
         self.assertNotIn("pat_secret_value", resp.text)
-        self.assertEqual(json.loads(self.calls[0].content)["userEmail"], "viewer@renphil.org")
+        self.assertEqual(json.loads(self.calls[1].content)["userEmail"], "viewer@renphil.org")
 
     def test_errors(self) -> None:
-        link = self._form(requires_authentication=True)
+        self._set_auth(True, "user")
+        link = self._form()
         self.auth_status, self.auth_body = 403, {"error": "This PAT is not granted access to this form"}
         forbidden = self.client.get(f"/forms/component/{link}/embed")
         self.assertEqual(forbidden.status_code, 422)
         self.assertEqual(forbidden.headers.get("cache-control"), "no-store")
+
+        self.form_status = 404
+        gone = self.client.get(f"/forms/component/{link}/embed")
+        self.assertEqual(gone.status_code, 422)
+        self.assertEqual(gone.headers.get("cache-control"), "no-store")
 
         missing = self.client.get("/forms/component/missing/embed")
         self.assertEqual(missing.status_code, 404)

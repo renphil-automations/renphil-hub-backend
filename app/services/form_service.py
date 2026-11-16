@@ -4,11 +4,14 @@ the `form` component upsert, and resolving a form component's embed URL for
 the viewer (authenticated via the stored PAT when the form requires `user`
 authentication).
 
-A form component's spec lives in its own `form_details` row (1:1 with the
-component, deleted with it by `ON DELETE CASCADE`), never in the component's
-`props`/`page_content`, so the canvas save can't touch it and the canvas read
-doesn't expose it. The form-builder PAT is stored retrievable (it's needed for
-runtime authentication) but never returned.
+A form component's settings live in their own `form_details` row (1:1 with
+the component, deleted with it by `ON DELETE CASCADE`), never in the
+component's `props`/`page_content`, so the canvas save can't touch them and
+the canvas read doesn't expose them. Only the form id, the PAT and
+`hide_back_button` are stored: the embed URL and authentication settings are
+fetched from the form builder on every load, so changes there show up
+automatically. The form-builder PAT is stored retrievable (it's needed for
+those runtime calls) but never returned.
 """
 
 from __future__ import annotations
@@ -62,7 +65,10 @@ _GENERIC_UPSTREAM_DETAIL = (
 # The form builder's `authType` values. Only "user" needs a per-viewer token
 # minted via `authenticate_with_pat`; "none" and "submission" embed as-is.
 FORM_AUTH_TYPES = ("none", "submission", "user")
+NO_AUTH_TYPE = "none"
 USER_AUTH_TYPE = "user"
+
+HIDE_BACK_BUTTON_PARAM = "hide_back_button"
 
 
 class FormBuilderError(Exception):
@@ -199,11 +205,17 @@ def _auth_type_or_none(value: Any) -> str | None:
     return None
 
 
+def is_public_form(requires_authentication: bool, authentication_type: str | None) -> bool:
+    """Whether the form needs no authentication at all (no `requiresAuthentication`,
+    or an `authType` of "none")."""
+    return not requires_authentication or authentication_type == NO_AUTH_TYPE
+
+
 def requires_user_token(requires_authentication: bool, authentication_type: str | None) -> bool:
     """Whether viewing the form needs a per-user token from
-    `authenticate_with_pat`: only an authenticated form of type "user". A row
-    with no recorded type (saved before it was stored) keeps the old
-    behaviour of authenticating whenever `requires_authentication` is set."""
+    `authenticate_with_pat`: only an authenticated form of type "user". A form
+    reporting no known type keeps the old behaviour of authenticating whenever
+    `requires_authentication` is set."""
     if not requires_authentication:
         return False
     return authentication_type is None or authentication_type == USER_AUTH_TYPE
@@ -267,14 +279,20 @@ def _int_or_none(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def with_query_param(url: str, name: str, value: str) -> str:
+    """`url` with `name=<value>` added to its query string (replacing any
+    existing `name` param). The rest of the query is kept byte-for-byte
+    rather than re-encoded, and a `#fragment` stays at the end."""
+    parts = urlsplit(url)
+    kept = [p for p in parts.query.split("&") if p and p.split("=", 1)[0] != name]
+    kept.append(f"{name}=" + quote(value, safe=""))
+    return urlunsplit(parts._replace(query="&".join(kept)))
+
+
 def with_embed_token(embed_url: str, token: str) -> str:
     """`embed_url` with `token=<token>` added to its query string (replacing
-    any existing `token` param). The rest of the query is kept byte-for-byte
-    rather than re-encoded, and a `#fragment` stays at the end."""
-    parts = urlsplit(embed_url)
-    kept = [p for p in parts.query.split("&") if p and p.split("=", 1)[0] != "token"]
-    kept.append("token=" + quote(token, safe=""))
-    return urlunsplit(parts._replace(query="&".join(kept)))
+    any existing `token` param)."""
+    return with_query_param(embed_url, "token", token)
 
 
 # ---------------------------------------------------------
@@ -283,21 +301,19 @@ def with_embed_token(embed_url: str, token: str) -> str:
 
 @dataclass(frozen=True)
 class FormEmbedTarget:
-    """One form component's stored embed settings. SERVER-INTERNAL: carries
-    the PAT, which must never be returned to the client."""
+    """One form component's stored settings. SERVER-INTERNAL: carries the
+    PAT, which must never be returned to the client."""
 
     link: str
     form_id: str
-    embed_url: str
-    requires_authentication: bool
-    authentication_type: str | None
+    hide_back_button: bool
     pat: str
 
 
 def get_form_embed_target(
     db: Session, link: str, *, access: ViewerAccess | None = None
 ) -> FormEmbedTarget:
-    """Resolve a form component's stored embed settings by its `link`.
+    """Resolve a form component's stored settings by its `link`.
 
     The caller must be able to view the component (`is_granted`, the same
     payload gate the canvas read uses); an unknown link, an invisible
@@ -323,33 +339,45 @@ def get_form_embed_target(
     return FormEmbedTarget(
         link=component.link,
         form_id=str(details.form_id),
-        embed_url=details.embed_url,
-        requires_authentication=bool(details.requires_authentication),
-        authentication_type=details.authentication_type,
+        hide_back_button=bool(details.hide_back_button),
         pat=details.pat,
     )
 
 
 async def resolve_form_embed(target: FormEmbedTarget, user_email: str) -> dict[str, Any]:
-    """The embed info to hand the viewer. Only a form that requires
-    authentication with type "user" calls the form builder: it gets a per-user
-    token, minted under the stored PAT for `user_email`, appended to its
-    embed URL. Every other form (no authentication, or type "none" /
-    "submission") gets its stored embed URL as-is."""
+    """The embed info to hand the viewer. The form's current embed URL and
+    authentication settings are fetched from the form builder under the
+    stored PAT. A non-public form gets `hide_back_button=true|false`
+    appended; one that requires authentication with type "user" also gets a
+    per-user token, minted under the stored PAT for `user_email`. Public
+    forms get the embed URL as-is."""
+    info = await get_form_embed_info(target.pat, target.form_id)
+    requires_authentication = info["requires_authentication"]
+    authentication_type = info["authentication_type"]
+    embed_url = info["embed_url"]
+
     result: dict[str, Any] = {
         "link": target.link,
         "form_id": target.form_id,
-        "embed_url": target.embed_url,
-        "requires_authentication": target.requires_authentication,
-        "authentication_type": target.authentication_type,
+        "embed_url": embed_url,
+        "requires_authentication": requires_authentication,
+        "authentication_type": authentication_type,
+        "hide_back_button": target.hide_back_button,
         "expires_in_seconds": None,
         "max_uses": None,
     }
-    if not requires_user_token(target.requires_authentication, target.authentication_type):
+    if is_public_form(requires_authentication, authentication_type):
+        return result
+
+    embed_url = with_query_param(
+        embed_url, HIDE_BACK_BUTTON_PARAM, "true" if target.hide_back_button else "false"
+    )
+    result["embed_url"] = embed_url
+    if not requires_user_token(requires_authentication, authentication_type):
         return result
 
     auth = await authenticate_with_pat(target.pat, target.form_id, user_email)
-    result["embed_url"] = with_embed_token(target.embed_url, auth["token"])
+    result["embed_url"] = with_embed_token(embed_url, auth["token"])
     result["expires_in_seconds"] = auth["expires_in_seconds"]
     result["max_uses"] = auth["max_uses"]
     return result
@@ -366,9 +394,7 @@ def _form_details_view(details: FormDetailsV2 | None) -> dict[str, Any] | None:
         return None
     return {
         "form_id": str(details.form_id),
-        "embed_url": details.embed_url,
-        "requires_authentication": bool(details.requires_authentication),
-        "authentication_type": details.authentication_type,
+        "hide_back_button": bool(details.hide_back_button),
     }
 
 def _form_component_view(
@@ -396,10 +422,8 @@ def save_form_component(
     link: str | None,
     document_id: str | None,
     form_id: str,
-    embed_url: str,
-    requires_authentication: bool,
-    authentication_type: str | None = None,
     pat: Any = _UNSET,
+    hide_back_button: Any = _UNSET,
     title: Any = _UNSET,
     description: Any = _UNSET,
     layout: dict[str, float | None] | None = None,
@@ -418,6 +442,9 @@ def save_form_component(
     re-saving a form can't resend it): `_UNSET`, `None` or blank keeps the
     stored PAT; a non-blank value replaces it. Required whenever the
     `form_details` row is being created (the column is NOT NULL).
+
+    `hide_back_button` is partial too: `_UNSET` or `None` keeps the stored
+    value (false on a new row); a bool replaces it.
 
     Returns `{"created", "component", "search_updates"}`, or None when the
     gridstack to create on doesn't exist (404 at the router). Raises
@@ -507,12 +534,11 @@ def save_form_component(
 
         now = datetime.now(timezone.utc)
         if details is None:
-            details = FormDetailsV2(component_id=component.id, created_at=now)
+            details = FormDetailsV2(component_id=component.id, created_at=now, hide_back_button=False)
             db.add(details)
         details.form_id = form_uuid
-        details.embed_url = embed_url
-        details.requires_authentication = bool(requires_authentication)
-        details.authentication_type = authentication_type
+        if hide_back_button is not _UNSET and hide_back_button is not None:
+            details.hide_back_button = bool(hide_back_button)
         if new_pat:
             details.pat = new_pat
         details.updated_at = now
