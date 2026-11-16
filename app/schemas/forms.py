@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator
 
@@ -12,14 +11,6 @@ from app.schemas.tab import StrictRequestModel
 
 # The form builder's `authType` values (see `form_service.FORM_AUTH_TYPES`).
 FormAuthType = Literal["none", "submission", "user"]
-
-
-def _validate_http_url(value: str) -> str:
-    value = value.strip()
-    parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("must be an absolute http(s) URL")
-    return value
 
 
 # ── Form-builder proxy ────────────────────────────────────────────────
@@ -56,12 +47,14 @@ class FormComponentEmbedResponse(BaseModel):
     form_id: str
     embed_url: str = Field(
         ...,
-        description="URL to load in the iframe. When `requires_authentication` is true "
-        "and `authentication_type` is `user`, it already carries the viewer's "
-        "`token=<jwt>` query param.",
+        description="URL to load in the iframe, freshly fetched from the form builder. "
+        "For a non-public form it carries `hide_back_button=true|false`; when "
+        "`requires_authentication` is true and `authentication_type` is `user`, it "
+        "also carries the viewer's `token=<jwt>` query param.",
     )
     requires_authentication: bool
     authentication_type: FormAuthType | None = None
+    hide_back_button: bool = False
     expires_in_seconds: int | None = Field(
         default=None,
         description="Token lifetime; null when no token was issued. Re-fetch to get a fresh one.",
@@ -80,15 +73,19 @@ class SaveFormComponentRequest(StrictRequestModel):
     `link` set and matching an existing component → update it. Otherwise a
     new `form` component is created on the gridstack named by `document_id`.
 
-    The form spec (`form_id`, `embed_url`, `requires_authentication`,
-    `authentication_type`) is replaced on every save — send the values
-    `GET /forms/{form_id}` returned. `title`/`description` are partial: omit
-    to keep the stored value on update.
+    `form_id` is replaced on every save. The form's embed URL and
+    authentication settings aren't stored — they're fetched from the form
+    builder whenever the form is loaded. `title`/`description` are partial:
+    omit to keep the stored value on update.
 
     `pat` is write-only (never returned, including by
     `GET /v2/tabs/{id}/content`): omit it, or send `null`/"", to keep the
     stored PAT; send a value to replace it. Required when the form is first
     created.
+
+    `hide_back_button` is meant for forms with `user` or `submission`
+    authentication: omit it (or send `null`) to keep the stored value
+    (false on create).
 
     `x`/`y`/`w`/`h` are applied only when creating; ignored on update.
     """
@@ -100,10 +97,8 @@ class SaveFormComponentRequest(StrictRequestModel):
     description: StrictStr | None = None
 
     form_id: StrictStr = Field(..., min_length=1, max_length=255)
-    embed_url: StrictStr = Field(..., min_length=1, max_length=2048)
-    requires_authentication: StrictBool = False
-    authentication_type: FormAuthType | None = None
     pat: StrictStr | None = Field(default=None, max_length=1024)
+    hide_back_button: StrictBool | None = None
 
     x: float | None = None
     y: float | None = None
@@ -118,20 +113,13 @@ class SaveFormComponentRequest(StrictRequestModel):
         except ValueError:
             raise ValueError("form_id must be a UUID") from None
 
-    @field_validator("embed_url")
-    @classmethod
-    def _check_embed_url(cls, value: str) -> str:
-        return _validate_http_url(value)
-
 
 class FormComponentSpec(BaseModel):
-    """The form spec stored in the component's `form_details` row. The PAT
-    is never returned."""
+    """The form settings stored in the component's `form_details` row. The
+    PAT is never returned."""
 
     form_id: str | None = None
-    embed_url: str | None = None
-    requires_authentication: bool = False
-    authentication_type: FormAuthType | None = None
+    hide_back_button: bool = False
 
 
 class FormComponentResponse(BaseModel):

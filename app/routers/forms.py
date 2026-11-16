@@ -4,9 +4,11 @@ Embedded forms router.
 * `GET /forms` / `GET /forms/{form_id}` — proxy the form-builder service under
   a caller-supplied PAT, sent in the `X-Form-PAT` header (never the URL, so it
   stays out of access logs). The PAT is used for that one call and not stored.
-* `PUT /forms/component` — upsert a `form` component's settings.
+* `PUT /forms/component` — upsert a `form` component's settings (form id,
+  PAT, `hide_back_button`).
 * `GET /forms/component/{link}/embed` — the embed URL to render one form
-  component, with a per-viewer token when the form requires `user`
+  component, fetched fresh from the form builder, with `hide_back_button`
+  for non-public forms and a per-viewer token when the form requires `user`
   authentication.
 """
 
@@ -124,7 +126,7 @@ def save_form_component(
     # `model_fields_set` keeps "absent" (preserve) distinct from "null".
     provided = body.model_fields_set
     optional: dict[str, object] = {}
-    for field in ("title", "description", "pat"):
+    for field in ("title", "description", "pat", "hide_back_button"):
         if field in provided:
             optional[field] = getattr(body, field)
 
@@ -134,9 +136,6 @@ def save_form_component(
             link=body.link,
             document_id=body.document_id,
             form_id=body.form_id,
-            embed_url=body.embed_url,
-            requires_authentication=body.requires_authentication,
-            authentication_type=body.authentication_type,
             layout={"x": body.x, "y": body.y, "w": body.w, "h": body.h},
             access=access,
             session=session,
@@ -157,16 +156,20 @@ def save_form_component(
     response_model=FormComponentEmbedResponse,
     summary="Get the embed URL for one form component",
     description="""
-Looks up the form component by its `link` in `form_details`.
+Looks up the form component by its `link` in `form_details`, then fetches the
+form's current embed URL and authentication settings from the form builder
+(`GET /api/forms/{form_id}`) with the stored PAT — nothing about them is
+cached, so changes in the form builder show up immediately.
 
-* `requires_authentication: false`, or `true` with `authentication_type`
-  `none` / `submission` — returns the stored `embed_url` as-is (no
-  form-builder call).
-* `requires_authentication: true` with `authentication_type: user` — calls
-  the form builder's
+* `requires_authentication: false`, or `true` with `authentication_type:
+  none` — returns the form builder's `embed_url` as-is.
+* `requires_authentication: true` with `authentication_type: submission` —
+  returns `embed_url` with `hide_back_button=true|false` appended.
+* `requires_authentication: true` with `authentication_type: user` (or an
+  unknown type) — also calls the form builder's
   `POST /api/authenticate_with_pat` with the stored PAT, the form id and the
-  signed-in user's email (from the JWT), and returns `embed_url` with
-  `token=<jwt>` appended. The token is per-viewer and short-lived
+  signed-in user's email (from the JWT), and appends `token=<jwt>` after
+  `hide_back_button`. The token is per-viewer and short-lived
   (`expires_in_seconds`, `max_uses`): fetch this right before rendering the
   iframe, and again to refresh it. The response is never cached.
 
@@ -175,7 +178,7 @@ otherwise (or for an unknown/non-form link) it's a 404.
 """,
     responses={
         404: {"description": "Form component not found / not visible, or not configured yet"},
-        422: {"description": "The form builder rejected the request (PAT no longer granted, form deleted, …) or the service isn't configured"},
+        422: {"description": "The form builder rejected the request (PAT no longer granted, form deleted/unpublished, …) or the service isn't configured"},
         502: {"description": "The form-builder service failed or couldn't be reached"},
         503: {"description": "The form-builder service is busy"},
     },
