@@ -17,6 +17,12 @@ from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String
 
 from app.db_v2.database import BaseV2
 
+# Every writer sets one of these on `category`. Rows written before the
+# column existed are NULL.
+NOTIFICATION_CATEGORY_THREADS = "threads"
+NOTIFICATION_CATEGORY_TASKS = "tasks"
+NOTIFICATION_CATEGORY_AIRTABLE_SYNC = "airtable_sync"
+
 
 class NotificationV2(BaseV2):
     """One fan-out event. Six thread triggers: someone was @-mentioned, someone
@@ -48,6 +54,10 @@ class NotificationV2(BaseV2):
     # NOTIFICATION_TYPE_* constants are the source of truth, and the longest
     # value (22 chars) fits without a column change.
     type = Column(String(32), nullable=False)
+
+    # Groups `type`s for the bell: one of the NOTIFICATION_CATEGORY_*
+    # constants above. Unbounded VARCHAR, NULL on pre-existing rows.
+    category = Column(String, nullable=True)
 
     actor_email = Column(String(320), nullable=True)
     actor_name = Column(String(255), nullable=True)

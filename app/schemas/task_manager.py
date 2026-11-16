@@ -11,6 +11,7 @@ from app.schemas.view_as import VIEW_AS_FLAG_DESCRIPTION, VIEW_AS_USER_DESCRIPTI
 
 TaskStatus = Literal["Pending", "In Progress", "Blocked", "Closed"]
 NotificationCadence = Literal["always", "never", "on_status_change"]
+TaskMode = Literal["group_task", "individual_task"]
 
 _CADENCE_DESCRIPTION = (
     "When owner/assignees are notified of changes: `always` (detail and status changes), "
@@ -18,6 +19,11 @@ _CADENCE_DESCRIPTION = (
 )
 _NOTIFY_CREATE_DELETE_DESCRIPTION = (
     "Notify on creation, on assignees being added/removed, and on deletion (unless the task is Closed)."
+)
+_MODE_DESCRIPTION = (
+    "`group_task`: one task shared by every assignee (a status change is seen by all); needs at "
+    "least 2 assignees. `individual_task`: one separate task per assignee. With 0 or 1 assignee "
+    "the task is always `individual_task`."
 )
 
 
@@ -49,6 +55,7 @@ class TaskResponse(BaseModel):
     editable_via_webhook: bool
     notification_cadence: NotificationCadence
     notify_on_create_and_delete: bool
+    mode: TaskMode = Field(..., description=_MODE_DESCRIPTION)
     is_owner: bool = Field(..., description="The caller owns this task.")
     is_assignee: bool = Field(..., description="The caller is one of this task's assignees.")
     can_manage: bool = Field(
@@ -87,14 +94,19 @@ class CreateTaskRequest(BaseModel):
     editable_via_webhook: bool = False
     notification_cadence: NotificationCadence = Field(default="always", description=_CADENCE_DESCRIPTION)
     notify_on_create_and_delete: bool = Field(default=True, description=_NOTIFY_CREATE_DELETE_DESCRIPTION)
+    mode: TaskMode | None = Field(
+        default=None,
+        description=_MODE_DESCRIPTION + " Defaults to `group_task` with 2+ assignees, `individual_task` "
+        "otherwise. `individual_task` with N assignees creates N tasks.",
+    )
 
 
 class UpdateTaskRequest(BaseModel):
     """Partial update: only the fields present in the body are changed.
 
     `title`, `description`, `assignees`, `editable_by_assignee`,
-    `editable_via_webhook`, `notification_cadence`, `notify_on_create_and_delete`
-    — task owner, editor of the Task Manager, or Admin on All Scopes. `status` — the same, or an assignee when the task's
+    `editable_via_webhook`, `notification_cadence`, `notify_on_create_and_delete`,
+    `mode` — task owner, editor of the Task Manager, or Admin on All Scopes. `status` — the same, or an assignee when the task's
     `editable_by_assignee` is true.
     """
 
@@ -108,11 +120,23 @@ class UpdateTaskRequest(BaseModel):
     notification_cadence: NotificationCadence | None = Field(default=None, description=_CADENCE_DESCRIPTION)
     notify_on_create_and_delete: bool | None = Field(default=None, description=_NOTIFY_CREATE_DELETE_DESCRIPTION)
     status: TaskStatus | None = None
+    mode: TaskMode | None = Field(
+        default=None,
+        description=_MODE_DESCRIPTION + " Only the task owner, an editor of the Task Manager or an Admin on "
+        "All Scopes may change it. When omitted, the task keeps its mode: a `group_task` reduced to fewer "
+        "than 2 assignees is refused, and an `individual_task` given N > 1 assignees is split. "
+        "`individual_task` on a task left with N > 1 assignees splits it: this task keeps one assignee and "
+        "N-1 copies are created, one per other assignee. A mode change alone never notifies anyone.",
+    )
 
 
 class TaskMutationResponse(_ViewAsEcho):
     success: bool = True
-    task: TaskResponse
+    tasks: list[TaskResponse] = Field(
+        ...,
+        description="Every task created or updated by the request: one, or one per assignee for an "
+        "`individual_task` with several assignees (on update, the updated task first, then the copies).",
+    )
 
 
 class DeleteTasksRequest(BaseModel):
