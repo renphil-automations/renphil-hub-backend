@@ -41,6 +41,17 @@ def _authorization_fingerprint(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _is_payload_granted(node: dict) -> bool:
+    """True when the person may read this node's CONTENT, not just see its shell.
+
+    `list_visible_nodes` emits `view`, `edit`, `revealed` and `edit_seed` for every visible node; it
+    never emits a `granted` key. `revealed` means "viewable but not granted" (the node opens as an
+    empty shell), so the payload is granted exactly when the node is viewable and not merely revealed.
+    Reading a `granted` key here returned nothing for every non-admin, so the Agent saw no content for them.
+    """
+    return bool(node.get("view")) and not node.get("revealed")
+
+
 def _signed_in_hub_user(db: Session, email: str):
     """Return the caller's Hub user row, or refuse (fail closed)."""
 
@@ -109,7 +120,7 @@ def _build_live_acl_response(
                 {
                     f"{node['node_kind']}:{node['node_id']}"
                     for node in list_visible_nodes(viewer_access.visibility)
-                    if node.get("granted")
+                    if _is_payload_granted(node)
                 }
             )
 

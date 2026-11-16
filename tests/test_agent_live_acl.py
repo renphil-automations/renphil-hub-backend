@@ -105,9 +105,10 @@ class AgentLiveAclTests(unittest.TestCase):
                 agent_access,
                 "list_visible_nodes",
                 lambda _visibility: [
-                    {"node_kind": "component", "node_id": 42, "granted": True},
-                    {"node_kind": "tab", "node_id": 5, "granted": False},
-                    {"node_kind": "component", "node_id": 8, "granted": True},
+                    # The REAL shape of `list_visible_nodes` (view/edit/revealed/edit_seed, no `granted`).
+                    {"node_kind": "component", "node_id": 42, "view": True, "edit": False, "revealed": False, "edit_seed": False},
+                    {"node_kind": "tab", "node_id": 5, "view": True, "edit": False, "revealed": True, "edit_seed": False},
+                    {"node_kind": "component", "node_id": 8, "view": True, "edit": True, "revealed": False, "edit_seed": True},
                 ],
             ),
         ):
@@ -120,6 +121,17 @@ class AgentLiveAclTests(unittest.TestCase):
         self.assertFalse(response["is_admin"])
         self.assertEqual(response["granted_node_keys"], ["component:42", "component:8"])
         self.assertIsInstance(response["authorization_fingerprint"], str)
+
+    def test_payload_grant_means_viewable_and_not_merely_revealed(self) -> None:
+        granted = agent_access._is_payload_granted
+        self.assertTrue(granted({"view": True, "edit": False, "revealed": False, "edit_seed": False}))
+        self.assertTrue(granted({"view": True, "edit": True, "revealed": False, "edit_seed": True}))
+        # An ancestor shown only so a granted descendant can be reached: a shell, no content.
+        self.assertFalse(granted({"view": True, "edit": False, "revealed": True, "edit_seed": False}))
+        self.assertFalse(granted({"view": False, "edit": False, "revealed": False, "edit_seed": False}))
+        # A key the service never emits must not grant anything.
+        self.assertFalse(granted({"granted": True}))
+        self.assertFalse(granted({}))
 
     def test_live_acl_fingerprint_changes_when_grants_change(self) -> None:
         before = agent_access._authorization_fingerprint(
