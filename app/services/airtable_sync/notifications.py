@@ -46,7 +46,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.airtable_sync import AirtableSyncItemV2, AirtableSyncRunV2
-from app.db_v2.models.notification import NotificationV2
+from app.db_v2.models.notification import NOTIFICATION_CATEGORY_AIRTABLE_SYNC, NotificationV2
 from app.db_v2.models.user import UserV2
 from app.services.thread_service import (
     NOTIFICATION_TYPE_AIRTABLE_SYNC_FINISHED,
@@ -184,6 +184,7 @@ def _write(
             NotificationV2(
                 recipient_email=email,
                 type=kind,
+                category=NOTIFICATION_CATEGORY_AIRTABLE_SYNC,
                 actor_email=actor[0],
                 actor_name=actor[1],
                 component_id=None,

@@ -74,7 +74,6 @@ from app.dependencies import (
     get_current_user,
     get_view_as_access,
     get_view_as_anonymous,
-    get_view_as_selection,
     get_viewer_access,
     is_hub_admin,
 )
@@ -107,7 +106,7 @@ from app.schemas.thread import (
     VoteRequest,
     VoteResponse,
 )
-from app.services import thread_service, view_as_service
+from app.services import thread_service
 from app.services.access_visibility_service import ViewerAccess, granted_single_node
 from app.services.rbac_graph_service import RbacClosures
 
@@ -116,34 +115,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/data", tags=["Threads"])
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: `anonymous=true` with `view_as_user`, a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
 THREAD_VIEW_AS_RESPONSES = {
     400: {
-        "description": (
-            "`anonymous=true` combined with `view_as_user`, or View As: a malformed `view_as` pair, "
-            "an unknown key or user, or too many pairs"
-        )
+        "description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"
     },
     403: {"description": "Caller does not satisfy the widget's access control, or View As refused"},
 }
 
-def _thread_subject(
-    user: UserInfo,
-    selection: view_as_service.ViewAsSelection | None,
-    anonymous: bool,
-) -> UserInfo | None:
+def _thread_subject(user: UserInfo, anonymous: bool) -> UserInfo | None:
     """Whose authorship, votes and authored edits the thread read endpoints
-    report: the caller's, including a View As of role/scope pairs only, or
-    nobody's (`None`) under `anonymous` or `view_as_user` — a selected user
-    is seen through their roles only, exactly like `anonymous`.
-    (`anonymous` with `view_as_user` never gets here: `get_view_as_selection`
-    refuses it with a 400.)"""
-    if anonymous or (selection is not None and selection.user is not None):
-        return None
-    return user
+    report: the caller's, whatever `view_as` pairs or `view_as_user` are
+    selected, or nobody's (`None`) under `anonymous`. A selected user's own
+    threads, votes and edits are never reported."""
+    return None if anonymous else user
 
 
 
@@ -241,13 +229,12 @@ async def list_threads(
     anonymous: bool = Depends(get_view_as_anonymous),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    """Own pending/rejected threads, votes and pending edits are nobody's
-    with `anonymous` or `view_as_user` (approved threads only, `my_vote` 0),
-    and the caller's otherwise — including with `view_as` pairs only."""
-    subject = _thread_subject(user, selection, anonymous)
+    """Own pending/rejected threads, votes and pending edits are the
+    caller's, whatever `view_as` pairs or `view_as_user` are selected, and
+    nobody's with `anonymous` (approved threads only, `my_vote` 0)."""
+    subject = _thread_subject(user, anonymous)
     result = await asyncio.to_thread(
         thread_service.list_threads_for_link,
         db,
@@ -648,13 +635,12 @@ async def get_thread(
     anonymous: bool = Depends(get_view_as_anonymous),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
     """Access, `my_vote`, authorship (who may open a pending/rejected
     thread) and the authored pending edits follow `_thread_subject`; edit
     rights (`viewer_is_editor`) follow the View As access."""
-    subject = _thread_subject(user, selection, anonymous)
+    subject = _thread_subject(user, anonymous)
     detail = await asyncio.to_thread(
         thread_service.get_thread_by_id, db, thread_id, subject, access=view_as_access.access
     )
@@ -746,12 +732,11 @@ async def list_comments(
     anonymous: bool = Depends(get_view_as_anonymous),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
     """Access follows the View As access; each comment's `my_vote` follows
     `_thread_subject`."""
-    subject = _thread_subject(user, selection, anonymous)
+    subject = _thread_subject(user, anonymous)
     result = await asyncio.to_thread(
         thread_service.list_comments_for_thread, db, thread_id, cursor, subject, access=view_as_access.access
     )

@@ -77,7 +77,7 @@ async def _release_now_unauthorized_locks(db: Session) -> None:
 ADMIN_ONLY = [Depends(require_hub_admin)]
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: `anonymous=true` with `view_as_user`, a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
@@ -93,8 +93,7 @@ def _delegation_identity(
     lets the delegation service load them), or exactly the verified View As
     selection — the given pairs plus the selected user's rows, one held row
     per pair. Direct-to-user grants play no part in delegation, so
-    ``anonymous`` changes nothing here beyond its 400 with
-    ``view_as_user``."""
+    ``anonymous`` changes nothing here."""
     if selection is None:
         return is_hub_admin(db, current, closures=closures), None
     return (

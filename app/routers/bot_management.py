@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import os
 import csv
-import asyncio
 import logging
 from collections import Counter
 from io import BytesIO, StringIO
 from datetime import date, timedelta
 from datetime import datetime, timezone
-from time import monotonic
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -20,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import get_settings as get_app_settings
 from app.db_v2.database import get_db_v2
@@ -30,11 +29,10 @@ from app.db_v2.models.bot_management import (
 )
 from app.dependencies import (
     CurrentHubUser,
-    get_airtable_service,
     get_current_hub_user,
 )
 from app.config import get_settings as get_app_settings
-from app.services.airtable_service import AirtableService
+from app.services.bot_feedback_service import list_bot_feedback
 from app.models.auth import UserInfo
 from app.services.rbac_graph_service import effective_pairs, hub_admin_target_ids
 
@@ -62,34 +60,15 @@ def _runtime_status_unavailable(category: str) -> HTTPException:
         },
     )
 
-# Feedback remains sourced from Airtable. A brief process-local cache prevents
-# every Analytics/Feedback tab switch from walking the same table again. The
-# Refresh button passes force_refresh=True and always bypasses this cache.
-_FEEDBACK_CACHE_TTL_SECONDS = 60.0
-_feedback_cache: tuple[float, list[dict]] | None = None
-_feedback_cache_lock = asyncio.Lock()
-
-
-async def _feedback_payload(
-    airtable_service: AirtableService,
-    *,
-    limit: int,
-    force_refresh: bool = False,
-) -> list[dict]:
-    global _feedback_cache
-    bounded_limit = min(max(int(limit), 1), 500)
-    now = monotonic()
-    if not force_refresh and _feedback_cache and now - _feedback_cache[0] < _FEEDBACK_CACHE_TTL_SECONDS:
-        return _feedback_cache[1][:bounded_limit]
-
-    async with _feedback_cache_lock:
-        now = monotonic()
-        if not force_refresh and _feedback_cache and now - _feedback_cache[0] < _FEEDBACK_CACHE_TTL_SECONDS:
-            return _feedback_cache[1][:bounded_limit]
-        records = await airtable_service.list_feedbacks(limit=500)
-        payload = [record.model_dump(by_alias=False) for record in records]
-        _feedback_cache = (monotonic(), payload)
-        return payload[:bounded_limit]
+def _bot_feedback_records(db: Session, *, limit: int = 500):
+    environment = get_app_settings().hub_environment
+    if environment == "unconfigured":
+        raise HTTPException(503, "Feedback environment is not configured.")
+    try:
+        return list_bot_feedback(db, environment=environment, limit=limit)
+    except SQLAlchemyError as exc:
+        logger.warning("Bot feedback unavailable: %s", type(exc).__name__)
+        raise HTTPException(503, "Bot feedback is temporarily unavailable.") from None
 
 
 def _validate_active_model_key(
@@ -475,7 +454,7 @@ def _build_bot_analytics_workbook(
     viewer_time_zone: str | None,
 ) -> bytes:
     output = BytesIO()
-    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True, "strings_to_formulas": False, "strings_to_urls": False})
     workbook.set_properties({"title": "RenPhil Hub bot analytics", "company": "Renaissance Philanthropy"})
     viewer_timezone, timezone_label = _analytics_export_timezone(viewer_time_zone)
     subtitle = f"RenPhil Hub bot analytics. Times are shown in {timezone_label}."
@@ -839,17 +818,18 @@ def list_settings_audit(
 
 
 @router.get("/feedback")
-async def list_feedback_for_bot_management(
+def list_feedback_for_bot_management(
+    request: Request,
+    response: Response,
     limit: int = 500,
     force_refresh: bool = False,
-    airtable_service: AirtableService = Depends(get_airtable_service),
+    db: Session = Depends(get_db_v2),
 ):
-    """Return the existing Airtable Feedbacks-table rows to All-Scopes admins."""
-    return {"data": await _feedback_payload(
-        airtable_service,
-        limit=limit,
-        force_refresh=force_refresh,
-    )}
+    """Read only Bot feedback from Neon; force_refresh remains compatible."""
+    if any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+        raise HTTPException(403, "Exit View As to read feedback.", headers={"Cache-Control": "no-store", "Vary": "Authorization"})
+    response.headers.update({"Cache-Control": "no-store", "Vary": "Authorization"})
+    return {"data": [record.model_dump(by_alias=False) for record in _bot_feedback_records(db, limit=limit)]}
 
 
 @router.get("/analytics/summary")
@@ -980,6 +960,7 @@ def export_bot_analytics_csv(
 
 @router.get("/analytics/export/xlsx")
 async def export_bot_analytics_workbook(
+    request: Request,
     report: Literal["all", "usage_by_user", "time_of_day", "response_time", "negative_feedback"] = "all",
     date_from: date | None = None,
     date_to: date | None = None,
@@ -991,9 +972,10 @@ async def export_bot_analytics_workbook(
     search: str | None = None,
     time_zone: str | None = None,
     db: Session = Depends(get_db_v2),
-    airtable_service: AirtableService = Depends(get_airtable_service),
 ):
     """Export native Excel charts with the non-content rows that support them."""
+    if report in ("all", "negative_feedback") and any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+        raise HTTPException(403, "Exit View As to export feedback.", headers={"Cache-Control": "no-store", "Vary": "Authorization"})
     runs, _ = _analytics_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
         model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
@@ -1003,7 +985,7 @@ async def export_bot_analytics_workbook(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,
         model_key=model_key, status=status, kind=kind, tool_name=tool_name, search=search,
     )
-    feedback_records = await airtable_service.list_feedbacks(limit=500) if report in ("all", "negative_feedback") else []
+    feedback_records = _bot_feedback_records(db) if report in ("all", "negative_feedback") else []
     workbook = _build_bot_analytics_workbook(
         report=report, points=points, runs=runs, feedback_records=feedback_records,
         viewer_time_zone=time_zone,

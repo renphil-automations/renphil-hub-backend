@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # plan §4.7 control 2 — "suggested starting points, tuned after observation
 # rather than guessed at precisely". action -> (max_requests, window_seconds).
 RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "hub_feedback": (10, 60),
     "thread": (10, 3600),
     "comment": (30, 3600),
     "vote": (120, 3600),

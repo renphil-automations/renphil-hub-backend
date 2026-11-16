@@ -1311,9 +1311,21 @@ def granted_single_node(
     *,
     is_admin: bool,
     closures: RbacClosures | None = None,
+    edit_only: bool = False,
+    grants: list[GrantMatch] | None = None,
 ) -> bool:
     """§8.1 step 3's O(depth) fast path: ``granted(n) ⟺ (ancestors(n) ∪ {n})
     ∩ S ≠ ∅`` — for ONE node, without building the whole tree.
+
+    ``edit_only=True`` answers ``granted_edit(n)`` instead, by keeping only
+    edit-level seeds — the same ``edit_seeds`` filter ``fold`` applies, and
+    the mirror conjunction below is then taken at the edit level too.
+
+    ``grants`` replaces the user's own matching grants as the seed set S —
+    View As passes the grants its adopted pairs reach
+    (``view_as_service.view_as_grants``), so the same walk answers for them;
+    ``hub_user_id`` is then unused. Omitted, S is ``matching_grants`` for
+    ``hub_user_id``, as before.
 
     plan_ac_enforcement_closeout_2026-09-09.md §5.3, Option B — chosen over
     Option A (reusing ``get_viewer_access`` as-is) after measuring
@@ -1385,8 +1397,14 @@ def granted_single_node(
     if node is None:
         return False
 
-    graph = closures if closures is not None else RbacClosures(db)
-    seeds = {(m.node_kind, m.node_id) for m in matching_grants(db, hub_user_id, closures=graph)}
+    if grants is None:
+        graph = closures if closures is not None else RbacClosures(db)
+        grants = matching_grants(db, hub_user_id, closures=graph)
+    seeds = {
+        (m.node_kind, m.node_id)
+        for m in grants
+        if not edit_only or m.level == LEVEL_EDIT
+    }
     if not seeds:
         return False  # nothing this user reaches — no walk needed either way
 
@@ -1446,10 +1464,16 @@ def users_granted_on_node(
     node: NodeRef,
     *,
     closures: RbacClosures | None = None,
+    edit_only: bool = False,
 ) -> set[int]:
     """Every ``hub_users`` id for whom ``granted_view(node)`` is true — the
     same PAYLOAD question ``ViewerAccess.is_granted`` answers for one caller
     (moderation plan §5.9), answered for every user at once.
+
+    ``edit_only=True`` answers ``granted_edit(node)`` instead: only
+    edit-level grants on the root path count (admins always do), and a
+    mirror's conjunction is taken at the edit level too — exactly how
+    ``fold`` / ``_apply_mirror_substitution`` treat ``granted_edit``.
 
     THIS IS ``_fold_down`` INVERTED, NOT A SECOND ALGORITHM. §8.1 step 3
     states the forward predicate as ``granted(n) ⟺ (ancestors(n) ∪ {n}) ∩ S_u
@@ -1537,6 +1561,8 @@ def users_granted_on_node(
         return audience_user_ids(db, admin_pairs, closures=graph) | bootstrap_admins
 
     grants = grants_on_nodes(db, chain)
+    if edit_only:
+        grants = [g for g in grants if g.level == LEVEL_EDIT]
     granted: set[int] = {g.user_id for g in grants if g.user_id is not None}
     # A soft-deleted user's user-form grant is kept for Restore but grants
     # nothing (plan_admin_soft_delete_user §3.4); `audience_user_ids` already
@@ -1565,7 +1591,9 @@ def users_granted_on_node(
             return audience_user_ids(db, admin_pairs, closures=graph) | bootstrap_admins
         # The target's own set already contains the admins, so the
         # intersection keeps them — no separate union needed.
-        granted &= users_granted_on_node(db, ("component", target.id), closures=graph)
+        granted &= users_granted_on_node(
+            db, ("component", target.id), closures=graph, edit_only=edit_only
+        )
 
     return granted
 

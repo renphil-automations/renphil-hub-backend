@@ -1959,6 +1959,7 @@ class FeedbackRecord(_TypedAirtableRecord):
     message_id: str | None = Field(default=None, alias="Message ID")
     query: str | None = Field(default=None, alias="Query")
     response: str | None = Field(default=None, alias="Response")
+    environment: str | None = None
 
 
 # ── Access Control ────────────────────────────────────────────────────

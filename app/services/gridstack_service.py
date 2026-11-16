@@ -44,6 +44,7 @@ from app.services.access_visibility_service import (
 )
 from app.services.tab_service import DEFAULT_ACCESS_CONTROL
 from app.services.content_link_registry import mark_component_links_deleted, sync_component_links
+from app.services.task_manager_service import assert_no_linked_tasks
 
 
 # ---------------------------------------------------------
@@ -2339,6 +2340,15 @@ def update_tab_content_v2(
 
         incoming_ids = set(incoming_widgets.keys())
 
+        # A Task Manager that still has tasks can't be deleted: refuse the
+        # whole save before any deletion step (SBN descendants included).
+        removed_component_ids: list[int] = []
+        for existing_id, component in existing_components.items():
+            if existing_id not in incoming_ids:
+                removed_component_ids.append(component.id)
+                removed_component_ids.extend(_collect_sbn_descendant_ids(db, component.id))
+        assert_no_linked_tasks(db, removed_component_ids)
+
         # Delete components removed from the canvas. A removed component may
         # be a Super Block Note's top-level widget, in which case its whole
         # descendant tree (`super_blocknote_id` chain) must go first — those
@@ -3667,6 +3677,12 @@ def delete_tab_subtree_by_document_id_v2(
             edit_lock_service.refuse_if_subtree_held(
                 db, edit_lock_service.resolve_lock_node(gridstack), session.holder
             )
+
+        # Checked up front over the whole subtree, variants included: the
+        # variant deletions below commit on their own.
+        assert_no_linked_tasks(
+            db, _component_ids_for_gridstack_tree(db, gridstack, include_variants=True)
+        )
 
         deleted_tabs: list[dict[str, Any]] = []
         deleted_component_ids: list[int] = []

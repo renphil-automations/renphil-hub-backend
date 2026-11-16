@@ -19,6 +19,7 @@ from app.schemas.tab import (
     UnlockTabRequest,
 )
 from app.services.edit_lock_service import EditSessionError, LockConflictError
+from app.services.task_manager_service import TaskManagerHasTasksError
 from app.services.tab_service import (
     create_tab,
     filter_widget_content_for_user,
@@ -129,6 +130,12 @@ def value_error_to_http_exception(error: ValueError) -> HTTPException:
                     for b in error.blocking
                 ],
             },
+        )
+
+    if isinstance(error, TaskManagerHasTasksError):
+        return HTTPException(
+            status_code=409,
+            detail={"code": error.code, "message": str(error), "component_ids": error.component_ids},
         )
 
     message = str(error)

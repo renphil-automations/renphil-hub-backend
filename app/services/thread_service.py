@@ -80,7 +80,7 @@ from sqlalchemy import and_, case, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
-from app.db_v2.models.notification import NotificationV2
+from app.db_v2.models.notification import NOTIFICATION_CATEGORY_THREADS, NotificationV2
 from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.thread import (
     THREAD_WIDGET_TYPE,
@@ -439,7 +439,7 @@ def _can_see_thread_revisions(
 
 def derive_mention_token(name: str) -> str:
     """plan §5.5: the person's name with everything that isn't a Unicode
-    letter or digit removed — `Roy Abdelnour` -> `RoyAbdelnour`. Keeps
+    letter or digit removed — `John Doe` -> `JohnDoe`. Keeps
     accented letters as-is (no transliteration); drops apostrophes, hyphens,
     periods and spaces, which is what makes the result a single "word" the
     caret regex (frontend) and the word-boundary check (`_token_occurs_in_content`
@@ -453,7 +453,7 @@ def _token_occurs_in_content(content: str, token: str) -> bool:
     """plan §5.3 check 2 — "the token ... occurs in content, as `@<token>`
     at a word boundary." The trailing negative lookahead is the boundary:
     without it, a token that is a PREFIX of a longer run of letters/digits
-    (`@RoyAbdelnour` inside `@RoyAbdelnourite`) would count as a match.
+    (`@JohnDoe` inside `@JohnDoite`) would count as a match.
     `\\w` under Python's default Unicode `re` matches non-ASCII letters
     too, so this holds for the 3 of 148 eligible names with accented
     characters (plan D13's own note) without any extra handling."""
@@ -846,6 +846,7 @@ def _notify_mentions(
             NotificationV2(
                 recipient_email=recipient,
                 type=NOTIFICATION_TYPE_MENTION,
+                category=NOTIFICATION_CATEGORY_THREADS,
                 actor_email=actor_email,
                 actor_name=actor.name,
                 component_id=component_id,
@@ -900,6 +901,7 @@ def _notify_new_thread_comment(
         NotificationV2(
             recipient_email=thread_author,
             type=NOTIFICATION_TYPE_THREAD_COMMENT,
+            category=NOTIFICATION_CATEGORY_THREADS,
             actor_email=actor_email,
             actor_name=actor.name,
             component_id=component_id,
@@ -947,6 +949,7 @@ def _notify_thread_decision(
         NotificationV2(
             recipient_email=recipient,
             type=NOTIFICATION_TYPE_THREAD_APPROVED if approved else NOTIFICATION_TYPE_THREAD_REJECTED,
+            category=NOTIFICATION_CATEGORY_THREADS,
             actor_email=reviewer_email,
             actor_name=reviewer.name,
             component_id=component_id,
@@ -995,6 +998,7 @@ def _notify_thread_edit_decision(
         NotificationV2(
             recipient_email=recipient,
             type=NOTIFICATION_TYPE_THREAD_EDIT_APPROVED if approved else NOTIFICATION_TYPE_THREAD_EDIT_REJECTED,
+            category=NOTIFICATION_CATEGORY_THREADS,
             actor_email=reviewer_email,
             actor_name=reviewer.name,
             component_id=component_id,
@@ -1070,6 +1074,7 @@ def _to_notification_entry(
     return NotificationEntry(
         id=notification.id,
         type=notification.type,
+        category=notification.category,
         actor_email=notification.actor_email,
         actor_name=notification.actor_name,
         thread_id=notification.thread_id,
@@ -1642,8 +1647,8 @@ def list_threads_for_link(
     anonymous: bool = False,
 ) -> ThreadListResponse:
     """`user` is whose own pending/rejected threads, votes and authored
-    revisions show up — the caller normally, the selected user under
-    nobody (`None`) for `anonymous` or `view_as_user`, which therefore list
+    revisions show up — the caller, with or without View As pairs or a
+    selected user, or nobody (`None`) for `anonymous`, which therefore lists
     approved threads only with `my_vote` 0 (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
@@ -1790,8 +1795,8 @@ def get_thread_by_id(
     access to the widget at all keeps getting 403, never 404.
 
     `user` is whose authorship, vote and authored revisions count — the
-    caller normally (View As pairs included), and nobody (`None`) for
-    `anonymous` or `view_as_user`."""
+    caller, with or without View As pairs or a selected user, and nobody
+    (`None`) for `anonymous`."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
     # access to the widget at all must keep getting the existing 403, never
@@ -2644,7 +2649,7 @@ def moderation_summary(
 
     `view_as=True` means `access` was built from the View As parameters
     (`dependencies.get_view_as_access`): its only direct grants are the
-    caller's own, with pairs only and without `anonymous`. `view_as` and
+    caller's own, unless `anonymous`. `view_as` and
     `view_as_user` are echoed in the body and suffix the ETag
     (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
