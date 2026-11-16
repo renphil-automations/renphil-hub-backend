@@ -5,13 +5,16 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import undefer
 
 from app.db_v2.models.hub_feedback import BotFeedbackV2
 from app.models.airtable import FeedbackCreate, FeedbackRecord
+from app.services.feedback_status_service import status_fields, status_ready
 
 
-def as_record(row: BotFeedbackV2) -> FeedbackRecord:
-    return FeedbackRecord.model_validate({"id": row.public_id, "Id": row.id,
+def as_record(row: BotFeedbackV2, status_available: bool = False) -> FeedbackRecord:
+    extra = status_fields(row, True) if status_available else {}
+    return FeedbackRecord.model_validate({**extra, "id": row.public_id, "Id": row.id,
         "From": row.actor_email, "Message": row.message, "Date & Time": row.created_at.isoformat(),
         "Source": "Bot", "Impression": row.impression, "Message ID": row.message_id,
         "Query": row.query, "Response": row.response, "environment": row.environment})
@@ -43,7 +46,18 @@ def create_bot_feedback(db, payload: FeedbackCreate, *, user_id: int, email: str
 
 
 def list_bot_feedback(db, *, environment: str | None, limit: int = 500) -> list[FeedbackRecord]:
+    available = status_ready(db, "bot_feedback")
     statement = select(BotFeedbackV2)
+    if available:
+        statement = statement.options(undefer(BotFeedbackV2.status), undefer(BotFeedbackV2.status_updated_at))
     if environment:
         statement = statement.where(BotFeedbackV2.environment == environment)
-    return [as_record(row) for row in db.scalars(statement.order_by(BotFeedbackV2.created_at.desc(), BotFeedbackV2.id.desc()).limit(min(max(limit, 1), 500))) ]
+    return [as_record(row, available) for row in db.scalars(statement.order_by(BotFeedbackV2.created_at.desc(), BotFeedbackV2.id.desc()).limit(min(max(limit, 1), 500))) ]
+
+
+def find_bot_feedback(db, *, environment: str, public_id: str) -> BotFeedbackV2 | None:
+    available = status_ready(db, "bot_feedback")
+    statement = select(BotFeedbackV2).where(BotFeedbackV2.environment == environment, BotFeedbackV2.public_id == public_id)
+    if available:
+        statement = statement.options(undefer(BotFeedbackV2.status), undefer(BotFeedbackV2.status_updated_at))
+    return db.scalar(statement)

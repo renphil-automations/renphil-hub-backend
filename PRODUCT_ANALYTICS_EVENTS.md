@@ -204,3 +204,14 @@ reveal any data. A future server-issued View As session/token would be needed
 to make anonymous mode cryptographically non-bypassable. This limitation must
 remain in the PR description and release notes until that broader View As
 design is introduced.
+
+## The Hub Analytics page (what people see and how filters behave)
+
+- **Access** is unchanged: All Scopes admins see Hub-wide activity; editors see activity on resources they currently edit. Feedback is no longer part of this page; it lives in the **Feedbacks** navigation item.
+- **Filters apply as you type.** Date, component, action and trigger changes apply after a short pause (about 0.15 s); typing in the person or page fields applies after about 0.4 s. The Apply button still works. The numbers already on screen stay visible while new ones load; Refresh sits at the right and says "Refreshing…".
+- **Page filter.** Pages are stored by route *pattern*, never by title (a page titled "Home" under the Dashboard is stored as `/dashboard/:tab`). The Page field is a picker of the pages that really have activity, with a friendly name, an event count and example page names; people can also type where an address starts (`/admin`). Typing a page path is understood: `/dashboard/home` is read as `/dashboard/:tab`, `/finance/q3` as `/:nav_tab/:tab`, and `Dashboard/Home/` works the same. Because titles are not stored, a pattern includes every page in its group, and the page says so. When nothing matches, it says so and offers pages that do have activity. Odd input (for example `%`) stays literal and never widens the filter. The server is the authority (`normalize_route_filter`).
+- **Active time** is how long a page was open and in use, not how many visits it had. A **visit** is a recorded page opening, including automatic selections.
+- **Page insights** (per page) lists each person with their visits, active time and last visit, most recent first, plus the time by tab and the interactions on that page. A person with foreground time but no recorded opening shows "-" for visits instead of an invented number.
+- **Time zone**: every time on the page is shown in the viewer's time zone and the page states which ("Times are shown in Asia/Beirut (UTC+2)"). Day buckets in charts are UTC and say so.
+- **Excel export**: "Include emails in Excel export" only adds people's emails and what each person used (Top people and Visited by person sheets). It never changes what the page shows. Names are not included by default.
+- The deployment environment name is not shown to people; the environment filter and badge appear only on a local development stack.

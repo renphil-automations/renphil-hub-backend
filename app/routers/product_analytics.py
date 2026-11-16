@@ -14,7 +14,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -547,6 +547,18 @@ def _page_insights_error(status_code: int, detail: str) -> HTTPException:
 _PAGE_SELECTION_EVENTS = frozenset({"root_tab.selected", "view_tab.selected", "sub_tab.selected"})
 
 
+def _as_utc(value: Any) -> datetime | None:
+    """A timezone-aware UTC datetime from a datetime or ISO string, else None."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 class _PageScope(NamedTuple):
     page: dict[str, Any]
     # (TabV2 id, document id, display name): the page first, then on a root
@@ -777,9 +789,27 @@ def get_page_insights(
             and row.get("target_id") in scope.page_ids and row.get("actor_email")
         )
         people_time: Counter[str] = Counter()
+        latest_activity: dict[str, datetime] = {}
+        last_visit: dict[str, datetime] = {}  # page openings only, never foreground time
+
+        def note_activity(person: str, value: Any) -> None:
+            stamp = _as_utc(value)
+            if stamp is not None and (person not in latest_activity or stamp > latest_activity[person]):
+                latest_activity[person] = stamp
+
+        # Latest activity is limited to the same two signals that list a person here:
+        # page-opening events and recorded foreground time. Other interactions never add people.
+        for row in rows:
+            if (row.get("event_name") in _PAGE_SELECTION_EVENTS and row.get("target_id") in scope.page_ids
+                    and row.get("actor_email")):
+                note_activity(row["actor_email"], row.get("received_at"))
+                opened_at = _as_utc(row.get("received_at"))
+                if opened_at is not None and (row["actor_email"] not in last_visit or opened_at > last_visit[row["actor_email"]]):
+                    last_visit[row["actor_email"]] = opened_at
         for group in filter_editable_engagements(db, service.engagement_people_for_tabs(db, filters, scope.page_ids), access=reader.access):
             if group.get("actor_email"):
                 people_time[group["actor_email"]] += group["active_seconds"]
+                note_activity(group["actor_email"], group.get("last_activity_at"))
         people = set(page_openers) | set(people_time)
         return {
             "page": scope.page,
@@ -790,7 +820,18 @@ def get_page_insights(
                 {"id": document_id, "name": name, "active_seconds": seconds_by_tab.get(document_id, 0)}
                 for _, document_id, name in scope.tabs
             ],
-            "page_openers": [{"person": person, "openings": page_openers[person], "active_seconds": people_time[person]} for person in sorted(people)],
+            # Most recently active first; people with no recorded timestamp last.
+            "page_openers": [
+                {
+                    "person": person, "openings": page_openers[person], "active_seconds": people_time[person],
+                    "last_activity_at": latest_activity[person].isoformat() if person in latest_activity else None,
+                    "last_visit_at": last_visit[person].isoformat() if person in last_visit else None,
+                }
+                for person in sorted(
+                    people,
+                    key=lambda person: (person not in latest_activity, -latest_activity[person].timestamp() if person in latest_activity else 0.0, person),
+                )
+            ],
             "clicks": {
                 "total": clicks["totals"]["events"],
                 "clicks": triggers.get("click", 0),

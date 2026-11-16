@@ -9,13 +9,14 @@ from uuid import uuid4
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, undefer
 
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.gridstack import GridstackV2
 from app.db_v2.models.hub_feedback import HubFeedbackV2
 from app.db_v2.models.tab import TabV2
 from app.schemas.hub_feedback import HubFeedbackCreate
+from app.services.feedback_status_service import status_fields, status_ready
 from app.services.access_visibility_service import ViewerAccess, build_node_tree, resolve_gridstack_node
 
 
@@ -55,6 +56,7 @@ class FeedbackResources:
     """
     def __init__(self, db: Session, access: ViewerAccess):
         self.access = access
+        self.status_ready = status_ready(db, "hub_feedback")
         self.tree = access.visibility.tree if access.visibility is not None else build_node_tree(db)
         self.pages: dict[str, Target] = {}
         self.components: dict[str, Target] = {}
@@ -109,6 +111,7 @@ class FeedbackResources:
             "id": row.public_id, "scope": row.scope, "message": row.message,
             "from_email": row.actor_email, "environment": row.environment,
             "created_at": row.created_at.isoformat(),
+            **status_fields(row, self.status_ready),
             "page_id": row.page_id if row.scope != "hub" and (self.access.full_access or self.allowed(page)) else None,
             "component_link": row.component_link,
             "page_name": page.label if self.allowed(page) else None,
@@ -157,7 +160,7 @@ def create_feedback(db: Session, payload: HubFeedbackCreate, *, user_id: int, em
 def list_feedback(db: Session, *, resources: FeedbackResources, environment: str | None,
                   scope: str | None = None, page_id: str | None = None,
                   component_link: str | None = None, limit: int = 25, offset: int = 0,
-                  public_id: str | None = None) -> tuple[list[dict], int]:
+                  public_id: str | None = None, status: str | None = None) -> tuple[list[dict], int]:
     # A component can move while its feedback keeps the original binding.
     # Do not let a reader who edits that component probe its hidden old page
     # by filtering on candidate ids, even though the serialized id is redacted.
@@ -170,6 +173,23 @@ def list_feedback(db: Session, *, resources: FeedbackResources, environment: str
                           (HubFeedbackV2.component_link, component_link), (HubFeedbackV2.public_id, public_id)):
         if value is not None:
             conditions.append(column == value)
+    if status is not None:
+        if resources.status_ready:
+            conditions.append(HubFeedbackV2.status == status)
+        elif status == "resolved":  # nothing can be resolved before the status columns exist
+            return [], 0
     total = db.scalar(select(func.count()).select_from(HubFeedbackV2).where(*conditions)) or 0
-    rows = db.scalars(select(HubFeedbackV2).where(*conditions).order_by(HubFeedbackV2.created_at.desc(), HubFeedbackV2.id.desc()).offset(offset).limit(limit)).all()
+    query = select(HubFeedbackV2).where(*conditions).order_by(HubFeedbackV2.created_at.desc(), HubFeedbackV2.id.desc()).offset(offset).limit(limit)
+    if resources.status_ready:
+        query = query.options(undefer(HubFeedbackV2.status), undefer(HubFeedbackV2.status_updated_at))
+    rows = db.scalars(query).all()
     return [resources.serialize(row) for row in rows], total
+
+
+def find_visible(db: Session, *, resources: FeedbackResources, environment: str, public_id: str) -> HubFeedbackV2 | None:
+    """One feedback row, only if this reader may currently read it (same rule and environment as the list)."""
+    query = select(HubFeedbackV2).where(
+        resources.read_predicate(), HubFeedbackV2.environment == environment, HubFeedbackV2.public_id == public_id)
+    if resources.status_ready:
+        query = query.options(undefer(HubFeedbackV2.status), undefer(HubFeedbackV2.status_updated_at))
+    return db.scalar(query)

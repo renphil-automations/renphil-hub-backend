@@ -1960,6 +1960,9 @@ class FeedbackRecord(_TypedAirtableRecord):
     query: str | None = Field(default=None, alias="Query")
     response: str | None = Field(default=None, alias="Response")
     environment: str | None = None
+    # Resolved / Unresolved; absent until the status columns exist.
+    status: str | None = None
+    status_updated_at: str | None = None
 
 
 # ── Access Control ────────────────────────────────────────────────────

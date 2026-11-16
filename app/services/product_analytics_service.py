@@ -126,6 +126,10 @@ _STATIC_SECTIONS: dict[str, frozenset[str]] = {
     "workflows": frozenset(),
     "knowledge": frozenset(),
     "my-access": frozenset(),
+    # Fixed application surfaces (not user-authored slugs). Without these their own
+    # activity would be stored as a generic Hub page (/:nav_tab).
+    "hub-analytics": frozenset(),
+    "feedbacks": frozenset(),
     "admin": frozenset({"llm", "bot-management", "access-control", "roles-and-scopes"}),
     "threads": frozenset({"management", "revisions"}),
     # The built-in Dashboard nav tab; anything below it is a title slug,
@@ -137,6 +141,7 @@ _STATIC_THIRD: dict[tuple[str, str], frozenset[str]] = {
     ("dashboard", "announcements"): frozenset({"new"}),
 }
 MAX_ROUTE_SEGMENTS = 8
+_SLUG_SEGMENT = re.compile(r"[a-z0-9][a-z0-9_.\-]*")
 
 
 def route_template(value: Any) -> str | None:
@@ -173,6 +178,58 @@ def route_template(value: Any) -> str | None:
         return "/" + "/".join(out)
     # Any other first segment is a nav tab's title slug.
     return "/" + "/".join([":nav_tab"] + [":tab"] * (len(segments) - 1))
+
+
+def normalize_route_filter(value: Any) -> str:
+    """What a person typed in "Page route starts with", in the form stored routes use.
+
+    Stored routes are lower-case TEMPLATES (``/:nav_tab/:tab``). Typing is forgiving: case,
+    a missing leading slash, a trailing slash, a pasted full URL, a query string or fragment
+    are all accepted. A path under a Hub page title (``/finance/q3``) is turned into its
+    template (``/:nav_tab/:tab``), because titles are never stored. A built-in section, or a
+    partly typed one (``/adm``), is kept as typed so prefix matching still narrows as you type.
+    """
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip()
+    if "://" in raw:
+        raw = "/" + raw.split("://", 1)[1].partition("/")[2]
+    raw = raw.split("?", 1)[0].split("#", 1)[0].strip().lower()
+    if not raw:
+        return ""
+    segments = [segment for segment in raw.replace("\\", "/").split("/") if segment][:MAX_ROUTE_SEGMENTS]
+    if not segments:
+        return "/"
+    first = segments[0]
+    # Below the Dashboard every segment is a page title, which is never stored: /dashboard/home is
+    # stored as /dashboard/:tab. ("announcements" and a partly typed "ann..." keep matching as typed.)
+    if (
+        first == "dashboard"
+        and len(segments) > 1
+        and not any(segment.startswith(":") for segment in segments)
+        and not "announcements".startswith(segments[1])
+        and all(_SLUG_SEGMENT.fullmatch(segment) for segment in segments[1:])
+    ):
+        return "/dashboard/" + "/".join([":tab"] * (len(segments) - 1))
+    keeps_as_typed = (
+        any(segment.startswith(":") for segment in segments)
+        or first in _STATIC_SECTIONS
+        or (len(segments) == 1 and any(section.startswith(first) for section in _STATIC_SECTIONS))
+    )
+    # Only real-looking page slugs become a template; anything else (``%``, ``a b``, ``<x>``) stays
+    # literal text, so odd input never silently widens the filter.
+    if keeps_as_typed or not all(_SLUG_SEGMENT.fullmatch(segment) for segment in segments):
+        return "/" + "/".join(segments)
+    return "/" + "/".join([":nav_tab"] + [":tab"] * (len(segments) - 1))
+
+
+def route_filter_clause(column: Any, value: Any):
+    """A case-insensitive prefix clause for a route column, or None when no route was typed."""
+    route = normalize_route_filter(value)
+    if not route:
+        return None
+    escaped = route.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return func.lower(column).like(f"{escaped}%", escape="\\")
 
 
 def sanitize_id(value: Any) -> str | None:
@@ -494,11 +551,10 @@ def _apply_filters(statement, filters: EventFilters):
         normalized = (value or "").strip().lower()
         if normalized:
             statement = statement.where(func.lower(column) == normalized)
-    route = (filters.page_route or "").strip()
-    if route:
-        # Prefix match so `/admin` covers every admin page beneath it.
-        escaped = route.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        statement = statement.where(model.page_route.like(f"{escaped}%", escape="\\"))
+    # Prefix match so `/admin` covers every admin page beneath it.
+    clause = route_filter_clause(model.page_route, filters.page_route)
+    if clause is not None:
+        statement = statement.where(clause)
     return statement
 
 
@@ -641,10 +697,9 @@ def _engagement_statement(filters: EventFilters):
         normalized = (value or "").strip().lower()
         if normalized:
             statement = statement.where(func.lower(column) == normalized)
-    route = (filters.page_route or "").strip()
-    if route:
-        escaped = route.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        statement = statement.where(model.page_route.like(f"{escaped}%", escape="\\"))
+    clause = route_filter_clause(model.page_route, filters.page_route)
+    if clause is not None:
+        statement = statement.where(clause)
     return statement
 
 
@@ -741,7 +796,12 @@ def engagement_people_for_tabs(db: Session, filters: EventFilters, tab_ids: set[
     model = HubProductEngagementV2
     statement = (
         _engagement_statement(filters).where(model.tab_id.in_(tab_ids))
-        .with_only_columns(model.nav_tab_id, model.tab_id, model.actor_email, func.coalesce(func.sum(model.active_seconds), 0))
+        .with_only_columns(
+            model.nav_tab_id, model.tab_id, model.actor_email,
+            func.coalesce(func.sum(model.active_seconds), 0),
+            # Server receipt time, not the browser's clock, so latest activity cannot be skewed.
+            func.max(model.received_at),
+        )
         .group_by(model.nav_tab_id, model.tab_id, model.actor_email)
         .limit(MAX_ENGAGEMENT_GROUPS + 1)
     )
@@ -754,7 +814,10 @@ def engagement_people_for_tabs(db: Session, filters: EventFilters, tab_ids: set[
         return []
     if len(rows) > MAX_ENGAGEMENT_GROUPS:
         raise AnalyticsScopeTooBroad()
-    return [{"nav_tab_id": nav, "tab_id": tab, "actor_email": actor, "active_seconds": int(seconds)} for nav, tab, actor, seconds in rows]
+    return [
+        {"nav_tab_id": nav, "tab_id": tab, "actor_email": actor, "active_seconds": int(seconds), "last_activity_at": last}
+        for nav, tab, actor, seconds, last in rows
+    ]
 
 
 def summarize_engagement_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:

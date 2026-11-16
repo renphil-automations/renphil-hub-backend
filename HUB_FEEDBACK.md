@@ -8,12 +8,32 @@ This feature uses two independent tables: `hub_feedback` for Hub/page/component 
 - Hub's floating feedback form offers Hub-wide or current host-page feedback, defaulting to the current page when a valid binding exists. Built-in screens with no resource binding offer Hub-wide feedback. Component controls bind to the exact occurrence and its containing page; mirror occurrences remain separate from originals.
 - Component controls appear on hover or keyboard focus in view mode and permanently in Edit Mode. Touch devices show the control without hover. Restricted placeholders and unsaved/v1 components do not get a control.
 - Editors can read global Hub feedback and feedback on resources they can currently edit. They can see the submitter's email, as explicitly approved. All Scopes admins see all Hub feedback. A viewer with no edit grants cannot read lists or details.
-- Bot feedback remains under Bot Management and requires its existing All Scopes admin gate. Hub feedback appears under Hub Analytics. Each reads its own table.
+- Hub feedback and Bot feedback are read in the **Feedbacks** navigation item (see below); they are no longer inside Hub Analytics or Bot Management. Bot feedback still requires the existing Admin + All Scopes gate. Each source reads its own table.
 - Feedback submission and reading are unavailable through View As parameters. The real authenticated user supplies identity; client email or role hints are not trusted. Like other View As requests, a caller deliberately stripping all markers is indistinguishable from their normal authenticated session.
 - Global feedback can retain an opaque validated page identifier and a privacy-safe route template privately for diagnosis. The route is only a client-reported hint, sanitized again by the server; no full URL/query string/title slug is retained. Private context is not returned in ordinary submission, list, detail or export responses, even on the ordinary admin list. No diagnostic UI/API is included in this release.
 - Names are resolved from live records. Deletion does not cascade into feedback. Editors lose access to deleted scoped targets; admins see an unavailable target with no old name/link. A moved component keeps its original binding, but access follows current component permissions; inaccessible historical page context is withheld.
 - Sandbox and production are locked to `HUB_ENVIRONMENT` server-side. Local may compare environments. An unconfigured environment refuses new writes and reads rather than guessing.
 - Feedback is retained until a separate policy is agreed. Product-analytics retention does not purge these tables. No feedback purge job is enabled.
+
+## Feedbacks navigation
+
+- **Feedbacks** is its own item in the sidebar (route `/feedbacks`), under Analytics, with the same access behavior feedback had inside Hub Analytics. It has two sub-tabs: **Hub feedback** (everyone who may read Hub feedback) and **Bot feedback** (offered only after the server confirms Admin + All Scopes; dropped immediately if that is later refused). The old Feedback tab in Bot Management was removed so there is one place to read feedback; the negative-feedback chart in Bot Management > Analytics links to it.
+- A refusal from the server (`403`) on any call removes everything shown on the page and displays "Access denied". Nothing read earlier stays on screen. While a refresh is loading, the list already on screen stays visible and the button says "Refreshing…".
+- Times are shown in the viewer's time zone, and the page states it ("Times are shown in Asia/Beirut (UTC+2)"); each card's date carries a short zone label. The deployment environment name is not shown to people; it appears only on a local development stack.
+- Feedback cards show a tag for the kind (Hub, Page, Component, or the Like/Dislike rating for Bot), the message, the person's email with an initial, the date, and the status.
+
+## Status: Resolved / Unresolved
+
+Every feedback has a status. New and historical feedback are **Unresolved** until someone resolves it.
+
+- **Who can change it** is exactly who can read that feedback, rechecked on every request:
+  - Hub feedback: All Scopes admins (any feedback in the configured environment) and editors, but only for feedback they can currently see (Hub-wide feedback and feedback on pages/components they currently edit). Feedback outside that set returns `404`, indistinguishable from feedback that does not exist. A reader who lost edit access, or a viewer who can only submit, gets `403`.
+  - Bot feedback: Admin with All Scopes only (the Bot Management router gate).
+- **What is recorded**: `status` (`unresolved` or `resolved`, enforced by a check constraint), `status_updated_at` and `status_updated_by_user_id`. The caller is derived from the authenticated session; the request body accepts only `status`.
+- **Boundaries**: View As parameters are refused (`403`). Only feedback of the configured `HUB_ENVIRONMENT` can be changed, even when a local administrator is comparing environments. The message, person, rating, target and every other field cannot be edited through this endpoint.
+- **API**: `PATCH /v2/hub-feedback/{id}/status` and `PATCH /v2/bot-management/feedback/{id}/status` with `{"status": "resolved" | "unresolved"}`. `GET /v2/hub-feedback` accepts `status=resolved|unresolved`, and both list responses include `status` and `status_updated_at` per item and a top-level `status_available` flag.
+- **Schema (additive)**: run `python -m scripts.add_feedback_status_columns --expected-host <reviewed-host> --expected-database <reviewed-name>`. It adds three columns and a check constraint to each feedback table with `IF NOT EXISTS`, is safe to repeat, refuses any other host or database, and leaves every existing row Unresolved. The new columns are *deferred* in the ORM, so a database that has not run the script yet keeps recording and listing feedback exactly as before: `status_available` is `false`, the UI hides status controls and a status change returns `503`. Run the script before relying on the feature.
+- **UI**: a status tag on every card, a "Mark as resolved" / "Reopen" button (shown only when `status_available`), and a Status filter. Hub feedback filters on the server; Bot feedback filters in the browser over its loaded records. A change updates the card in place and the list stays on screen while saving.
 
 ## API and compatibility
 
@@ -34,6 +54,7 @@ This feature uses two independent tables: `hub_feedback` for Hub/page/component 
 5. Blank/unknown source records stop the import. Only after reviewing them, use `--missing-source hub` or `--missing-source bot` for blank sources, or explicitly `--skip-ambiguous`. Unknown environments can remain `unknown`; they are not automatically visible to sandbox/production readers.
 6. Add `--apply --expected-host <reviewed-endpoint> --expected-database <reviewed-name>` only after review of the preview and target. The configured target must match both flags. Unchanged `(environment, Airtable record id)` values are skipped. Changed source content or classification fails and rolls back the batch for reconciliation. Imports retain original timestamps and author email as historical source data; they do not provision or impersonate Hub users. Logs contain counts only.
 7. Coordinate the backend cutover with old instances: a snapshot taken before cutover can miss final Airtable submissions. After all old instances stop writing there, import a final delta snapshot through the same repeatable process. No dual-write or automatic Airtable deletion is performed.
+7a. Run `python -m scripts.add_feedback_status_columns --expected-host <reviewed-endpoint> --expected-database <reviewed-name>` after the tables exist (see Status). It is additive; take a backup first and keep the row counts it prints before and after.
 8. Deploy the matching frontend after backend/schema readiness. Recheck viewer submission, editor reads/revocation, admin Bot isolation, environment lock, View As, duplicates and inaccessible targets.
 9. Rollback must preserve both databases. Older application code will not display new Neon-only submissions; keep the data and plan reconciliation explicitly. Do not delete the new tables or silently copy private context back into legacy fields.
 
@@ -56,3 +77,5 @@ Omit `-ApprovedBlankSourceIsHub` unless every blank-source row in that particula
 ## Release status
 
 The Feedback work is based on the Analytics changes merged into sandbox. In the user-approved development database, the Feedback tables have been created and 24 historical Hub records and 21 Bot records were imported with the `sandbox` environment; the original Airtable data remains. This dev operation does not set up or migrate any deployment target. A fresh reviewed snapshot, final delta, verified target and cutover/rollback plan remain necessary for each deployment. The user reports that live permission revocation worked; this check has no separately captured result. Deployed-environment checks remain release gates. Do not include private snapshots or review documents in a PR.
+
+On 2026-11-16 the status columns were added to the user-approved development database (`renphil-hub-db`, sandbox). Row counts did not change (30 Hub, 22 Bot) and every existing feedback is Unresolved. No other database has been changed.

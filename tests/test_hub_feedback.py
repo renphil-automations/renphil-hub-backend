@@ -379,3 +379,96 @@ def test_component_label_uses_current_title_or_widget_type():
     assert component_label(SimpleNamespace(title=None, type="quick_actions")) == "Quick Actions"
     assert component_label(SimpleNamespace(title="  Custom  ", type="quick_actions")) == "Custom"
     assert component_label(SimpleNamespace(title=" ", type="unknown")) == "Untitled component"
+
+
+# ---- Resolved / Unresolved status -------------------------------------------------------------------------------
+def status_url(feedback_id):
+    return f"/v2/hub-feedback/{feedback_id}/status"
+
+
+def test_admin_can_resolve_and_reopen_hub_feedback_and_filter_by_status(hub):
+    first = hub.client.post("/v2/hub-feedback", json=payload()).json()
+    second = hub.client.post("/v2/hub-feedback", json=payload("page", page_id="page-a")).json()
+    assert first["status"] == "unresolved" and first["status_updated_at"] is None
+    listed = hub.client.get("/v2/hub-feedback").json()
+    assert listed["status_available"] is True and {row["status"] for row in listed["data"]} == {"unresolved"}
+    done = hub.client.patch(status_url(first["id"]), json={"status": "resolved"})
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "resolved" and done.json()["status_updated_at"]
+    assert hub.client.get("/v2/hub-feedback?status=resolved").json()["total"] == 1
+    assert hub.client.get("/v2/hub-feedback?status=unresolved").json()["data"][0]["id"] == second["id"]
+    with hub.sessions() as db:
+        saved = db.scalar(select(HubFeedbackV2).where(HubFeedbackV2.public_id == first["id"]))
+        assert saved.status_updated_by_user_id == 1          # the caller, derived on the server
+    assert hub.client.patch(status_url(first["id"]), json={"status": "unresolved"}).json()["status"] == "unresolved"
+    assert hub.client.get("/v2/hub-feedback?status=resolved").json()["total"] == 0
+
+
+def test_status_follows_the_same_access_as_reading_the_feedback(hub):
+    mine = hub.client.post("/v2/hub-feedback", json=payload("page", page_id="page-a")).json()
+    private = hub.client.post("/v2/hub-feedback", json=payload("page", page_id="page-b")).json()
+    overall = hub.client.post("/v2/hub-feedback", json=payload()).json()
+    as_editor(hub)                                            # edits page A only
+    assert hub.client.patch(status_url(mine["id"]), json={"status": "resolved"}).status_code == 200
+    assert hub.client.patch(status_url(overall["id"]), json={"status": "resolved"}).status_code == 200
+    # Feedback on a page this editor cannot edit is indistinguishable from feedback that does not exist.
+    assert hub.client.patch(status_url(private["id"]), json={"status": "resolved"}).status_code == 404
+    assert hub.client.patch(status_url(str(uuid4())), json={"status": "resolved"}).status_code == 404
+    as_editor(hub, level="view")                              # can send feedback, cannot read it, so cannot change it
+    assert hub.client.patch(status_url(mine["id"]), json={"status": "unresolved"}).status_code == 403
+    hub.seeds = []                                            # revoked
+    assert hub.client.patch(status_url(mine["id"]), json={"status": "unresolved"}).status_code == 403
+    hub.admin = True
+    assert hub.client.get("/v2/hub-feedback?status=resolved").json()["total"] == 2
+    assert hub.client.get(f"/v2/hub-feedback/{private['id']}").json()["status"] == "unresolved"
+
+
+@pytest.mark.parametrize("body", [{"status": "done"}, {}, {"status": "resolved", "message": "rewritten"}, {"status": "resolved", "actor_email": "x@y.z"}])
+def test_status_update_accepts_only_a_known_status_and_nothing_else(hub, body):
+    created = hub.client.post("/v2/hub-feedback", json=payload()).json()
+    assert hub.client.patch(status_url(created["id"]), json=body).status_code == 422
+    assert hub.client.get("/v2/hub-feedback").json()["data"][0]["status"] == "unresolved"
+
+
+def test_status_update_is_blocked_in_view_as_and_for_other_environments_and_bad_ids(hub):
+    created = hub.client.post("/v2/hub-feedback", json=payload()).json()
+    assert hub.client.patch(status_url(created["id"]) + "?view_as=role:scope", json={"status": "resolved"}).status_code == 403
+    assert hub.client.patch(status_url("not-a-uuid"), json={"status": "resolved"}).status_code == 404
+    hub.environment = "production"        # a different deployment cannot change sandbox feedback
+    assert hub.client.patch(status_url(created["id"]), json={"status": "resolved"}).status_code == 404
+    hub.environment = "local"             # not even a local admin who is comparing environments
+    assert hub.client.patch(status_url(created["id"]) + "?environment=sandbox", json={"status": "resolved"}).status_code == 404
+
+
+def test_feedback_still_works_and_status_is_unavailable_before_the_columns_exist(hub):
+    created = hub.client.post("/v2/hub-feedback", json=payload()).json()
+    with patch("app.services.hub_feedback_service.status_ready", lambda *_: False):
+        listed = hub.client.get("/v2/hub-feedback").json()
+        assert listed["status_available"] is False and listed["total"] == 1
+        assert hub.client.get("/v2/hub-feedback?status=resolved").json()["total"] == 0
+        assert hub.client.patch(status_url(created["id"]), json={"status": "resolved"}).status_code == 503
+    assert hub.client.get(status_url(created["id"]).removesuffix("/status")).json()["status"] == "unresolved"
+
+
+def test_bot_feedback_status_is_admin_only_and_changes_nothing_else(hub):
+    data = {"source": "Bot", "message": "Check this answer", "message_id": "m1", "impression": "Dislike", "query": "Q", "response": "A"}
+    created = hub.client.post("/data/feedbacks", json=data).json()
+    url = f"/v2/bot-management/feedback/{created['id']}/status"
+    listed = hub.client.get("/v2/bot-management/feedback").json()
+    assert listed["status_available"] is True and listed["data"][0]["status"] == "unresolved"
+    done = hub.client.patch(url, json={"status": "resolved"})
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "resolved" and done.json()["message"] == "Check this answer" and done.json()["impression"] == "Dislike"
+    assert hub.client.get("/v2/bot-management/feedback").json()["data"][0]["status"] == "resolved"
+    assert hub.client.patch(url, json={"status": "bogus"}).status_code == 422
+    assert hub.client.patch(url + "?view_as=role:scope", json={"status": "unresolved"}).status_code == 403
+    assert hub.client.patch(f"/v2/bot-management/feedback/{uuid4()}/status", json={"status": "resolved"}).status_code == 404
+    as_editor(hub)                                            # an editor is not a Bot Management admin
+    assert hub.client.patch(url, json={"status": "unresolved"}).status_code == 403
+    hub.admin = True
+    hub.environment = "production"
+    assert hub.client.patch(url, json={"status": "unresolved"}).status_code == 404
+    with patch("app.services.bot_feedback_service.status_ready", lambda *_: False), patch.object(bot_management, "status_ready", lambda *_: False):
+        hub.environment = "sandbox"
+        assert hub.client.get("/v2/bot-management/feedback").json()["status_available"] is False
+        assert hub.client.patch(url, json={"status": "unresolved"}).status_code == 503
