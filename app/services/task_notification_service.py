@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.db_v2.models.notification import NotificationV2
+from app.db_v2.models.notification import NOTIFICATION_CATEGORY_TASKS, NotificationV2
 from app.db_v2.models.task import TaskV2
 from app.db_v2.models.user import UserV2
 
@@ -89,6 +89,7 @@ class TaskNotifier:
                 NotificationV2(
                     recipient_email=recipient.email,
                     type=kind,
+                    category=NOTIFICATION_CATEGORY_TASKS,
                     actor_email=actor.email if actor is not None else None,
                     actor_name=self.actor_name,
                     component_id=task.component_id,

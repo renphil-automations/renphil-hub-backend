@@ -561,6 +561,9 @@ class NotificationEntry(BaseModel):
 
     id: int
     type: str
+    # 'threads' | 'tasks' | 'airtable_sync'; None on rows written before the
+    # column existed.
+    category: str | None = None
     actor_email: str | None
     actor_name: str | None
     thread_id: int | None

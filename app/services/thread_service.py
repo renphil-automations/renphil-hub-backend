@@ -80,7 +80,7 @@ from sqlalchemy import and_, case, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
-from app.db_v2.models.notification import NotificationV2
+from app.db_v2.models.notification import NOTIFICATION_CATEGORY_THREADS, NotificationV2
 from app.db_v2.models.page_content import PageContentV2
 from app.db_v2.models.thread import (
     THREAD_WIDGET_TYPE,
@@ -846,6 +846,7 @@ def _notify_mentions(
             NotificationV2(
                 recipient_email=recipient,
                 type=NOTIFICATION_TYPE_MENTION,
+                category=NOTIFICATION_CATEGORY_THREADS,
                 actor_email=actor_email,
                 actor_name=actor.name,
                 component_id=component_id,
@@ -900,6 +901,7 @@ def _notify_new_thread_comment(
         NotificationV2(
             recipient_email=thread_author,
             type=NOTIFICATION_TYPE_THREAD_COMMENT,
+            category=NOTIFICATION_CATEGORY_THREADS,
             actor_email=actor_email,
             actor_name=actor.name,
             component_id=component_id,
@@ -947,6 +949,7 @@ def _notify_thread_decision(
         NotificationV2(
             recipient_email=recipient,
             type=NOTIFICATION_TYPE_THREAD_APPROVED if approved else NOTIFICATION_TYPE_THREAD_REJECTED,
+            category=NOTIFICATION_CATEGORY_THREADS,
             actor_email=reviewer_email,
             actor_name=reviewer.name,
             component_id=component_id,
@@ -995,6 +998,7 @@ def _notify_thread_edit_decision(
         NotificationV2(
             recipient_email=recipient,
             type=NOTIFICATION_TYPE_THREAD_EDIT_APPROVED if approved else NOTIFICATION_TYPE_THREAD_EDIT_REJECTED,
+            category=NOTIFICATION_CATEGORY_THREADS,
             actor_email=reviewer_email,
             actor_name=reviewer.name,
             component_id=component_id,
@@ -1070,6 +1074,7 @@ def _to_notification_entry(
     return NotificationEntry(
         id=notification.id,
         type=notification.type,
+        category=notification.category,
         actor_email=notification.actor_email,
         actor_name=notification.actor_name,
         thread_id=notification.thread_id,
