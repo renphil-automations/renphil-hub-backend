@@ -578,6 +578,7 @@ class TaskNotificationTests(_DbTestCase):
         result = [(n.recipient_email.split("@")[0], n.type, n.excerpt) for n in rows]
         for n in rows:
             assert n.component_id == self.tm.id and n.thread_id is None
+            assert n.category == "tasks"
         if clear:
             self.db.query(NotificationV2).delete()
             self.db.commit()
