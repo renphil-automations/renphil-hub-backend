@@ -625,17 +625,8 @@ def resolve_view_as_access(
     closures: RbacClosures | None = None,
 ) -> ViewerAccess:
     """The ``ViewerAccess`` a holder of exactly these pairs would get, plus
-<<<<<<< Updated upstream
-    the grants shared DIRECTLY with ``user_id`` when given — only ever the
-    caller themselves, without ``anonymous`` (never a selected user).
-
-    Pairs are expanded ONE AT A TIME and unioned afterwards — the same
-    per-row rule ``effective_pairs`` applies to real assignments, so a role
-    from one pair is never combined with a scope from another.
-=======
     the grants shared DIRECTLY with ``user_id`` when given (see
     ``view_as_grants``).
->>>>>>> Stashed changes
 
     ``full_access`` follows ``any_pair_is_hub_admin``.
     """
