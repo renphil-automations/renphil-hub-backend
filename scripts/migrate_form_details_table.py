@@ -2,8 +2,8 @@
 
 Idempotent: creates the table if it doesn't exist, otherwise upgrades an
 existing one (adds missing columns and the ``component_id`` uniqueness, and
-drops the retired webhook columns/index if they're still there). Safe to
-re-run.
+drops the retired webhook / embed-spec columns and index if they're still
+there). Safe to re-run.
 
     python -m scripts.migrate_form_details_table
 """
@@ -17,17 +17,14 @@ from app.db_v2.models.component import ComponentV2  # noqa: F401  (FK target)
 from app.db_v2.models.form_details import FormDetailsV2
 
 UPGRADE_STATEMENTS = [
-    "ALTER TABLE public.form_details ADD COLUMN IF NOT EXISTS embed_url TEXT",
     "ALTER TABLE public.form_details ADD COLUMN IF NOT EXISTS pat TEXT",
-    "ALTER TABLE public.form_details ADD COLUMN IF NOT EXISTS requires_authentication BOOLEAN NOT NULL DEFAULT false",
-    "ALTER TABLE public.form_details ADD COLUMN IF NOT EXISTS authentication_type VARCHAR",
+    "ALTER TABLE public.form_details ADD COLUMN IF NOT EXISTS hide_back_button BOOLEAN DEFAULT false",
     "ALTER TABLE public.form_details ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()",
     "UPDATE public.form_details SET created_at = now() WHERE created_at IS NULL",
     "ALTER TABLE public.form_details ALTER COLUMN created_at SET DEFAULT now()",
     "ALTER TABLE public.form_details ALTER COLUMN created_at SET NOT NULL",
     # Fail (and roll the whole upgrade back) if a pre-existing row has no
-    # embed_url / pat — fill those in first.
-    "ALTER TABLE public.form_details ALTER COLUMN embed_url SET NOT NULL",
+    # pat — fill those in first.
     "ALTER TABLE public.form_details ALTER COLUMN pat SET NOT NULL",
     """
     DO $$
@@ -40,7 +37,7 @@ UPGRADE_STATEMENTS = [
               AND i.indisunique AND i.indnatts = 1 AND a.attname = 'component_id'
         ) THEN
             ALTER TABLE public.form_details
-                ADD CONSTRAINT form_details_component_id_key UNIQUE (component_id);
+                ADD CONSTRAINT unique_component_id_constraint UNIQUE (component_id);
         END IF;
     END $$;
     """,
@@ -50,6 +47,11 @@ UPGRADE_STATEMENTS = [
     "ALTER TABLE public.form_details DROP COLUMN IF EXISTS webhook_url",
     "ALTER TABLE public.form_details DROP COLUMN IF EXISTS webhook_token_hash",
     "ALTER TABLE public.form_details DROP COLUMN IF EXISTS webhook_token_updated_at",
+    # Retired: the embed URL and authentication settings are fetched from
+    # the form builder on every load instead of being stored.
+    "ALTER TABLE public.form_details DROP COLUMN IF EXISTS embed_url",
+    "ALTER TABLE public.form_details DROP COLUMN IF EXISTS requires_authentication",
+    "ALTER TABLE public.form_details DROP COLUMN IF EXISTS authentication_type",
 ]
 
 

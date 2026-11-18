@@ -1212,8 +1212,11 @@ class ThreadListViewAsTests(_ThreadsFixture):
         return {item["title"]: item["my_vote"] for item in body["items"]}, body
 
     def test_regular_flow_is_the_callers(self) -> None:
+        # 2026-11-13: approved threads only; Alice's own pending thread is
+        # counted (`pending_count`) instead of listed.
         items, body = self._list()
-        self.assertEqual(items, {"approved": -1, "alice-pending": 0})
+        self.assertEqual(items, {"approved": -1})
+        self.assertEqual(body["pending_count"], 1)
         self.assertEqual((body["view_as"], body["view_as_user"]), (False, None))
 
     def test_view_as_user_marks_nothing_as_theirs(self) -> None:
@@ -1230,11 +1233,13 @@ class ThreadListViewAsTests(_ThreadsFixture):
 
     def test_pairs_only_view_keeps_the_callers_own_threads_and_votes(self) -> None:
         items, body = self._list({"view_as": "member:progA"})
-        self.assertEqual(items, {"approved": -1, "alice-pending": 0})
+        self.assertEqual(items, {"approved": -1})
+        self.assertEqual(body["pending_count"], 1)
         self.assertEqual((body["view_as"], body["view_as_user"]), (True, None))
 
         items, body = self._list({"view_as": "member:progA", "anonymous": "true"})
         self.assertEqual(items, {"approved": 0})
+        self.assertEqual(body["pending_count"], 0)
         self.assertEqual((body["view_as"], body["view_as_user"]), (True, None))
 
     def test_anonymous_with_view_as_user_is_refused(self) -> None:

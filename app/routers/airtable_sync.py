@@ -140,20 +140,20 @@ def update_sync_settings(
 @router.get(
     "/notification-preference",
     response_model=NotificationPreferenceAPIResponse,
-    summary="Get whether the caller receives run notifications",
+    summary="Get which run notifications the caller receives",
     responses=FORBIDDEN_RESPONSE,
 )
 def get_notification_preference(
     db: Session = Depends(get_db_v2),
     current: CurrentHubUser = Depends(get_current_hub_user),
 ):
-    return {"data": {"enabled": settings_service.get_notifications_enabled(db, current.hub_user_id)}}
+    return {"data": {"mode": settings_service.get_notifications_mode(db, current.hub_user_id)}}
 
 
 @router.put(
     "/notification-preference",
     response_model=NotificationPreferenceAPIResponse,
-    summary="Set whether the caller receives run notifications",
+    summary="Set which run notifications the caller receives",
     responses=FORBIDDEN_RESPONSE,
 )
 def update_notification_preference(
@@ -161,9 +161,9 @@ def update_notification_preference(
     db: Session = Depends(get_db_v2),
     current: CurrentHubUser = Depends(get_current_hub_user),
 ):
-    enabled = settings_service.set_notifications_enabled(db, current.hub_user_id, request.enabled)
+    mode = settings_service.set_notifications_mode(db, current.hub_user_id, request.mode)
     db.commit()
-    return {"data": {"enabled": enabled}}
+    return {"data": {"mode": mode}}
 
 
 # ---------------------------------------------------------
