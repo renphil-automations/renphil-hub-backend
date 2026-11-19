@@ -32,7 +32,8 @@ from app.dependencies import (
     get_current_hub_user,
 )
 from app.config import get_settings as get_app_settings
-from app.services.bot_feedback_service import list_bot_feedback
+from app.services.bot_feedback_service import as_record, find_bot_feedback, list_bot_feedback
+from app.services.feedback_status_service import FeedbackStatusUnavailable, set_status, status_ready
 from app.models.auth import UserInfo
 from app.services.rbac_graph_service import effective_pairs, hub_admin_target_ids
 
@@ -829,7 +830,45 @@ def list_feedback_for_bot_management(
     if any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
         raise HTTPException(403, "Exit View As to read feedback.", headers={"Cache-Control": "no-store", "Vary": "Authorization"})
     response.headers.update({"Cache-Control": "no-store", "Vary": "Authorization"})
-    return {"data": [record.model_dump(by_alias=False) for record in _bot_feedback_records(db, limit=limit)]}
+    return {"data": [record.model_dump(by_alias=False) for record in _bot_feedback_records(db, limit=limit)],
+            "status_available": status_ready(db, "bot_feedback")}
+
+
+class BotFeedbackStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["unresolved", "resolved"]
+
+
+@router.patch("/feedback/{feedback_id}/status")
+def update_bot_feedback_status(
+    feedback_id: str,
+    payload: BotFeedbackStatusUpdate,
+    request: Request,
+    response: Response,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Resolve or reopen one Bot feedback. Same people as reading it (Admin with All Scopes, enforced by the router)."""
+    headers = {"Cache-Control": "no-store", "Vary": "Authorization"}
+    if any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+        raise HTTPException(403, "Exit View As to change feedback.", headers=headers)
+    response.headers.update(headers)
+    environment = get_app_settings().hub_environment
+    if environment == "unconfigured":
+        raise HTTPException(503, "Feedback environment is not configured.")
+    try:
+        row = find_bot_feedback(db, environment=environment, public_id=feedback_id)
+        if row is None:
+            raise HTTPException(404, "Feedback is unavailable.")
+        try:
+            set_status(db, row, payload.status, user_id=current.hub_user_id, ready=status_ready(db, "bot_feedback"))
+        except FeedbackStatusUnavailable:
+            raise HTTPException(503, "Feedback status is not available yet.") from None
+        return as_record(row, True).model_dump(by_alias=False)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning("Bot feedback status unavailable: %s", type(exc).__name__)
+        raise HTTPException(503, "Bot feedback is temporarily unavailable.") from None
 
 
 @router.get("/analytics/summary")

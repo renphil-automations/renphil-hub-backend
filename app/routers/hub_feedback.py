@@ -7,7 +7,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 from uuid import uuid4
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -17,6 +17,7 @@ from app.dependencies import CurrentHubUser, get_current_hub_user
 from app.schemas.hub_feedback import HubFeedbackCreate
 from app.routers.product_analytics import _viewer_access, read_bounded_body
 from app.services import hub_feedback_service as service
+from app.services.feedback_status_service import FeedbackStatusUnavailable, set_status
 from app.services.rate_limit_service import get_rate_limit_service
 from app.models.airtable import FeedbackCreate, FeedbackRecord
 from app.services.bot_feedback_service import create_bot_feedback
@@ -46,7 +47,7 @@ class FeedbackRoute(APIRoute):
                 markers = ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")
                 if any(request.query_params.get(key) for key in markers):
                     raise HTTPException(403, "Exit View As to use feedback.")
-                if request.method == "POST":
+                if request.method in {"POST", "PATCH"}:
                     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/json":
                         raise HTTPException(415, "Feedback requires JSON.")
                     request._body = await _feedback_body(request, limit=16 * 1024)
@@ -147,16 +148,21 @@ async def submit(payload: HubFeedbackCreate, response: Response,
     return result
 
 
+def _require_reader(resources) -> None:
+    if not resources.access.full_access and not (
+        resources.access.visibility is not None and resources.access.visibility.granted_edit
+    ):
+        raise HTTPException(403, "Feedback requires current edit access.")
+
+
 def _read(current, environment, **filters):
     with SessionLocalV2() as db:
         try:
             resources = _resources(db, current)
-            if not resources.access.full_access and not (
-                resources.access.visibility is not None and resources.access.visibility.granted_edit
-            ):
-                raise HTTPException(403, "Feedback requires current edit access.")
+            _require_reader(resources)
             rows, total = service.list_feedback(db, resources=resources, environment=environment, **filters)
             return {"data": rows, "total": total, "environment": environment or "all",
+                    "status_available": resources.status_ready,
                     "can_compare_environments": get_settings().hub_environment == "local"}
         except SQLAlchemyError as exc:
             logger.warning("Hub feedback read unavailable: %s", type(exc).__name__)
@@ -168,10 +174,11 @@ def list_entries(scope: Literal["hub", "page", "component"] | None = None,
                  page_id: str | None = Query(default=None, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"),
                  component_link: str | None = Query(default=None, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"),
                  environment: Literal["local", "sandbox", "production", "unknown", "all"] | None = None,
+                 status: Literal["unresolved", "resolved"] | None = None,
                  limit: int = Query(default=25, ge=1, le=100), offset: int = Query(default=0, ge=0, le=100000),
                  current: CurrentHubUser = Depends(get_current_hub_user)):
     return _read(current, _environment(environment), scope=scope, page_id=page_id,
-                 component_link=component_link, limit=limit, offset=offset)
+                 component_link=component_link, limit=limit, offset=offset, status=status)
 
 
 @router.get("/{feedback_id}")
@@ -188,3 +195,42 @@ def get_entry(feedback_id: str,
     if not result["data"]:
         raise HTTPException(404, NOT_FOUND)
     return result["data"][0]
+
+
+class HubFeedbackStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["unresolved", "resolved"]
+
+
+def _set_status(current, feedback_id: str, status: str, environment: str):
+    with SessionLocalV2() as db:
+        try:
+            resources = _resources(db, current)
+            # Same people and same rows as reading: All Scopes admins, or editors for the feedback they can currently see.
+            _require_reader(resources)
+            row = service.find_visible(db, resources=resources, environment=environment, public_id=feedback_id)
+            if row is None:
+                raise HTTPException(404, NOT_FOUND)
+            try:
+                set_status(db, row, status, user_id=current.hub_user_id, ready=resources.status_ready)
+            except FeedbackStatusUnavailable:
+                raise HTTPException(503, "Feedback status is not available yet.") from None
+            return resources.serialize(row)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.warning("Hub feedback status unavailable: %s", type(exc).__name__)
+            raise HTTPException(503, UNAVAILABLE) from None
+
+
+@router.patch("/{feedback_id}/status")
+async def update_status(feedback_id: str, payload: HubFeedbackStatusUpdate,
+                        current: CurrentHubUser = Depends(get_current_hub_user)):
+    from uuid import UUID
+    try:
+        if str(UUID(feedback_id)) != feedback_id:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(404, NOT_FOUND) from None
+    _environment()
+    # Only the configured environment's feedback can be changed, even when a local admin is comparing others.
+    return await run_in_threadpool(_set_status, current, feedback_id, payload.status, get_settings().hub_environment)
