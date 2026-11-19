@@ -317,3 +317,59 @@ def test_preview_is_admin_only_and_unavailable_in_view_as(client, monkeypatch):
     assert client.get(base + "?view_as=role:scope").status_code == 403
     monkeypatch.setattr(bot_management, "effective_pairs", lambda *_: set())
     assert client.get(base).status_code == 403
+
+
+def test_show_more_reads_the_rest_of_an_indexed_document_page_by_page(database, client, monkeypatch):
+    database.execute(text("""
+        INSERT INTO content_links (id, url, provider, resource_type, ingested, ingestion_enabled) VALUES
+            (1, 'https://example.test/a.pdf', 'p', 'PDF', TRUE, TRUE), (2, 'https://example.test/b.pdf', 'p', 'PDF', FALSE, TRUE)
+    """))
+    database.commit()
+    monkeypatch.setattr(external_resources, "get_settings", lambda: SimpleNamespace(
+        hub_environment="local", AGENT_API_URL="https://agent.example.test", AGENT_SYNC_TOKEN="test-only-token"))
+    calls, replies = [], []
+
+    def agent(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: replies.pop(0))
+
+    monkeypatch.setattr(external_resources.httpx, "get", agent)
+    base = "/v2/external-resources/resources"
+    version = "0123456789abcdef"
+
+    replies.append({"available": True, "version": version, "title": "Letter", "sections": 30, "start": 0, "next": 12,
+                    "text": " Page one text. ", "collection": "secret"})
+    first = client.get(base + "/1/content")
+    assert first.status_code == 200 and first.headers["cache-control"] == "private, no-store"
+    assert first.json() == {"available": True, "version": version, "start": 0, "next": 12, "sections": 30, "text": "Page one text."}
+    assert calls[-1] == ("https://agent.example.test/internal/external-documents/1/content", {"start": 0})
+
+    replies.append({"available": True, "version": version, "sections": 30, "start": 12, "next": None, "text": "The end."})
+    last = client.get(f"{base}/1/content?start=12&version={version}").json()
+    assert last["next"] is None and last["text"] == "The end."
+    assert calls[-1][1] == {"start": 12, "version": version}
+
+    replies.append({"available": True, "changed": True, "version": "fedcba9876543210"})
+    assert client.get(f"{base}/1/content?start=12&version={version}").json() == {"available": True, "changed": True, "version": "fedcba9876543210"}
+
+    replies.append({"available": True, "version": version, "sections": 30, "next": 5, "text": "x"})   # next must move forward
+    assert client.get(f"{base}/1/content?start=12&version={version}").json()["next"] is None
+
+    calls.clear()
+    assert client.get(base + "/2/content").json() == {"available": False, "reason": "not_indexed"}
+    assert calls == []                                                   # not indexed: the Agent is not asked
+    assert client.get(base + "/99/content").status_code == 404
+    assert client.get(base + "/1/content?start=-1").status_code == 422
+    assert client.get(base + "/1/content?version=../../x").status_code == 422
+
+    def down(*_a, **_k):
+        raise external_resources.httpx.ConnectError("agent down")
+    monkeypatch.setattr(external_resources.httpx, "get", down)
+    assert client.get(base + "/1/content").json() == {"available": False, "reason": "unavailable"}
+
+
+def test_show_more_is_admin_only_and_unavailable_in_view_as(client, monkeypatch):
+    base = "/v2/external-resources/resources/1/content"
+    assert client.get(base + "?view_as=role:scope").status_code == 403
+    monkeypatch.setattr(bot_management, "effective_pairs", lambda *_: set())
+    assert client.get(base).status_code == 403

@@ -8,7 +8,7 @@ The source of truth is `EVENT_CATALOG` in `app/services/product_analytics_servic
 - **Agent / MCP telemetry** (`bot_telemetry_*`, shown under Bot Management → *Analytics*). That data describes Agent runs; this data describes UI clicks. They are stored, counted and exported separately and are never summed.
 - **PostHog** (`lib/posthog.ts`). That is third-party pageviews and autocapture. It is untouched by this feature.
 
-## Events: 17 requested actions, 18 events
+## Events: 20 requested actions, 22 events
 
 Event names are stable, so rename only with a migration of historical rows. `component_type` and `action` are derived server-side from the name.
 
@@ -32,6 +32,17 @@ Event names are stable, so rename only with a migration of historical rows. `com
 | 15 | Threads Management Pending/History | `threads_management.tab_selected` | threads_management / select_tab | `view` = pending / history | – |
 | 16 | Revisions Management Pending/History | `revisions_management.tab_selected` | revisions_management / select_tab | `view` = pending / history | – |
 | 17 | Profile "Go to Profile" | `profile_menu.go_to_profile` | profile_menu / go_to_profile | Profile menu item | – |
+| 18 | Thread Review Pending/History | `thread_review.tab_selected` | thread_review / select_tab | `view` = pending / history, `kind` = all / new / edit. Replaces 15 and 16, which stay for stored rows | – |
+| 19 | My Revisions tabs | `my_revisions.tab_selected` | my_revisions / select_tab | `view` = needs-changes / awaiting / closed | – |
+| 20 | Built-in page opened | `builtin_page.opened` | builtin_page / open | Once per opening of a built-in page (sidebar, link, address bar, back/forward): `surface` | – |
+| 20 | Built-in page control used | `builtin_control.used` | builtin_control / use | A deliberate, successful action on a built-in page: `surface`, `control`, optional `view` | – |
+
+### Built-in (hard-coded) pages
+
+Built-in pages are the ones the Hub ships rather than ones people build: Bot Management, External Resources, LLM settings, Access Control, Root Access, Roles and Scopes, Thread Review, My Revisions, Analytics, Feedback, My Access, Profile, Bookmarks, Knowledge, Announcements and Tracking. Their addresses keep their names in `page_route` (for example `/admin/bot-management`, `/threads/review`), and active time is recorded on every one of them.
+
+- **Fixed codes only.** `surface` is the page; `control` is one of `view_selected`, `filter_changed`, `search_used`, `refreshed`, `exported`, `saved`, `status_changed`, `decision_changed`, `details_opened`, `page_changed`, `load_more`, `check_now`, `pause_changed`, `created`, `deleted`, `approved`, `declined`, `changes_requested`, `granted`, `revoked`; `view` is a sub-view code (for example `worker`, `settings_changes`, `root_access`, `bot`). Unknown values are dropped. No search text, names, emails or record ids are ever sent; these events carry no `target_id` or `component_id`.
+- **Who sees it: All Scopes admins only.** An editor sees analytics only about data they can currently edit, and a built-in page is not such data. `BUILTIN_PAGE_EVENTS` in `product_analytics_refs.filter_editable_events` drops these events (and the older thread/profile codes) for every non-admin reader, even one with edit access across the whole Hub, and route-only active time already stays invisible to editors. The summary, events list, page insights and exports follow the same rule. Covered by `tests/test_builtin_page_analytics.py`.
 
 **Why 18 events:** request 14, "Resource Carousel arrow / open-document action", names two different controls. The arrow-style *open document* link opens a document; the previous/next *scroll* arrows only move the carousel. They are kept as two events so document opens are never inflated by scrolling. Link components (5), Quick Actions (9), carousel document opens (14) and carousel scrolls (14) are four distinct `(component_type, action)` pairs.
 
@@ -116,6 +127,7 @@ Existence is not enough. Every record-backed id is also checked against the **re
 | GET | `/v2/product-analytics/summary` | Same; editors receive only currently editable resources and scoped page openers |
 | GET | `/v2/product-analytics/events?page&page_size` | Same, scoped to currently editable resources; includes the actor and read-time names. `page_size` ≤ 200 |
 | GET | `/v2/product-analytics/pages/{page_id}/insights` | Current edit access to that page, or All Scopes admin; scope is rechecked per request |
+| GET | `/v2/product-analytics/pages/{page_id}/feedback` | Same page scope as insights **and** the Feedback page's read rule per row (editors: page feedback for pages they edit, component feedback for components they edit). Page and component Hub feedback on the page, its variants and the canvases beneath them, configured environment only: `total`, `on_page`, `on_components`, `unresolved` (null before the status columns exist) and the 5 latest. Hub-wide and Bot feedback are excluded. Private, `no-store` |
 | GET | `/v2/product-analytics/export` | All Scopes admin only. CSV, ≤ 50,000 rows, formula-injection safe |
 | GET | `/v2/product-analytics/export/xlsx?include_people=false&time_zone=…` | Scoped editor or All Scopes admin; including people in the workbook requires All Scopes admin |
 

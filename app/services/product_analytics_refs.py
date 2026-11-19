@@ -68,6 +68,13 @@ class IdRule:
 # My Revisions (plan_my_revisions §5.1) adds its three tab codes.
 VIEW_CODES = frozenset({"pending", "history", "needs-changes", "awaiting", "closed"})
 
+# Activity on built-in (hard-coded) pages is not tied to any Hub resource, so no editor can be shown it: an editor
+# sees only analytics about data they can currently edit. All Scopes admins see it like all other activity.
+BUILTIN_PAGE_EVENTS = frozenset({
+    "builtin_page.opened", "builtin_control.used", "thread_review.tab_selected", "my_revisions.tab_selected",
+    "threads_management.tab_selected", "revisions_management.tab_selected", "profile_menu.go_to_profile",
+})
+
 ID_RULES: dict[str, IdRule] = {
     "navigation_tab.selected": IdRule(target="nav_tab"),
     "root_tab.selected": IdRule(target="root_tab"),
@@ -89,6 +96,8 @@ ID_RULES: dict[str, IdRule] = {
     "my_revisions.tab_selected": IdRule(target="view_code"),
     "thread_review.tab_selected": IdRule(target="view_code"),
     "profile_menu.go_to_profile": IdRule(),
+    "builtin_page.opened": IdRule(),
+    "builtin_control.used": IdRule(),
 }
 
 _MAX_ID_LENGTH = 255
@@ -410,6 +419,8 @@ def filter_editable_events(
     )
     out: list[dict[str, Any]] = []
     for original, row in zip(events, rows):
+        if original.get("event_name") in BUILTIN_PAGE_EVENTS:
+            continue  # built-in page activity: All Scopes admins only (see BUILTIN_PAGE_EVENTS)
         rule = ID_RULES.get(original.get("event_name"), IdRule())
         # Fixed view codes and rows without a verified resource have no
         # editable-object proof, so they never reach an editor's analytics.

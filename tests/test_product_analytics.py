@@ -2533,11 +2533,13 @@ class CatalogTests(unittest.TestCase):
             18: {"my_revisions.tab_selected"},
             # plan_thread_review_merge_2026-11-11 R6 — the merged page's tabs.
             19: {"thread_review.tab_selected"},
+            # Opening and using built-in pages (All Scopes admins only).
+            20: {"builtin_page.opened", "builtin_control.used"},
         }
         mapped = set().union(*requested.values())
-        self.assertEqual(len(requested), 19)
+        self.assertEqual(len(requested), 20)
         self.assertEqual(mapped, set(service.EVENT_CATALOG))
-        self.assertEqual(len(service.EVENT_CATALOG), 20)
+        self.assertEqual(len(service.EVENT_CATALOG), 22)
 
     def test_link_quick_action_and_carousel_events_are_distinct(self) -> None:
         kinds = {name: (e.component_type, e.action) for name, e in service.EVENT_CATALOG.items()}

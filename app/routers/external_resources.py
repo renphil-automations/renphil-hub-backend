@@ -160,28 +160,45 @@ def worker_retrieval(environment: Environment):
     return {"state": state if state in ("on", "off", "misconfigured") else "unknown"}
 
 
-@router.get("/resources/{link_id}/preview")
-def resource_preview(link_id: int, response: Response, db: Db, environment: Environment):
-    """What a document says, in a few lines, like a link preview. Only for a document the worker has indexed."""
-    response.headers["Cache-Control"] = "private, no-store"
+def _indexed_or_reason(db: Session, link_id: int) -> str | None:
+    """None when the registry says the document is indexed and active; otherwise the reason to show nothing."""
     row = db.execute(text("""
         SELECT ingested, ingestion_enabled, deleted, archived, ingestion_supported FROM content_links WHERE id = :id
     """), {"id": link_id}).mappings().one_or_none()
     if row is None:
         raise HTTPException(404, "Resource not found.")
     if not (row["ingested"] and row["ingestion_enabled"]) or row["deleted"] or row["archived"] or row["ingestion_supported"] is False:
-        return {"available": False, "reason": "not_indexed"}
+        return "not_indexed"
+    return None
+
+
+def _agent_document_get(path: str, params: dict[str, object] | None = None) -> dict | None:
+    """GET an Agent document endpoint with the shared service token. None when the Agent is not configured or
+    cannot answer; details are never passed on."""
     settings = get_settings()
     url = (settings.AGENT_API_URL or "").strip().rstrip("/")
     token = (settings.AGENT_SYNC_TOKEN or "").strip()
     if not url or not token:
-        return {"available": False, "reason": "unavailable"}
+        return None
     try:
-        reply = httpx.get(f"{url}/internal/external-documents/{link_id}/preview",
+        reply = httpx.get(f"{url}/internal/external-documents/{path}", params=params,
                           headers={"X-Sync-Token": token, "Accept": "application/json"}, timeout=8.0)
         reply.raise_for_status()
         body = reply.json()
     except (httpx.HTTPError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+@router.get("/resources/{link_id}/preview")
+def resource_preview(link_id: int, response: Response, db: Db, environment: Environment):
+    """What a document says, in a few lines, like a link preview. Only for a document the worker has indexed."""
+    response.headers["Cache-Control"] = "private, no-store"
+    reason = _indexed_or_reason(db, link_id)
+    if reason:
+        return {"available": False, "reason": reason}
+    body = _agent_document_get(f"{link_id}/preview")
+    if body is None:
         return {"available": False, "reason": "unavailable"}
     if not isinstance(body, dict) or body.get("available") is not True or not isinstance(body.get("excerpt"), str) or not body["excerpt"].strip():
         return {"available": False, "reason": "not_indexed"}
@@ -191,6 +208,45 @@ def resource_preview(link_id: int, response: Response, db: Db, environment: Envi
         "title": title.strip()[:200] if isinstance(title, str) and title.strip() else None,
         "excerpt": body["excerpt"].strip()[:1000],
         "sections": sections if isinstance(sections, int) and not isinstance(sections, bool) and sections > 0 else None,
+    }
+
+
+_CONTENT_TEXT_LIMIT = 20_000
+
+
+def _whole(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+@router.get("/resources/{link_id}/content")
+def resource_content(
+    link_id: int, response: Response, db: Db, environment: Environment,
+    start: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    version: Annotated[str | None, Query(pattern=r"^[0-9a-f]{16}$")] = None,
+):
+    """The rest of an indexed document's text, in order, one "Show more" step at a time. Same access and registry
+    checks as the preview; the Agent re-checks the registry and returns only this document's current version."""
+    response.headers["Cache-Control"] = "private, no-store"
+    reason = _indexed_or_reason(db, link_id)
+    if reason:
+        return {"available": False, "reason": reason}
+    body = _agent_document_get(f"{link_id}/content", {"start": start, **({"version": version} if version else {})})
+    if body is None:
+        return {"available": False, "reason": "unavailable"}
+    current = body.get("version") if isinstance(body.get("version"), str) and re.fullmatch(r"[0-9a-f]{16}", body["version"]) else None
+    if body.get("available") is True and body.get("changed") is True and current:
+        return {"available": True, "changed": True, "version": current}
+    text_value, sections, next_start = body.get("text"), _whole(body.get("sections")), body.get("next")
+    if body.get("available") is not True or not current or not isinstance(text_value, str) or sections is None:
+        return {"available": False, "reason": "not_indexed"}
+    next_start = _whole(next_start)
+    return {
+        "available": True,
+        "version": current,
+        "start": start,
+        "next": next_start if next_start is not None and start < next_start <= sections else None,
+        "sections": sections,
+        "text": text_value.strip()[:_CONTENT_TEXT_LIMIT],
     }
 
 

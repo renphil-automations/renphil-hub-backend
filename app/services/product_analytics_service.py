@@ -70,7 +70,30 @@ EVENT_CATALOG: dict[str, CatalogEntry] = {
     # revisions_management (no longer emitted; kept so stored rows resolve).
     "thread_review.tab_selected": CatalogEntry("thread_review", "select_tab", "Thread Review Pending/History tab selected"),
     "profile_menu.go_to_profile": CatalogEntry("profile_menu", "go_to_profile", "Profile menu \"Go to profile\" clicked"),
+    # Built-in (hard-coded) pages: which page was opened and which of its controls were used, as fixed codes
+    # (`surface`, `control`, `view`). They carry no Hub resource id, so they are visible to All Scopes admins only
+    # (BUILTIN_PAGE_EVENTS in product_analytics_refs.filter_editable_events).
+    "builtin_page.opened": CatalogEntry("builtin_page", "open", "Built-in Hub page opened (Bot Management, Access Control, Thread Review, Analytics, Feedback, ...)"),
+    "builtin_control.used": CatalogEntry("builtin_control", "use", "Control used on a built-in Hub page (sub-view, filter, search, export, save, decision, ...)"),
 }
+
+# Built-in pages, by the fixed code the browser sends as `surface`.
+BUILTIN_SURFACES = frozenset({
+    "bot_management", "external_resources", "llm_settings", "access_control", "root_access", "roles_and_scopes",
+    "thread_review", "my_revisions", "analytics", "feedback", "my_access", "profile", "bookmarks", "knowledge",
+    "announcements", "tracking",
+})
+BUILTIN_CONTROLS = frozenset({
+    "view_selected", "filter_changed", "search_used", "refreshed", "exported", "saved", "status_changed",
+    "decision_changed", "details_opened", "page_changed", "load_more", "check_now", "pause_changed",
+    "created", "deleted", "approved", "declined", "changes_requested", "granted", "revoked",
+})
+# Sub-views of built-in pages (`view`), plus the thread list tabs.
+BUILTIN_VIEWS = frozenset({
+    "pending", "history", "needs-changes", "awaiting", "closed",
+    "settings", "settings_changes", "analytics", "external_resources", "resources", "worker",
+    "users", "deleted_users", "airtable_sync", "root_access", "hub", "bot", "overview", "page_insights",
+})
 
 TRIGGERS = ("click", "default")
 # A browser batch flushes every ~5 s; 25 clicks/defaults in one batch is
@@ -104,9 +127,11 @@ _ENUM_PROPERTIES: dict[str, frozenset[str]] = {
     "button_style": frozenset({"arrow", "button"}),
     "link_style": frozenset({"link", "button"}),
     "direction": frozenset({"previous", "next"}),
-    "view": frozenset({"pending", "history", "needs-changes", "awaiting", "closed"}),
+    "view": BUILTIN_VIEWS,
     # Thread Review's Pending kind chip at the time of the click (R6).
     "kind": frozenset({"all", "new", "edit"}),
+    "surface": BUILTIN_SURFACES,
+    "control": BUILTIN_CONTROLS,
 }
 _INT_PROPERTIES: dict[str, tuple[int, int]] = {"depth": (0, 20), "item_index": (0, 1000)}
 _BOOL_PROPERTIES = frozenset({"reselect"})
@@ -136,7 +161,7 @@ _STATIC_SECTIONS: dict[str, frozenset[str]] = {
     # activity would be stored as a generic Hub page (/:nav_tab).
     "hub-analytics": frozenset(),
     "feedbacks": frozenset(),
-    "admin": frozenset({"llm", "bot-management", "access-control", "roles-and-scopes"}),
+    "admin": frozenset({"llm", "bot-management", "access-control", "roles-and-scopes", "external-resources", "hub-analytics"}),
     # `management` / `revisions` only redirect to `review` now (Thread
     # Review merge); kept so a stray visit still templates readably.
     "threads": frozenset({"management", "revisions", "my-revisions", "review"}),

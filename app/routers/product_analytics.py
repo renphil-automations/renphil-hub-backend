@@ -23,18 +23,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, undefer
 
 from app.config import get_settings
 from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.gridstack import GridstackV2
+from app.db_v2.models.hub_feedback import HubFeedbackV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.tab import TabV2
 from app.dependencies import CurrentHubUser, RbacClosures, get_current_hub_user, is_hub_admin
 from app.routers.bot_management import require_bot_management_admin
 from app.services import product_analytics_service as service
+from app.services import hub_feedback_service as feedback
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services import view_as_service
 from app.services.product_analytics_refs import (
@@ -847,6 +849,68 @@ def get_page_insights(
         raise _page_insights_error(422, _TOO_BROAD) from None
     except SQLAlchemyError as exc:
         _log_database_unavailable("page insights", exc)
+        raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc
+
+
+_PAGE_FEEDBACK_LATEST = 5
+
+
+@router.get("/pages/{page_id}/feedback")
+def get_page_feedback(
+    page_id: str,
+    response: Response,
+    db: Session = Depends(get_db_v2),
+    reader: AnalyticsReader = Depends(require_product_analytics_reader),
+):
+    """Hub feedback about one page and the components on it, for Page Insights.
+
+    Two existing rules apply together, re-checked on every call: the page scope is the same as Page Insights
+    (current edit access on this exact page, its variants and the canvases beneath them), and each feedback row
+    must also be readable on the Feedback page (All Scopes admins: all; editors: page feedback for pages they edit
+    and component feedback for components they edit). Only the configured environment's feedback is counted.
+    Hub-wide feedback and Bot feedback are not about a page, so they never appear here.
+    """
+    _private_analytics_response(response)
+    environment = get_settings().hub_environment
+    if environment not in {"local", "sandbox", "production"}:
+        return {"available": False, "reason": "unconfigured"}
+    try:
+        scope = _page_insight_scope(db, page_id, reader)
+        resources = feedback.FeedbackResources(db, reader.access)
+        conditions = [
+            resources.read_predicate(),
+            HubFeedbackV2.environment == environment,
+            HubFeedbackV2.scope.in_(("page", "component")),
+            HubFeedbackV2.page_id.in_(scope.page_ids),
+        ]
+        total = db.scalar(select(func.count()).select_from(HubFeedbackV2).where(*conditions)) or 0
+        unresolved = None
+        if resources.status_ready:
+            unresolved = db.scalar(
+                select(func.count()).select_from(HubFeedbackV2).where(*conditions, HubFeedbackV2.status == "unresolved")
+            ) or 0
+        by_scope = dict(db.execute(
+            select(HubFeedbackV2.scope, func.count()).where(*conditions).group_by(HubFeedbackV2.scope)
+        ).all())
+        query = (select(HubFeedbackV2).where(*conditions)
+                 .order_by(HubFeedbackV2.created_at.desc(), HubFeedbackV2.id.desc()).limit(_PAGE_FEEDBACK_LATEST))
+        if resources.status_ready:
+            query = query.options(undefer(HubFeedbackV2.status), undefer(HubFeedbackV2.status_updated_at))
+        latest = [resources.serialize(row) for row in db.scalars(query).all()]
+        return {
+            "available": True,
+            "environment": environment,
+            "total": int(total),
+            "on_page": int(by_scope.get("page", 0)),
+            "on_components": int(by_scope.get("component", 0)),
+            "unresolved": int(unresolved) if unresolved is not None else None,
+            "status_available": resources.status_ready,
+            "latest": latest,
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        _log_database_unavailable("page feedback", exc)
         raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc
 
 
