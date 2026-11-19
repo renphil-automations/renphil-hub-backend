@@ -73,8 +73,8 @@ EVENT_CATALOG: dict[str, CatalogEntry] = {
     # Built-in (hard-coded) pages: which page was opened and which of its controls were used, as fixed codes
     # (`surface`, `control`, `view`). They carry no Hub resource id, so they are visible to All Scopes admins only
     # (BUILTIN_PAGE_EVENTS in product_analytics_refs.filter_editable_events).
-    "builtin_page.opened": CatalogEntry("builtin_page", "open", "Built-in Hub page opened (Bot Management, Access Control, Thread Review, Analytics, Feedback, ...)"),
-    "builtin_control.used": CatalogEntry("builtin_control", "use", "Control used on a built-in Hub page (sub-view, filter, search, export, save, decision, ...)"),
+    "builtin_page.opened": CatalogEntry("builtin_page", "open", "Built-in page opened"),
+    "builtin_control.used": CatalogEntry("builtin_control", "use", "Built-in page action"),
 }
 
 # Built-in pages, by the fixed code the browser sends as `surface`.

@@ -950,6 +950,67 @@ def resolve_names(
 UNAVAILABLE_DESTINATION = "Deleted or unavailable destination"
 
 
+# Built-in (hard-coded) pages, by the fixed `surface` code: a product constant name and route. Their events carry no
+# Hub record to resolve, so without this they would read "Deleted or unavailable destination".
+BUILTIN_PAGE_DESTINATIONS: dict[str, tuple[str, str]] = {
+    "bot_management": ("Bot Management", "/admin/bot-management"),
+    "external_resources": ("External Resources", "/admin/external-resources"),
+    "llm_settings": ("LLM settings", "/admin/llm"),
+    "access_control": ("Access Control", "/admin/access-control"),
+    "root_access": ("Root Access", "/admin/access-control/root-access"),
+    "roles_and_scopes": ("Roles and Scopes", "/admin/roles-and-scopes"),
+    "thread_review": ("Thread Review", "/threads/review"),
+    "my_revisions": ("My Revisions", "/threads/my-revisions"),
+    "analytics": ("Analytics", "/hub-analytics"),
+    "feedback": ("Feedback", "/feedbacks"),
+    "my_access": ("My Access", "/my-access"),
+    "profile": ("Profile", "/profile"),
+    "bookmarks": ("Bookmarks", "/bookmarks"),
+    "knowledge": ("Knowledge", "/knowledge"),
+    "announcements": ("Announcements", "/dashboard/announcements"),
+    "tracking": ("Tracking", "/tracking"),
+}
+_EVENT_SURFACES = {
+    "thread_review.tab_selected": "thread_review",
+    "threads_management.tab_selected": "thread_review",
+    "revisions_management.tab_selected": "thread_review",
+    "my_revisions.tab_selected": "my_revisions",
+    "profile_menu.go_to_profile": "profile",
+}
+
+
+_ROUTE_SURFACES: tuple[tuple[str, str], ...] = tuple(sorted(
+    [(path, surface) for surface, (_, path) in BUILTIN_PAGE_DESTINATIONS.items()]
+    + [("/threads/management", "thread_review"), ("/threads/revisions", "thread_review"), ("/admin/hub-analytics", "analytics")],
+    key=lambda item: -len(item[0]),
+))
+
+
+def _surface_from_route(route: Any) -> str | None:
+    """The built-in page a stored route template belongs to (longest matching prefix), else None."""
+    if not isinstance(route, str):
+        return None
+    for path, surface in _ROUTE_SURFACES:
+        if route == path or route.startswith(path + "/"):
+            return surface
+    return None
+
+
+def builtin_destination(event: dict[str, Any]) -> tuple[str, str, str] | None:
+    """(group key, page name, route) for an event on a built-in page, else None."""
+    name = event.get("event_name")
+    if name not in BUILTIN_PAGE_EVENTS:
+        return None
+    properties = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+    surface = properties.get("surface") if name in ("builtin_page.opened", "builtin_control.used") else _EVENT_SURFACES.get(name)
+    if not isinstance(surface, str) or surface not in BUILTIN_PAGE_DESTINATIONS:
+        surface = _surface_from_route(event.get("page_route"))  # grouped rows carry no properties
+    page = BUILTIN_PAGE_DESTINATIONS.get(surface) if isinstance(surface, str) else None
+    if page is None:
+        return None
+    return f"builtin:{surface}", page[0], page[1]
+
+
 def _destination(event: dict[str, Any]) -> tuple[str, str, str | None]:
     """(group key, readable label, internal href or None) for a resolved event.
 
@@ -959,6 +1020,9 @@ def _destination(event: dict[str, Any]) -> tuple[str, str, str | None]:
     string or an opaque id is never a label: without a current name the
     destination is the neutral, non-clickable `UNAVAILABLE_DESTINATION`.
     """
+    builtin = builtin_destination(event)
+    if builtin is not None:
+        return builtin
     name = event.get("target_name") or event.get("open_component_name") or event.get("component_name")
     path = event.get("open_path")
     component_link = event.get("open_component_link")

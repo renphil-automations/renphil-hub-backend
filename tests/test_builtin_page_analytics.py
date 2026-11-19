@@ -104,3 +104,19 @@ del _Harness  # keep pytest from collecting the borrowed harness's own tests a s
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_built_in_events_name_their_page_and_link_to_it():
+    from app.services.product_analytics_refs import builtin_destination
+
+    assert builtin_destination({"event_name": "builtin_page.opened", "properties": {"surface": "bot_management"}}) == (
+        "builtin:bot_management", "Bot Management", "/admin/bot-management")
+    assert builtin_destination({"event_name": "builtin_control.used", "properties": {"surface": "external_resources", "control": "exported"}})[1:] == (
+        "External Resources", "/admin/external-resources")
+    assert builtin_destination({"event_name": "thread_review.tab_selected", "properties": {"view": "history"}})[1] == "Thread Review"
+    # Grouped rows have no properties: the stored route identifies the page.
+    assert builtin_destination({"event_name": "builtin_page.opened", "properties": {}, "page_route": "/admin/access-control/root-access"})[1] == "Root Access"
+    assert builtin_destination({"event_name": "builtin_page.opened", "properties": {}, "page_route": "/dashboard/announcements/:segment"})[1] == "Announcements"
+    # Unknown codes and ordinary Hub events are left to the normal name resolution.
+    assert builtin_destination({"event_name": "builtin_page.opened", "properties": {"surface": "x"}, "page_route": "/:nav_tab"}) is None
+    assert builtin_destination({"event_name": "link.clicked", "properties": {}, "page_route": "/admin/bot-management"}) is None
