@@ -448,16 +448,47 @@ def rebuild(link_id: int, db: Db, environment: Environment, actor: Actor):
     return _queue_check(link_id, db, environment, actor, rebuild=True)
 
 
+def _progress(total: int | None, done: int | None) -> dict | None:
+    """Documents finished out of the documents the run selected, from its recorded manifest.
+
+    Runs recorded before the manifest existed have no items; their progress is
+    unknown (None) rather than guessed.
+    """
+    if not total:
+        return None
+    done = min(int(done or 0), int(total))
+    return {"total": int(total), "done": done, "percent": int(done * 100 / int(total))}
+
+
+# Per-run manifest counts. Items start as 'not_processed', become 'in_progress'
+# while the worker handles them, and count as done once any final outcome is written.
+_RUN_PROGRESS_SQL = """
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS progress_total,
+               COUNT(*) FILTER (WHERE item.outcome NOT IN ('not_processed', 'in_progress')) AS progress_done
+        FROM external_worker_run_items AS item WHERE item.run_id = runs.id
+    ) AS progress ON TRUE
+"""
+
+
 @router.get("/worker/runs")
 def runs(db: Db, environment: Environment, before_id: int | None = None):
-    rows = db.execute(text("""
-        SELECT id, started_at, finished_at, status, mode, selected, queue_depth, outcomes,
-               CASE WHEN status = 'failed' THEN 'Run failed' END AS message
-        FROM external_worker_runs
-        WHERE environment = :environment AND (CAST(:before_id AS BIGINT) IS NULL OR id < :before_id)
-        ORDER BY id DESC LIMIT 50
+    rows = db.execute(text(f"""
+        SELECT runs.id, runs.started_at, runs.finished_at, runs.status, runs.mode, runs.selected,
+               runs.queue_depth, runs.outcomes, progress.progress_total, progress.progress_done,
+               CASE WHEN runs.status = 'failed' THEN 'Run failed' END AS message
+        FROM external_worker_runs AS runs
+        {_RUN_PROGRESS_SQL}
+        WHERE runs.environment = :environment AND (CAST(:before_id AS BIGINT) IS NULL OR runs.id < :before_id)
+        ORDER BY runs.id DESC LIMIT 50
     """), {"environment": environment, "before_id": before_id}).mappings().all()
-    return {"data": rows}
+    return {"data": [_with_progress(row) for row in rows]}
+
+
+def _with_progress(row) -> dict:
+    data = {key: value for key, value in row.items() if key not in ("progress_total", "progress_done")}
+    data["progress"] = _progress(row["progress_total"], row["progress_done"])
+    return data
 
 
 @router.get("/worker/status")
@@ -493,14 +524,19 @@ def trends(db: Db, environment: Environment, date_from: date | None = None, date
 
 @router.get("/worker/runs/{run_id}")
 def run_detail(run_id: int, db: Db, environment: Environment):
-    row = db.execute(text("""
-        SELECT id, started_at, finished_at, status, mode, selected, queue_depth, outcomes, config_snapshot
-        FROM external_worker_runs WHERE id = :id AND environment = :environment
+    row = db.execute(text(f"""
+        SELECT runs.id, runs.started_at, runs.finished_at, runs.status, runs.mode, runs.selected,
+               runs.queue_depth, runs.outcomes, runs.config_snapshot,
+               progress.progress_total, progress.progress_done
+        FROM external_worker_runs AS runs
+        {_RUN_PROGRESS_SQL}
+        WHERE runs.id = :id AND runs.environment = :environment
     """), {"id": run_id, "environment": environment}).mappings().one_or_none()
     if row is None:
         raise HTTPException(404, "Worker run was not found in this environment.")
     allowed = {"paused", "max_pdf_bytes", "pdf_max_pages", "ocr_max_pages", "ocr_timeout_seconds",
                "recheck_interval_hours", "retry_max_attempts", "settings_version_id"}
+    row = _with_progress(row)
     config = row["config_snapshot"] if isinstance(row["config_snapshot"], dict) else {}
     return {**row, "config_snapshot": {
         key: config[key] for key in allowed if key in config and isinstance(config[key], (int, bool))

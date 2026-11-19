@@ -373,3 +373,29 @@ def test_show_more_is_admin_only_and_unavailable_in_view_as(client, monkeypatch)
     assert client.get(base + "?view_as=role:scope").status_code == 403
     monkeypatch.setattr(bot_management, "effective_pairs", lambda *_: set())
     assert client.get(base).status_code == 403
+
+def test_run_progress_counts_finished_documents_and_never_guesses_old_runs(database, client):
+    database.execute(text("""
+        INSERT INTO external_worker_runs (id, status, mode, environment) VALUES
+            (91, 'running', 'live', 'local'), (92, 'completed', 'live', 'local'),
+            (93, 'completed', 'live', 'local'), (94, 'running', 'live', 'sandbox')
+    """))
+    # Run 91: 3 selected, 1 finished, 1 being processed, 1 still waiting.
+    database.execute(text("""
+        INSERT INTO external_worker_run_items (run_id, link_id, outcome) VALUES
+            (91, 1, 'ingested'), (91, 2, 'in_progress'), (91, 3, 'not_processed'),
+            (92, 1, 'ingested'), (92, 2, 'skipped_locked'), (94, 1, 'not_processed')
+    """))
+    database.commit()
+
+    rows = {row["id"]: row["progress"] for row in client.get("/v2/external-resources/worker/runs").json()["data"]}
+    assert rows == {
+        91: {"total": 3, "done": 1, "percent": 33},
+        92: {"total": 2, "done": 2, "percent": 100},
+        93: None,  # recorded before the manifest existed: unknown, not 0 or 100
+    }
+    assert client.get("/v2/external-resources/worker/runs/91").json()["progress"] == {"total": 3, "done": 1, "percent": 33}
+    assert client.get("/v2/external-resources/worker/runs/93").json()["progress"] is None
+    status = client.get("/v2/external-resources/worker/status").json()
+    assert status["latest"]["id"] == 93 and status["latest"]["progress"] is None
+    assert client.get("/v2/external-resources/worker/runs/94").status_code == 404

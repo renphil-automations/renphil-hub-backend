@@ -46,6 +46,10 @@ The Worker worktree includes example systemd service and timer units under deplo
 
 The Worker records at most one note per document per run in `external_worker_run_items.ocr_note` (`VARCHAR(64)`, nullable): `ocr_date_corrected`, `ocr_implausible_date`, `ocr_unreadable_text` or `ocr_page_rotated`. The column is added by `scripts.setup_external_worker_operations` (`ADD COLUMN IF NOT EXISTS`, additive). Run it **before** starting a Worker version that writes the note; the Worker tolerates a missing column and the run-items API returns `ocr_note: null` before the migration. The API returns only these four codes (anything else is hidden) and the Hub shows each as a plain sentence in Run details. A note is a hint to a person; it never changes what was indexed, and a historical item without a note is not guessed.
 
+## Run progress (0–100)
+
+`GET /v2/external-resources/worker/runs`, `/worker/runs/{id}` and `latest` in `/worker/status` include `progress: {total, done, percent}`, computed from the run's own document list in `external_worker_run_items`. A document counts as done once it has any final outcome (ingested, unchanged, failed, skipped, ...); `not_processed` and `in_progress` do not. Runs recorded before per-document lists existed return `progress: null` and the Hub shows no bar for them rather than a guess. No schema change, no Worker change: the Worker already writes each item as it goes. While the latest run is running, the Worker tab reloads itself every 10 seconds (only while the browser tab is visible) and an open Run details dialog refreshes in place.
+
 ## Admin API behavior worth knowing
 
 - **Search** (`GET /v2/external-resources/resources?search=`) matches the URL (without query or fragment), provider and type as plain text: `%` and `_` are ordinary characters, not wildcards. A numeric search also matches a resource or folder id.
