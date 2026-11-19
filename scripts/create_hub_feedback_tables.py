@@ -10,7 +10,7 @@ def main():
         inspector = inspect(engine_v2)
         columns = {column["name"]: column for column in inspector.get_columns(model.__tablename__)}
         if set(model.__table__.columns.keys()) - set(columns):
-            raise RuntimeError(f"{model.__tablename__} has an older schema; review an additive upgrade before deployment.")
+            raise RuntimeError(f"{model.__tablename__} has an older schema; run scripts/add_feedback_status_columns.py (additive) before deployment.")
         if any(column.nullable != columns[column.name]["nullable"] for column in model.__table__.columns):
             raise RuntimeError(f"{model.__tablename__} has incompatible column nullability; review the schema before deployment.")
         uniques = {tuple(value["column_names"]) for value in inspector.get_unique_constraints(model.__tablename__)}

@@ -8,7 +8,7 @@ The source of truth is `EVENT_CATALOG` in `app/services/product_analytics_servic
 - **Agent / MCP telemetry** (`bot_telemetry_*`, shown under Bot Management → *Analytics*). That data describes Agent runs; this data describes UI clicks. They are stored, counted and exported separately and are never summed.
 - **PostHog** (`lib/posthog.ts`). That is third-party pageviews and autocapture. It is untouched by this feature.
 
-## Events: 17 requested actions, 18 events
+## Events: 20 requested actions, 22 events
 
 Event names are stable, so rename only with a migration of historical rows. `component_type` and `action` are derived server-side from the name.
 
@@ -32,6 +32,18 @@ Event names are stable, so rename only with a migration of historical rows. `com
 | 15 | Threads Management Pending/History | `threads_management.tab_selected` | threads_management / select_tab | `view` = pending / history | – |
 | 16 | Revisions Management Pending/History | `revisions_management.tab_selected` | revisions_management / select_tab | `view` = pending / history | – |
 | 17 | Profile "Go to Profile" | `profile_menu.go_to_profile` | profile_menu / go_to_profile | Profile menu item | – |
+| 18 | Thread Review Pending/History | `thread_review.tab_selected` | thread_review / select_tab | `view` = pending / history, `kind` = all / new / edit. Replaces 15 and 16, which stay for stored rows | – |
+| 19 | My Revisions tabs | `my_revisions.tab_selected` | my_revisions / select_tab | `view` = needs-changes / awaiting / closed | – |
+| 20 | Built-in page opened | `builtin_page.opened` | builtin_page / open | Once per opening of a built-in page (sidebar, link, address bar, back/forward): `surface` | – |
+| 20 | Built-in page control used | `builtin_control.used` | builtin_control / use | A deliberate, successful action on a built-in page: `surface`, `control`, optional `view` | – |
+
+### Built-in (hard-coded) pages
+
+Built-in pages are the ones the Hub ships rather than ones people build: Bot Management, External Resources, LLM settings, Access Control, Root Access, Roles and Scopes, Thread Review, My Revisions, Analytics, Feedback, My Access, Profile, Bookmarks, Knowledge, Announcements and Tracking. Their addresses keep their names in `page_route` (for example `/admin/bot-management`, `/threads/review`), and active time is recorded on every one of them.
+
+- **Fixed codes only.** `surface` is the page; `control` is one of `view_selected`, `filter_changed`, `search_used`, `refreshed`, `exported`, `saved`, `status_changed`, `decision_changed`, `details_opened`, `page_changed`, `load_more`, `check_now`, `pause_changed`, `created`, `deleted`, `approved`, `declined`, `changes_requested`, `granted`, `revoked`; `view` is a sub-view code (for example `worker`, `settings_changes`, `root_access`, `bot`). Unknown values are dropped. No search text, names, emails or record ids are ever sent; these events carry no `target_id` or `component_id`.
+- **How they read.** The events list names the page and the action ("Bot Management opened", "External Resources · Exported", with the sub-view below), and the destination is the page itself with a link, from a fixed product list (`BUILTIN_PAGE_DESTINATIONS` in `product_analytics_refs.py`), never from event data. Grouped rows without codes are placed by their stored route.
+- **Who sees it: All Scopes admins only.** An editor sees analytics only about data they can currently edit, and a built-in page is not such data. `BUILTIN_PAGE_EVENTS` in `product_analytics_refs.filter_editable_events` drops these events (and the older thread/profile codes) for every non-admin reader, even one with edit access across the whole Hub, and route-only active time already stays invisible to editors. The summary, events list, page insights and exports follow the same rule. Covered by `tests/test_builtin_page_analytics.py`.
 
 **Why 18 events:** request 14, "Resource Carousel arrow / open-document action", names two different controls. The arrow-style *open document* link opens a document; the previous/next *scroll* arrows only move the carousel. They are kept as two events so document opens are never inflated by scrolling. Link components (5), Quick Actions (9), carousel document opens (14) and carousel scrolls (14) are four distinct `(component_type, action)` pairs.
 
@@ -116,6 +128,7 @@ Existence is not enough. Every record-backed id is also checked against the **re
 | GET | `/v2/product-analytics/summary` | Same; editors receive only currently editable resources and scoped page openers |
 | GET | `/v2/product-analytics/events?page&page_size` | Same, scoped to currently editable resources; includes the actor and read-time names. `page_size` ≤ 200 |
 | GET | `/v2/product-analytics/pages/{page_id}/insights` | Current edit access to that page, or All Scopes admin; scope is rechecked per request |
+| GET | `/v2/product-analytics/pages/{page_id}/feedback` | Same page scope as insights **and** the Feedback page's read rule per row (editors: page feedback for pages they edit, component feedback for components they edit). Page and component Hub feedback on the page, its variants and the canvases beneath them, configured environment only: `total`, `on_page`, `on_components`, `unresolved` (null before the status columns exist) and the 5 latest. Hub-wide and Bot feedback are excluded. Private, `no-store` |
 | GET | `/v2/product-analytics/export` | All Scopes admin only. CSV, ≤ 50,000 rows, formula-injection safe |
 | GET | `/v2/product-analytics/export/xlsx?include_people=false&time_zone=…` | Scoped editor or All Scopes admin; including people in the workbook requires All Scopes admin |
 
@@ -204,3 +217,14 @@ reveal any data. A future server-issued View As session/token would be needed
 to make anonymous mode cryptographically non-bypassable. This limitation must
 remain in the PR description and release notes until that broader View As
 design is introduced.
+
+## The Hub Analytics page (what people see and how filters behave)
+
+- **Access** is unchanged: All Scopes admins see Hub-wide activity; editors see activity on resources they currently edit. Feedback is no longer part of this page; it lives in the **Feedbacks** navigation item.
+- **Filters apply as you type.** Date, component, action and trigger changes apply after a short pause (about 0.15 s); typing in the person or page fields applies after about 0.4 s. The Apply button still works. The numbers already on screen stay visible while new ones load; Refresh sits at the right and says "Refreshing…".
+- **Page filter.** Pages are stored by route *pattern*, never by title (a page titled "Home" under the Dashboard is stored as `/dashboard/:tab`). The Page field is a picker of the pages that really have activity, with a friendly name, an event count and example page names; people can also type where an address starts (`/admin`). Typing a page path is understood: `/dashboard/home` is read as `/dashboard/:tab`, `/finance/q3` as `/:nav_tab/:tab`, and `Dashboard/Home/` works the same. Because titles are not stored, a pattern includes every page in its group, and the page says so. When nothing matches, it says so and offers pages that do have activity. Odd input (for example `%`) stays literal and never widens the filter. The server is the authority (`normalize_route_filter`).
+- **Active time** is how long a page was open and in use, not how many visits it had. A **visit** is a recorded page opening, including automatic selections.
+- **Page insights** (per page) lists each person with their visits, active time and last visit, most recent first, plus the time by tab and the interactions on that page. A person with foreground time but no recorded opening shows "-" for visits instead of an invented number.
+- **Time zone**: every time on the page is shown in the viewer's time zone and the page states which ("Times are shown in Asia/Beirut (UTC+2)"). Day buckets in charts are UTC and say so.
+- **Excel export**: "Include emails in Excel export" only adds people's emails and what each person used (Top people and Visited by person sheets). It never changes what the page shows. Names are not included by default.
+- The deployment environment name is not shown to people; the environment filter and badge appear only on a local development stack.

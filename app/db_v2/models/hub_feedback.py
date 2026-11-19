@@ -1,7 +1,8 @@
 """Hub product feedback; independent of Agent feedback and usage telemetry."""
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Column, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, Column, DateTime, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy.orm import deferred
 
 from app.db_v2.database import BaseV2
 
@@ -25,8 +26,13 @@ class HubFeedbackV2(BaseV2):
     diagnostic_route = Column(String(256), nullable=True)
     airtable_record_id = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    # Resolved / Unresolved. Deferred so a database without these columns keeps working (see feedback_status_service).
+    status = deferred(Column(String(16), nullable=False, server_default=text("'unresolved'")))
+    status_updated_at = deferred(Column(DateTime(timezone=True), nullable=True))
+    status_updated_by_user_id = deferred(Column(Integer, nullable=True))
 
     __table_args__ = (
+        CheckConstraint("status IN ('unresolved', 'resolved')", name="ck_hub_feedback_status"),
         UniqueConstraint("actor_user_id", "submission_id", name="uq_hub_feedback_actor_submission"),
         UniqueConstraint("environment", "airtable_record_id", name="uq_hub_feedback_airtable_environment"),
         Index("ix_hub_feedback_environment_created", "environment", "created_at"),
@@ -52,8 +58,12 @@ class BotFeedbackV2(BaseV2):
     response = Column(Text, nullable=True)
     airtable_record_id = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    status = deferred(Column(String(16), nullable=False, server_default=text("'unresolved'")))
+    status_updated_at = deferred(Column(DateTime(timezone=True), nullable=True))
+    status_updated_by_user_id = deferred(Column(Integer, nullable=True))
 
     __table_args__ = (
+        CheckConstraint("status IN ('unresolved', 'resolved')", name="ck_bot_feedback_status"),
         UniqueConstraint("actor_user_id", "submission_id", name="uq_bot_feedback_actor_submission"),
         UniqueConstraint("environment", "airtable_record_id", name="uq_bot_feedback_airtable_environment"),
         Index("ix_bot_feedback_environment_created", "environment", "created_at"),

@@ -14,7 +14,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -23,18 +23,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, undefer
 
 from app.config import get_settings
 from app.db_v2.database import SessionLocalV2, get_db_v2
 from app.db_v2.models.component import ComponentV2
 from app.db_v2.models.gridstack import GridstackV2
+from app.db_v2.models.hub_feedback import HubFeedbackV2
 from app.db_v2.models.nav_tab import NavTabV2
 from app.db_v2.models.tab import TabV2
 from app.dependencies import CurrentHubUser, RbacClosures, get_current_hub_user, is_hub_admin
 from app.routers.bot_management import require_bot_management_admin
 from app.services import product_analytics_service as service
+from app.services import hub_feedback_service as feedback
 from app.services.access_visibility_service import ViewerAccess, resolve_viewer_access
 from app.services import view_as_service
 from app.services.product_analytics_refs import (
@@ -547,6 +549,18 @@ def _page_insights_error(status_code: int, detail: str) -> HTTPException:
 _PAGE_SELECTION_EVENTS = frozenset({"root_tab.selected", "view_tab.selected", "sub_tab.selected"})
 
 
+def _as_utc(value: Any) -> datetime | None:
+    """A timezone-aware UTC datetime from a datetime or ISO string, else None."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 class _PageScope(NamedTuple):
     page: dict[str, Any]
     # (TabV2 id, document id, display name): the page first, then on a root
@@ -777,9 +791,27 @@ def get_page_insights(
             and row.get("target_id") in scope.page_ids and row.get("actor_email")
         )
         people_time: Counter[str] = Counter()
+        latest_activity: dict[str, datetime] = {}
+        last_visit: dict[str, datetime] = {}  # page openings only, never foreground time
+
+        def note_activity(person: str, value: Any) -> None:
+            stamp = _as_utc(value)
+            if stamp is not None and (person not in latest_activity or stamp > latest_activity[person]):
+                latest_activity[person] = stamp
+
+        # Latest activity is limited to the same two signals that list a person here:
+        # page-opening events and recorded foreground time. Other interactions never add people.
+        for row in rows:
+            if (row.get("event_name") in _PAGE_SELECTION_EVENTS and row.get("target_id") in scope.page_ids
+                    and row.get("actor_email")):
+                note_activity(row["actor_email"], row.get("received_at"))
+                opened_at = _as_utc(row.get("received_at"))
+                if opened_at is not None and (row["actor_email"] not in last_visit or opened_at > last_visit[row["actor_email"]]):
+                    last_visit[row["actor_email"]] = opened_at
         for group in filter_editable_engagements(db, service.engagement_people_for_tabs(db, filters, scope.page_ids), access=reader.access):
             if group.get("actor_email"):
                 people_time[group["actor_email"]] += group["active_seconds"]
+                note_activity(group["actor_email"], group.get("last_activity_at"))
         people = set(page_openers) | set(people_time)
         return {
             "page": scope.page,
@@ -790,7 +822,18 @@ def get_page_insights(
                 {"id": document_id, "name": name, "active_seconds": seconds_by_tab.get(document_id, 0)}
                 for _, document_id, name in scope.tabs
             ],
-            "page_openers": [{"person": person, "openings": page_openers[person], "active_seconds": people_time[person]} for person in sorted(people)],
+            # Most recently active first; people with no recorded timestamp last.
+            "page_openers": [
+                {
+                    "person": person, "openings": page_openers[person], "active_seconds": people_time[person],
+                    "last_activity_at": latest_activity[person].isoformat() if person in latest_activity else None,
+                    "last_visit_at": last_visit[person].isoformat() if person in last_visit else None,
+                }
+                for person in sorted(
+                    people,
+                    key=lambda person: (person not in latest_activity, -latest_activity[person].timestamp() if person in latest_activity else 0.0, person),
+                )
+            ],
             "clicks": {
                 "total": clicks["totals"]["events"],
                 "clicks": triggers.get("click", 0),
@@ -806,6 +849,68 @@ def get_page_insights(
         raise _page_insights_error(422, _TOO_BROAD) from None
     except SQLAlchemyError as exc:
         _log_database_unavailable("page insights", exc)
+        raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc
+
+
+_PAGE_FEEDBACK_LATEST = 5
+
+
+@router.get("/pages/{page_id}/feedback")
+def get_page_feedback(
+    page_id: str,
+    response: Response,
+    db: Session = Depends(get_db_v2),
+    reader: AnalyticsReader = Depends(require_product_analytics_reader),
+):
+    """Hub feedback about one page and the components on it, for Page Insights.
+
+    Two existing rules apply together, re-checked on every call: the page scope is the same as Page Insights
+    (current edit access on this exact page, its variants and the canvases beneath them), and each feedback row
+    must also be readable on the Feedback page (All Scopes admins: all; editors: page feedback for pages they edit
+    and component feedback for components they edit). Only the configured environment's feedback is counted.
+    Hub-wide feedback and Bot feedback are not about a page, so they never appear here.
+    """
+    _private_analytics_response(response)
+    environment = get_settings().hub_environment
+    if environment not in {"local", "sandbox", "production"}:
+        return {"available": False, "reason": "unconfigured"}
+    try:
+        scope = _page_insight_scope(db, page_id, reader)
+        resources = feedback.FeedbackResources(db, reader.access)
+        conditions = [
+            resources.read_predicate(),
+            HubFeedbackV2.environment == environment,
+            HubFeedbackV2.scope.in_(("page", "component")),
+            HubFeedbackV2.page_id.in_(scope.page_ids),
+        ]
+        total = db.scalar(select(func.count()).select_from(HubFeedbackV2).where(*conditions)) or 0
+        unresolved = None
+        if resources.status_ready:
+            unresolved = db.scalar(
+                select(func.count()).select_from(HubFeedbackV2).where(*conditions, HubFeedbackV2.status == "unresolved")
+            ) or 0
+        by_scope = dict(db.execute(
+            select(HubFeedbackV2.scope, func.count()).where(*conditions).group_by(HubFeedbackV2.scope)
+        ).all())
+        query = (select(HubFeedbackV2).where(*conditions)
+                 .order_by(HubFeedbackV2.created_at.desc(), HubFeedbackV2.id.desc()).limit(_PAGE_FEEDBACK_LATEST))
+        if resources.status_ready:
+            query = query.options(undefer(HubFeedbackV2.status), undefer(HubFeedbackV2.status_updated_at))
+        latest = [resources.serialize(row) for row in db.scalars(query).all()]
+        return {
+            "available": True,
+            "environment": environment,
+            "total": int(total),
+            "on_page": int(by_scope.get("page", 0)),
+            "on_components": int(by_scope.get("component", 0)),
+            "unresolved": int(unresolved) if unresolved is not None else None,
+            "status_available": resources.status_ready,
+            "latest": latest,
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        _log_database_unavailable("page feedback", exc)
         raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc
 
 

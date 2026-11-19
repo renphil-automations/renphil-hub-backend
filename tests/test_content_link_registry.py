@@ -137,6 +137,25 @@ class ContentLinkRegistryTests(unittest.TestCase):
         self.assertEqual(persisted.provider, "Google Drive")
         self.assertEqual(persisted.resource_type, "PDF")
 
+    def test_airtable_backed_component_urls_are_not_registered(self) -> None:
+        self.component.type = "airtable_metric"
+        self.component.props = {"sourceUrl": "https://airtable.com/appExample"}
+
+        self.assertEqual(sync_component_links(self.db, self.component), 0)
+        self.db.flush()
+        self.assertEqual(self.db.query(ContentLinkV2).count(), 0)
+        self.assertEqual(self.db.query(ComponentLinkMapV2).count(), 0)
+
+    def test_converting_a_registered_component_to_a_chart_removes_its_maps(self) -> None:
+        self.assertEqual(sync_component_links(self.db, self.component), 2)
+        self.db.flush()
+
+        self.component.type = "chart"
+        self.assertEqual(sync_component_links(self.db, self.component), 0)
+        self.db.flush()
+        self.assertEqual(self.db.query(ComponentLinkMapV2).count(), 0)
+        self.assertTrue(all(link.deleted for link in self.db.query(ContentLinkV2).all()))
+
     def test_acl_refresh_marks_only_active_links_for_affected_components(self) -> None:
         sync_component_links(self.db, self.component)
         self.db.flush()
@@ -153,3 +172,51 @@ class ContentLinkRegistryTests(unittest.TestCase):
         mark_component_links_deleted(self.db, self.component.id)
         self.db.flush()
         self.assertEqual(mark_components_acl_refresh(self.db, [self.component.id]), 0)
+
+    def test_form_embed_configuration_is_excluded_and_old_maps_are_removed(self) -> None:
+        self.component.description = "Read https://example.org/guide.pdf"
+        self.component.props = {"embedUrl": "https://forms.example/embed"}
+        page = self.db.get(PageContentV2, self.component.page_content_id)
+        page.content = {"pending": {"embedUrl": "https://forms.example/pending"}}
+        sync_component_links(self.db, self.component)
+        self.db.flush()
+
+        self.component.type = "form"
+        self.assertEqual(sync_component_links(self.db, self.component), 1)
+        self.db.flush()
+        active = self.db.query(ContentLinkV2).filter_by(deleted=False).all()
+        self.assertEqual([row.normalized_url for row in active], ["https://example.org/guide.pdf"])
+        self.assertEqual(self.db.query(ComponentLinkMapV2).count(), 1)
+
+    def test_canvas_widget_links_follow_add_edit_and_remove(self) -> None:
+        for widget_type in (
+            "block_note", "super_block_note", "markdown", "banner", "links",
+            "button", "booking", "calendar", "html", "resource_carousel",
+            "detail_cards", "quick_actions", "thread",
+        ):
+            with self.subTest(widget_type=widget_type):
+                self.component.type = widget_type
+                self.component.description = ""
+                page = self.db.get(PageContentV2, self.component.page_content_id)
+                self.component.props = {}
+                page.content = {"nested": [{"url": "https://example.org/first.pdf"}]}
+                self.assertEqual(sync_component_links(self.db, self.component), 1)
+                page.content = {"nested": [{"url": "https://example.org/second.pdf"}]}
+                self.assertEqual(sync_component_links(self.db, self.component), 1)
+                self.db.flush()
+                self.assertTrue(self.db.query(ContentLinkV2).filter_by(normalized_url="https://example.org/first.pdf").one().deleted)
+                page.content = {}
+                self.assertEqual(sync_component_links(self.db, self.component), 0)
+                self.db.flush()
+                self.assertEqual(self.db.query(ComponentLinkMapV2).count(), 0)
+
+    def test_title_links_are_captured_and_invalid_ports_do_not_break_saves(self) -> None:
+        self.component.title = "Read https://example.org/title.pdf"
+        self.component.description = "https://example.org:invalid/bad.pdf"
+        self.component.props = {}
+        self.db.get(PageContentV2, self.component.page_content_id).content = {}
+        self.assertEqual(sync_component_links(self.db, self.component), 1)
+        self.assertEqual(
+            self.db.query(ContentLinkV2).one().normalized_url,
+            "https://example.org/title.pdf",
+        )

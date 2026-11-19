@@ -24,6 +24,7 @@ from app.routers import (
     airtable_sync_tick,
     bookmarks,
     bot_management,
+    external_resources,
     auth,
     calendar,
     dify,
@@ -111,6 +112,7 @@ def create_app() -> FastAPI:
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
     app.include_router(bot_management.router, prefix=api_prefix)
+    app.include_router(external_resources.router, prefix=api_prefix)
     app.include_router(product_analytics.router, prefix=api_prefix)
     app.include_router(hub_feedback.router, prefix=api_prefix)
     app.include_router(product_analytics_archive_trigger.router, prefix=api_prefix)

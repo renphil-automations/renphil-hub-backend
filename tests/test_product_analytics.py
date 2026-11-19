@@ -144,6 +144,17 @@ def _engagement(**overrides) -> dict:
     return engagement
 
 
+def _without_latest(items: list[dict]) -> list[dict]:
+    """People rows minus `last_activity_at`, after checking it is a timestamp string."""
+    stripped = []
+    for item in items:
+        item = dict(item)
+        assert isinstance(item.pop("last_activity_at"), str)
+        item.pop("last_visit_at")
+        stripped.append(item)
+    return stripped
+
+
 class FakeLimiter:
     """Stands in for RateLimitService (the shared Upstash limiter)."""
 
@@ -748,8 +759,8 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         root = ("tab", 1, 4, 8, [("root-doc-1", 3), ("variant-doc-1", 5)])
         variant = ("variant", 0, 2, 5, [("variant-doc-1", 5)])
         self.assertEqual((view("root-doc-1"), view("variant-doc-1")), (root, variant))
-        self.assertEqual(self._insights("root-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 2, "active_seconds": 8}])
-        self.assertEqual(self._insights("variant-doc-1").json()["page_openers"], [{"person": ADMIN.email, "openings": 1, "active_seconds": 5}])
+        self.assertEqual(_without_latest(self._insights("root-doc-1").json()["page_openers"]), [{"person": ADMIN.email, "openings": 2, "active_seconds": 8}])
+        self.assertEqual(_without_latest(self._insights("variant-doc-1").json()["page_openers"]), [{"person": ADMIN.email, "openings": 1, "active_seconds": 5}])
         # An editor of the root sees the same roll-up; an editor of the variant
         # alone gets the variant and never its parent.
         self._edit_root_tab()
@@ -830,12 +841,56 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self._edit_root_tab()
         response = self._insights("root-doc-1")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["page_openers"], [{"person": ADMIN.email, "openings": 1, "active_seconds": 0}])
+        self.assertEqual(_without_latest(response.json()["page_openers"]), [{"person": ADMIN.email, "openings": 1, "active_seconds": 0}])
         self._assert_private_404(self._insights("root-doc-2"))
         with self.Session() as db:
             other_id = db.query(TabV2.id).filter_by(document_id="root-doc-2").scalar()
         self.grants = {MEMBER.hub_user_id: [grant("tab", other_id, "edit")]}
         self._assert_private_404(self._insights("root-doc-1"))
+
+    def test_page_insights_people_show_latest_activity_most_recent_first(self) -> None:
+        oldest = datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc)
+        middle, newest = oldest + timedelta(days=1), oldest + timedelta(days=2)
+        self.current = ADMIN
+        # ADMIN: opened at `oldest`, foreground time received at `middle` -> latest is `middle`.
+        self._insert_events(1, actor_email=ADMIN.email, hub_user_id=1, target_id="root-doc-1", received_at=oldest, occurred_at=oldest)
+        self._insert_intervals(1, actor_email=ADMIN.email, hub_user_id=1, received_at=middle, ended_at=middle, started_at=middle - timedelta(seconds=3))
+        # MEMBER: opening only, at `newest`. A third person: foreground time only, at `oldest`.
+        self._insert_events(1, actor_email=MEMBER.email, hub_user_id=2, target_id="root-doc-1", received_at=newest, occurred_at=newest)
+        self._insert_intervals(1, actor_email="third@renphil.org", hub_user_id=3, received_at=oldest, ended_at=oldest, started_at=oldest - timedelta(seconds=3))
+        body = self._insights("root-doc-1").json()
+        self.assertEqual(
+            [(item["person"], item["last_activity_at"]) for item in body["page_openers"]],
+            [(MEMBER.email, newest.isoformat()), (ADMIN.email, middle.isoformat()), ("third@renphil.org", oldest.isoformat())],
+        )
+
+    def test_page_insights_last_visit_is_the_latest_page_opening_not_foreground_time(self) -> None:
+        opened, later = datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc), datetime(2026, 11, 9, 9, 0, tzinfo=timezone.utc)
+        self.current = ADMIN
+        # Two openings by ADMIN (visits=2), then foreground time recorded LATER: last visit stays the opening.
+        self._insert_events(1, actor_email=ADMIN.email, hub_user_id=1, target_id="root-doc-1", received_at=opened - timedelta(days=1), occurred_at=opened - timedelta(days=1))
+        self._insert_events(1, actor_email=ADMIN.email, hub_user_id=1, target_id="root-doc-1", received_at=opened, occurred_at=opened)
+        self._insert_intervals(1, actor_email=ADMIN.email, hub_user_id=1, received_at=later, ended_at=later, started_at=later - timedelta(seconds=3))
+        # A person with foreground time only has no recorded visit at all.
+        self._insert_intervals(1, actor_email="timeonly@renphil.org", hub_user_id=3, received_at=later, ended_at=later, started_at=later - timedelta(seconds=3))
+        people = {item["person"]: item for item in self._insights("root-doc-1").json()["page_openers"]}
+        self.assertEqual(people[ADMIN.email]["openings"], 2)
+        self.assertEqual(people[ADMIN.email]["last_visit_at"], opened.isoformat())
+        self.assertEqual(people[ADMIN.email]["last_activity_at"], later.isoformat())
+        self.assertEqual(people["timeonly@renphil.org"]["openings"], 0)
+        self.assertIsNone(people["timeonly@renphil.org"]["last_visit_at"])
+        self.assertEqual(people["timeonly@renphil.org"]["last_activity_at"], later.isoformat())
+
+    def test_page_insights_latest_activity_ignores_other_pages_and_non_opening_clicks(self) -> None:
+        later = datetime(2026, 11, 5, 9, 0, tzinfo=timezone.utc)
+        earlier = datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc)
+        self.current = ADMIN
+        self._insert_events(1, actor_email=ADMIN.email, hub_user_id=1, target_id="root-doc-1", received_at=earlier, occurred_at=earlier)
+        # Later activity on ANOTHER page and a component click must not move this page's timestamp.
+        self._insert_events(1, actor_email=ADMIN.email, hub_user_id=1, target_id="root-doc-2", received_at=later, occurred_at=later)
+        self._insert_intervals(1, actor_email=ADMIN.email, hub_user_id=1, tab_id="root-doc-2", nav_tab_id="nav-doc-2", received_at=later, ended_at=later, started_at=later - timedelta(seconds=3))
+        body = self._insights("root-doc-1").json()
+        self.assertEqual([(item["person"], item["last_activity_at"]) for item in body["page_openers"]], [(ADMIN.email, earlier.isoformat())])
 
     def test_insights_includes_foreground_person_without_a_selection_event(self) -> None:
         variant_id = self._add_variant()
@@ -844,7 +899,7 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.current = MEMBER
         self.grants = {MEMBER.hub_user_id: [grant("tab", variant_id, "edit")]}
         body = self._insights("variant-doc-1").json()
-        self.assertEqual(body["page_openers"], [{"person": ADMIN.email, "openings": 0, "active_seconds": 3}])
+        self.assertEqual(_without_latest(body["page_openers"]), [{"person": ADMIN.email, "openings": 0, "active_seconds": 3}])
 
     def test_event_page_binding_is_derived_from_verified_placement_not_client(self) -> None:
         self.current = ADMIN
@@ -1092,6 +1147,54 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(engagement["active_seconds"], 3)
         self.assertEqual(engagement["click_only_filters"], ["component_type", "trigger"])
         self.assertNotIn("component_type", engagement["applied_filters"])
+
+    def test_route_filter_normalizer_accepts_what_people_actually_type(self) -> None:
+        normalize = service.normalize_route_filter
+        for typed, expected in {
+            "": "", "   ": "", None: "", 42: "",
+            "/admin": "/admin", "ADMIN": "/admin", "/Admin/": "/admin", "/admin/bot": "/admin/bot",
+            "/adm": "/adm", "/hub-analytics": "/hub-analytics", "Hub-Analytics": "/hub-analytics", "/feedbacks": "/feedbacks",
+            "/finance": "/:nav_tab", "finance/q3": "/:nav_tab/:tab", "/Finance/Q3/Board?x=1#frag": "/:nav_tab/:tab/:tab",
+            "https://hub.example.test/finance/q3?x=1": "/:nav_tab/:tab", "https://hub.example.test": "/",
+            "/:nav_tab/:tab": "/:nav_tab/:tab", ":nav_tab": "/:nav_tab", "/": "/",
+            # Dashboard pages are stored as /dashboard/:tab, so a typed page path finds them.
+            "/dashboard/home": "/dashboard/:tab", "Dashboard/Home/": "/dashboard/:tab", "/dashboard/:tab": "/dashboard/:tab",
+            "/dashboard": "/dashboard", "/dashboard/ann": "/dashboard/ann", "/dashboard/announcements/new": "/dashboard/announcements/new",
+            # Odd input stays literal text (never widened into a template, never a wildcard).
+            "/%": "/%", "/a b": "/a b", "/<x>": "/<x>", "/_": "/_",
+        }.items():
+            with self.subTest(typed=typed):
+                self.assertEqual(normalize(typed), expected)
+
+    def test_fixed_application_pages_are_not_recorded_as_generic_hub_pages(self) -> None:
+        for path in ("/hub-analytics", "/feedbacks", "/Hub-Analytics?x=1"):
+            with self.subTest(path=path):
+                self.assertEqual(service.route_template(path), "/" + path.lower().split("?")[0].strip("/"))
+        self.current = ADMIN
+        self._ingest(_event(page_route="/hub-analytics", target_id="root-doc-1"))
+        self.assertEqual([row.page_route for row in self._rows()], ["/hub-analytics"])
+
+    def test_page_route_filter_matches_case_slashes_urls_and_page_paths(self) -> None:
+        self.current = ADMIN
+        self._ingest(
+            _event(page_route="/finance/private-board"),
+            _event(page_route="/admin/bot-management"),
+            _event(page_route="/hub-analytics"),
+        )
+        def total(route: str) -> int:
+            response = self.client.get("/v2/product-analytics/events", params={"page_route": route})
+            self.assertEqual(response.status_code, 200, route)
+            return response.json()["total"]
+        # A real page path is turned into the stored template, so it now finds the event.
+        self.assertEqual(total("/finance/private-board"), 1)
+        self.assertEqual(total("Finance/Private-Board?x=1"), 1)
+        self.assertEqual(total("https://hub.example.test/finance/private-board#top"), 1)
+        self.assertEqual(total("/ADMIN/"), 1)
+        self.assertEqual(total("admin"), 1)
+        self.assertEqual(total("/HUB-ANALYTICS"), 1)
+        self.assertEqual(total("/:nav_tab"), 1)
+        self.assertEqual(total("/profile"), 0)
+        self.assertEqual(total(""), 3)
 
     def test_page_user_date_and_environment_filters_narrow_active_time(self) -> None:
         self._ingest_engagements(_engagement())
@@ -2016,8 +2119,9 @@ class ProductAnalyticsApiTests(unittest.TestCase):
         self.assertEqual(total(page_route="/dashboard/:tab"), 3)
         self.assertEqual(total(page_route="/dashboard/:tab/:tab"), 1)
         self.assertEqual(total(page_route="/:nav_tab"), 1)
-        # Titles are not stored, so filtering by one finds nothing.
-        self.assertEqual(total(page_route="/dashboard/finance"), 0)
+        # Titles are not stored, so a typed page path is read as its stored pattern: every page under the Dashboard.
+        self.assertEqual(total(page_route="/dashboard/finance"), 3)
+        self.assertEqual(total(page_route="/dashboard/finance/q3"), 1)
         self.assertEqual(total(component_type="root_tab"), 1)
         self.assertEqual(total(event_name="button.clicked"), 1)
         self.assertEqual(total(action="select"), 2)
@@ -2429,11 +2533,13 @@ class CatalogTests(unittest.TestCase):
             18: {"my_revisions.tab_selected"},
             # plan_thread_review_merge_2026-11-11 R6 — the merged page's tabs.
             19: {"thread_review.tab_selected"},
+            # Opening and using built-in pages (All Scopes admins only).
+            20: {"builtin_page.opened", "builtin_control.used"},
         }
         mapped = set().union(*requested.values())
-        self.assertEqual(len(requested), 19)
+        self.assertEqual(len(requested), 20)
         self.assertEqual(mapped, set(service.EVENT_CATALOG))
-        self.assertEqual(len(service.EVENT_CATALOG), 20)
+        self.assertEqual(len(service.EVENT_CATALOG), 22)
 
     def test_link_quick_action_and_carousel_events_are_distinct(self) -> None:
         kinds = {name: (e.component_type, e.action) for name, e in service.EVENT_CATALOG.items()}
