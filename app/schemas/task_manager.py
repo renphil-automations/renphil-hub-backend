@@ -11,7 +11,9 @@ from app.schemas.view_as import VIEW_AS_FLAG_DESCRIPTION, VIEW_AS_USER_DESCRIPTI
 
 TaskStatus = Literal["Pending", "In Progress", "Blocked", "Closed"]
 NotificationCadence = Literal["always", "never", "on_status_change"]
-TaskMode = Literal["group_task", "individual_task"]
+TaskMode = Literal["individual", "shared_task", "super_task", "replication"]
+CreatableTaskMode = Literal["individual", "shared_task", "super_task"]
+UpdateScope = Literal["update_all", "update_selected"]
 
 _CADENCE_DESCRIPTION = (
     "When owner/assignees are notified of changes: `always` (detail and status changes), "
@@ -21,9 +23,11 @@ _NOTIFY_CREATE_DELETE_DESCRIPTION = (
     "Notify on creation, on assignees being added/removed, and on deletion (unless the task is Closed)."
 )
 _MODE_DESCRIPTION = (
-    "`group_task`: one task shared by every assignee (a status change is seen by all); needs at "
-    "least 2 assignees. `individual_task`: one separate task per assignee. With 0 or 1 assignee "
-    "the task is always `individual_task`."
+    "`individual`: 0 or 1 assignee. `shared_task`: one task shared by 2+ assignees (a status change "
+    "is seen by all). `super_task`: created for 2+ assignees, with one `replication` of it per "
+    "assignee; its assignees are its replications' and its status is derived from theirs "
+    "(In Progress > Pending > Blocked > Closed). `replication`: one assignee's copy of a super task "
+    "(see `abstract_task`); at most one assignee, its mode never changes."
 )
 
 
@@ -56,15 +60,23 @@ class TaskResponse(BaseModel):
     notification_cadence: NotificationCadence
     notify_on_create_and_delete: bool
     mode: TaskMode = Field(..., description=_MODE_DESCRIPTION)
+    abstract_task: int | None = Field(default=None, description="The super task's id, for a `replication`.")
     is_owner: bool = Field(..., description="The caller owns this task.")
     is_assignee: bool = Field(..., description="The caller is one of this task's assignees.")
     can_manage: bool = Field(
         ...,
-        description="The caller can edit every field of this task and delete it "
-        "(task owner, editor of the Task Manager, or Admin on All Scopes).",
+        description="The caller can edit every field of this task and delete it (task owner, editor of "
+        "the Task Manager, Admin on All Scopes, or the owner of a replication's super task).",
     )
     can_edit_status: bool = Field(
-        ..., description="The caller can change the status (can_manage, or assignee while editable_by_assignee)."
+        ...,
+        description="The caller can change the status (can_manage, or assignee while editable_by_assignee; "
+        "never an assignee on a super task).",
+    )
+    replications: list[TaskResponse] | None = Field(
+        default=None,
+        description="A `super_task`'s replications (null on other tasks). Only the super task's managers "
+        "ever get a super task; an assignee who can't manage it gets their replication alone.",
     )
 
 
@@ -81,7 +93,11 @@ class ListTasksResponse(_ViewAsEcho):
         description="Always true: anyone who can see the Task Manager can create tasks in it. In "
         "anonymous View As mode this previews what the roles allow; the write itself is refused.",
     )
-    tasks: list[TaskResponse]
+    tasks: list[TaskResponse] = Field(
+        ...,
+        description="Super tasks come with their replications nested in `replications` (which aren't "
+        "repeated at the top level); a replication of a super task the caller can't see stands alone.",
+    )
 
 
 class CreateTaskRequest(BaseModel):
@@ -94,27 +110,32 @@ class CreateTaskRequest(BaseModel):
     editable_via_webhook: bool = False
     notification_cadence: NotificationCadence = Field(default="always", description=_CADENCE_DESCRIPTION)
     notify_on_create_and_delete: bool = Field(default=True, description=_NOTIFY_CREATE_DELETE_DESCRIPTION)
-    mode: TaskMode | None = Field(
+    mode: CreatableTaskMode | None = Field(
         default=None,
-        description=_MODE_DESCRIPTION + " Defaults to `group_task` with 2+ assignees, `individual_task` "
-        "otherwise. `individual_task` with N assignees creates N tasks.",
+        description=_MODE_DESCRIPTION + " Defaults to `individual` with 0 or 1 assignee, `shared_task` "
+        "otherwise. `shared_task` and `super_task` need 2+ assignees, `individual` at most one.",
     )
 
 
 class UpdateTaskRequest(BaseModel):
     """Partial update: only the fields present in the body are changed.
 
-    `title`, `description`, `assignees`, `editable_by_assignee`,
+    `title`, `description`, `assignees`, `owner`, `editable_by_assignee`,
     `editable_via_webhook`, `notification_cadence`, `notify_on_create_and_delete`,
-    `mode` — task owner, editor of the Task Manager, or Admin on All Scopes. `status` — the same, or an assignee when the task's
-    `editable_by_assignee` is true.
+    `mode` — task owner, editor of the Task Manager, Admin on All Scopes, or the
+    owner of a replication's super task. `status` — the same, or an assignee
+    when the task's `editable_by_assignee` is true (never on a super task).
     """
 
     title: str | None = Field(default=None, min_length=1)
     description: str | None = None
     assignees: list[str] | None = Field(
-        default=None, description="Replaces the full assignee list (emails); [] or null removes all assignees."
+        default=None,
+        description="Replaces the full assignee list (emails); [] or null removes all assignees. At most one "
+        "on a replication. On a super task (`update_all` only), adds a replication per new assignee and "
+        "deletes the replications of removed ones.",
     )
+    owner: str | None = Field(default=None, description="The new owner's email.")
     editable_by_assignee: bool | None = None
     editable_via_webhook: bool | None = None
     notification_cadence: NotificationCadence | None = Field(default=None, description=_CADENCE_DESCRIPTION)
@@ -122,11 +143,21 @@ class UpdateTaskRequest(BaseModel):
     status: TaskStatus | None = None
     mode: TaskMode | None = Field(
         default=None,
-        description=_MODE_DESCRIPTION + " Only the task owner, an editor of the Task Manager or an Admin on "
-        "All Scopes may change it. When omitted, the task keeps its mode: a `group_task` reduced to fewer "
-        "than 2 assignees is refused, and an `individual_task` given N > 1 assignees is split. "
-        "`individual_task` on a task left with N > 1 assignees splits it: this task keeps one assignee and "
-        "N-1 copies are created, one per other assignee. A mode change alone never notifies anyone.",
+        description=_MODE_DESCRIPTION + " Sending the current mode is a no-op. On an `individual` / "
+        "`shared_task` task, omitted or null follows the assignee count; `super_task` turns it into a "
+        "super task whose assignees each get a replication. A super task or a replication never "
+        "changes mode. A mode change alone never notifies anyone.",
+    )
+    update_scope: UpdateScope | None = Field(
+        default=None,
+        description="Required when editing a super task (refused on other tasks). `update_all`: the super "
+        "task and every replication. `update_selected`: only the `replication_ids` (the super task itself "
+        "isn't changed, apart from its derived status).",
+    )
+    replication_ids: list[int] | None = Field(
+        default=None,
+        description="With `update_selected`: the replications to update; must be non-empty and all "
+        "replications of the edited super task.",
     )
 
 
@@ -134,8 +165,8 @@ class TaskMutationResponse(_ViewAsEcho):
     success: bool = True
     tasks: list[TaskResponse] = Field(
         ...,
-        description="Every task created or updated by the request: one, or one per assignee for an "
-        "`individual_task` with several assignees (on update, the updated task first, then the copies).",
+        description="The created or updated task (a super task with its replications nested). After a "
+        "replication's update, followed by its super task when the caller can manage that one.",
     )
 
 

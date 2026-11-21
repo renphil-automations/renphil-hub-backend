@@ -6,9 +6,17 @@ tab-subtree delete refuse it up front — see
 ``task_manager_service.assert_no_linked_tasks``).
 
 Assignees live in ``task_assignee_relationship`` (many per task; both FKs
-``ON DELETE CASCADE``, so deleting a task or a user drops the links). A
-``group_task`` (2+ assignees) shares one row, status included, between all
-of them; an ``individual_task`` has at most one assignee.
+``ON DELETE CASCADE``, so deleting a task or a user drops the links).
+
+``mode``:
+
+* ``individual`` — at most one assignee.
+* ``shared_task`` — one row (status included) shared by 2+ assignees.
+* ``super_task`` — an abstraction over its replications; it has no assignee
+  links of its own (its assignees are those of its replications) and its
+  status is derived from theirs.
+* ``replication`` — one assignee's copy of a super task, whose id it holds in
+  ``abstract_task``. The service deletes replications before their super task.
 
 No ORM ``relationship()`` — same rule as every other ``db_v2`` model.
 """
@@ -57,9 +65,11 @@ class TaskV2(BaseV2):
     # 'always' | 'never' | 'on_status_change'; NULL is treated as 'always'.
     notification_cadence = Column(String, nullable=True, default="always", server_default=text("'always'"))
     notify_on_create_and_delete = Column(Boolean, nullable=False, default=True, server_default=text("true"))
-    # 'group_task' | 'individual_task'; NULL is derived from the assignee count
-    # (more than one → 'group_task').
+    # 'individual' | 'shared_task' | 'super_task' | 'replication'; a NULL one is
+    # derived from the assignee count (more than one → 'shared_task').
     mode = Column(String, nullable=True)
+    # The super task of a 'replication'; NULL otherwise.
+    abstract_task = Column(Integer, ForeignKey("tasks.id", name="abstract_task_constraint"), nullable=True)
 
     __table_args__ = (
         Index(

@@ -11,16 +11,24 @@ Access reuses the existing checkers rather than re-deriving anything:
   role on the universal scope) — which is also what ``ViewerAccess.full_access``
   is set from.
 
-Who may manage a task (edit its details, change its status, delete it): its
-owner, an Admin on All Scopes, or anyone with edit on its Task Manager
-component. Its assignees may change its status only, and only when
-``editable_by_assignee`` is true. Assignees are many-per-task, stored in
-``task_assignee_relationship``.
+Who may manage a task (edit its details, owner included, change its status,
+delete it): its owner, an Admin on All Scopes, or anyone with edit on its Task
+Manager component — and, for a replication, the owner of its super task. Its
+assignees may change its status only, and only when ``editable_by_assignee``
+is true. Assignees are many-per-task, stored in ``task_assignee_relationship``.
 
-A task's ``mode`` is ``group_task`` (one row shared by 2+ assignees, so a
-status change is seen by all of them) or ``individual_task`` (at most one
-assignee). Asking for ``individual_task`` with N > 1 assignees produces N
-independent tasks, one per assignee, as if each had been created separately.
+A task's ``mode``:
+
+* ``individual`` — 0 or 1 assignee.
+* ``shared_task`` — one row shared by 2+ assignees (a status change is seen by
+  all of them).
+* ``super_task`` — created for 2+ assignees: an abstraction over one
+  ``replication`` per assignee (each holding the super task's id in
+  ``abstract_task``). The super task has no assignee links of its own; its
+  assignees are its replications' ones, and its status is derived from
+  theirs (``STATUS_PRECEDENCE``). Only its managers ever see it, with its
+  replications nested; a plain assignee sees their replication alone.
+* ``replication`` — at most one assignee; can never change mode.
 
 Service functions raise ``TaskManagerError`` (carrying the HTTP status) or the
 access service's ``AccessDeniedError``; the router maps both.
@@ -32,7 +40,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import false, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.component import ComponentV2
@@ -46,29 +54,45 @@ TASK_MANAGER_WIDGET_TYPE = "task_manager"
 
 TASK_STATUSES = ("Pending", "In Progress", "Blocked", "Closed")
 DEFAULT_TASK_STATUS = "Pending"
+# A super task takes the first of these found among its replications' statuses.
+STATUS_PRECEDENCE = ("In Progress", "Pending", "Blocked", "Closed")
 
-TASK_MODE_GROUP = "group_task"
-TASK_MODE_INDIVIDUAL = "individual_task"
-TASK_MODES = (TASK_MODE_GROUP, TASK_MODE_INDIVIDUAL)
-MIN_GROUP_ASSIGNEES = 2
+TASK_MODE_INDIVIDUAL = "individual"
+TASK_MODE_SHARED = "shared_task"
+TASK_MODE_SUPER = "super_task"
+TASK_MODE_REPLICATION = "replication"
+TASK_MODES = (TASK_MODE_INDIVIDUAL, TASK_MODE_SHARED, TASK_MODE_SUPER, TASK_MODE_REPLICATION)
+CREATABLE_TASK_MODES = (TASK_MODE_INDIVIDUAL, TASK_MODE_SHARED, TASK_MODE_SUPER)
+MULTI_ASSIGNEE_MODES = (TASK_MODE_SHARED, TASK_MODE_SUPER)
+MIN_MULTI_ASSIGNEES = 2
+
+# How an edit of a super task is applied.
+UPDATE_ALL = "update_all"  # the super task and every replication
+UPDATE_SELECTED = "update_selected"  # only the listed replications
+UPDATE_SCOPES = (UPDATE_ALL, UPDATE_SELECTED)
 
 # Fields only a task manager (owner, Admin on All Scopes, component editor) may change.
 CONTENT_FIELDS = (
     "title",
     "description",
     "assignees",
+    "owner",
     "editable_by_assignee",
     "editable_via_webhook",
     "notification_cadence",
     "notify_on_create_and_delete",
 )
 # The subset whose change sends the "updated the task" notification. Assignees
-# and status have their own notifications; the two notification settings none.
-DETAIL_FIELDS = ("title", "description", "editable_by_assignee", "editable_via_webhook")
+# and status have their own notifications; owner and notification settings none.
+DETAIL_FIELDS = frozenset(("title", "description", "editable_by_assignee", "editable_via_webhook"))
 BOOLEAN_FIELDS = ("editable_by_assignee", "editable_via_webhook", "notify_on_create_and_delete")
+
+_MANAGERS = "Only the task owner, an editor of this Task Manager or an Admin on All Scopes"
 
 # ``component_id -> caller has edit on it``; supplied by the router.
 ComponentEditCheck = Callable[[int], bool]
+# ``(task, owner id of its super task or None) -> caller may manage it``.
+ManageCheck = Callable[[TaskV2, int | None], bool]
 
 
 class TaskManagerError(Exception):
@@ -134,6 +158,16 @@ def _resolve_assignee_ids(db: Session, emails: Iterable[str | None] | None) -> l
     return ids
 
 
+def _resolve_owner_id(db: Session, email: str | None) -> int:
+    cleaned = (email or "").strip().lower()
+    if not cleaned:
+        raise TaskManagerError(422, "owner cannot be empty", "OWNER_REQUIRED")
+    user = find_user_by_email(db, cleaned)
+    if user is None:
+        raise TaskManagerError(404, f"No user found with email: {cleaned}", "OWNER_NOT_FOUND")
+    return user.id
+
+
 def _validate_status(status: str | None) -> str:
     if status not in TASK_STATUSES:
         raise TaskManagerError(
@@ -160,7 +194,7 @@ def _validate_title(title: str | None) -> str:
 
 
 def _default_mode(assignee_count: int) -> str:
-    return TASK_MODE_GROUP if assignee_count >= MIN_GROUP_ASSIGNEES else TASK_MODE_INDIVIDUAL
+    return TASK_MODE_SHARED if assignee_count >= MIN_MULTI_ASSIGNEES else TASK_MODE_INDIVIDUAL
 
 
 def mode_of(task: TaskV2, assignee_ids: list[int]) -> str:
@@ -169,18 +203,37 @@ def mode_of(task: TaskV2, assignee_ids: list[int]) -> str:
 
 
 def _validate_mode(mode: str | None, assignee_count: int) -> str:
-    if mode not in TASK_MODES:
+    """A mode a task (not a replication) may be created with or turned into."""
+    if mode == TASK_MODE_REPLICATION:
         raise TaskManagerError(
-            422, f"Invalid mode {mode!r}. Supported values: {', '.join(TASK_MODES)}", "INVALID_TASK_MODE"
+            422, "A replication is only created through a super task", "INVALID_TASK_MODE"
         )
-    if mode == TASK_MODE_GROUP and assignee_count < MIN_GROUP_ASSIGNEES:
+    if mode not in CREATABLE_TASK_MODES:
         raise TaskManagerError(
             422,
-            f"A {TASK_MODE_GROUP} needs at least {MIN_GROUP_ASSIGNEES} assignees; "
-            f"use {TASK_MODE_INDIVIDUAL} for a task with {assignee_count}",
+            f"Invalid mode {mode!r}. Supported values: {', '.join(CREATABLE_TASK_MODES)}",
+            "INVALID_TASK_MODE",
+        )
+    if mode in MULTI_ASSIGNEE_MODES and assignee_count < MIN_MULTI_ASSIGNEES:
+        raise TaskManagerError(
+            422,
+            f"A {mode} needs at least {MIN_MULTI_ASSIGNEES} assignees; "
+            f"a task with {assignee_count} is {TASK_MODE_INDIVIDUAL}",
+            "INVALID_TASK_MODE",
+        )
+    if mode == TASK_MODE_INDIVIDUAL and assignee_count >= MIN_MULTI_ASSIGNEES:
+        raise TaskManagerError(
+            422,
+            f"An {TASK_MODE_INDIVIDUAL} task has at most one assignee; use {TASK_MODE_SHARED} or "
+            f"{TASK_MODE_SUPER} for {assignee_count}",
             "INVALID_TASK_MODE",
         )
     return mode
+
+
+def _derived_status(statuses: Iterable[str]) -> str | None:
+    present = set(statuses)
+    return next((s for s in STATUS_PRECEDENCE if s in present), None)
 
 
 def _assignee_ids_by_task(db: Session, task_ids: Iterable[int]) -> dict[int, list[int]]:
@@ -200,6 +253,16 @@ def _assignee_ids_by_task(db: Session, task_ids: Iterable[int]) -> dict[int, lis
     return result
 
 
+def _replications_of(db: Session, super_ids: Iterable[int]) -> dict[int, list[TaskV2]]:
+    ids = set(super_ids)
+    result: dict[int, list[TaskV2]] = {sid: [] for sid in ids}
+    if not ids:
+        return result
+    for rep in db.query(TaskV2).filter(TaskV2.abstract_task.in_(ids)).order_by(TaskV2.id).all():
+        result[rep.abstract_task].append(rep)
+    return result
+
+
 def _set_assignees(db: Session, task_id: int, current: list[int], wanted: list[int]) -> bool:
     """Make the task's links exactly ``wanted``; True if anything changed."""
     removed = [uid for uid in current if uid not in wanted]
@@ -211,6 +274,50 @@ def _set_assignees(db: Session, task_id: int, current: list[int], wanted: list[i
     for uid in added:
         db.add(TaskAssigneeV2(task_id=task_id, assignee_id=uid))
     return bool(removed or added)
+
+
+def _create_replications(
+    db: Session, super_task: TaskV2, assignee_ids: list[int], caller_id: int, now: datetime
+) -> list[TaskV2]:
+    """One replication of ``super_task`` (as it is now) per assignee."""
+    replications: list[TaskV2] = []
+    for uid in assignee_ids:
+        rep = TaskV2(
+            title=super_task.title,
+            description=super_task.description,
+            status=super_task.status,
+            owner_id=super_task.owner_id,
+            component_id=super_task.component_id,
+            created_at=now,
+            last_updated_at=now,
+            last_updated_by=caller_id,
+            status_last_updated_at=super_task.status_last_updated_at,
+            status_last_updated_by=super_task.status_last_updated_by,
+            editable_by_assignee=super_task.editable_by_assignee,
+            editable_via_webhook=super_task.editable_via_webhook,
+            notification_cadence=super_task.notification_cadence,
+            notify_on_create_and_delete=super_task.notify_on_create_and_delete,
+            mode=TASK_MODE_REPLICATION,
+            abstract_task=super_task.id,
+        )
+        db.add(rep)
+        db.flush()
+        _set_assignees(db, rep.id, [], [uid])
+        replications.append(rep)
+    return replications
+
+
+def _refresh_super_status(db: Session, super_task: TaskV2, caller_id: int, now: datetime) -> bool:
+    """Set the super task's status from its replications' (unchanged when it has none)."""
+    db.flush()
+    statuses = [s for (s,) in db.query(TaskV2.status).filter(TaskV2.abstract_task == super_task.id).all()]
+    derived = _derived_status(statuses)
+    if derived is None or derived == super_task.status:
+        return False
+    super_task.status = derived
+    super_task.status_last_updated_at = now
+    super_task.status_last_updated_by = caller_id
+    return True
 
 
 def _emails_by_user_id(db: Session, user_ids: Iterable[int | None]) -> dict[int, str | None]:
@@ -227,9 +334,11 @@ def serialize_task(
     emails: dict[int, str | None],
     *,
     can_manage: bool,
+    replications: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     is_assignee = caller_id in assignee_ids
-    return {
+    is_super = task.mode == TASK_MODE_SUPER
+    data = {
         "id": task.id,
         "title": task.title,
         "description": task.description,
@@ -248,23 +357,67 @@ def serialize_task(
         "notification_cadence": cadence_of(task),
         "notify_on_create_and_delete": task.notify_on_create_and_delete,
         "mode": mode_of(task, assignee_ids),
+        "abstract_task": task.abstract_task,
         "is_owner": task.owner_id == caller_id,
         "is_assignee": is_assignee,
         "can_manage": can_manage,
-        "can_edit_status": can_manage or (is_assignee and bool(task.editable_by_assignee)),
+        # A super task's status is never the assignees' to change (only their replication's).
+        "can_edit_status": can_manage or (not is_super and is_assignee and bool(task.editable_by_assignee)),
     }
+    data["replications"] = (replications or []) if is_super else None
+    return data
 
 
-def _serialize_one(db: Session, task: TaskV2, caller_id: int, *, can_manage: bool) -> dict[str, Any]:
-    assignee_ids = _assignee_ids_by_task(db, [task.id])[task.id]
-    emails = _emails_by_user_id(db, [task.owner_id, *assignee_ids])
-    return serialize_task(task, caller_id, assignee_ids, emails, can_manage=can_manage)
+def _serialize_tree(
+    db: Session, tasks: list[TaskV2], caller_id: int | None, can_manage: ManageCheck
+) -> list[dict[str, Any]]:
+    """``tasks`` in order. Each super task among them comes with all its
+    replications nested (and any of those also in ``tasks`` isn't repeated at
+    the top level); any other replication stands alone. A super task's
+    assignees are its replications' ones."""
+    nested = _replications_of(db, [t.id for t in tasks if t.mode == TASK_MODE_SUPER])
+    nested_ids = {r.id for reps in nested.values() for r in reps}
+    top = [t for t in tasks if t.id not in nested_ids]
+    every = [*top, *(r for reps in nested.values() for r in reps)]
+    assignees = _assignee_ids_by_task(db, [t.id for t in every])
+    for super_id, reps in nested.items():
+        assignees[super_id] = list(dict.fromkeys(uid for r in reps for uid in assignees[r.id]))
+
+    super_owner = {t.id: t.owner_id for t in top if t.mode == TASK_MODE_SUPER}
+    missing = {t.abstract_task for t in top if t.abstract_task is not None} - set(super_owner)
+    if missing:
+        super_owner.update(dict(db.query(TaskV2.id, TaskV2.owner_id).filter(TaskV2.id.in_(missing)).all()))
+    emails = _emails_by_user_id(db, [uid for t in every for uid in (t.owner_id, *assignees[t.id])])
+
+    def one(task: TaskV2) -> dict[str, Any]:
+        reps = [one(r) for r in nested[task.id]] if task.id in nested else None
+        return serialize_task(
+            task,
+            caller_id,
+            assignees[task.id],
+            emails,
+            can_manage=can_manage(task, super_owner.get(task.abstract_task)),
+            replications=reps,
+        )
+
+    return [one(t) for t in top]
 
 
-def _can_manage(task: TaskV2, caller_id: int, is_admin: bool, can_edit_component: ComponentEditCheck) -> bool:
-    if is_admin or task.owner_id == caller_id:
+def _can_manage(
+    task: TaskV2,
+    caller_id: int,
+    is_admin: bool,
+    can_edit_component: ComponentEditCheck,
+    super_owner_id: int | None = None,
+) -> bool:
+    if is_admin or task.owner_id == caller_id or (super_owner_id is not None and super_owner_id == caller_id):
         return True
     return task.component_id is not None and can_edit_component(task.component_id)
+
+
+def _manager(caller_id: int, is_admin: bool, can_edit_component: ComponentEditCheck) -> ManageCheck:
+    check = _cached(can_edit_component)
+    return lambda task, super_owner_id: _can_manage(task, caller_id, is_admin, check, super_owner_id)
 
 
 def _cached(check: ComponentEditCheck) -> ComponentEditCheck:
@@ -302,12 +455,14 @@ def _require_component_view(db: Session, access: ViewerAccess, component_id: int
 def list_tasks(
     db: Session, component_id: int, *, caller_id: int, access: ViewerAccess, anonymous: bool = False
 ) -> dict[str, Any]:
-    """Tasks of one Task Manager component.
+    """Tasks of one Task Manager component, super tasks with their
+    replications nested.
 
     The caller needs at least view on the component (``_require_component_view``).
     Callers with edit on the component (Hub Admins included) get every task
     and can manage all of them; everyone else only the tasks they own or are
-    assigned to.
+    assigned to: a super task they own comes with all its replications, a
+    replication of someone else's super task comes alone.
 
     ``anonymous`` (View As): nothing of the caller's own counts — no owned or
     assigned tasks unless ``access`` already shows every task, ``is_owner`` /
@@ -318,29 +473,27 @@ def list_tasks(
     is_editor = bool(verdict.edit)
     subject_id = None if anonymous else caller_id
     query = db.query(TaskV2).filter(TaskV2.component_id == component_id)
-    if not is_editor:
-        if subject_id is None:
-            query = query.filter(false())
-        else:
-            assigned = db.query(TaskAssigneeV2.task_id).filter(TaskAssigneeV2.assignee_id == subject_id)
-            query = query.filter(or_(TaskV2.owner_id == subject_id, TaskV2.id.in_(assigned)))
-    tasks = query.order_by(TaskV2.created_at.desc(), TaskV2.id.desc()).all()
+    if is_editor:
+        tasks = query.order_by(TaskV2.created_at.desc(), TaskV2.id.desc()).all()
+    elif subject_id is None:
+        tasks = []
+    else:
+        assigned = db.query(TaskAssigneeV2.task_id).filter(TaskAssigneeV2.assignee_id == subject_id)
+        tasks = (
+            query.filter(or_(TaskV2.owner_id == subject_id, TaskV2.id.in_(assigned)))
+            .order_by(TaskV2.created_at.desc(), TaskV2.id.desc())
+            .all()
+        )
 
-    assignees = _assignee_ids_by_task(db, [t.id for t in tasks])
-    emails = _emails_by_user_id(
-        db, [uid for t in tasks for uid in (t.owner_id, *assignees[t.id])]
-    )
+    def can_manage(task: TaskV2, super_owner_id: int | None) -> bool:
+        return is_editor or (subject_id is not None and subject_id in (task.owner_id, super_owner_id))
+
     return {
         "component_id": component_id,
         "can_view_all_tasks": is_editor,
         # Anyone who can see the Task Manager can create tasks in it.
         "can_create_tasks": True,
-        "tasks": [
-            serialize_task(
-                t, subject_id, assignees[t.id], emails, can_manage=is_editor or t.owner_id == subject_id
-            )
-            for t in tasks
-        ],
+        "tasks": _serialize_tree(db, tasks, subject_id, can_manage),
     }
 
 
@@ -369,10 +522,11 @@ def create_task(
     Requires view on the component (``_require_component_view``). Each
     assignee is notified when ``notify_on_create_and_delete`` is true.
 
-    ``mode`` defaults to ``group_task`` with 2+ assignees and
-    ``individual_task`` otherwise; ``group_task`` with fewer than 2 is refused.
-    ``individual_task`` with N > 1 assignees creates N tasks, one per assignee.
-    Returns every created task, in assignee order."""
+    ``mode`` defaults to ``individual`` with 0 or 1 assignee and
+    ``shared_task`` with more. ``shared_task`` / ``super_task`` need 2+
+    assignees and ``individual`` at most one. A ``super_task`` is stored
+    without assignees, plus one ``replication`` of it per assignee.
+    Returns the created task (a super task with its replications nested)."""
     _require_component_view(db, access, component_id)
 
     title = _validate_title(title)
@@ -380,50 +534,122 @@ def create_task(
     assignee_ids = _resolve_assignee_ids(db, assignee_emails)
     cadence = _validate_cadence(notification_cadence or "always")
     mode = _default_mode(len(assignee_ids)) if mode is None else _validate_mode(mode, len(assignee_ids))
-    if mode == TASK_MODE_INDIVIDUAL and len(assignee_ids) > 1:
-        assignee_sets = [[uid] for uid in assignee_ids]
-    else:
-        assignee_sets = [assignee_ids]
 
     now = _utc_now()
-    tasks: list[TaskV2] = []
     try:
         notifier = TaskNotifier(db, caller_id)
-        for task_assignees in assignee_sets:
-            task = TaskV2(
-                title=title,
-                description=description,
-                status=status,
-                owner_id=caller_id,
-                component_id=component_id,
-                created_at=now,
-                last_updated_at=now,
-                status_last_updated_at=now,
-                last_updated_by=caller_id,
-                status_last_updated_by=caller_id,
-                editable_by_assignee=editable_by_assignee,
-                editable_via_webhook=editable_via_webhook,
-                notification_cadence=cadence,
-                notify_on_create_and_delete=notify_on_create_and_delete,
-                mode=mode,
-            )
-            db.add(task)
-            db.flush()
-            _set_assignees(db, task.id, [], task_assignees)
-            notifier.assignees_changed(task, added=task_assignees, removed=[])
-            tasks.append(task)
+        task = TaskV2(
+            title=title,
+            description=description,
+            status=status,
+            owner_id=caller_id,
+            component_id=component_id,
+            created_at=now,
+            last_updated_at=now,
+            status_last_updated_at=now,
+            last_updated_by=caller_id,
+            status_last_updated_by=caller_id,
+            editable_by_assignee=editable_by_assignee,
+            editable_via_webhook=editable_via_webhook,
+            notification_cadence=cadence,
+            notify_on_create_and_delete=notify_on_create_and_delete,
+            mode=mode,
+        )
+        db.add(task)
+        db.flush()
+        if mode == TASK_MODE_SUPER:
+            for rep, uid in zip(_create_replications(db, task, assignee_ids, caller_id, now), assignee_ids):
+                notifier.assignees_changed(rep, added=[uid], removed=[])
+        else:
+            _set_assignees(db, task.id, [], assignee_ids)
+            notifier.assignees_changed(task, added=assignee_ids, removed=[])
         db.commit()
     except Exception:
         db.rollback()
         raise
-    for task in tasks:
-        db.refresh(task)
-    return [_serialize_one(db, task, caller_id, can_manage=True) for task in tasks]
+    db.refresh(task)
+    return _serialize_tree(db, [task], caller_id, lambda _task, _super_owner: True)
 
 
 # ---------------------------------------------------------
 # Update
 # ---------------------------------------------------------
+
+
+def _forbidden(action: str) -> TaskManagerError:
+    return TaskManagerError(403, f"{_MANAGERS} can {action}", "FORBIDDEN")
+
+
+def _check_assignee_status_change(task: TaskV2, caller_id: int, assignee_ids: list[int]) -> None:
+    """A caller who can't manage the task changes its status as an assignee."""
+    if caller_id not in assignee_ids:
+        raise TaskManagerError(
+            403,
+            "Only the task owner, its assignees, an editor of this Task Manager or an Admin "
+            "on All Scopes can change its status",
+            "FORBIDDEN",
+        )
+    if not task.editable_by_assignee:
+        raise TaskManagerError(
+            403, "Assignees are not allowed to change this task's status", "ASSIGNEE_EDIT_DISABLED"
+        )
+
+
+def _validated_values(db: Session, content_changes: dict[str, Any]) -> dict[str, Any]:
+    """Column values for the sent content fields other than ``assignees``."""
+    values: dict[str, Any] = {}
+    if "title" in content_changes:
+        values["title"] = _validate_title(content_changes["title"])
+    if "description" in content_changes:
+        values["description"] = content_changes["description"]
+    if "owner" in content_changes:
+        values["owner_id"] = _resolve_owner_id(db, content_changes["owner"])
+    if "notification_cadence" in content_changes:
+        values["notification_cadence"] = _validate_cadence(content_changes["notification_cadence"])
+    for flag in BOOLEAN_FIELDS:
+        if flag in content_changes:
+            if content_changes[flag] is None:
+                raise TaskManagerError(422, f"{flag} cannot be null", "INVALID_VALUE")
+            values[flag] = bool(content_changes[flag])
+    return values
+
+
+def _apply_values(task: TaskV2, values: dict[str, Any]) -> set[str]:
+    """Write only the values that differ; return the changed columns."""
+    changed: set[str] = set()
+    for field, value in values.items():
+        current = cadence_of(task) if field == "notification_cadence" else getattr(task, field)
+        if current != value:
+            setattr(task, field, value)
+            changed.add(field)
+    return changed
+
+
+def _touch(task: TaskV2, now: datetime, caller_id: int) -> None:
+    task.last_updated_at = now
+    task.last_updated_by = caller_id
+
+
+def _apply_status(task: TaskV2, status: str | None, now: datetime, caller_id: int) -> bool:
+    if status is None or task.status == status:
+        return False
+    task.status = status
+    task.status_last_updated_at = now
+    task.status_last_updated_by = caller_id
+    return True
+
+
+# (task, its assignees, changed columns, status changed)
+_Touched = tuple[TaskV2, list[int], set[str], bool]
+
+
+def _notify_changes(notifier: TaskNotifier, touched: list[_Touched]) -> None:
+    for task, assignee_ids, changed, _ in touched:
+        if changed & DETAIL_FIELDS:
+            notifier.details_changed(task, assignee_ids)
+    for task, assignee_ids, _, status_changed in touched:
+        if status_changed:
+            notifier.status_changed(task, assignee_ids)
 
 
 def update_task(
@@ -434,173 +660,320 @@ def update_task(
     is_admin: bool,
     can_edit_component: ComponentEditCheck,
     changes: dict[str, Any],
+    update_scope: str | None = None,
+    replication_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply ``changes`` (only the keys the client actually sent).
+    """Apply ``changes`` (only the keys the client actually sent; only values
+    that differ are written).
 
     * Content fields (``CONTENT_FIELDS``; ``assignees`` replaces the whole
-      list): task owner, Admin on All Scopes, or an editor of the task's
-      component. Bumps ``last_updated_at`` / ``last_updated_by``.
+      list, ``owner`` is an email): task owner, Admin on All Scopes, an editor
+      of the task's component, or — for a replication — its super task's
+      owner. Bumps ``last_updated_at`` / ``last_updated_by``.
     * ``status``: the same people, or an assignee when the task's
-      ``editable_by_assignee`` is true. Bumps ``status_last_updated_at`` /
-      ``status_last_updated_by``.
-    * ``mode``: only the task owner, Admin on All Scopes, or an editor of the
-      task's component may change it (sending the current mode is a no-op
-      anyone may do). When omitted, the task keeps its mode: a
-      ``group_task`` left with fewer than 2 assignees is refused, and an
-      ``individual_task`` given N > 1 assignees is split. A split keeps one
-      assignee on the task (one it already had, if any) and creates N-1
-      copies of it (after this update), one per other assignee, owned by the
-      same owner. A mode change alone never notifies anyone; added/removed
-      assignees, detail and status changes notify as usual.
+      ``editable_by_assignee`` is true (never on a super task). Bumps
+      ``status_last_updated_at`` / ``status_last_updated_by``.
+    * ``mode`` (managers only; sending the current one is a no-op):
+      ``individual`` / ``shared_task`` follow the assignee count when omitted;
+      either may be turned into a ``super_task`` (its assignees move onto one
+      replication each). A super task or a replication never changes mode.
+    * A replication has at most one assignee, who has no other replication of
+      the same super task. A change of its status re-derives its super task's.
+    * A super task needs ``update_scope``: ``update_all`` applies the changes
+      to it and every replication (``assignees`` then adds / deletes
+      replications); ``update_selected`` to the ``replication_ids`` only
+      (which must all be its replications; ``assignees`` refused). Its status
+      is then re-derived from its replications'.
 
-    Everything is validated before anything is written. Timestamps only move
-    when a value actually changes. Notifications (``task_notification_service``)
-    follow the task's settings AFTER this update, and are written in the same
-    commit. Returns the updated task, then any copies, in assignee order.
+    Everything is validated before anything is written. Notifications
+    (``task_notification_service``) follow the tasks' settings AFTER this
+    update, and are written in the same commit. Returns the updated task (a
+    super task with its replications nested); for a replication, followed by
+    its super task when the caller can manage that one.
     """
     task = db.query(TaskV2).filter(TaskV2.id == task_id).first()
     if task is None:
         raise TaskManagerError(404, "Task not found", "TASK_NOT_FOUND")
 
     content_changes = {k: v for k, v in changes.items() if k in CONTENT_FIELDS}
-    status_change = "status" in changes
-    mode_requested = "mode" in changes
-    if not content_changes and not status_change and not mode_requested:
+    if not content_changes and "status" not in changes and "mode" not in changes:
         raise TaskManagerError(400, "No updatable fields were provided", "NO_CHANGES")
 
+    manager = _manager(caller_id, is_admin, can_edit_component)
+    args = dict(caller_id=caller_id, manager=manager, changes=changes, content_changes=content_changes)
+    if task.mode == TASK_MODE_SUPER:
+        return _update_super_task(db, task, update_scope=update_scope, replication_ids=replication_ids, **args)
+    if update_scope is not None or replication_ids:
+        raise TaskManagerError(
+            422, "update_scope and replication_ids only apply to a super task", "UPDATE_SCOPE_NOT_APPLICABLE"
+        )
+    if task.mode == TASK_MODE_REPLICATION:
+        return _update_replication(db, task, **args)
+    return _update_standalone(db, task, **args)
+
+
+def _update_standalone(
+    db: Session,
+    task: TaskV2,
+    *,
+    caller_id: int,
+    manager: ManageCheck,
+    changes: dict[str, Any],
+    content_changes: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """An ``individual`` or ``shared_task`` task."""
     current_assignees = _assignee_ids_by_task(db, [task.id])[task.id]
     current_mode = mode_of(task, current_assignees)
-    can_manage = _can_manage(task, caller_id, is_admin, can_edit_component)
-    is_assignee = caller_id in current_assignees
+    can_manage = manager(task, None)
+    status_change = "status" in changes
+    mode_requested = "mode" in changes
+    requested_mode = changes.get("mode")
 
     if content_changes and not can_manage:
-        raise TaskManagerError(
-            403,
-            "Only the task owner, an editor of this Task Manager or an Admin on All Scopes "
-            "can edit this task's details",
-            "FORBIDDEN",
-        )
-    if mode_requested and changes["mode"] != current_mode and not can_manage:
-        raise TaskManagerError(
-            403,
-            "Only the task owner, an editor of this Task Manager or an Admin on All Scopes "
-            "can change this task's mode",
-            "FORBIDDEN",
-        )
+        raise _forbidden("edit this task's details")
+    if mode_requested and requested_mode not in (None, current_mode) and not can_manage:
+        raise _forbidden("change this task's mode")
     if status_change and not can_manage:
-        if not is_assignee:
-            raise TaskManagerError(
-                403,
-                "Only the task owner, its assignees, an editor of this Task Manager or an Admin "
-                "on All Scopes can change its status",
-                "FORBIDDEN",
-            )
-        if not task.editable_by_assignee:
-            raise TaskManagerError(
-                403, "Assignees are not allowed to change this task's status", "ASSIGNEE_EDIT_DISABLED"
-            )
+        _check_assignee_status_change(task, caller_id, current_assignees)
 
-    new_values: dict[str, Any] = {}
-    if "title" in content_changes:
-        new_values["title"] = _validate_title(content_changes["title"])
-    if "description" in content_changes:
-        new_values["description"] = content_changes["description"]
-    if "notification_cadence" in content_changes:
-        new_values["notification_cadence"] = _validate_cadence(content_changes["notification_cadence"])
-    for flag in BOOLEAN_FIELDS:
-        if flag in content_changes:
-            if content_changes[flag] is None:
-                raise TaskManagerError(422, f"{flag} cannot be null", "INVALID_VALUE")
-            new_values[flag] = bool(content_changes[flag])
-    wanted_assignees = (
-        _resolve_assignee_ids(db, content_changes["assignees"]) if "assignees" in content_changes else None
-    )
+    values = _validated_values(db, content_changes)
+    wanted = _resolve_assignee_ids(db, content_changes["assignees"]) if "assignees" in content_changes else None
     new_status = _validate_status(changes["status"]) if status_change else None
-    final_assignees = current_assignees if wanted_assignees is None else wanted_assignees
-    mode_in_play = mode_requested or wanted_assignees is not None
-    if not mode_in_play:
+    final_assignees = current_assignees if wanted is None else wanted
+    if mode_requested or wanted is not None:
+        new_mode = (
+            _default_mode(len(final_assignees))
+            if requested_mode is None
+            else _validate_mode(requested_mode, len(final_assignees))
+        )
+    else:
         new_mode = current_mode
-    else:
-        new_mode = _validate_mode(changes["mode"] if mode_requested else current_mode, len(final_assignees))
-
-    split = mode_in_play and new_mode == TASK_MODE_INDIVIDUAL and len(final_assignees) > 1
-    if split:
-        keeper = next((uid for uid in final_assignees if uid in current_assignees), final_assignees[0])
-        kept_assignees = [keeper]
-        copy_assignees = [uid for uid in final_assignees if uid != keeper]
-    else:
-        kept_assignees = final_assignees
-        copy_assignees = []
+    to_super = new_mode == TASK_MODE_SUPER
 
     try:
         now = _utc_now()
-        changed_fields: set[str] = set()
-        for field, value in new_values.items():
-            current = cadence_of(task) if field == "notification_cadence" else getattr(task, field)
-            if current != value:
-                setattr(task, field, value)
-                changed_fields.add(field)
+        changed = _apply_values(task, values)
         if task.mode != new_mode:
             # Storing a NULL task's derived mode alone is not a change.
             task.mode = new_mode
             if new_mode != current_mode:
-                changed_fields.add("mode")
-        if _set_assignees(db, task.id, current_assignees, kept_assignees):
-            changed_fields.add("assignees")
-        if changed_fields:
-            task.last_updated_at = now
-            task.last_updated_by = caller_id
-        status_changed = status_change and task.status != new_status
-        if status_changed:
-            task.status = new_status
-            task.status_last_updated_at = now
-            task.status_last_updated_by = caller_id
+                changed.add("mode")
+        # A super task keeps no assignee links: they move onto its replications.
+        if _set_assignees(db, task.id, current_assignees, [] if to_super else final_assignees):
+            changed.add("assignees")
+        if changed:
+            _touch(task, now, caller_id)
+        status_changed = status_change and _apply_status(task, new_status, now, caller_id)
 
-        copies: list[TaskV2] = []
-        for uid in copy_assignees:
-            copy = TaskV2(
-                title=task.title,
-                description=task.description,
-                status=task.status,
-                owner_id=task.owner_id,
-                component_id=task.component_id,
-                created_at=now,
-                last_updated_at=now,
-                last_updated_by=caller_id,
-                status_last_updated_at=task.status_last_updated_at,
-                status_last_updated_by=task.status_last_updated_by,
-                editable_by_assignee=task.editable_by_assignee,
-                editable_via_webhook=task.editable_via_webhook,
-                notification_cadence=task.notification_cadence,
-                notify_on_create_and_delete=task.notify_on_create_and_delete,
-                mode=TASK_MODE_INDIVIDUAL,
-            )
-            db.add(copy)
+        if to_super:
             db.flush()
-            _set_assignees(db, copy.id, [], [uid])
-            copies.append(copy)
+            replications = _create_replications(db, task, final_assignees, caller_id, now)
+            touched = [(rep, [uid], changed, status_changed) for rep, uid in zip(replications, final_assignees)]
+        else:
+            touched = [(task, final_assignees, changed, status_changed)]
 
-        # One notification per person, sent through the original task: those
-        # moved onto a copy were already assigned and aren't told twice. The
-        # mode itself never notifies (it isn't a DETAIL_FIELD).
+        # Those moved onto a replication were already assigned and aren't told
+        # again. The mode itself never notifies (it isn't a DETAIL_FIELD).
         notifier = TaskNotifier(db, caller_id)
         notifier.assignees_changed(
             task,
             added=[uid for uid in final_assignees if uid not in current_assignees],
             removed=[uid for uid in current_assignees if uid not in final_assignees],
         )
-        if changed_fields & set(DETAIL_FIELDS):
-            notifier.details_changed(task, final_assignees)
-        if status_changed:
-            notifier.status_changed(task, final_assignees)
+        _notify_changes(notifier, touched)
         db.commit()
     except Exception:
         db.rollback()
         raise
     db.refresh(task)
-    for copy in copies:
-        db.refresh(copy)
-    return [_serialize_one(db, t, caller_id, can_manage=can_manage) for t in (task, *copies)]
+    return _serialize_tree(db, [task], caller_id, manager)
+
+
+def _update_replication(
+    db: Session,
+    task: TaskV2,
+    *,
+    caller_id: int,
+    manager: ManageCheck,
+    changes: dict[str, Any],
+    content_changes: dict[str, Any],
+) -> list[dict[str, Any]]:
+    super_task = db.get(TaskV2, task.abstract_task) if task.abstract_task is not None else None
+    current_assignees = _assignee_ids_by_task(db, [task.id])[task.id]
+    can_manage = manager(task, super_task.owner_id if super_task is not None else None)
+    status_change = "status" in changes
+
+    if changes.get("mode") not in (None, TASK_MODE_REPLICATION):
+        raise TaskManagerError(
+            422, f"A replication can't be turned into a {changes['mode']}", "INVALID_TASK_MODE"
+        )
+    if content_changes and not can_manage:
+        raise _forbidden("edit this task's details")
+    if status_change and not can_manage:
+        _check_assignee_status_change(task, caller_id, current_assignees)
+
+    values = _validated_values(db, content_changes)
+    wanted = _resolve_assignee_ids(db, content_changes["assignees"]) if "assignees" in content_changes else None
+    if wanted is not None:
+        if len(wanted) > 1:
+            raise TaskManagerError(422, "A replication can have at most one assignee", "TOO_MANY_ASSIGNEES")
+        if wanted and super_task is not None:
+            taken = (
+                db.query(TaskAssigneeV2.task_id)
+                .join(TaskV2, TaskV2.id == TaskAssigneeV2.task_id)
+                .filter(
+                    TaskV2.abstract_task == super_task.id,
+                    TaskV2.id != task.id,
+                    TaskAssigneeV2.assignee_id == wanted[0],
+                )
+                .first()
+            )
+            if taken is not None:
+                raise TaskManagerError(
+                    409,
+                    "This user already has a replication of the same super task",
+                    "ASSIGNEE_ALREADY_HAS_REPLICATION",
+                )
+    new_status = _validate_status(changes["status"]) if status_change else None
+    final_assignees = current_assignees if wanted is None else wanted
+
+    try:
+        now = _utc_now()
+        changed = _apply_values(task, values)
+        if _set_assignees(db, task.id, current_assignees, final_assignees):
+            changed.add("assignees")
+        if changed:
+            _touch(task, now, caller_id)
+        status_changed = status_change and _apply_status(task, new_status, now, caller_id)
+        if status_changed and super_task is not None:
+            _refresh_super_status(db, super_task, caller_id, now)
+
+        notifier = TaskNotifier(db, caller_id)
+        notifier.assignees_changed(
+            task,
+            added=[uid for uid in final_assignees if uid not in current_assignees],
+            removed=[uid for uid in current_assignees if uid not in final_assignees],
+        )
+        _notify_changes(notifier, [(task, final_assignees, changed, status_changed)])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(task)
+    result = _serialize_tree(db, [task], caller_id, manager)
+    if super_task is not None and manager(super_task, None):
+        db.refresh(super_task)
+        result += _serialize_tree(db, [super_task], caller_id, manager)
+    return result
+
+
+def _update_super_task(
+    db: Session,
+    task: TaskV2,
+    *,
+    caller_id: int,
+    manager: ManageCheck,
+    changes: dict[str, Any],
+    content_changes: dict[str, Any],
+    update_scope: str | None,
+    replication_ids: list[int] | None,
+) -> list[dict[str, Any]]:
+    can_manage = manager(task, None)
+    status_change = "status" in changes
+
+    if changes.get("mode") not in (None, TASK_MODE_SUPER):
+        raise TaskManagerError(
+            422, f"A super task can't be turned into a {changes['mode']}", "INVALID_TASK_MODE"
+        )
+    if status_change and not can_manage:
+        raise TaskManagerError(
+            403,
+            f"{_MANAGERS} can change a super task's status; an assignee changes their own replication's",
+            "FORBIDDEN",
+        )
+    if content_changes and not can_manage:
+        raise _forbidden("edit this task's details")
+    if update_scope is None:
+        raise TaskManagerError(
+            422,
+            f"Editing a super task needs update_scope: {UPDATE_ALL} or {UPDATE_SELECTED}",
+            "UPDATE_SCOPE_REQUIRED",
+        )
+    if update_scope not in UPDATE_SCOPES:
+        raise TaskManagerError(
+            422,
+            f"Invalid update_scope {update_scope!r}. Supported values: {', '.join(UPDATE_SCOPES)}",
+            "INVALID_UPDATE_SCOPE",
+        )
+
+    replications = _replications_of(db, [task.id])[task.id]
+    if update_scope == UPDATE_SELECTED:
+        selected = list(dict.fromkeys(replication_ids or []))
+        if not selected:
+            raise TaskManagerError(
+                422, f"replication_ids is required with {UPDATE_SELECTED}", "REPLICATION_IDS_REQUIRED"
+            )
+        by_id = {rep.id: rep for rep in replications}
+        foreign = [rid for rid in selected if rid not in by_id]
+        if foreign:
+            raise TaskManagerError(
+                422,
+                f"Not replications of super task {task.id}: {', '.join(map(str, foreign))}",
+                "INVALID_REPLICATION_IDS",
+            )
+        if "assignees" in content_changes:
+            raise TaskManagerError(
+                422, f"A super task's assignees can only be changed with {UPDATE_ALL}", "ASSIGNEES_NEED_UPDATE_ALL"
+            )
+        targets = [by_id[rid] for rid in selected]
+    else:
+        targets = [task, *replications]
+
+    values = _validated_values(db, content_changes)
+    wanted = _resolve_assignee_ids(db, content_changes["assignees"]) if "assignees" in content_changes else None
+    new_status = _validate_status(changes["status"]) if status_change else None
+    rep_assignees = _assignee_ids_by_task(db, [rep.id for rep in replications])
+    current_assignees = list(dict.fromkeys(uid for rep in replications for uid in rep_assignees[rep.id]))
+
+    try:
+        now = _utc_now()
+        touched: list[_Touched] = []
+        for target in targets:
+            changed = _apply_values(target, values)
+            if changed:
+                _touch(target, now, caller_id)
+            status_changed = status_change and _apply_status(target, new_status, now, caller_id)
+            touched.append((target, rep_assignees.get(target.id, []), changed, status_changed))
+
+        added: list[int] = []
+        removed: list[int] = []
+        if wanted is not None:
+            added = [uid for uid in wanted if uid not in current_assignees]
+            removed = [uid for uid in current_assignees if uid not in wanted]
+            gone = [rep for rep in replications if any(uid in removed for uid in rep_assignees[rep.id])]
+            if gone:
+                gone_ids = {rep.id for rep in gone}
+                db.query(TaskAssigneeV2).filter(TaskAssigneeV2.task_id.in_(gone_ids)).delete(
+                    synchronize_session=False
+                )
+                for rep in gone:
+                    db.delete(rep)
+                touched = [t for t in touched if t[0].id not in gone_ids]
+            db.flush()
+            _create_replications(db, task, added, caller_id, now)
+            if added or removed:
+                _touch(task, now, caller_id)
+        _refresh_super_status(db, task, caller_id, now)
+
+        notifier = TaskNotifier(db, caller_id)
+        notifier.assignees_changed(task, added=added, removed=removed)
+        _notify_changes(notifier, touched)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(task)
+    return _serialize_tree(db, [task], caller_id, manager)
 
 
 # ---------------------------------------------------------
@@ -617,13 +990,19 @@ def delete_tasks(
     can_edit_component: ComponentEditCheck,
 ) -> dict[str, Any]:
     """Delete every task the caller may manage (owner, Admin on All Scopes,
-    editor of the task's component). A task that can't be deleted doesn't
-    block the others; it is reported in ``failed`` instead. Owner and
-    assignees are notified when the task wasn't Closed and its
-    ``notify_on_create_and_delete`` is true."""
+    editor of the task's component, owner of a replication's super task). A
+    task that can't be deleted doesn't block the others; it is reported in
+    ``failed`` instead. Deleting a super task deletes all its replications
+    (listed in ``deleted`` after the requested ids); deleting some of them
+    re-derives its status. Owner and assignees are notified when the task
+    wasn't Closed and its ``notify_on_create_and_delete`` is true."""
     unique_ids = list(dict.fromkeys(task_ids))
     tasks = {t.id: t for t in db.query(TaskV2).filter(TaskV2.id.in_(unique_ids)).all()} if unique_ids else {}
-    check = _cached(can_edit_component)
+    manager = _manager(caller_id, is_admin, can_edit_component)
+    super_ids = {t.abstract_task for t in tasks.values() if t.abstract_task is not None}
+    super_owner = (
+        dict(db.query(TaskV2.id, TaskV2.owner_id).filter(TaskV2.id.in_(super_ids)).all()) if super_ids else {}
+    )
 
     deleted: list[int] = []
     failed: list[dict[str, Any]] = []
@@ -634,32 +1013,50 @@ def delete_tasks(
                 {"task_id": task_id, "status_code": 404, "code": "TASK_NOT_FOUND", "message": "Task not found"}
             )
             continue
-        if not _can_manage(task, caller_id, is_admin, check):
+        if not manager(task, super_owner.get(task.abstract_task)):
             failed.append(
                 {
                     "task_id": task_id,
                     "status_code": 403,
                     "code": "FORBIDDEN",
-                    "message": "Only the task owner, an editor of this Task Manager or an Admin on "
-                    "All Scopes can delete this task",
+                    "message": f"{_MANAGERS} can delete this task",
                 }
             )
             continue
         deleted.append(task_id)
 
     if deleted:
+        doomed = {tid: tasks[tid] for tid in deleted}
+        deleted_supers = [tid for tid in deleted if tasks[tid].mode == TASK_MODE_SUPER]
+        for reps in _replications_of(db, deleted_supers).values():
+            for rep in reps:
+                if rep.id not in doomed:
+                    doomed[rep.id] = rep
+                    deleted.append(rep.id)
         try:
+            now = _utc_now()
             # Read the assignees before their links go.
-            assignees = _assignee_ids_by_task(db, deleted)
+            assignees = _assignee_ids_by_task(db, doomed)
             notifier = TaskNotifier(db, caller_id)
             for task_id in deleted:
-                notifier.deleted(tasks[task_id], assignees[task_id])
+                notifier.deleted(doomed[task_id], assignees[task_id])
             # The FK cascades too; deleting the links explicitly doesn't rely on it.
             db.query(TaskAssigneeV2).filter(TaskAssigneeV2.task_id.in_(deleted)).delete(
                 synchronize_session=False
             )
-            for task_id in deleted:
-                db.delete(tasks[task_id])
+            # Replications go before the super task they point to.
+            replications = [t for t in doomed.values() if t.abstract_task is not None]
+            for task in replications:
+                db.delete(task)
+            db.flush()
+            for task in doomed.values():
+                if task.abstract_task is None:
+                    db.delete(task)
+            db.flush()
+            for super_id in {t.abstract_task for t in replications} - set(doomed):
+                super_task = db.get(TaskV2, super_id)
+                if super_task is not None:
+                    _refresh_super_status(db, super_task, caller_id, now)
             db.commit()
         except Exception:
             db.rollback()

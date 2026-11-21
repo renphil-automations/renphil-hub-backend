@@ -5,7 +5,8 @@ Written in the caller's transaction (no commit here), so a task change and
 its notifications land together. One row per recipient, keyed by email like
 every other notification; ``component_id`` is the task's Task Manager, so the
 bell links to it and hides it from anyone without access to that component.
-The actor never notifies themselves.
+The actor never notifies themselves, and nobody gets the same message twice in
+one request.
 
 When a notification is sent:
 
@@ -59,6 +60,9 @@ class TaskNotifier:
         self.db = db
         self.actor_id = actor_id
         self._users: dict[int, UserV2 | None] = {}
+        # (recipient, type, message) already written in this request: a change
+        # applied to a super task and its replications reaches its owner once.
+        self._sent: set[tuple[int, str, str]] = set()
         self.written = 0
 
     def _user(self, user_id: int) -> UserV2 | None:
@@ -82,9 +86,13 @@ class TaskNotifier:
         for user_id in dict.fromkeys(recipient_ids):
             if user_id == self.actor_id:
                 continue
+            key = (user_id, kind, message)
+            if key in self._sent:
+                continue
             recipient = self._user(user_id)
             if recipient is None or recipient.is_deleted or not recipient.email:
                 continue
+            self._sent.add(key)
             self.db.add(
                 NotificationV2(
                     recipient_email=recipient.email,

@@ -141,10 +141,13 @@ inherited from an ancestor (role/scope pairs or a share to their email).
 
 * Admin on All Scopes, or edit on the component → every task of the component
   (and they can manage all of them).
-* Otherwise → only the tasks the caller owns or is one of the assignees of.
+* Otherwise → only the tasks the caller owns or is one of the assignees of. A
+  super task they own comes with all its replications; a replication of a
+  super task they don't own comes alone (its super task isn't returned).
 
-Each task carries `is_owner` / `is_assignee` / `can_manage` / `can_edit_status`
-for the caller.
+Super tasks carry their replications nested in `replications`; those aren't
+repeated at the top level. Each task carries `is_owner` / `is_assignee` /
+`can_manage` / `can_edit_status` for the caller.
 
 **View As** (`view_as` pairs, `view_as_user`, `anonymous`): view and edit on
 the component (and Admin on All Scopes) follow the selected pairs, plus
@@ -194,13 +197,17 @@ to `Pending`. `assignees` is a list of emails; each must match a user
 gets a "You've been assigned …" notification.
 
 `mode`:
-* `group_task` (default with 2+ assignees): one task shared by all assignees —
-  a status change is seen by all of them. Refused (422 `INVALID_TASK_MODE`)
-  with fewer than 2 assignees.
-* `individual_task` (default with 0 or 1 assignee): with N > 1 assignees, N
-  independent tasks are created, one per assignee.
+* `individual` (default with 0 or 1 assignee): at most one assignee.
+* `shared_task` (default with 2+ assignees): one task shared by all assignees —
+  a status change is seen by all of them.
+* `super_task` (2+ assignees): a super task without assignee links of its own,
+  plus one `replication` of it per assignee (same details, `abstract_task` =
+  the super task's id). Returned with its replications nested.
 
-`tasks` lists every created task, in assignee order.
+`shared_task` / `super_task` with fewer than 2 assignees, or `individual` with
+more than one: 422 `INVALID_TASK_MODE`.
+
+`tasks` holds the created task.
 
 **View As** (`view_as` pairs, `view_as_user`): the selected pairs (plus content
 shared directly with the caller) must be able to view the component. The task
@@ -212,7 +219,7 @@ when `anonymous=true`.
         400: {"description": f"The component is not a Task Manager component, or {_VIEW_AS_400}"},
         403: {"description": f"The component is visible but its content isn't shared with you, or {_VIEW_AS_403}"},
         404: {"description": "Component not found / not visible, or an assignee email not found"},
-        422: {"description": "Invalid body (e.g. empty title, unsupported status, `group_task` with < 2 assignees)"},
+        422: {"description": "Invalid body (e.g. empty title, unsupported status, mode not matching the assignee count)"},
     },
 )
 def create_task(
@@ -249,45 +256,65 @@ def create_task(
     response_model=TaskMutationResponse,
     summary="Update a task",
     description="""
-Partial update — only the fields present in the body change.
+Partial update — only the fields present in the body change, and only values
+that differ are written.
 
+Who may change what:
 * `title`, `description`, `assignees` (list of emails, replaces the whole
-  list; `[]`/null removes all), `editable_by_assignee`, `editable_via_webhook`:
-  `notification_cadence`, `notify_on_create_and_delete`: task owner, editor of
-  the task's Task Manager, or Admin on All Scopes. Sets `last_updated_at` /
+  list; `[]`/null removes all), `owner` (email), `editable_by_assignee`,
+  `editable_via_webhook`, `notification_cadence`, `notify_on_create_and_delete`,
+  `mode`: task owner, editor of the task's Task Manager, Admin on All Scopes,
+  or — for a replication — its super task's owner. Sets `last_updated_at` /
   `last_updated_by`.
 * `status` (`Pending`, `In Progress`, `Blocked`, `Closed`): the same people, or
-  an assignee when `editable_by_assignee` is true. Sets
-  `status_last_updated_at` / `status_last_updated_by`.
-* `mode` (`group_task`, `individual_task`): only the task owner, an editor of
-  the task's Task Manager, or an Admin on All Scopes may change it (sending the
-  current mode is a no-op anyone may do).
-  * Omitted: the task keeps its mode. A `group_task` left with fewer than 2
-    assignees is refused (422 `INVALID_TASK_MODE`); an `individual_task` given
-    N > 1 assignees is split (below).
-  * `group_task` with fewer than 2 assignees: 422 `INVALID_TASK_MODE`.
-  * `individual_task` on a task left with N > 1 assignees splits it: this task
-    keeps one assignee (one it already had, if any) and N-1 copies of it (after
-    this update, same owner) are created, one per other assignee.
+  an assignee when `editable_by_assignee` is true — never on a super task.
+  Sets `status_last_updated_at` / `status_last_updated_by`.
 
-Timestamps only move when a value actually changes. `tasks` lists the updated
-task first, then any copies created by a split.
+By mode:
+* `individual` / `shared_task`: when `mode` is omitted or null, it follows the
+  assignee count (0-1 → `individual`, 2+ → `shared_task`). An explicit mode
+  must match the count (422 `INVALID_TASK_MODE`). `super_task` (2+ assignees)
+  turns the task into a super task: its assignees each move onto a new
+  replication.
+* `replication`: at most one assignee (422 `TOO_MANY_ASSIGNEES`), who has no
+  other replication of the same super task (409
+  `ASSIGNEE_ALREADY_HAS_REPLICATION`); its mode never changes. A status change
+  re-derives its super task's status. `tasks` holds it, followed by its super
+  task when the caller can manage that one.
+* `super_task`: `update_scope` is required (422 `UPDATE_SCOPE_REQUIRED`); its
+  mode never changes.
+  * `update_all`: the changes go to the super task and every replication.
+    `assignees` adds a replication per new assignee and deletes the
+    replications of removed ones.
+  * `update_selected`: the changes go to the `replication_ids` only (the
+    super task isn't changed). Empty, or listing a task that isn't one of its
+    replications: 422 `REPLICATION_IDS_REQUIRED` / `INVALID_REPLICATION_IDS`;
+    `assignees` is refused (422 `ASSIGNEES_NEED_UPDATE_ALL`).
+  * Its status is then re-derived from its replications' (when it has any):
+    the first of In Progress, Pending, Blocked, Closed found among them.
+* `update_scope` / `replication_ids` on any other task: 422
+  `UPDATE_SCOPE_NOT_APPLICABLE`.
 
-Notifications (to the owner and assignees, never the caller), following the
-task's settings after the update:
+Timestamps only move when a value actually changes. A super task is returned
+with its replications nested.
+
+Notifications (to the owner and assignees, never the caller, nobody twice for
+the same message), following the task's settings after the update:
 * assignees added/removed → the added/removed users and the owner, when
-  `notify_on_create_and_delete` is true (assignees moved onto a split copy
+  `notify_on_create_and_delete` is true (assignees moved onto a replication
   were already assigned and aren't notified);
 * title/description/editable flags → owner + assignees, when cadence is `always`;
 * status → owner + assignees, when cadence is `always` or `on_status_change`;
-* the two notification settings and `mode` themselves → none.
+* the owner, the two notification settings and `mode` themselves → none.
 """ + _VIEW_AS_WRITE_DOC,
     dependencies=[Depends(_refuse_anonymous)],
     responses={
         400: {"description": f"No updatable field was provided, or {_VIEW_AS_400}"},
         403: {"description": f"Not allowed to make this change, or {_VIEW_AS_403}"},
-        404: {"description": "Task not found, or an assignee email not found"},
-        422: {"description": "Invalid body (e.g. empty title, unsupported status, `group_task` with < 2 assignees)"},
+        404: {"description": "Task not found, or an assignee / owner email not found"},
+        409: {"description": "The assignee already has a replication of the same super task"},
+        422: {"description": "Invalid body (e.g. empty title, unsupported status, mode not matching the "
+              "assignee count, missing or misused `update_scope` / `replication_ids`)"},
     },
 )
 def update_task(
@@ -298,7 +325,8 @@ def update_task(
     db: Session = Depends(get_db_v2),
 ) -> TaskMutationResponse:
     # `model_fields_set` keeps "absent" (unchanged) distinct from "null".
-    changes = {field: getattr(body, field) for field in body.model_fields_set}
+    scope_fields = {"update_scope", "replication_ids"}
+    changes = {field: getattr(body, field) for field in body.model_fields_set - scope_fields}
     is_admin, can_edit_component = _task_permissions(db, current, selection)
     try:
         tasks = task_manager_service.update_task(
@@ -308,6 +336,8 @@ def update_task(
             is_admin=is_admin,
             can_edit_component=can_edit_component,
             changes=changes,
+            update_scope=body.update_scope,
+            replication_ids=body.replication_ids,
         )
     except task_manager_service.TaskManagerError as e:
         raise _to_http(e)
@@ -320,7 +350,10 @@ def update_task(
     summary="Delete one or more tasks",
     description="""
 Deletes each task the caller may manage: one they own, one in a Task Manager
-they have edit on, or any task for an Admin on All Scopes. A task that can't be
+they have edit on, a replication of a super task they own, or any task for an
+Admin on All Scopes. Deleting a super task deletes all its replications too
+(their ids follow the requested ones in `deleted`); deleting some of them
+re-derives its status. A task that can't be
 deleted (not found, not allowed) doesn't block the others: it's listed in
 `failed` with its reason. 200 unless the View As parameters are refused — check
 `success` / `failed`.
