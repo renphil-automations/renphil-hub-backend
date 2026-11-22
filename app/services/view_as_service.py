@@ -186,18 +186,14 @@ class ViewAsPairsError(Exception):
     """The View As request was refused. ``failures`` lists every blocking
     item (not just the first), each as
     ``{"source", "pair", "role_key", "scope_key", "code", "message"}`` —
-    ``source`` is ``"view_as"`` for a given pair and ``"view_as_user"`` for
-    the selected user (unknown, or holding a row the caller can't adopt)."""
+    ``source`` is always ``"view_as"``."""
 
-    def __init__(
-        self, status_code: int, code: str, message: str, failures: list[dict], *, user_email: str | None = None
-    ) -> None:
+    def __init__(self, status_code: int, code: str, message: str, failures: list[dict]) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.failures = failures
-        self.user_email = user_email
 
 
 def normalize_pair_values(values: list[str] | None) -> list[str]:
@@ -262,38 +258,24 @@ def verify_view_as(
 
 
 SOURCE_PAIR = "view_as"
-SOURCE_USER = "view_as_user"
-
-
-@dataclass(frozen=True)
-class ViewAsUser:
-    """The user picked through ``view_as_user``."""
-
-    id: int
-    email: str
-    name: str | None
 
 
 @dataclass(frozen=True)
 class ViewAsSelection:
-    """A verified View As request. ``targets`` is the union of the given
-    ``view_as`` pairs and the selected user's assignment rows, one per
-    ``(role, scope)``. ``user`` is the selected user, when one was given:
-    access uses only their assignments, never their direct grants."""
+    """A verified View As request: ``targets`` are the given ``view_as``
+    pairs, one per ``(role, scope)``. ``view_as_from`` is the email of the
+    user the pairs were picked from, when the client sent one — audit
+    context only, it never changes access."""
 
     targets: list[ViewAsTarget]
-    user: ViewAsUser | None = None
-
-    @property
-    def user_email(self) -> str | None:
-        return self.user.email if self.user is not None else None
+    view_as_from: str | None = None
 
 
 class _Adoptable:
     """"May ``caller_id`` adopt ``(role_id, scope_id)``?" — the same rule as
     ``verify_view_as``, by id, with the caller's viewable scopes loaded once
-    and their viewable roles cached per scope. Used to vet a selected user's
-    rows and to list the users a caller may select."""
+    and their viewable roles cached per scope. Used to list the users whose
+    assignments a caller may adopt."""
 
     def __init__(self, db: Session, caller_id: int, closures: RbacClosures) -> None:
         self._db = db
@@ -316,16 +298,6 @@ class _Adoptable:
         if role_id not in self.role_ids(scope_id):
             return "view_as_role_not_allowed"
         return None
-
-
-def _find_user(db: Session, email: str) -> UserV2 | None:
-    """Active user by ``work_email``, else ``alias_email`` — same order as
-    ``resolve_user_id``."""
-    for column in (UserV2.work_email, UserV2.alias_email):
-        user = db.query(UserV2).filter(func.lower(column) == email, UserV2.not_deleted()).first()
-        if user is not None:
-            return user
-    return None
 
 
 def _check_pairs(
@@ -366,135 +338,46 @@ def _check_pairs(
     return targets, failures
 
 
-def _check_user(
-    db: Session, caller_id: int, email: str, closures: RbacClosures
-) -> tuple[ViewAsUser | None, list[ViewAsTarget], list[dict]]:
-    """Resolve the selected user and vet EVERY one of their assignment rows
-    against what the caller may adopt. Failures name the selected user, so
-    the caller can tell the refusal came from them and not from a pair."""
-    user = _find_user(db, email)
-    if user is None:
-        return None, [], [
-            {
-                "source": SOURCE_USER,
-                "pair": None,
-                "role_key": None,
-                "scope_key": None,
-                "code": "view_as_user_not_found",
-                "message": f"No active user has the email '{email}'.",
-                "_status": 400,
-            }
-        ]
-
-    rows = (
-        db.query(
-            RoleAssignmentV2.role_id, RoleV2.key, RoleV2.name,
-            RoleAssignmentV2.scope_id, ScopeV2.key, ScopeV2.name,
-        )
-        .join(RoleV2, RoleV2.id == RoleAssignmentV2.role_id)
-        .join(ScopeV2, ScopeV2.id == RoleAssignmentV2.scope_id)
-        .filter(RoleAssignmentV2.user_id == user.id)
-        .order_by(RoleAssignmentV2.id)
-        .all()
-    )
-    adoptable = _Adoptable(db, caller_id, closures)
-    targets: list[ViewAsTarget] = []
-    failures: list[dict] = []
-    for role_id, role_key, role_name, scope_id, scope_key, scope_name in rows:
-        code = adoptable.blocking_code(role_id, scope_id)
-        if code is None:
-            targets.append(ViewAsTarget(role_id, role_key, role_name, scope_id, scope_key, scope_name))
-            continue
-        blocked_part = f"scope '{scope_key}'" if code == "view_as_scope_not_allowed" else (
-            f"role '{role_key}' in scope '{scope_key}'"
-        )
-        failures.append(
-            {
-                "source": SOURCE_USER,
-                "pair": f"{role_key}{PAIR_SEPARATOR}{scope_key}",
-                "role_key": role_key,
-                "scope_key": scope_key,
-                "code": code,
-                "message": (
-                    f"The selected user '{email}' holds role '{role_key}' in scope '{scope_key}', "
-                    f"and you are not allowed to view the hub as {blocked_part}."
-                ),
-                "_status": 403,
-            }
-        )
-    return ViewAsUser(id=user.id, email=email, name=user.name), targets, failures
-
-
-# Top-level error code by (who blocked, status): only the selected user,
-# only the pairs, or both.
-_TOP_LEVEL_CODES = {
-    (SOURCE_USER, 400): "view_as_user_not_found",
-    (SOURCE_USER, 403): "view_as_user_not_allowed",
-    (SOURCE_PAIR, 400): "view_as_invalid_pairs",
-    (SOURCE_PAIR, 403): "view_as_pairs_not_allowed",
-    (None, 400): "view_as_invalid",
-    (None, 403): "view_as_not_allowed",
-}
-
-
-def _raise_failures(failures: list[dict], user_email: str | None) -> None:
+def _raise_failures(failures: list[dict]) -> None:
     status_code = 400 if any(f["_status"] == 400 for f in failures) else 403
     for failure in failures:
         del failure["_status"]
-    sources = {f["source"] for f in failures}
-    code = _TOP_LEVEL_CODES[(sources.pop() if len(sources) == 1 else None, status_code)]
-
-    parts = []
-    user_failures = [f for f in failures if f["source"] == SOURCE_USER]
-    pair_failures = [f for f in failures if f["source"] == SOURCE_PAIR]
-    if any(f["code"] == "view_as_user_not_found" for f in user_failures):
-        parts.append(f"No active user has the email '{user_email}'.")
-    elif user_failures:
-        blocked = ", ".join(f"'{f['pair']}'" for f in user_failures)
-        parts.append(
-            f"The selected user '{user_email}' holds {blocked}, which you are not allowed to view the hub as."
-        )
-    if pair_failures:
-        parts.append(f"View As refused for {', '.join(repr(f['pair']) for f in pair_failures)}.")
-    raise ViewAsPairsError(status_code, code, " ".join(parts), failures, user_email=user_email)
+    code = "view_as_invalid_pairs" if status_code == 400 else "view_as_pairs_not_allowed"
+    message = f"View As refused for {', '.join(repr(f['pair']) for f in failures)}."
+    raise ViewAsPairsError(status_code, code, message, failures)
 
 
 def resolve_view_as_selection(
     db: Session,
     caller_id: int,
     values: list[str],
-    user_email: str | None,
     *,
+    view_as_from: str | None = None,
     closures: RbacClosures | None = None,
 ) -> ViewAsSelection:
     """Verify the ``view_as`` pairs (already normalized by
-    ``normalize_pair_values``) and the selected user (``user_email``,
-    already normalized by ``normalize_email``). Everything must pass;
-    otherwise ``ViewAsPairsError`` lists EVERY blocking item, each tagged
-    with its ``source``. 400 when any failure is a malformed value, an
-    unknown key or an unknown user, else 403."""
+    ``normalize_pair_values``). Every pair must pass; otherwise
+    ``ViewAsPairsError`` lists EVERY blocking pair — 400 when any is
+    malformed or names an unknown key, else 403. ``view_as_from`` (already
+    normalized by ``normalize_email``) is carried along unverified: it is
+    audit context and grants nothing."""
     if len(values) > MAX_VIEW_AS_PAIRS:
         raise ViewAsPairsError(
             400,
             "view_as_too_many_pairs",
             f"At most {MAX_VIEW_AS_PAIRS} view_as pairs can be given ({len(values)} were).",
             [],
-            user_email=user_email,
         )
 
     graph = closures if closures is not None else RbacClosures(db)
-    user, user_targets, failures = (None, [], [])
-    if user_email is not None:
-        user, user_targets, failures = _check_user(db, caller_id, user_email, graph)
-    pair_targets, pair_failures = _check_pairs(db, caller_id, values, graph)
-    failures += pair_failures
+    targets, failures = _check_pairs(db, caller_id, values, graph)
     if failures:
-        _raise_failures(failures, user_email)
+        _raise_failures(failures)
 
     unique: dict[tuple[int, int], ViewAsTarget] = {}
-    for target in user_targets + pair_targets:
+    for target in targets:
         unique.setdefault((target.role_id, target.scope_id), target)
-    return ViewAsSelection(targets=list(unique.values()), user=user)
+    return ViewAsSelection(targets=list(unique.values()), view_as_from=view_as_from)
 
 
 def verify_view_as_pairs(
@@ -504,8 +387,8 @@ def verify_view_as_pairs(
     *,
     closures: RbacClosures | None = None,
 ) -> list[ViewAsTarget]:
-    """``resolve_view_as_selection`` for pairs only."""
-    return resolve_view_as_selection(db, user_id, values, None, closures=closures).targets
+    """``resolve_view_as_selection``'s verified pairs."""
+    return resolve_view_as_selection(db, user_id, values, closures=closures).targets
 
 
 def normalize_email(value: str | None) -> str | None:
@@ -516,7 +399,9 @@ def normalize_email(value: str | None) -> str | None:
 
 def list_viewable_users(db: Session, caller_id: int) -> list[dict]:
     """``[{"id", "name", "email", "assignments": [{"role_key", "scope_key"}]}]``
-    for every active user the caller may pick through ``view_as_user``:
+    for every active user the caller may pick in View As — the client adopts
+    their assignments as ``view_as`` pairs and sends the email as
+    ``view_as_from``:
     EVERY one of their assignment rows must be adoptable by the caller (a
     single row above the caller's reach excludes them), and a user with no
     assignment at all qualifies (with ``assignments: []``). The caller

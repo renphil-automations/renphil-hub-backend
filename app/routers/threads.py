@@ -115,22 +115,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/data", tags=["Threads"])
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key, or too many pairs"},
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
 THREAD_VIEW_AS_RESPONSES = {
     400: {
-        "description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"
+        "description": "View As: a malformed `view_as` pair, an unknown key, or too many pairs"
     },
     403: {"description": "Caller does not satisfy the widget's access control, or View As refused"},
 }
 
 def _thread_subject(user: UserInfo, anonymous: bool) -> UserInfo | None:
     """Whose authorship, votes and authored edits the thread read endpoints
-    report: the caller's, whatever `view_as` pairs or `view_as_user` are
-    selected, or nobody's (`None`) under `anonymous`. A selected user's own
-    threads, votes and edits are never reported."""
+    report: the caller's, whatever `view_as` pairs are selected, or nobody's
+    (`None`) under `anonymous`. The `view_as_from` user's own threads, votes
+    and edits are never reported."""
     return None if anonymous else user
 
 
@@ -232,8 +232,8 @@ async def list_threads(
     view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
     """Own pending/rejected threads, votes and pending edits are the
-    caller's, whatever `view_as` pairs or `view_as_user` are selected, and
-    nobody's with `anonymous` (approved threads only, `my_vote` 0)."""
+    caller's, whatever `view_as` pairs are selected, and nobody's with
+    `anonymous` (approved threads only, `my_vote` 0)."""
     subject = _thread_subject(user, anonymous)
     result = await asyncio.to_thread(
         thread_service.list_threads_for_link,
@@ -245,7 +245,7 @@ async def list_threads(
         anonymous=anonymous,
     )
     return result.model_copy(
-        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+        update={"view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
     )
 
 
@@ -361,7 +361,7 @@ async def get_moderation_summary(
         db,
         access=view_as_access.access,
         view_as=view_as_access.view_as,
-        view_as_user=view_as_access.view_as_user,
+        view_as_from=view_as_access.view_as_from,
     )
     # Same 304-on-unchanged shape as `/notifications/unread-count` above.
     # `Cache-Control: no-store` on both the 200 and the 304 (followups plan
@@ -478,7 +478,7 @@ async def get_revision_moderation_summary(
         db,
         access=view_as_access.access,
         view_as=view_as_access.view_as,
-        view_as_user=view_as_access.view_as_user,
+        view_as_from=view_as_access.view_as_from,
     )
     # Identical discipline to `/threads/moderation/summary` above: no-store
     # on both the 200 and the 304, 304 only for JS's own If-None-Match.
@@ -645,7 +645,7 @@ async def get_thread(
         thread_service.get_thread_by_id, db, thread_id, subject, access=view_as_access.access
     )
     return ThreadDetailViewAsResponse(
-        **detail.model_dump(), view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
+        **detail.model_dump(), view_as=view_as_access.view_as, view_as_from=view_as_access.view_as_from
     )
 
 
@@ -741,7 +741,7 @@ async def list_comments(
         thread_service.list_comments_for_thread, db, thread_id, cursor, subject, access=view_as_access.access
     )
     return result.model_copy(
-        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+        update={"view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
     )
 
 
