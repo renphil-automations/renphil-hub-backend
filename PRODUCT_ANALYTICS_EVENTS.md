@@ -181,9 +181,11 @@ New events also receive a nullable `page_id` derived on the server from an autho
 
 ## Known View As boundary
 
-The current multi-pair and View As user selection is verified against Hub's
-live View As rules during ingestion. The real caller remains the actor. Verified
-role/scope pairs and the selected user's internal ID are stored only in the
+The current multi-pair View As selection (`view_as` pairs) is verified against
+Hub's live View As rules during ingestion. The real caller remains the actor.
+Verified role/scope pairs, and the internal ID of the `view_as_from` user (the
+user the pairs were picked from — audit context, unverified, `null` when the
+email matches no active user), are stored only in the
 nullable `view_as_context` field for internal diagnostics; analytics responses
 and exports must not expose it. Run the analytics table setup script before
 deploying this version to add that field to existing tables.

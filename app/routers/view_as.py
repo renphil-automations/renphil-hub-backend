@@ -1,6 +1,8 @@
 """View As pickers — the scopes, then the roles on a scope, that the caller
 may adopt through the repeatable ``view_as=role_key:scope_key`` parameter of the
-hub's read endpoints, and the users they may pick through ``view_as_user``.
+hub's read endpoints, and the users whose assignments they may adopt (the
+client sends those assignments as ``view_as`` pairs and the user's email as
+the audit-only ``view_as_from``).
 Rules: ``app/services/view_as_service.py``."""
 
 from __future__ import annotations
@@ -72,7 +74,7 @@ def list_view_as_roles(
 @router.get(
     "/users",
     response_model=ViewAsUserListAPIResponse,
-    summary="Users the caller may pick through view_as_user",
+    summary="Users whose assignments the caller may adopt in View As",
 )
 def list_view_as_users(
     current: CurrentHubUser = Depends(get_current_hub_user),
@@ -83,5 +85,6 @@ def list_view_as_users(
     child of one, or the public scope). A single assignment beyond the
     caller's reach excludes the user. Users with no assignment are
     included; the caller and users with no email are not. Sorted by name.
-    Each user carries their assignments as `role_key`/`scope_key`."""
+    Each user carries their assignments as `role_key`/`scope_key`: send them as
+    `view_as` pairs and the user's `email` as `view_as_from`."""
     return {"data": view_as_service.list_viewable_users(db, _user_id(db, current))}

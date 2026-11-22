@@ -826,7 +826,7 @@ def list_feedback_for_bot_management(
     db: Session = Depends(get_db_v2),
 ):
     """Read only Bot feedback from Neon; force_refresh remains compatible."""
-    if any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+    if any(request.query_params.get(key) for key in ("view_as", "view_as_from", "view_as_role", "view_as_scope", "anonymous")):
         raise HTTPException(403, "Exit View As to read feedback.", headers={"Cache-Control": "no-store", "Vary": "Authorization"})
     response.headers.update({"Cache-Control": "no-store", "Vary": "Authorization"})
     return {"data": [record.model_dump(by_alias=False) for record in _bot_feedback_records(db, limit=limit)]}
@@ -974,7 +974,7 @@ async def export_bot_analytics_workbook(
     db: Session = Depends(get_db_v2),
 ):
     """Export native Excel charts with the non-content rows that support them."""
-    if report in ("all", "negative_feedback") and any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+    if report in ("all", "negative_feedback") and any(request.query_params.get(key) for key in ("view_as", "view_as_from", "view_as_role", "view_as_scope", "anonymous")):
         raise HTTPException(403, "Exit View As to export feedback.", headers={"Cache-Control": "no-store", "Vary": "Authorization"})
     runs, _ = _analytics_rows(
         db, date_from=date_from, date_to=date_to, actor_email=actor_email,

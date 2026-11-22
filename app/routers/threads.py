@@ -145,22 +145,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/data", tags=["Threads"])
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key, or too many pairs"},
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
 THREAD_VIEW_AS_RESPONSES = {
     400: {
-        "description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"
+        "description": "View As: a malformed `view_as` pair, an unknown key, or too many pairs"
     },
     403: {"description": "Caller does not satisfy the widget's access control, or View As refused"},
 }
 
 def _thread_subject(user: UserInfo, anonymous: bool) -> UserInfo | None:
     """Whose authorship, votes and authored edits the thread read endpoints
-    report: the caller's, whatever `view_as` pairs or `view_as_user` are
-    selected, or nobody's (`None`) under `anonymous`. A selected user's own
-    threads, votes and edits are never reported."""
+    report: the caller's, whatever `view_as` pairs are selected, or nobody's
+    (`None`) under `anonymous`. The `view_as_from` user's own threads, votes
+    and edits are never reported."""
     return None if anonymous else user
 
 
@@ -276,24 +276,53 @@ async def list_declined_items(
 # ~2.4 s for a non-admin (landmine 16). `get_current_hub_user` + the View As
 # selection only; the service gates per widget with `granted_single_node`
 # and one shared `RbacClosures`, built only when the author has any rows.
-# Under ANY View As selection, or `anonymous`, both answer empty with
-# `view_as: true` (M7) — the section is personal, View As is read-only.
+# The items are always the CALLER's. With `view_as` pairs (no `anonymous`),
+# only widgets the pairs can view count — the pairs' grants plus content
+# shared directly with the caller, and full access when a pair is Hub Admin —
+# the same access every other View As read uses; `view_as` is true. With
+# `anonymous`, both answer empty with `view_as: true` (M7).
 # ---------------------------------------------------------
 
 
-def _admin_check(db: Session, current: CurrentHubUser):
-    return lambda closures: is_hub_admin(db, current, closures=closures)
-
-
-def _my_revisions_sync(db: Session, current: CurrentHubUser) -> MyRevisionsResponse:
-    return thread_service.list_my_declined_items(
-        db, current.info, hub_user_id=current.hub_user_id, is_admin=_admin_check(db, current)
+def _widget_gate(
+    db: Session, current: CurrentHubUser, selection: view_as_service.ViewAsSelection | None
+) -> tuple[thread_service.IsAdminFn, thread_service.GrantsFn | None]:
+    """`(is_admin, grants)` for the My Revisions per-widget gate: the
+    caller's own (`grants=None` lets `granted_single_node` load their grants),
+    or the View As pairs' — Hub Admin when any pair is, else the pairs'
+    grants plus the caller's direct shares (`view_as_service.view_as_grants`)."""
+    if selection is None:
+        return (lambda closures: is_hub_admin(db, current, closures=closures)), None
+    targets = selection.targets
+    return (
+        lambda closures: view_as_service.any_pair_is_hub_admin(db, targets, closures=closures),
+        lambda closures: view_as_service.view_as_grants(
+            db, targets, user_id=current.hub_user_id, closures=closures
+        ),
     )
 
 
-def _my_revisions_summary_sync(db: Session, current: CurrentHubUser) -> tuple[MyRevisionsSummary, str]:
+def _my_revisions_sync(
+    db: Session, current: CurrentHubUser, selection: view_as_service.ViewAsSelection | None
+) -> MyRevisionsResponse:
+    is_admin, grants = _widget_gate(db, current, selection)
+    result = thread_service.list_my_declined_items(
+        db, current.info, hub_user_id=current.hub_user_id, is_admin=is_admin, grants=grants
+    )
+    return result.model_copy(update={"view_as": selection is not None})
+
+
+def _my_revisions_summary_sync(
+    db: Session, current: CurrentHubUser, selection: view_as_service.ViewAsSelection | None
+) -> tuple[MyRevisionsSummary, str]:
+    is_admin, grants = _widget_gate(db, current, selection)
     return thread_service.my_revisions_summary(
-        db, current.info, hub_user_id=current.hub_user_id, is_admin=_admin_check(db, current)
+        db,
+        current.info,
+        hub_user_id=current.hub_user_id,
+        is_admin=is_admin,
+        grants=grants,
+        view_as=selection is not None,
     )
 
 
@@ -312,10 +341,14 @@ async def list_my_revisions(
     """Open items newest decline first (cap 100, `truncated`), closed ones
     newest close first (cap 50, `closed_truncated`), pending ones newest
     submission first (cap 100, `pending_truncated`). A widget the caller can
-    no longer view drops out entirely."""
-    if anonymous or selection is not None:
+    no longer view drops out entirely.
+
+    Always the caller's own items. With `view_as` pairs, only on widgets the
+    pairs can view (plus content shared directly with the caller); with
+    `anonymous`, empty. Both set `view_as`."""
+    if anonymous:
         return MyRevisionsResponse(view_as=True)
-    return await asyncio.to_thread(_my_revisions_sync, db, current)
+    return await asyncio.to_thread(_my_revisions_sync, db, current, selection)
 
 
 @router.get(
@@ -332,10 +365,13 @@ async def get_my_revisions_summary(
     current: CurrentHubUser = Depends(get_current_hub_user),
     selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
 ):
-    if anonymous or selection is not None:
+    """The counts follow exactly the list's filter (`view_as` pairs
+    included), so the badge always matches the list; empty with
+    `anonymous`."""
+    if anonymous:
         summary, etag = thread_service.my_revisions_view_as_answer()
     else:
-        summary, etag = await asyncio.to_thread(_my_revisions_summary_sync, db, current)
+        summary, etag = await asyncio.to_thread(_my_revisions_summary_sync, db, current, selection)
     # The `/threads/moderation/summary` shape: `no-store` on the 200 AND the
     # 304, so the browser's URL-keyed HTTP cache never serves one user's
     # body to the next (followups plan §1).
@@ -369,8 +405,8 @@ async def list_threads(
     view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
     """Own pending/rejected threads, votes and pending edits are the
-    caller's, whatever `view_as` pairs or `view_as_user` are selected, and
-    nobody's with `anonymous` (approved threads only, `my_vote` 0)."""
+    caller's, whatever `view_as` pairs are selected, and nobody's with
+    `anonymous` (approved threads only, `my_vote` 0)."""
     subject = _thread_subject(user, anonymous)
     result = await asyncio.to_thread(
         thread_service.list_threads_for_link,
@@ -382,7 +418,7 @@ async def list_threads(
         anonymous=anonymous,
     )
     return result.model_copy(
-        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+        update={"view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
     )
 
 
@@ -587,7 +623,7 @@ async def get_moderation_summary(
         db,
         access=view_as_access.access,
         view_as=view_as_access.view_as,
-        view_as_user=view_as_access.view_as_user,
+        view_as_from=view_as_access.view_as_from,
     )
     # Same 304-on-unchanged shape as `/notifications/unread-count` above.
     # `Cache-Control: no-store` on both the 200 and the 304 (followups plan
@@ -719,7 +755,7 @@ async def get_revision_moderation_summary(
         db,
         access=view_as_access.access,
         view_as=view_as_access.view_as,
-        view_as_user=view_as_access.view_as_user,
+        view_as_from=view_as_access.view_as_from,
     )
     # Identical discipline to `/threads/moderation/summary` above: no-store
     # on both the 200 and the 304, 304 only for JS's own If-None-Match.
@@ -1092,7 +1128,7 @@ async def get_thread(
         thread_service.get_thread_by_id, db, thread_id, subject, access=view_as_access.access
     )
     return ThreadDetailViewAsResponse(
-        **detail.model_dump(), view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
+        **detail.model_dump(), view_as=view_as_access.view_as, view_as_from=view_as_access.view_as_from
     )
 
 
@@ -1193,7 +1229,7 @@ async def list_comments(
         thread_service.list_comments_for_thread, db, thread_id, cursor, subject, access=view_as_access.access
     )
     return result.model_copy(
-        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+        update={"view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
     )
 
 
