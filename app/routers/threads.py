@@ -69,8 +69,11 @@ from sqlalchemy.orm import Session
 from app.db_v2.database import get_db_v2
 from app.dependencies import (
     CurrentHubUser,
+    ViewAsAccess,
     get_current_hub_user,
     get_current_user,
+    get_view_as_access,
+    get_view_as_anonymous,
     get_viewer_access,
     is_hub_admin,
 )
@@ -86,6 +89,7 @@ from app.schemas.thread import (
     RevisionDecisionRequest,
     ThreadCreateRequest,
     ThreadDetail,
+    ThreadDetailViewAsResponse,
     ThreadHistoryFacets,
     ThreadListResponse,
     ThreadModerationListResponse,
@@ -109,6 +113,26 @@ from app.services.rbac_graph_service import RbacClosures
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["Threads"])
+
+VIEW_AS_ERROR_RESPONSES = {
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
+}
+
+THREAD_VIEW_AS_RESPONSES = {
+    400: {
+        "description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"
+    },
+    403: {"description": "Caller does not satisfy the widget's access control, or View As refused"},
+}
+
+def _thread_subject(user: UserInfo, anonymous: bool) -> UserInfo | None:
+    """Whose authorship, votes and authored edits the thread read endpoints
+    report: the caller's, whatever `view_as` pairs or `view_as_user` are
+    selected, or nobody's (`None`) under `anonymous`. A selected user's own
+    threads, votes and edits are never reported."""
+    return None if anonymous else user
+
 
 
 # ---------------------------------------------------------
@@ -197,17 +221,31 @@ async def get_thread_widget_counts(
     "/threads/component/{link}",
     response_model=ThreadListResponse,
     summary="One page of threads for a thread widget, newest first",
-    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+    responses=THREAD_VIEW_AS_RESPONSES,
 )
 async def list_threads(
     link: str = Path(..., description="The thread widget component's stable `link`."),
     cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    anonymous: bool = Depends(get_view_as_anonymous),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    return await asyncio.to_thread(
-        thread_service.list_threads_for_link, db, link, cursor, user, access=access
+    """Own pending/rejected threads, votes and pending edits are the
+    caller's, whatever `view_as` pairs or `view_as_user` are selected, and
+    nobody's with `anonymous` (approved threads only, `my_vote` 0)."""
+    subject = _thread_subject(user, anonymous)
+    result = await asyncio.to_thread(
+        thread_service.list_threads_for_link,
+        db,
+        link,
+        cursor,
+        subject,
+        access=view_as_access.access,
+        anonymous=anonymous,
+    )
+    return result.model_copy(
+        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
     )
 
 
@@ -310,14 +348,21 @@ async def get_thread_history_facets(
     "/threads/moderation/summary",
     response_model=ThreadModerationSummary,
     summary="Whether the caller moderates anything, and how many threads are pending",
+    responses=VIEW_AS_ERROR_RESPONSES,
 )
 async def get_moderation_summary(
     request: Request,
     response: Response,
     db: Session = Depends(get_db_v2),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    summary, etag = await asyncio.to_thread(thread_service.moderation_summary, db, access=access)
+    summary, etag = await asyncio.to_thread(
+        thread_service.moderation_summary,
+        db,
+        access=view_as_access.access,
+        view_as=view_as_access.view_as,
+        view_as_user=view_as_access.view_as_user,
+    )
     # Same 304-on-unchanged shape as `/notifications/unread-count` above.
     # `Cache-Control: no-store` on both the 200 and the 304 (followups plan
     # §1) so the browser's own HTTP cache never stores this body — that
@@ -420,15 +465,20 @@ async def get_revision_history_facets(
     "/threads/revision-moderation/summary",
     response_model=ThreadRevisionModerationSummary,
     summary="Whether the caller moderates anything, and how many revisions are pending",
+    responses=VIEW_AS_ERROR_RESPONSES,
 )
 async def get_revision_moderation_summary(
     request: Request,
     response: Response,
     db: Session = Depends(get_db_v2),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
     summary, etag = await asyncio.to_thread(
-        thread_service.revision_moderation_summary, db, access=access
+        thread_service.revision_moderation_summary,
+        db,
+        access=view_as_access.access,
+        view_as=view_as_access.view_as,
+        view_as_user=view_as_access.view_as_user,
     )
     # Identical discipline to `/threads/moderation/summary` above: no-store
     # on both the 200 and the 304, 304 only for JS's own If-None-Match.
@@ -576,18 +626,26 @@ async def reject_thread_revision(
 
 @router.get(
     "/threads/{thread_id}",
-    response_model=ThreadDetail,
+    response_model=ThreadDetailViewAsResponse,
     summary="Fetch one thread's full content — any viewer with widget access",
-    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+    responses={**THREAD_VIEW_AS_RESPONSES, 404: {"description": "Thread not found"}},
 )
 async def get_thread(
     thread_id: int = Path(...),
+    anonymous: bool = Depends(get_view_as_anonymous),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    return await asyncio.to_thread(
-        thread_service.get_thread_by_id, db, thread_id, user, access=access
+    """Access, `my_vote`, authorship (who may open a pending/rejected
+    thread) and the authored pending edits follow `_thread_subject`; edit
+    rights (`viewer_is_editor`) follow the View As access."""
+    subject = _thread_subject(user, anonymous)
+    detail = await asyncio.to_thread(
+        thread_service.get_thread_by_id, db, thread_id, subject, access=view_as_access.access
+    )
+    return ThreadDetailViewAsResponse(
+        **detail.model_dump(), view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
     )
 
 
@@ -666,17 +724,24 @@ async def vote_on_thread(
     "/threads/{thread_id}/comments",
     response_model=CommentListResponse,
     summary="One page of comments on a thread, oldest first",
-    responses={403: {"description": "Caller does not satisfy the widget's access control"}},
+    responses={**THREAD_VIEW_AS_RESPONSES, 404: {"description": "Thread not found"}},
 )
 async def list_comments(
     thread_id: int = Path(...),
     cursor: str | None = Query(default=None, description="Opaque next-page cursor."),
+    anonymous: bool = Depends(get_view_as_anonymous),
     db: Session = Depends(get_db_v2),
     user: UserInfo = Depends(get_current_user),
-    access: ViewerAccess = Depends(get_viewer_access),
+    view_as_access: ViewAsAccess = Depends(get_view_as_access),
 ):
-    return await asyncio.to_thread(
-        thread_service.list_comments_for_thread, db, thread_id, cursor, user, access=access
+    """Access follows the View As access; each comment's `my_vote` follows
+    `_thread_subject`."""
+    subject = _thread_subject(user, anonymous)
+    result = await asyncio.to_thread(
+        thread_service.list_comments_for_thread, db, thread_id, cursor, subject, access=view_as_access.access
+    )
+    return result.model_copy(
+        update={"view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
     )
 
 

@@ -23,14 +23,12 @@ from app.dependencies import (
     CurrentHubUser,
     HubUserRemoved,
     _ensure_hub_user,
-    get_airtable_service,
     get_auth_service,
     get_current_hub_user,
     is_hub_admin,
 )
 from app.helpers.exceptions import UserRemovedError
 from app.models.auth import MeResponse, TokenResponse, UserInfo
-from app.services.airtable_service import AirtableService
 from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -54,17 +52,16 @@ async def callback(
     code: str = Query(..., description="Authorization code from Google"),
     state: str = Query(..., description="OAuth state parameter (PKCE tie-back)"),
     auth_service: AuthService = Depends(get_auth_service),
-    airtable_service: AirtableService = Depends(get_airtable_service),
     db: Session = Depends(get_db_v2),
 ):
     """
     Google redirects here after the user consents.
     Exchanges the code for tokens (using the PKCE verifier tied to state),
-    verifies the domain, resolves the user's roles from Airtable, and
-    redirects to the frontend with the JWT and roles.
+    enforces the login allow-list, and redirects to the frontend with the
+    JWT. No Airtable call (plan_login_airtable_removal_2026-10-31.md).
     """
     token_response, frontend_redirect_uri = await auth_service.handle_callback(
-        code, state, airtable_service, db
+        code, state, db
     )
 
     # findings_dev_login_live_testing_2026-09-12.md #1: the frontend never
@@ -118,14 +115,13 @@ async def callback(
 @router.get("/me", response_model=MeResponse, summary="Current user info")
 async def me(
     current: CurrentHubUser = Depends(get_current_hub_user),
-    airtable_service: AirtableService = Depends(get_airtable_service),
     db: Session = Depends(get_db_v2),
 ):
     """Return the authenticated user's profile.
 
-    Includes ``scoped_roles``: per-assignment role info from the Access
-    Control table, with each entry's ``role_name``, ``scope``, and
-    ``fund_or_program_name`` (null when the role's scope is ``Hub``).
+    No Airtable call: the old ``scoped_roles`` field (read from the Airtable
+    Access Control table) was removed with the frontend role fallback
+    (plan_login_airtable_removal_2026-10-31.md, Step 4).
 
     Also includes the real ``is_hub_admin(db, current)`` answer
     (``BOOTSTRAP_ADMIN_EMAILS`` OR a live `role_assignments` row) — NOT whether "Hub
@@ -139,13 +135,11 @@ async def me(
     `types/index.ts`'s `User.is_hub_admin`.
     """
     user = current.info
-    scoped_roles = await airtable_service.get_user_scoped_roles(user.email)
     return MeResponse(
         email=user.email,
         name=user.name,
         picture=user.picture,
         roles=user.roles,
-        scoped_roles=scoped_roles,
         is_hub_admin=is_hub_admin(db, current),
     )
 

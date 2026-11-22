@@ -37,9 +37,6 @@ from app.services.gridstack_service import (
     AIRTABLE_WIDGET_TYPE,
 )
 from app.models.airtable import (
-    AccessControlAssign,
-    AccessControlRecord,
-    AccessControlRevoke,
     ActiveProgramItem,
     AirtableUserIdResponse,
     AmountSumResponse,
@@ -303,12 +300,6 @@ class AirtableService:
         return self._api.table(
             self._settings.AIRTABLE_FUNDRAISING_BASE_ID,
             self._settings.TOTAL_MOVED_AND_DEPLOYED_TABLE_NAME,
-        )
-
-    def _admins_table(self):
-        return self._api.table(
-            self._settings.RENPHIL_HUB_BASE_ID,
-            self._settings.ADMINS_TABLE,
         )
 
     # ── Generic read-only preview (dashboard Airtable widget) ───────────
@@ -3212,179 +3203,6 @@ class AirtableService:
             rows=rows,
         )
 
-    async def is_admin(self, email: str) -> bool:
-        """Return True if the given email has an entry in the Admins table."""
-        if not email:
-            logger.info("Admin lookup skipped: empty email → classifying as 'user'")
-            return False
-        email_field = self._settings.ADMINS_EMAIL_FIELD
-        normalized = email.strip().lower()
-        formula = f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
-        table = self._admins_table()
-        try:
-            records = await asyncio.to_thread(
-                table.all, formula=formula, max_records=1, fields=[email_field]
-            )
-        except RequestException as exc:
-            logger.error("Airtable admin lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during admin lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        is_admin = bool(records)
-        logger.info(
-            "Admin lookup for email=%s → classified as '%s'",
-            normalized,
-            "admin" if is_admin else "user",
-        )
-        return is_admin
-
-    async def get_user_roles(self, email: str) -> list[str]:
-        """Return the list of role names assigned to ``email`` in the
-        Access Control table.
-
-        Reads the ``Role Name`` lookup field from every Access Control
-        record matching the user's email, flattens them, de-duplicates
-        while preserving order, and returns the resulting list. Returns
-        an empty list when the email is empty, no record is found, or
-        the lookup field is missing.
-        """
-        if not email:
-            logger.info("Role lookup skipped: empty email → returning []")
-            return []
-
-        # if self._is_dev_admin_override(email):
-        #     logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
-        #     return [self.HUB_ADMIN_ROLE]
-
-        s = self._settings
-        email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
-        role_name_field = s.ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD
-        normalized = email.strip().lower()
-        formula = f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
-
-        table = self._access_control_table()
-        try:
-            records = await asyncio.to_thread(
-                table.all,
-                formula=formula,
-                fields=[email_field, role_name_field],
-            )
-        except RequestException as exc:
-            logger.error("Airtable role lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during role lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-
-        roles: list[str] = []
-        seen: set[str] = set()
-        for rec in records:
-            fields = rec.get("fields", {}) or {}
-            value = fields.get(role_name_field)
-            if value is None:
-                continue
-            items = value if isinstance(value, list) else [value]
-            for item in items:
-                if item is None:
-                    continue
-                name = str(item).strip()
-                if not name or name in seen:
-                    continue
-                seen.add(name)
-                roles.append(name)
-
-        logger.info("Role lookup for email=%s → roles=%s", normalized, roles)
-        return roles
-
-    # def _is_dev_admin_override(self, email: str) -> bool:
-    #     """True when ``email`` is a configured local-testing admin override.
-    #
-    #     Gated on DEBUG so this can never silently activate in production.
-    #     """
-    #     s = self._settings
-    #     if not s.DEBUG or not s.DEV_ADMIN_OVERRIDE_EMAILS:
-    #         return False
-    #     overrides = {
-    #         e.strip().lower()
-    #         for e in s.DEV_ADMIN_OVERRIDE_EMAILS.split(",")
-    #         if e.strip()
-    #     }
-    #     return email.strip().lower() in overrides
-
-    # Role scope value that represents a global (non-scoped) role.
-    HUB_SCOPE = "Hub"
-
-    async def get_user_scoped_roles(self, email: str):
-        """Return the per-assignment scoped roles for ``email``.
-
-        Each entry contains the role name, its scope, and the fund or
-        program name from the matching Access Control record. The
-        fund/program is set to ``None`` when the role's scope is
-        ``Hub`` (global).
-        """
-        # Imported here to avoid a circular import with app.models.auth.
-        from app.models.auth import ScopedRole
-
-        if not email:
-            return []
-
-        # if self._is_dev_admin_override(email):
-        #     logger.warning("DEV_ADMIN_OVERRIDE_EMAILS granting Hub Admin to %s", email)
-        #     return [
-        #         ScopedRole(
-        #             role_name=self.HUB_ADMIN_ROLE,
-        #             scope=self.HUB_SCOPE,
-        #             fund_or_program_name=None,
-        #         )
-        #     ]
-
-        s = self._settings
-        email_field = s.ACCESS_CONTROL_USER_EMAIL_FIELD
-        normalized = email.strip().lower()
-        formula = f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
-        table = self._access_control_table()
-        try:
-            records = await asyncio.to_thread(table.all, formula=formula)
-        except RequestException as exc:
-            logger.error("Airtable scoped-role lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during scoped-role lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-
-        if not records:
-            return []
-
-        # Build role_id → (name, scope) map from the Roles catalog.
-        roles_catalog = await self.get_unique_roles()
-        role_by_id = {r.id: r for r in roles_catalog}
-
-        out: list = []
-        seen: set[tuple[str, str, str]] = set()
-        for rec in records:
-            ac = self._build_access_control_record(rec)
-            for role in ac.roles:
-                catalog_role = role_by_id.get(role.id)
-                scope = catalog_role.scope if catalog_role else None
-                name = role.name or (catalog_role.name if catalog_role else None)
-                if scope and scope.strip().lower() == self.HUB_SCOPE.lower():
-                    fund_or_program = None
-                else:
-                    fund_or_program = ac.fund_or_program_name
-                key = (name or "", scope or "", fund_or_program or "")
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append(
-                    ScopedRole(
-                        role_name=name,
-                        scope=scope,
-                        fund_or_program_name=fund_or_program,
-                    )
-                )
-        return out
-
     @staticmethod
     def _escape(value: str) -> str:
         """Escape backslashes and single quotes for Airtable formula literals."""
@@ -5027,7 +4845,7 @@ class AirtableService:
         )
 
     # Announcement field name constants (loaded from settings/.env)
-    _F_ANN_ID = _S.AT_F_ANN_ID
+    _F_ANN_ID = _S.AIRTABLE_ID_FIELD
     _F_ANN_TITLE = _S.AT_F_ANN_TITLE
     _F_ANN_CONTENT = _S.AT_F_ANN_CONTENT
     _F_ANN_AUTHOR_EMAIL = _S.AT_F_ANN_AUTHOR_EMAIL
@@ -5247,14 +5065,12 @@ class AirtableService:
         return sorted(unique)
 
     # ══════════════════════════════════════════════════════════════════
-    # Access Control (RenPhil Hub base)
+    # Teams / Roles / Permissions (RenPhil Hub base)
+    #
+    # The Airtable Access Control table and its readers/writers were
+    # removed 2026-10-31 (plan_login_airtable_removal_2026-10-31.md, Step 5);
+    # access lives in Postgres (`role_assignments` / `resource_grants`).
     # ══════════════════════════════════════════════════════════════════
-    def _access_control_table(self):
-        return self._api.table(
-            self._settings.RENPHIL_HUB_BASE_ID,
-            self._settings.ACCESS_CONTROL_TABLE,
-        )
-
     def _teams_table(self):
         return self._api.table(
             self._settings.RENPHIL_HUB_BASE_ID,
@@ -5272,283 +5088,6 @@ class AirtableService:
             self._settings.RENPHIL_HUB_BASE_ID,
             self._settings.PERMISSIONS_TABLE,
         )
-
-    async def list_access_control_records(self) -> list[AccessControlRecord]:
-        """Return all Access Control records as typed objects."""
-        records = await self._list_records(self._access_control_table())
-        return [self._build_access_control_record(r) for r in records]
-
-    def _build_access_control_record(
-        self, record: dict[str, Any]
-    ) -> AccessControlRecord:
-        """Build an :class:`AccessControlRecord` from a raw Airtable record.
-
-        Resolves the role and permission objects from the parallel lookup
-        arrays exposed on the Access Control table.
-        """
-        s = self._settings
-        fields = record.get("fields", {}) or {}
-
-        def _as_list(value: Any) -> list[Any]:
-            if value is None:
-                return []
-            return list(value) if isinstance(value, list) else [value]
-
-        role_ids = _as_list(fields.get(s.ACCESS_CONTROL_ROLES_FIELD))
-        role_names = _as_list(
-            fields.get(s.ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD)
-        )
-        perm_ids = _as_list(fields.get(s.ACCESS_CONTROL_PERMISSIONS_FIELD))
-        perm_names = _as_list(
-            fields.get(s.ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD)
-        )
-        perm_descriptions = _as_list(
-            fields.get(s.ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD)
-        )
-
-        def _str_or_none(value: Any) -> str | None:
-            if value is None:
-                return None
-            text = str(value).strip()
-            return text or None
-
-        roles: list[Role] = []
-        for idx, rid in enumerate(role_ids):
-            if not isinstance(rid, str):
-                continue
-            name = _str_or_none(role_names[idx]) if idx < len(role_names) else None
-            roles.append(Role(id=rid, name=name, permissions=[]))
-
-        permissions: list[Permission] = []
-        for idx, pid in enumerate(perm_ids):
-            if not isinstance(pid, str):
-                continue
-            name = _str_or_none(perm_names[idx]) if idx < len(perm_names) else None
-            desc = (
-                _str_or_none(perm_descriptions[idx])
-                if idx < len(perm_descriptions)
-                else None
-            )
-            permissions.append(Permission(id=pid, name=name, description=desc))
-
-        # Fund or Program Name is a lookup → list; flatten to a single string.
-        fund_or_program_raw = fields.get(
-            s.ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD
-        )
-        if isinstance(fund_or_program_raw, list):
-            items = [
-                str(v).strip()
-                for v in fund_or_program_raw
-                if v is not None and str(v).strip()
-            ]
-            fund_or_program_name = ", ".join(items) if items else None
-        else:
-            fund_or_program_name = _str_or_none(fund_or_program_raw)
-
-        return AccessControlRecord(
-            id=record["id"],
-            user_email=_str_or_none(
-                fields.get(s.ACCESS_CONTROL_USER_EMAIL_FIELD)
-            ),
-            roles=roles,
-            permissions=permissions,
-            fund_or_program_name=fund_or_program_name,
-        )
-
-    async def _find_access_control_by_email(
-        self, email: str
-    ) -> dict[str, Any] | None:
-        """Find an Access Control record by exact (case-insensitive) email."""
-        email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
-        normalized = (email or "").strip().lower()
-        if not normalized:
-            return None
-        formula = (
-            f"LOWER({{{email_field}}}) = '{self._escape(normalized)}'"
-        )
-        table = self._access_control_table()
-        try:
-            records = await asyncio.to_thread(
-                table.all, formula=formula, max_records=1
-            )
-        except RequestException as exc:
-            logger.error("Airtable access-control lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during access-control lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        return records[0] if records else None
-
-    async def access_control_email_exists(self, email: str) -> bool:
-        """Return True when ``email`` already has an Access Control record."""
-        return await self._find_access_control_by_email(email) is not None
-
-    async def _find_role_id_by_name(self, role_name: str) -> str | None:
-        """Return the Airtable record id of the Role matching ``role_name``."""
-        name_field = self._settings.ROLES_NAME_FIELD
-        normalized = (role_name or "").strip().lower()
-        if not normalized:
-            return None
-        formula = f"LOWER({{{name_field}}}) = '{self._escape(normalized)}'"
-        table = self._roles_table()
-        try:
-            records = await asyncio.to_thread(
-                table.all, formula=formula, max_records=1
-            )
-        except RequestException as exc:
-            logger.error("Airtable role lookup failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during role lookup")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        return records[0]["id"] if records else None
-
-    async def ensure_access_control_member(self, email: str) -> None:
-        """Ensure ``email`` has an Access Control record.
-
-        No-op when the user already exists in the Access Control table.
-        Otherwise creates a record with the user's email and the linked
-        ``Hub Member`` role resolved from the Roles table.
-        """
-        if not email:
-            return
-
-        existing = await self._find_access_control_by_email(email)
-        if existing is not None:
-            return
-
-        default_role = self._settings.DEFAULT_MEMBER_ROLE
-        role_id = await self._find_role_id_by_name(default_role)
-        if role_id is None:
-            logger.error(
-                "Cannot auto-provision access control for %s: role '%s' not found",
-                email,
-                default_role,
-            )
-            return
-
-        s = self._settings
-        fields = {
-            s.ACCESS_CONTROL_USER_EMAIL_FIELD: email.strip(),
-            s.ACCESS_CONTROL_ROLES_FIELD: [role_id],
-        }
-        table = self._access_control_table()
-        try:
-            await asyncio.to_thread(table.create, fields)
-            logger.info(
-                "Auto-provisioned access control for %s with role '%s'",
-                email,
-                default_role,
-            )
-        except RequestException as exc:
-            logger.error("Airtable access-control auto-provision failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception(
-                "Unexpected Airtable error during access-control auto-provision"
-            )
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-
-    async def upsert_access_control(
-        self, payload: AccessControlAssign
-    ) -> AccessControlRecord:
-        """Assign role(s) and/or permission(s) to an email (upsert + merge)."""
-        email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
-        roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
-        permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
-
-        roles_in = list(payload.roles or [])
-        permissions_in = list(payload.permissions or [])
-        table = self._access_control_table()
-
-        existing = await self._find_access_control_by_email(payload.user_email)
-        try:
-            if existing is None:
-                fields: dict[str, Any] = {email_field: payload.user_email.strip()}
-                if roles_in:
-                    fields[roles_field] = roles_in
-                if permissions_in:
-                    fields[permissions_field] = permissions_in
-                result = await asyncio.to_thread(table.create, fields)
-            else:
-                fields_existing = existing.get("fields", {}) or {}
-                current_roles = fields_existing.get(roles_field) or []
-                current_perms = fields_existing.get(permissions_field) or []
-
-                merged_roles = list(dict.fromkeys([*current_roles, *roles_in]))
-                merged_perms = list(dict.fromkeys([*current_perms, *permissions_in]))
-
-                update_fields: dict[str, Any] = {}
-                if roles_in and merged_roles != current_roles:
-                    update_fields[roles_field] = merged_roles
-                if permissions_in and merged_perms != current_perms:
-                    update_fields[permissions_field] = merged_perms
-
-                if not update_fields:
-                    result = existing
-                else:
-                    result = await asyncio.to_thread(
-                        table.update, existing["id"], update_fields
-                    )
-        except RequestException as exc:
-            logger.error("Airtable access-control upsert failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during access-control upsert")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-
-        return self._build_access_control_record(result)
-
-    async def revoke_access_control(
-        self, payload: AccessControlRevoke
-    ) -> AccessControlRecord:
-        """Remove role(s) and/or permission(s) from the record matching the email."""
-        email_field = self._settings.ACCESS_CONTROL_USER_EMAIL_FIELD
-        roles_field = self._settings.ACCESS_CONTROL_ROLES_FIELD
-        permissions_field = self._settings.ACCESS_CONTROL_PERMISSIONS_FIELD
-
-        existing = await self._find_access_control_by_email(payload.user_email)
-        if existing is None:
-            raise HTTPException(
-                status_code=_http_status.HTTP_404_NOT_FOUND,
-                detail=(
-                    f"Access Control record for email '{payload.user_email}' "
-                    "not found."
-                ),
-            )
-
-        fields_existing = existing.get("fields", {}) or {}
-        current_roles = list(fields_existing.get(roles_field) or [])
-        current_perms = list(fields_existing.get(permissions_field) or [])
-
-        roles_to_remove = set(payload.roles or [])
-        perms_to_remove = set(payload.permissions or [])
-
-        new_roles = [r for r in current_roles if r not in roles_to_remove]
-        new_perms = [p for p in current_perms if p not in perms_to_remove]
-
-        update_fields: dict[str, Any] = {}
-        if payload.roles is not None and new_roles != current_roles:
-            update_fields[roles_field] = new_roles
-        if payload.permissions is not None and new_perms != current_perms:
-            update_fields[permissions_field] = new_perms
-
-        if not update_fields:
-            return self._build_access_control_record(existing)
-
-        table = self._access_control_table()
-        try:
-            result = await asyncio.to_thread(
-                table.update, existing["id"], update_fields
-            )
-        except RequestException as exc:
-            logger.error("Airtable access-control revoke failed: %s", exc)
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-        except Exception as exc:
-            logger.exception("Unexpected Airtable error during access-control revoke")
-            raise AirtableError(f"Airtable API error: {exc}") from exc
-
-        return self._build_access_control_record(result)
 
     async def get_unique_team_emails(self) -> list[str]:
         """Return the sorted unique non-empty Work Email values from Teams."""
@@ -5709,7 +5248,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════════
     # Grant Application Resources (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════════
-    _F_GAR_ID = _S.AT_F_GAR_ID
+    _F_GAR_ID = _S.AIRTABLE_ID_FIELD
     _F_GAR_DOCUMENT = _S.AT_F_GAR_DOCUMENT
     _F_GAR_DOCUMENT_URL = _S.AT_F_GAR_DOCUMENT_URL
     _F_GAR_NOTES = _S.AT_F_GAR_NOTES
@@ -5881,7 +5420,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Finance Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_FL_ID = _S.AT_F_FL_ID
+    _F_FL_ID = _S.AIRTABLE_ID_FIELD
     _F_FL_DOCUMENT = _S.AT_F_FL_DOCUMENT
     _F_FL_DOCUMENT_URL = _S.AT_F_FL_DOCUMENT_URL
 
@@ -6219,7 +5758,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Partnerships Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_PL_ID = _S.AT_F_PL_ID
+    _F_PL_ID = _S.AIRTABLE_ID_FIELD
     _F_PL_TEXT = _S.AT_F_PL_TEXT
     _F_PL_LINK = _S.AT_F_PL_LINK
     _F_PL_CATEGORY = _S.AT_F_PL_CATEGORY
@@ -6413,7 +5952,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Policy Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_POL_ID = _S.AT_F_POL_ID
+    _F_POL_ID = _S.AIRTABLE_ID_FIELD
     _F_POL_TEXT = _S.AT_F_POL_TEXT
     _F_POL_URL = _S.AT_F_POL_URL
 
@@ -6559,7 +6098,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Events Quick Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_EQL_ID = _S.AT_F_EQL_ID
+    _F_EQL_ID = _S.AIRTABLE_ID_FIELD
     _F_EQL_TITLE = _S.AT_F_EQL_TITLE
     _F_EQL_ANCHOR_TEXT = _S.AT_F_EQL_ANCHOR_TEXT
     _F_EQL_TYPE = _S.AT_F_EQL_TYPE
@@ -6717,7 +6256,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Finance Quick Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_FQL_ID = _S.AT_F_FQL_ID
+    _F_FQL_ID = _S.AIRTABLE_ID_FIELD
     _F_FQL_ANCHOR_TEXT = _S.AT_F_FQL_ANCHOR_TEXT
     _F_FQL_URL = _S.AT_F_FQL_URL
     _F_FQL_ENTITY = _S.AT_F_FQL_ENTITY
@@ -6871,7 +6410,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # RenPhil Due Diligence Links (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_DDL_ID = _S.AT_F_DDL_ID
+    _F_DDL_ID = _S.AIRTABLE_ID_FIELD
     _F_DDL_ANCHOR_TEXT = _S.AT_F_DDL_ANCHOR_TEXT
     _F_DDL_URL = _S.AT_F_DDL_URL
     _F_DDL_ENTITY = _S.AT_F_DDL_ENTITY
@@ -7037,7 +6576,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Board Member List (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_BM_ID = _S.AT_F_BM_ID
+    _F_BM_ID = _S.AIRTABLE_ID_FIELD
     _F_BM_TITLE = _S.AT_F_BM_TITLE
     _F_BM_FULL_NAME = _S.AT_F_BM_FULL_NAME
     _F_BM_ROLE = _S.AT_F_BM_ROLE
@@ -7204,7 +6743,7 @@ class AirtableService:
     # ══════════════════════════════════════════════════════════════
     # Organization Info (RenPhil Hub base)
     # ══════════════════════════════════════════════════════════════
-    _F_OI_ID = _S.AT_F_OI_ID
+    _F_OI_ID = _S.AIRTABLE_ID_FIELD
     _F_OI_TITLE = _S.AT_F_OI_TITLE
     _F_OI_CONTENT = _S.AT_F_OI_CONTENT
     _F_OI_ENTITY = _S.AT_F_OI_ENTITY
@@ -7396,13 +6935,13 @@ class AirtableService:
     # Quick Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
     # Quick Links field name constants (loaded from settings/.env)
-    _F_QL_ID = _S.AT_F_QL_ID
+    _F_QL_ID = _S.AIRTABLE_ID_FIELD
     _F_QL_ANCHOR_TEXT = _S.AT_F_QL_ANCHOR_TEXT
     _F_QL_URL = _S.AT_F_QL_URL
     _F_QL_EMAIL = _S.AT_F_QL_EMAIL
     _F_QL_ACTION = _S.AT_F_QL_ACTION
     _F_QL_QA_LINK = _S.AT_F_QL_QUICK_ACTIONS_LINK
-    _F_QA_ID = _S.AT_F_QA_ID
+    _F_QA_ID = _S.AIRTABLE_ID_FIELD
     _F_QA_ACTION = _S.AT_F_QA_ACTION
 
     def _quick_links_table(self):
@@ -7717,7 +7256,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # Comms Quick Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_CQL_ID = _S.AT_F_CQL_ID
+    _F_CQL_ID = _S.AIRTABLE_ID_FIELD
     _F_CQL_ANCHOR_TEXT = _S.AT_F_CQL_ANCHOR_TEXT
     _F_CQL_TYPE = _S.AT_F_CQL_TYPE
     _F_CQL_URL = _S.AT_F_CQL_URL
@@ -7868,7 +7407,7 @@ class AirtableService:
     # ═══════════════════════════════════════════════════════════════
     # HR Quick Links (RenPhil Hub base)
     # ═══════════════════════════════════════════════════════════════
-    _F_HRQL_ID = _S.AT_F_HRQL_ID
+    _F_HRQL_ID = _S.AIRTABLE_ID_FIELD
     _F_HRQL_ANCHOR_TEXT = _S.AT_F_HRQL_ANCHOR_TEXT
     _F_HRQL_TYPE = _S.AT_F_HRQL_TYPE
     _F_HRQL_URL = _S.AT_F_HRQL_URL
@@ -8327,7 +7866,7 @@ class AirtableService:
         )
 
     # Ticket field name constants (loaded from settings/.env)
-    _F_TICKET_ID = _S.AT_F_TICKET_ID
+    _F_TICKET_ID = _S.AIRTABLE_ID_FIELD
     _F_TICKET_TITLE = _S.AT_F_TICKET_TITLE
     _F_TICKET_DESCRIPTION = _S.AT_F_TICKET_DESCRIPTION
     _F_TICKET_STATUS = _S.AT_F_TICKET_STATUS

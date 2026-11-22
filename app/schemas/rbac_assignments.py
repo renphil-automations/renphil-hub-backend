@@ -43,8 +43,24 @@ class AssignmentListAPIResponse(BaseModel):
     data: list[AssignmentResponse] = Field(default_factory=list)
 
 
+class RevocableAssignmentListAPIResponse(AssignmentListAPIResponse):
+    view_as: bool = Field(
+        default=False,
+        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+    )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+
+
 class AssignmentAPIResponse(BaseModel):
     data: AssignmentResponse
+
+
+class CreatedAssignmentAPIResponse(AssignmentAPIResponse):
+    view_as: bool = Field(
+        default=False,
+        description="True when the grant was authorised against the View As parameters (`view_as` and/or `view_as_user`).",
+    )
+    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
 
 
 class CreateAssignmentRequest(StrictRequestModel):

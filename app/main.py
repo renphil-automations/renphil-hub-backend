@@ -26,6 +26,7 @@ from app.routers import (
     calendar,
     dify,
     drive,
+    forms,
     knowledge,
     locks_v2,
     nav_tabs,
@@ -50,6 +51,10 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         handlers=[logging.StreamHandler()],
     )
+    # At DEBUG these log the OAuth client secret (Basic auth header) and the
+    # Google access / refresh / id tokens on every sign-in. Never below WARNING.
+    for name in ("requests_oauthlib", "oauthlib"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     logger.info("Starting %s …", settings.APP_NAME)
     await init_http_client()
     yield
@@ -113,6 +118,8 @@ def create_app() -> FastAPI:
     app.include_router(rbac_assignments.router, prefix=api_prefix)
     app.include_router(resource_grants.router, prefix=api_prefix)
     app.include_router(bookmarks.router, prefix=api_prefix)
+    app.include_router(view_as.router, prefix=api_prefix)
+    app.include_router(forms.router, prefix=api_prefix)
     app.include_router(view_as.router, prefix=api_prefix)
 
     # ── Health check ───────────────────────────────────────────────────

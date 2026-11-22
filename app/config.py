@@ -87,6 +87,15 @@ class Settings(BaseSettings):
     DIFY_API_BASE_URL: str = "https://api.dify.ai/v1"
     DIFY_API_KEY: str
 
+    # ── Form builder (embedded forms) ──────────────────────────────────
+    # The form-builder service the `/forms/*` endpoints proxy. Both are
+    # optional so the app boots without them; the form endpoints answer a
+    # clean 422 until they're set. The PAT itself is never configured here —
+    # each caller supplies their own per request.
+    FORM_BUILDER_BASE_URL: str | None = None
+    # Sent as the `sourceUi` query param on every form-builder call.
+    FORM_BUILDER_SOURCE_UI: str | None = None
+
     # ══════════════════════════════════════════════════════════════════
     # Airtable
     # ══════════════════════════════════════════════════════════════════
@@ -120,7 +129,6 @@ class Settings(BaseSettings):
     AWARDED_OPPORTUNITIES_TABLE: str
     DELIVERABLES_TABLE: str
     # RenPhil Hub base
-    ADMINS_TABLE: str
     ANNOUNCEMENTS_TABLE: str
     TICKETS_TABLE: str
     FEEDBACKS_TABLE: str
@@ -128,7 +136,6 @@ class Settings(BaseSettings):
     FINANCE_LINKS_TABLE: str
     GOOGLE_DOCS_TABS_TABLE: str
     OFFICE_SPACES_TABLE: str
-    ACCESS_CONTROL_TABLE: str
     TEAMS_TABLE: str
     USERS_TABLE: str
     ROLES_TABLE: str
@@ -153,18 +160,8 @@ class Settings(BaseSettings):
     ORGANIZATION_INFO_TABLE: str | None = None
 
     # ── Field names ───────────────────────────────────────────────────
-    # Admins / Access Control
-    ADMINS_EMAIL_FIELD: str
-    ACCESS_CONTROL_USER_EMAIL_FIELD: str
-    ACCESS_CONTROL_ROLES_FIELD: str
-    ACCESS_CONTROL_PERMISSIONS_FIELD: str
-    ACCESS_CONTROL_FUND_OR_PROGRAM_NAME_FIELD: str
-    ACCESS_CONTROL_ROLE_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_NAME_LOOKUP_FIELD: str
-    ACCESS_CONTROL_PERMISSION_DESCRIPTION_LOOKUP_FIELD: str
     # Teams / Users
     TEAMS_WORK_EMAIL_FIELD: str
-    TEAMS_NAME_FIELD: str
     USERS_WORK_EMAIL_FIELD: str
     USERS_ALIAS_EMAIL_FIELD: str
     USERS_NAME_FIELD: str
@@ -187,16 +184,12 @@ class Settings(BaseSettings):
     USERS_MANAGER_FIELD: str
     USERS_TECH_STACK_SELECTIONS_FIELD: str
     USERS_HEADSHOT_FIELD: str
-    USERS_FOR_WEBSITE_FIELD: str
     # Roles / Permissions
     ROLES_NAME_FIELD: str
     ROLES_PERMISSIONS_FIELD: str
     ROLES_SCOPE_FIELD: str
     PERMISSIONS_NAME_FIELD: str
     PERMISSIONS_DESCRIPTION_FIELD: str
-
-    # Role auto-assigned to first-time authenticated users.
-    DEFAULT_MEMBER_ROLE: str = "Hub Member"
 
     # ── Fundraising (Total Moved & Deployed) fields ───────────────────
     AT_F_AMOUNT: str
@@ -234,8 +227,10 @@ class Settings(BaseSettings):
     AT_F_REVIEW_UNTIL: str
     AT_F_PERIOD: str
 
+    # Primary-key field name shared by every Airtable table looked up by ID.
+    AIRTABLE_ID_FIELD: str = "Id"
+
     # ── Announcements fields ──────────────────────────────────────────
-    AT_F_ANN_ID: str
     AT_F_ANN_TITLE: str
     AT_F_ANN_CONTENT: str
     AT_F_ANN_AUTHOR_EMAIL: str
@@ -259,7 +254,6 @@ class Settings(BaseSettings):
     AT_F_FEEDBACK_RESPONSE: str = "Response"
 
     # ── Tickets fields ────────────────────────────────────────────────
-    AT_F_TICKET_ID: str
     AT_F_TICKET_TITLE: str
     AT_F_TICKET_DESCRIPTION: str
     AT_F_TICKET_STATUS: str
@@ -274,7 +268,6 @@ class Settings(BaseSettings):
     AT_F_TICKET_PARENT_LINK: str
 
     # ── Grant Application Resources fields ────────────────────────────
-    AT_F_GAR_ID: str | None = None
     AT_F_GAR_DOCUMENT: str | None = None
     AT_F_GAR_DOCUMENT_URL: str | None = None
     AT_F_GAR_NOTES: str | None = None
@@ -282,7 +275,6 @@ class Settings(BaseSettings):
     AT_F_GAR_TABS: str | None = None
 
     # ── Finance Links fields ──────────────────────────────────────────
-    AT_F_FL_ID: str
     AT_F_FL_DOCUMENT: str
     AT_F_FL_DOCUMENT_URL: str
 
@@ -294,32 +286,7 @@ class Settings(BaseSettings):
     # ── Google Docs Tabs fields ───────────────────────────────────────
     AT_F_GDT_UI_PAGE: str
 
-    # ── Meeting Cadence fields ────────────────────────────────────────
-    AT_F_MC_MEETING_TITLE: str
-    AT_F_MC_DESCRIPTION: str
-    AT_F_MC_ATTACHMENT_URL: str
-
-    # ── Useful Links fields ───────────────────────────────────────────
-    AT_F_UL_DOCUMENT: str
-    AT_F_UL_DOCUMENT_URL: str
-    AT_F_UL_DESCRIPTION: str
-
-    # ── HR & Benefits fields ──────────────────────────────────────────
-    AT_F_HR_DOCUMENT: str
-    AT_F_HR_DOCUMENT_URL: str
-    AT_F_HR_DESCRIPTION: str
-
-    # ── Onboarding fields ─────────────────────────────────────────────
-    AT_F_OB_DOCUMENT: str
-    AT_F_OB_DOCUMENT_URL: str
-    AT_F_OB_NOTES: str
-
-    # ── Onboarding Calls fields ───────────────────────────────────────
-    AT_F_OBC_DATE: str
-    AT_F_OBC_NOTES: str
-
     # ── Quick Links fields ────────────────────────────────────────────
-    AT_F_QL_ID: str
     AT_F_QL_ANCHOR_TEXT: str
     AT_F_QL_URL: str
     AT_F_QL_EMAIL: str
@@ -327,23 +294,19 @@ class Settings(BaseSettings):
     AT_F_QL_QUICK_ACTIONS_LINK: str
 
     # ── Quick Actions fields ──────────────────────────────────────────
-    AT_F_QA_ID: str = "ID"
     AT_F_QA_ACTION: str
 
     # ── Partnerships Links fields ─────────────────────────────────────
-    AT_F_PL_ID: str
     AT_F_PL_TEXT: str
     AT_F_PL_LINK: str
     AT_F_PL_CATEGORY: str
     AT_F_PL_TYPE: str
 
     # ── Policy Links fields ───────────────────────────────────────────
-    AT_F_POL_ID: str | None = None
     AT_F_POL_TEXT: str | None = None
     AT_F_POL_URL: str | None = None
 
     # ── Events Quick Links fields ───────────────────────────────────
-    AT_F_EQL_ID: str | None = None
     AT_F_EQL_TITLE: str | None = None
     AT_F_EQL_ANCHOR_TEXT: str | None = None
     AT_F_EQL_TYPE: str | None = None
@@ -351,35 +314,30 @@ class Settings(BaseSettings):
     AT_F_EQL_EMAIL: str | None = None
 
     # ── Finance Quick Links fields ──────────────────────────────────
-    AT_F_FQL_ID: str | None = None
     AT_F_FQL_ANCHOR_TEXT: str | None = None
     AT_F_FQL_URL: str | None = None
     AT_F_FQL_ENTITY: str | None = None
     AT_F_FQL_TABS: str | None = None
 
     # ── Comms Quick Links fields ────────────────────────────────────
-    AT_F_CQL_ID: str = "ID"
     AT_F_CQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_CQL_TYPE: str = "Type"
     AT_F_CQL_URL: str = "URL"
     AT_F_CQL_EMAIL: str = "Email"
 
     # ── HR Quick Links fields ───────────────────────────────────────
-    AT_F_HRQL_ID: str = "ID"
     AT_F_HRQL_ANCHOR_TEXT: str = "Anchor Text"
     AT_F_HRQL_TYPE: str = "Type"
     AT_F_HRQL_URL: str = "URL"
     AT_F_HRQL_EMAIL: str = "Email"
 
     # ── RenPhil Due Diligence Links fields ────────────────────────
-    AT_F_DDL_ID: str | None = None
     AT_F_DDL_ANCHOR_TEXT: str | None = None
     AT_F_DDL_URL: str | None = None
     AT_F_DDL_ENTITY: str | None = None
     AT_F_DDL_TABS: str | None = None
 
     # ── Board Member List fields ─────────────────────────────────────
-    AT_F_BM_ID: str | None = None
     AT_F_BM_TITLE: str | None = None
     AT_F_BM_FULL_NAME: str | None = None
     AT_F_BM_ROLE: str | None = None
@@ -388,7 +346,6 @@ class Settings(BaseSettings):
     AT_F_BM_ENTITY: str | None = None
     AT_F_BM_TABS: str | None = None
     # ── Organization Info fields ────────────────────────────────
-    AT_F_OI_ID: str | None = None
     AT_F_OI_TITLE: str | None = None
     AT_F_OI_CONTENT: str | None = None
     AT_F_OI_ENTITY: str | None = None
