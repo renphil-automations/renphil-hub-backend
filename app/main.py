@@ -46,6 +46,7 @@ from app.routers import (
     threads,
     view_as,
 )
+from app.services import mcp_oauth_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ async def lifespan(app: FastAPI):
     # Google access / refresh / id tokens on every sign-in. Never below WARNING.
     for name in ("requests_oauthlib", "oauthlib"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    mcp_oauth_rate_limit.warn_if_forwarded_for_untrusted(settings)
     logger.info("Starting %s …", settings.APP_NAME)
     await init_http_client()
     yield

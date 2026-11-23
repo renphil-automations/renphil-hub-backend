@@ -247,14 +247,79 @@ def _digest(key: bytes, value: str) -> str:
     return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def client_network(*, forwarded_for: str | None, peer_host: str | None) -> str:
+def _configured_trusted_proxies() -> tuple:
+    """``TRUSTED_PROXY_CIDRS`` from the current settings (empty when unset)."""
+    from app.config import get_settings
+
+    return tuple(getattr(get_settings(), "trusted_proxy_networks", ()) or ())
+
+
+def _parse_address(value: str | None):
+    try:
+        address = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def _is_trusted(address, trusted_proxies) -> bool:
+    return address is not None and any(
+        address.version == network.version and address in network for network in trusted_proxies
+    )
+
+
+def _client_address(forwarded_for: str | None, peer_host: str | None, trusted_proxies) -> str:
+    """The raw (unparsed) client address to bucket on.
+
+    With no trusted proxies configured this is the historical rule: the
+    right-most ``X-Forwarded-For`` entry, from any peer. With trusted proxies
+    the header is honoured only when the direct peer is one of them; it is
+    then walked right to left, skipping trusted hops, and the first untrusted
+    (or unparseable) entry is the client. If every hop is trusted, the
+    left-most one is used.
+    """
+    if not trusted_proxies:
+        return (forwarded_for.split(",")[-1] if forwarded_for else (peer_host or "")).strip()
+    if not _is_trusted(_parse_address(peer_host), trusted_proxies):
+        return (peer_host or "").strip()
+    hops = [hop.strip() for hop in forwarded_for.split(",")] if forwarded_for else []
+    for hop in reversed(hops):
+        if not _is_trusted(_parse_address(hop), trusted_proxies):
+            return hop
+    return hops[0] if hops else (peer_host or "").strip()
+
+
+def warn_if_forwarded_for_untrusted(settings) -> None:
+    """One startup warning when XFF is trusted from any peer outside local/debug."""
+    if getattr(settings, "is_local_or_debug", False):
+        return
+    if getattr(settings, "trusted_proxy_networks", ()):
+        return
+    logger.warning(
+        "TRUSTED_PROXY_CIDRS is not set: X-Forwarded-For is trusted from any peer for MCP OAuth rate "
+        "limiting. Set it to the reverse proxy CIDRs so clients cannot choose their own bucket."
+    )
+
+
+def client_network(
+    *,
+    forwarded_for: str | None,
+    peer_host: str | None,
+    trusted_proxies: tuple | None = None,
+) -> str:
     """Normalized caller network: IPv4 address, IPv6 /64, or ``invalid``.
 
-    Behind Hub's hosting proxy the right-most ``X-Forwarded-For`` entry is the
-    address the proxy itself observed (a client can prepend entries but not
-    replace the proxy's own). Values that do not parse share one bucket.
+    ``trusted_proxies`` defaults to ``TRUSTED_PROXY_CIDRS``; see
+    ``_client_address`` for how ``X-Forwarded-For`` is used. Behind Hub's
+    hosting proxy the right-most entry is the address the proxy itself
+    observed (a client can prepend entries but not replace the proxy's own).
+    Values that do not parse share one bucket.
     """
-    candidate = (forwarded_for.split(",")[-1] if forwarded_for else (peer_host or "")).strip()
+    if trusted_proxies is None:
+        trusted_proxies = _configured_trusted_proxies()
+    candidate = _client_address(forwarded_for, peer_host, trusted_proxies)
     try:
         address = ipaddress.ip_address(candidate)
     except ValueError:

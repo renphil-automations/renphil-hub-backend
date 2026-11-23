@@ -3,9 +3,26 @@ Centralised application settings loaded from environment variables.
 Uses pydantic-settings so every value is validated at startup.
 """
 
+import ipaddress
 from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_cidrs(value: str) -> tuple[IPNetwork, ...]:
+    """Parse a comma-separated CIDR list; ``ValueError`` names a bad entry."""
+    networks = []
+    for raw in (value or "").split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"TRUSTED_PROXY_CIDRS: invalid CIDR {entry!r}") from exc
+    return tuple(networks)
 
 
 class Settings(BaseSettings):
@@ -705,6 +722,33 @@ class Settings(BaseSettings):
     def hub_environment(self) -> str:
         value = self.HUB_ENVIRONMENT.strip().lower()
         return value if value in {"local", "sandbox", "production"} else "unconfigured"
+
+    @property
+    def is_local_or_debug(self) -> bool:
+        """Local development: ``DEBUG=true`` or ``HUB_ENVIRONMENT=local``."""
+        return bool(self.DEBUG) or self.hub_environment == "local"
+
+    # ══════════════════════════════════════════════════════════════════
+    # Reverse proxies
+    # ══════════════════════════════════════════════════════════════════
+    # Comma-separated CIDRs (or bare addresses) of the reverse proxies in
+    # front of the API. When set, `X-Forwarded-For` is honoured only when
+    # the direct peer is inside one of them, walking the header right to
+    # left past trusted hops. Empty (the default) keeps the historical
+    # behaviour: the right-most `X-Forwarded-For` entry from ANY peer, which
+    # a client that can reach the API directly can spoof; a startup warning
+    # is logged outside local/debug. An invalid entry fails validation.
+    TRUSTED_PROXY_CIDRS: str = ""
+
+    @field_validator("TRUSTED_PROXY_CIDRS")
+    @classmethod
+    def _validate_trusted_proxy_cidrs(cls, value: str) -> str:
+        _parse_cidrs(value)
+        return value
+
+    @property
+    def trusted_proxy_networks(self) -> tuple[IPNetwork, ...]:
+        return _parse_cidrs(self.TRUSTED_PROXY_CIDRS)
 
 
 def get_settings() -> Settings:
