@@ -246,6 +246,27 @@ class TestDevLoginRedirectShape(DevLoginFixture):
             self.assertNotIn("access_token", resp.text)
         self.assertEqual(self.db.query(UserV2).count(), 0)
 
+    def test_mcp_continuation_redirect_is_refused_and_mints_nothing(self):
+        # N-1: the login allow-list accepts <issuer>/continue/<id>, but
+        # dev-login must never put a session token on that Hub URL.
+        os.environ["DEBUG"] = "True"
+        issuer = "http://localhost:8000/mcp/oauth"
+        settings = get_settings().model_copy(
+            update={
+                "ALLOWED_ORIGINS": ["http://localhost:5000"],
+                "MCP_OAUTH_ISSUER": issuer,
+            }
+        )
+        app = self.client.app
+        app.dependency_overrides[get_settings] = lambda: settings
+        app.dependency_overrides[get_auth_service] = lambda: AuthService(settings)
+        redirect_uri = f"{issuer}/continue/abc123"
+        self.assertTrue(AuthService(settings).is_allowed_login_redirect_uri(redirect_uri))
+        resp = self._get(email="persona@example.com", redirect_uri=redirect_uri)
+        self.assertEqual(resp.status_code, 400)
+        self.assertNotIn("location", resp.headers)
+        self.assertNotIn("access_token", resp.text)
+        self.assertEqual(self.db.query(UserV2).count(), 0)
 
 class TestDevLoginProvisionsHubUserSynchronously(DevLoginFixture):
     """Item 6: the whole point of extracting `_ensure_hub_user` — the row
