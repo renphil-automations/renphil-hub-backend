@@ -163,6 +163,16 @@ def _basic_client_id(authorization: str | None) -> str | None:
     return client_id if separator and client_id else None
 
 
+async def _token_form_bucket(request: Request, settings) -> tuple[str | None, str]:
+    """``(grant_type, client bucket)`` of a token request; never raises."""
+    try:
+        form = await request.form()
+        grant_type = form.get("grant_type")
+    except Exception:
+        return None, "unknown"
+    return (grant_type if isinstance(grant_type, str) else None), await _token_client_bucket(request, settings)
+
+
 async def _token_client_bucket(request: Request, settings) -> str:
     try:
         form = await request.form()
@@ -212,14 +222,22 @@ class McpOAuthRateLimitedRoute(APIRoute):
                 if store is None:
                     raise rate_limit.RateLimitStoreUnavailable("rate-limit store not configured")
                 if endpoint == "token":
-                    decision = await rate_limit.evaluate(
-                        store, rate_limit.build_checks(settings, endpoint, network=network, client=None, phase="pre"), endpoint,
-                    )
-                    if decision.allowed:
-                        client = await _token_client_bucket(request, settings)
+                    grant_type, client = await _token_form_bucket(request, settings)
+                    refresh_grant = grant_type == "refresh_token"
+                    if refresh_grant:
+                        # Own budget (per network, per client, global) and no
+                        # part in the code-exchange failure lockout (S5).
                         decision = await rate_limit.evaluate(
-                            store, rate_limit.build_checks(settings, endpoint, network=network, client=client, phase="client"), endpoint,
+                            store, rate_limit.build_checks(settings, "refresh", network=network, client=client), "refresh",
                         )
+                    else:
+                        decision = await rate_limit.evaluate(
+                            store, rate_limit.build_checks(settings, endpoint, network=network, client=None, phase="pre"), endpoint,
+                        )
+                        if decision.allowed:
+                            decision = await rate_limit.evaluate(
+                                store, rate_limit.build_checks(settings, endpoint, network=network, client=client, phase="client"), endpoint,
+                            )
                 elif endpoint in {"consent", "revoke"}:
                     # Part of the same browser sign-in: counted against the
                     # authorize per-network budget only, so floods of unknown
@@ -247,9 +265,10 @@ class McpOAuthRateLimitedRoute(APIRoute):
                 logger.warning("MCP OAuth request denied: endpoint=token category=dpop_replay_store_unavailable")
                 return _oauth_error(503, _UNAVAILABLE, rate_limit.UNAVAILABLE_RETRY_AFTER_SECONDS)
             except Exception:
-                await _record_token_failure(store, settings, network)
+                if not refresh_grant:
+                    await _record_token_failure(store, settings, network)
                 raise
-            if response.status_code >= 400:
+            if response.status_code >= 400 and not refresh_grant:
                 await _record_token_failure(store, settings, network)
             return response
 

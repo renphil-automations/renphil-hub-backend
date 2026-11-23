@@ -84,6 +84,15 @@ MCP_OAUTH_RATE_LIMITS: dict[str, tuple[Bucket, ...]] = {
         Bucket("client", 300, 60),
         Bucket("global", 1500, 60),
     ),
+    # grant_type=refresh_token at the token endpoint: its own budget, no
+    # failure bucket (refresh tokens are 384-bit random; reuse is detected
+    # and revokes the family), so refreshes never share the code-exchange
+    # lockout in either direction.
+    "refresh": (
+        Bucket("network", 30, 60),
+        Bucket("client", 300, 60),
+        Bucket("global", 1500, 60),
+    ),
     "register": (
         Bucket("network", 5, 60),
         Bucket("global", 60, 60),
@@ -98,7 +107,7 @@ MCP_OAUTH_RATE_LIMITS: dict[str, tuple[Bucket, ...]] = {
     ),
 }
 # Per-window limit of the single shared bucket for unknown/malformed clients.
-UNKNOWN_CLIENT_LIMITS = {"authorize": 60, "token": 30}
+UNKNOWN_CLIENT_LIMITS = {"authorize": 60, "token": 30, "refresh": 30}
 TOKEN_FAILURE_BUCKET = Bucket("failures", 20, 600)
 
 
