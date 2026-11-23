@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     # still validated and binds the token. Empty (default): DPoP is required
     # for every external provider. Unknown names fail start-up.
     MCP_OAUTH_BEARER_PROVIDERS: str = ""
+    # RFC 8707: the MCP server's resource URL (e.g. https://mcp.example/mcp).
+    # A ``resource`` parameter sent to /authorize or /token must equal it
+    # (a trailing slash is ignored), otherwise ``invalid_target``. Requests
+    # without ``resource`` are unaffected. Unset: any ``resource`` is refused.
+    MCP_OAUTH_RESOURCE_URL: str | None = None
 
     @field_validator("MCP_OAUTH_BEARER_PROVIDERS")
     @classmethod

@@ -6,6 +6,7 @@ import hmac
 import logging
 import re
 from functools import lru_cache
+from typing import Annotated
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, status
@@ -231,6 +232,34 @@ def _service() -> PersistentMcpOAuthService:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP OAuth is not configured.") from exc
 
 
+_INVALID_TARGET = {
+    "error": "invalid_target",
+    "error_description": "The requested resource is not served by this authorization server.",
+}
+
+
+def _normalized_resource(value: object) -> str:
+    text = value if isinstance(value, str) else ""
+    return text[:-1] if text.endswith("/") else text
+
+
+def _require_valid_resource(resources: list[str] | None) -> None:
+    """RFC 8707: every ``resource`` sent must be the configured MCP resource.
+
+    Absent ``resource`` keeps the previous behaviour. Comparison is exact
+    after removing one trailing slash; no case folding or other rewriting.
+    """
+    if resources is None:
+        return
+    configured = _normalized_resource(getattr(get_settings(), "MCP_OAUTH_RESOURCE_URL", None) or "")
+    if not configured or not resources:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVALID_TARGET)
+    for value in resources:
+        supplied = _normalized_resource(value)
+        if not supplied or not hmac.compare_digest(supplied.encode("utf-8"), configured.encode("utf-8")):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVALID_TARGET)
+
+
 def _redirect_with_code(*, redirect_uri: str, code: str, state: str) -> str:
     parts = urlsplit(redirect_uri)
     query = parse_qsl(parts.query, keep_blank_values=True)
@@ -272,12 +301,16 @@ def authorize(
     code_challenge: str = Query(...),
     code_challenge_method: str = Query(...),
     db: Session = Depends(get_db_v2),
+    resource: Annotated[list[str] | None, Query()] = None,
 ):
     """Begin authorization, then reuse normal Hub Google sign-in."""
     if response_type != "code":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="response_type must be code.")
     if _is_agent_client(client_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth authorization request.")
+    # Refused before any redirect, so an invalid target never reaches the
+    # client callback (no open redirect on an unvalidated request).
+    _require_valid_resource(resource)
     if not _external_client_is_enabled(db, client_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
     service = _service()
@@ -304,11 +337,13 @@ def token(
     code_verifier: str = Form(...),
     dpop: str | None = Header(default=None, alias="DPoP"),
     db: Session = Depends(get_db_v2),
+    resource: Annotated[list[str] | None, Form()] = None,
 ):
     if grant_type != "authorization_code":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported grant type.")
     if _is_agent_client(client_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.")
+    _require_valid_resource(resource)
     decision = _external_admission(db, client_id)
     if not decision.allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
