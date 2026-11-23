@@ -319,12 +319,14 @@ class ProductAnalyticsApiTests(unittest.TestCase):
     def test_new_view_as_selection_is_verified_and_private(self) -> None:
         targets = [SimpleNamespace(role_key="editor", scope_key="one"),
                    SimpleNamespace(role_key="member", scope_key="two")]
-        selection = SimpleNamespace(targets=targets, user=SimpleNamespace(id=42))
-        with patch.object(product_analytics.view_as_service, "resolve_user_id", return_value=2), \
+        selection = SimpleNamespace(targets=targets)
+        user_ids = {"other@example.org": 42}
+        with patch.object(product_analytics.view_as_service, "resolve_user_id",
+                          side_effect=lambda _db, email: user_ids.get(email, 2)), \
                 patch.object(product_analytics.view_as_service, "resolve_view_as_selection", return_value=selection) as verify:
-            response = self._ingest(_event(), query="?view_as=editor%3Aone&view_as=member%3Atwo&view_as_user=other%40example.org")
+            response = self._ingest(_event(), query="?view_as=editor%3Aone&view_as=member%3Atwo&view_as_from=Other%40example.org")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(verify.call_args.args[2:], (["editor:one", "member:two"], "other@example.org"))
+        self.assertEqual(verify.call_args.args[2:], (["editor:one", "member:two"],))
         (row,) = self._rows()
         self.assertEqual(row.actor_email, MEMBER.email)
         self.assertEqual(row.view_as_context, {"pairs": [{"role": "editor", "scope": "one"}, {"role": "member", "scope": "two"}], "user_id": 42})

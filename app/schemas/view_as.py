@@ -7,11 +7,13 @@ from pydantic import BaseModel, Field
 
 from app.schemas.tab import NavTabListAPIResponse, TabSummaryListAPIResponse, TabWorkspaceAPIResponse
 
-VIEW_AS_USER_DESCRIPTION = "Email of the user selected through `view_as_user`, echoed back; null when none."
+VIEW_AS_FROM_DESCRIPTION = (
+    "The `view_as_from` audit email, echoed back under View As; null when none was sent or "
+    "without `view_as` pairs."
+)
 
 VIEW_AS_FLAG_DESCRIPTION = (
-    "True when the response was built from the View As parameters "
-    "(`view_as` pairs and/or `view_as_user`); False for the caller's own access."
+    "True when the response was built from the `view_as` pairs; False for the caller's own access."
 )
 
 
@@ -37,7 +39,7 @@ class ViewAsUserAssignment(BaseModel):
 class ViewAsUserOption(BaseModel):
     id: int
     name: str
-    email: str = Field(description="Send this as `view_as_user`.")
+    email: str = Field(description="Send this as `view_as_from`, alongside the user's assignments as `view_as` pairs.")
     assignments: list[ViewAsUserAssignment] = Field(
         default_factory=list,
         description="The user's role/scope assignments, as keys. Empty when they hold none.",
@@ -55,14 +57,14 @@ class ViewAsRoleListAPIResponse(BaseModel):
 
 class NavTabListViewAsAPIResponse(NavTabListAPIResponse):
     view_as: bool = Field(default=False, description=VIEW_AS_FLAG_DESCRIPTION)
-    view_as_user: str | None = Field(default=None, description=VIEW_AS_USER_DESCRIPTION)
+    view_as_from: str | None = Field(default=None, description=VIEW_AS_FROM_DESCRIPTION)
 
 
 class TabSummaryListViewAsAPIResponse(TabSummaryListAPIResponse):
     view_as: bool = Field(default=False, description=VIEW_AS_FLAG_DESCRIPTION)
-    view_as_user: str | None = Field(default=None, description=VIEW_AS_USER_DESCRIPTION)
+    view_as_from: str | None = Field(default=None, description=VIEW_AS_FROM_DESCRIPTION)
 
 
 class TabWorkspaceViewAsAPIResponse(TabWorkspaceAPIResponse):
     view_as: bool = Field(default=False, description=VIEW_AS_FLAG_DESCRIPTION)
-    view_as_user: str | None = Field(default=None, description=VIEW_AS_USER_DESCRIPTION)
+    view_as_from: str | None = Field(default=None, description=VIEW_AS_FROM_DESCRIPTION)

@@ -2117,15 +2117,16 @@ class LockedRereadRefreshes(_ResubmitFixture):
 # FIXTURE (reported before code): widget A on tab A (`_widget`), widget B on
 # tab B (`gridstack_b`), the same five grants on each. AUTHOR's direct
 # `component` grant on B is the one revoked/restored for "lost view". View As
-# pairs / user go through the REAL `get_view_as_selection` with
-# `view_as_service.resolve_view_as_selection` patched to return a verified
-# selection; `anonymous` is unpatched.
+# pairs go through the REAL verification against role/scope rows seeded by
+# `_role_widgets`; `anonymous` is unpatched.
 # ---------------------------------------------------------
 
 from app.db_v2.models.component import ComponentV2  # noqa: E402
 from app.db_v2.models.resource_grant import ResourceGrantV2  # noqa: E402
+from app.db_v2.models.role import RoleV2  # noqa: E402
+from app.db_v2.models.role_assignment import RoleAssignmentV2  # noqa: E402
+from app.db_v2.models.scope import ScopeV2  # noqa: E402
 from app.dependencies import CurrentHubUser, is_hub_admin  # noqa: E402
-from app.services import view_as_service  # noqa: E402
 from app.services.thread_service import THREAD_WIDGET_TYPE  # noqa: E402
 
 TAB_ONLY = "tabonly@example.com"
@@ -2402,26 +2403,87 @@ class MyRevisions(_ResubmitFixture):
 
     # -- View As (M7) -------------------------------------------------
 
-    def test_view_as_pairs_user_and_anonymous_are_empty(self) -> None:
+    def _role_widgets(self) -> tuple[ComponentV2, ComponentV2]:
+        """AUTHOR holds (r1, s1) and (r2, s2); widget C is view-granted to
+        (r1, s1) only and widget D to (r2, s2) only — neither directly to
+        AUTHOR, who still has direct view grants on A and B."""
+        now = thread_service._utc_now()
+        author = self._seed_hub_user(AUTHOR)
+        widgets = []
+        for n, link in ((1, "myrev-c"), (2, "myrev-d")):
+            role = RoleV2(key=f"r{n}", name=f"R{n}", is_public=False, is_system=False, created_at=now)
+            scope = ScopeV2(key=f"s{n}", name=f"S{n}", is_universal=False, is_public=False, is_system=False, created_at=now)
+            self.db.add_all([role, scope])
+            self.db.flush()
+            self.db.add(RoleAssignmentV2(user_id=author.id, role_id=role.id, scope_id=scope.id, created_at=now))
+            widget = self._seed_thread_widget(link)
+            self.db.add(
+                ResourceGrantV2(component_id=widget.id, role_id=role.id, scope_id=scope.id, level="view", created_at=now)
+            )
+            self.db.commit()
+            self._grant(email=EDITOR, node=("component", widget.id), level="edit")
+            widgets.append(widget)
+        return widgets[0], widgets[1]
+
+    def test_view_as_pairs_keep_the_callers_items_on_widgets_the_pairs_can_view(self) -> None:
+        c, d = self._role_widgets()
+        t_a = self._declined_thread(self.a, 10, title="A")
+        t_c = self._declined_thread(c, 20, title="C")
+        self._declined_thread(d, 30, title="D")
+        pending_c = self._pending(c, title="Pending C")
+        self._pending(d, title="Pending D")
+        self._declined_thread(c, 40, author=VIEWER, title="Not mine")
+
+        own = self._me()
+        self.assertEqual(len(own["items"]), 3)  # non-vacuous: A, C and D
+        self.assertFalse(own["view_as"])
+
+        # (r1, s1) views C; A stays through AUTHOR's own direct share; D is out.
+        params = {"view_as": "r1:s1", "view_as_from": "someone@renphil.org"}
+        body = self._me(params=params)
+        self.assertEqual(self._keys(body["items"]), [("thread", t_c.id), ("thread", t_a.id)])
+        self.assertEqual(self._keys(body["pending"]), [("thread", pending_c.id)])
+        self.assertTrue(body["view_as"])
+
+        resp = self._summary(params=params)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json(),
+            {"open_count": 2, "closed_count": 0, "pending_count": 1, "has_any": True, "view_as": True},
+        )
+        etag = resp.headers["ETag"]
+        self.assertTrue(etag.endswith('-va"'), etag)
+        self.assertEqual(self._summary(params=params, etag=etag).status_code, 304)
+        # The caller's own summary never 304s against the View As tag.
+        own_summary = self._summary(etag=etag)
+        self.assertEqual(own_summary.status_code, 200)
+        self.assertEqual(own_summary.json()["open_count"], 3)
+
+        # (r2, s2) views D instead.
+        s = self._summary(params={"view_as": "r2:s2"}).json()
+        self.assertEqual((s["open_count"], s["pending_count"]), (2, 1))
+
+    def test_view_as_pairs_with_no_viewable_item_widget_read_as_empty(self) -> None:
+        _c, d = self._role_widgets()
+        self._declined_thread(d, 10)
+        body = self._me(params={"view_as": "r1:s1"})
+        self.assertEqual((body["items"], body["closed"], body["pending"], body["view_as"]), ([], [], [], True))
+        resp = self._summary(params={"view_as": "r1:s1"})
+        self.assertEqual(
+            resp.json(),
+            {"open_count": 0, "closed_count": 0, "pending_count": 0, "has_any": False, "view_as": True},
+        )
+
+    def test_anonymous_is_empty_with_or_without_pairs(self) -> None:
+        self._role_widgets()
         self._declined_thread(self.a, 10)
         self._pending(self.a)
         self.assertEqual(len(self._me()["items"]), 1)  # non-vacuous
         self.assertTrue(self._summary().json()["has_any"])
-        pairs = view_as_service.ViewAsSelection(targets=[])
-        as_user = view_as_service.ViewAsSelection(
-            targets=[], user=view_as_service.ViewAsUser(id=999, email=VIEWER, name="Viewer")
-        )
-        cases = (
-            ("pairs", {"view_as": "role_x:scope_y"}, pairs),
-            ("user", {"view_as_user": VIEWER}, as_user),
-            ("anonymous", {"anonymous": "true"}, None),
-        )
-        for label, params, selection in cases:
-            with self.subTest(label):
-                patcher = mock.patch.object(view_as_service, "resolve_view_as_selection", return_value=selection)
-                with patcher:
-                    body = self._me(params=params)
-                    resp = self._summary(params=params)
+        for params in ({"anonymous": "true"}, {"anonymous": "true", "view_as": "r1:s1"}):
+            with self.subTest(params=params):
+                body = self._me(params=params)
+                resp = self._summary(params=params)
                 self.assertEqual((body["items"], body["closed"], body["pending"]), ([], [], []))
                 self.assertTrue(body["view_as"])
                 self.assertEqual(resp.status_code, 200, resp.text)

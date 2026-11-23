@@ -412,7 +412,7 @@ class ViewAsEndpointTests(_ViewAsHub):
 
         response = self.client.get("/v2/tabs/tab-1/children", params=member_a)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(), {"data": [], "view_as": True, "view_as_user": None})
+        self.assertEqual(response.json(), {"data": [], "view_as": True, "view_as_from": None})
 
     def test_variants(self) -> None:
         variant = TabV2(
@@ -509,7 +509,7 @@ class ThreadModerationSummaryViewAsTests(_ViewAsHub):
                 body, etag = self._summary(path)
                 self.assertEqual(
                     body,
-                    {"can_moderate": True, "moderated_component_count": 5, "pending_count": 5, "view_as": False, "view_as_user": None},
+                    {"can_moderate": True, "moderated_component_count": 5, "pending_count": 5, "view_as": False, "view_as_from": None},
                 )
                 self.assertNotIn("-va", etag)
 
@@ -536,7 +536,7 @@ class ThreadModerationSummaryViewAsTests(_ViewAsHub):
                             "moderated_component_count": expected,
                             "pending_count": expected,
                             "view_as": True,
-                            "view_as_user": None,
+                            "view_as_from": None,
                         },
                     )
                     self.assertTrue(etag.endswith('-va"'), etag)
@@ -554,7 +554,7 @@ class ThreadModerationSummaryViewAsTests(_ViewAsHub):
                     self.assertEqual(
                         body,
                         {"can_moderate": True, "moderated_component_count": expected, "pending_count": expected,
-                         "view_as": view_as, "view_as_user": None},
+                         "view_as": view_as, "view_as_from": None},
                     )
 
     def test_view_as_with_no_editable_widget(self) -> None:
@@ -566,7 +566,7 @@ class ThreadModerationSummaryViewAsTests(_ViewAsHub):
             with self.subTest(path=path):
                 body, etag = self._summary(path, {"view_as": "public:hub"})
                 self.assertEqual(
-                    body, {"can_moderate": False, "moderated_component_count": 0, "pending_count": 0, "view_as": True, "view_as_user": None}
+                    body, {"can_moderate": False, "moderated_component_count": 0, "pending_count": 0, "view_as": True, "view_as_from": None}
                 )
                 self.assertEqual(etag, '"0-0-0-0-va"')
 
@@ -581,31 +581,28 @@ class ThreadModerationSummaryViewAsTests(_ViewAsHub):
                 response = self.client.get(path, params=params, headers={"If-None-Match": view_as_etag})
                 self.assertEqual(response.status_code, 304)
 
-    def test_view_as_user_ignores_their_direct_grants_and_has_its_own_etag(self) -> None:
-        self._user("Dave", work="dave@renphil.org", holds=[("member", "progA")])
-        self.db.commit()
+    def test_view_as_from_is_echoed_never_changes_access_and_has_its_own_etag(self) -> None:
+        # Asked by the admin, who has no direct grants.
+        self.email = "admin@renphil.org"
         for path in self.PATHS:
             with self.subTest(path=path):
-                # Alice: (lead, org) reaches four widgets; c-direct, shared with her directly, is left out.
-                self.email = "admin@renphil.org"
-                body, _ = self._summary(path, {"view_as_user": "alice@renphil.org"})
-                self.assertEqual(
-                    body,
-                    {"can_moderate": True, "moderated_component_count": 4, "pending_count": 4,
-                     "view_as": True, "view_as_user": "alice@renphil.org"},
-                )
-
-                # Dave's body equals the (member, progA) body except for
-                # view_as_user. Asked by the admin, who has no direct grants.
                 pair_body, pair_etag = self._summary(path, {"view_as": "member:progA"})
-                user_body, user_etag = self._summary(path, {"view_as_user": "dave@renphil.org"})
-                self.assertEqual({**pair_body, "view_as_user": "dave@renphil.org"}, user_body)
-                self.assertNotEqual(pair_etag, user_etag)
-                self.assertNotIn("dave", user_etag)
+                from_body, from_etag = self._summary(
+                    path, {"view_as": "member:progA", "view_as_from": "  DAVE@renphil.org "}
+                )
+                self.assertEqual({**pair_body, "view_as_from": "dave@renphil.org"}, from_body)
+                self.assertNotEqual(pair_etag, from_etag)
+                self.assertNotIn("dave", from_etag)
                 response = self.client.get(
-                    path, params={"view_as_user": "dave@renphil.org"}, headers={"If-None-Match": pair_etag}
+                    path,
+                    params={"view_as": "member:progA", "view_as_from": "dave@renphil.org"},
+                    headers={"If-None-Match": pair_etag},
                 )
                 self.assertEqual(response.status_code, 200)
+
+                # Without pairs it turns nothing on: the caller's own answer.
+                regular_body, regular_etag = self._summary(path)
+                self.assertEqual(self._summary(path, {"view_as_from": "dave@renphil.org"}), (regular_body, regular_etag))
 
     def test_view_as_errors(self) -> None:
         cases = [
@@ -958,10 +955,12 @@ class MultiPairViewAsEndpointTests(_ViewAsAssignments):
         self.assertEqual(response.json()["detail"]["code"], "view_as_pairs_not_allowed")
 
 
-class ViewAsUserTests(_ViewAsAssignments):
+class ViewAsFromTests(_ViewAsAssignments):
     """Alice really holds (lead, org). Dave holds (member, progA) and N6 is
     shared directly with him; carol's (member, progB) row is beyond Alice's
-    reach, so Alice can never select Carol."""
+    reach, so the picker never offers Carol. Picking a user means sending
+    their assignments as `view_as` pairs and their email as `view_as_from`,
+    which is audit context only."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -1020,47 +1019,54 @@ class ViewAsUserTests(_ViewAsAssignments):
     def test_every_picked_user_is_accepted(self) -> None:
         for user in self._users():
             with self.subTest(email=user["email"]):
-                response = self.client.get("/v2/nav-tabs", params={"view_as_user": user["email"]})
+                pairs = [f"{a['role_key']}:{a['scope_key']}" for a in user["assignments"]]
+                response = self.client.get("/v2/nav-tabs", params={"view_as": pairs, "view_as_from": user["email"]})
                 self.assertEqual(response.status_code, 200, response.text)
 
-    # -- content -------------------------------------------------------
+    # -- view_as_from --------------------------------------------------
 
-    def test_sees_the_selected_users_assignments_without_their_direct_grants(self) -> None:
-        # N6 is shared directly with Dave: left out.
-        with self.assertLogs("app.dependencies", level=logging.INFO) as logs:
-            response = self.client.get("/v2/nav-tabs", params={"view_as_user": "  DAVE@renphil.org "})
-        self.assertEqual(self._nav_titles(response), {"N1"})
-        body = response.json()
-        self.assertIs(body["view_as"], True)
-        self.assertEqual(body["view_as_user"], "dave@renphil.org")
-        self.assertTrue(any("View As verified" in line and "'dave@renphil.org'" in line for line in logs.output))
+    def test_view_as_from_is_echoed_and_logged_but_never_changes_access(self) -> None:
+        pairs_only = self.client.get("/v2/nav-tabs", params={"view_as": "member:progA"})
+        # N3 is shared directly with Alice, the caller.
+        self.assertEqual(self._nav_titles(pairs_only), {"N1", "N3"})
+        # N6, shared directly with Dave, stays out; Carol and an unknown
+        # email are not verified either — nothing about access changes.
+        for email, echoed in (
+            ("  DAVE@renphil.org ", "dave@renphil.org"),
+            ("carol@renphil.org", "carol@renphil.org"),
+            ("ghost@renphil.org", "ghost@renphil.org"),
+        ):
+            with self.subTest(email=email):
+                with self.assertLogs("app.dependencies", level=logging.INFO) as logs:
+                    response = self.client.get(
+                        "/v2/nav-tabs", params={"view_as": "member:progA", "view_as_from": email}
+                    )
+                self.assertEqual(response.json()["data"], pairs_only.json()["data"])
+                self.assertEqual((response.json()["view_as"], response.json()["view_as_from"]), (True, echoed))
+                self.assertTrue(any("View As verified" in line and repr(echoed) in line for line in logs.output))
 
-    def test_user_combined_with_pairs_is_the_union(self) -> None:
-        response = self.client.get("/v2/nav-tabs", params={"view_as_user": "dave@renphil.org", "view_as": "lead:org"})
-        self.assertEqual(self._nav_titles(response), {"N1", "N2"})
+    def test_view_as_from_without_pairs_turns_nothing_on(self) -> None:
+        for email in ("dave@renphil.org", "   "):
+            with self.subTest(email=email):
+                response = self.client.get("/v2/nav-tabs", params={"view_as_from": email})
+                self.assertEqual(self._nav_titles(response), {"N1", "N2", "N3"})
+                self.assertEqual((response.json()["view_as"], response.json()["view_as_from"]), (False, None))
 
-        response = self.client.get("/v2/nav-tabs", params={"view_as_user": "nobody@renphil.org"})
-        self.assertEqual(self._nav_titles(response), set())
-        response = self.client.get(
-            "/v2/nav-tabs", params={"view_as_user": "nobody@renphil.org", "view_as": "member:progA"}
-        )
-        self.assertEqual(self._nav_titles(response), {"N1"})
+    def test_view_as_user_is_no_longer_accepted(self) -> None:
+        response = self.client.get("/v2/nav-tabs", params={"view_as_user": "dave@renphil.org"})
+        self.assertEqual(self._nav_titles(response), {"N1", "N2", "N3"})
+        self.assertIs(response.json()["view_as"], False)
+        self.assertNotIn("view_as_user", response.json())
 
     def test_duplicate_pairs_collapse(self) -> None:
         selection = view_as_service.resolve_view_as_selection(
-            self.db, self.alice.id, ["member:progA"], "dave@renphil.org"
+            self.db, self.alice.id, ["member:progA", "member:progA"], view_as_from="dave@renphil.org"
         )
         self.assertEqual([(t.role_key, t.scope_key) for t in selection.targets], [("member", "progA")])
-        self.assertEqual(selection.user_email, "dave@renphil.org")
+        self.assertEqual(selection.view_as_from, "dave@renphil.org")
 
-    def test_alias_email_selects_the_user(self) -> None:
-        self.email = "carol@renphil.org"
-        response = self.client.get("/v2/nav-tabs", params={"view_as_user": "bob.alias@renphil.org"})
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["view_as_user"], "bob.alias@renphil.org")
-
-    def test_every_view_as_endpoint_echoes_the_user(self) -> None:
-        params = {"view_as_user": "dave@renphil.org"}
+    def test_every_view_as_endpoint_echoes_view_as_from(self) -> None:
+        params = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
         for path in (
             "/v2/nav-tabs",
             "/v2/nav-tabs/nav-n1/tabs",
@@ -1074,61 +1080,23 @@ class ViewAsUserTests(_ViewAsAssignments):
             with self.subTest(path=path):
                 response = self.client.get(path, params=params)
                 self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual((response.json()["view_as"], response.json()["view_as_user"]), (True, "dave@renphil.org"))
+                self.assertEqual((response.json()["view_as"], response.json()["view_as_from"]), (True, "dave@renphil.org"))
 
-    # -- errors --------------------------------------------------------
-
-    def test_more_powerful_user_is_refused_and_named(self) -> None:
-        with self.assertLogs("app.dependencies", level=logging.WARNING) as logs:
-            response = self.client.get("/v2/nav-tabs", params={"view_as_user": "carol@renphil.org"})
-        self.assertEqual(response.status_code, 403, response.text)
-        detail = response.json()["detail"]
-        self.assertEqual(detail["code"], "view_as_user_not_allowed")
-        self.assertEqual(detail["view_as_user"], "carol@renphil.org")
-        self.assertEqual(
-            [(p["source"], p["pair"], p["code"]) for p in detail["pairs"]],
-            [("view_as_user", "member:progB", "view_as_scope_not_allowed")],
-        )
-        self.assertIn("selected user 'carol@renphil.org'", detail["message"])
-        self.assertIn("selected user 'carol@renphil.org'", detail["pairs"][0]["message"])
-        self.assertTrue(any("view_as_user 'member:progB'" in line for line in logs.output))
-
-    def test_unknown_or_deleted_user(self) -> None:
-        self.dave.is_deleted = True
-        self.db.commit()
-        for email in ("ghost@renphil.org", "dave@renphil.org"):
-            with self.subTest(email=email):
-                response = self.client.get("/v2/nav-tabs", params={"view_as_user": email})
-                self.assertEqual(response.status_code, 400, response.text)
-                detail = response.json()["detail"]
-                self.assertEqual(detail["code"], "view_as_user_not_found")
-                self.assertEqual([(p["source"], p["code"]) for p in detail["pairs"]], [("view_as_user", "view_as_user_not_found")])
-
-    def test_user_and_pair_failures_are_reported_together(self) -> None:
+    def test_pair_failures_do_not_name_view_as_from(self) -> None:
         response = self.client.get(
-            "/v2/nav-tabs", params={"view_as_user": "carol@renphil.org", "view_as": ["lead:progB", "member:progA"]}
+            "/v2/nav-tabs", params={"view_as": ["lead:progB", "member:progA"], "view_as_from": "carol@renphil.org"}
         )
         self.assertEqual(response.status_code, 403, response.text)
         detail = response.json()["detail"]
-        self.assertEqual(detail["code"], "view_as_not_allowed")
-        self.assertEqual(
-            [(p["source"], p["pair"]) for p in detail["pairs"]],
-            [("view_as_user", "member:progB"), ("view_as", "lead:progB")],
-        )
-
-        response = self.client.get("/v2/nav-tabs", params={"view_as_user": "ghost@renphil.org", "view_as": "bogus"})
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["detail"]["code"], "view_as_invalid")
-
-    def test_blank_user_means_not_requested(self) -> None:
-        response = self.client.get("/v2/nav-tabs", params={"view_as_user": "   "})
-        self.assertEqual(self._nav_titles(response), {"N1", "N2", "N3"})
-        self.assertEqual((response.json()["view_as"], response.json()["view_as_user"]), (False, None))
+        self.assertEqual(detail["code"], "view_as_pairs_not_allowed")
+        self.assertNotIn("view_as_from", detail)
+        self.assertEqual([(p["source"], p["pair"]) for p in detail["pairs"]], [("view_as", "lead:progB")])
 
     # -- assignments ---------------------------------------------------
 
-    def test_delegation_uses_the_selected_users_rows(self) -> None:
-        response = self.client.get("/v2/rbac/me/revocable", params={"view_as_user": "dave@renphil.org"})
+    def test_delegation_uses_only_the_pairs(self) -> None:
+        dave = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
+        response = self.client.get("/v2/rbac/me/revocable", params=dave)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(
             {(r["user_email"], r["role_id"], r["scope_id"]) for r in response.json()["data"]},
@@ -1142,22 +1110,23 @@ class ViewAsUserTests(_ViewAsAssignments):
                 json={"user_email": "bob@renphil.org", "role_id": self.role["member"].id, "scope_id": self.scope["progA1"].id},
             )
 
-        response = grant({"view_as_user": "dave@renphil.org"})
+        response = grant(dave)
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["detail"]["code"], "not_delegable")
 
-        response = grant({"view_as_user": "dave@renphil.org", "view_as": "lead:progA"})
+        response = grant({**dave, "view_as": ["member:progA", "lead:progA"]})
         self.assertEqual(response.status_code, 201, response.text)
         body = response.json()
-        self.assertEqual((body["view_as"], body["view_as_user"]), (True, "dave@renphil.org"))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (True, "dave@renphil.org"))
         self.assertEqual(body["data"]["granted_by_email"], "alice@renphil.org")
 
-    def test_revoke_with_selected_user(self) -> None:
+    def test_revoke_uses_only_the_pairs(self) -> None:
+        dave = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
         frank_row = self.db.query(RoleAssignmentV2.id).filter_by(role_id=self.role["public"].id).scalar()
         erin_row = self.db.query(RoleAssignmentV2.id).filter_by(user_id=self.erin.id).scalar()
-        response = self.client.delete(f"/v2/rbac/assignments/{erin_row}", params={"view_as_user": "dave@renphil.org"})
+        response = self.client.delete(f"/v2/rbac/assignments/{erin_row}", params=dave)
         self.assertEqual(response.status_code, 409, response.text)
-        response = self.client.delete(f"/v2/rbac/assignments/{frank_row}", params={"view_as_user": "dave@renphil.org"})
+        response = self.client.delete(f"/v2/rbac/assignments/{frank_row}", params=dave)
         self.assertEqual(response.status_code, 204, response.text)
 
 
@@ -1217,39 +1186,42 @@ class ThreadListViewAsTests(_ThreadsFixture):
         items, body = self._list()
         self.assertEqual(items, {"approved": -1})
         self.assertEqual(body["pending_count"], 1)
-        self.assertEqual((body["view_as"], body["view_as_user"]), (False, None))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (False, None))
 
-    def test_view_as_user_marks_nothing_as_theirs(self) -> None:
-        items, body = self._list({"view_as_user": "dave@renphil.org"})
-        self.assertEqual(items, {"approved": 0})
-        self.assertEqual((body["items"][0]["up_count"], body["items"][0]["down_count"]), (1, 1))
-        self.assertEqual((body["view_as"], body["view_as_user"]), (True, "dave@renphil.org"))
+    def test_view_as_from_keeps_the_callers_own_threads_and_votes(self) -> None:
+        items, body = self._list({"view_as": "member:progA", "view_as_from": "dave@renphil.org"})
+        self.assertEqual(items, {"approved": -1})
+        # Alice's pending thread; Dave's pending and rejected ones are not hers.
+        self.assertEqual((body["pending_count"], body["declined_count"]), (1, 0))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (True, "dave@renphil.org"))
 
     def test_anonymous_marks_no_vote_but_keeps_counts(self) -> None:
         items, body = self._list({"anonymous": "true"})
         self.assertEqual(items, {"approved": 0})
         self.assertEqual((body["items"][0]["up_count"], body["items"][0]["down_count"]), (1, 1))
-        self.assertEqual((body["view_as"], body["view_as_user"]), (False, None))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (False, None))
 
     def test_pairs_only_view_keeps_the_callers_own_threads_and_votes(self) -> None:
         items, body = self._list({"view_as": "member:progA"})
         self.assertEqual(items, {"approved": -1})
         self.assertEqual(body["pending_count"], 1)
-        self.assertEqual((body["view_as"], body["view_as_user"]), (True, None))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (True, None))
 
         items, body = self._list({"view_as": "member:progA", "anonymous": "true"})
         self.assertEqual(items, {"approved": 0})
         self.assertEqual(body["pending_count"], 0)
-        self.assertEqual((body["view_as"], body["view_as_user"]), (True, None))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (True, None))
 
-    def test_anonymous_with_view_as_user_is_refused(self) -> None:
-        with self.assertLogs("app.dependencies", level=logging.WARNING):
-            response = self.client.get(self.PATH, params={"view_as_user": "dave@renphil.org", "anonymous": "true"})
-        self.assertEqual(response.status_code, 400, response.text)
-        self.assertEqual(response.json()["detail"]["code"], "view_as_user_with_anonymous")
+    def test_anonymous_with_view_as_from_has_no_subject(self) -> None:
+        items, body = self._list(
+            {"view_as": "member:progA", "view_as_from": "dave@renphil.org", "anonymous": "true"}
+        )
+        self.assertEqual(items, {"approved": 0})
+        self.assertEqual((body["pending_count"], body["declined_count"]), (0, 0))
+        self.assertEqual((body["view_as"], body["view_as_from"]), (True, "dave@renphil.org"))
 
-    def test_access_follows_the_selected_user(self) -> None:
-        response = self.client.get(self.PATH, params={"view_as_user": "frank@renphil.org"})
+    def test_access_follows_the_pairs_only(self) -> None:
+        response = self.client.get(self.PATH, params={"view_as": "public:hub", "view_as_from": "frank@renphil.org"})
         self.assertEqual(response.status_code, 403, response.text)
 
 
@@ -1321,33 +1293,34 @@ class ThreadReadViewAsTests(_ThreadsFixture):
         detail = self._detail(self.thread.id)
         self.assertEqual((detail["my_vote"], detail["up_count"], detail["down_count"]), (-1, 1, 1))
         self.assertEqual((detail["pending_revision_count"], detail["pending_revisions"]), (0, []))
-        self.assertEqual((detail["view_as"], detail["view_as_user"]), (False, None))
+        self.assertEqual((detail["view_as"], detail["view_as_from"]), (False, None))
         comments = self._comments(self.thread.id)
         self.assertEqual([c["my_vote"] for c in comments["items"]], [1])
-        self.assertEqual((comments["view_as"], comments["view_as_user"]), (False, None))
+        self.assertEqual((comments["view_as"], comments["view_as_from"]), (False, None))
 
-    def test_view_as_user_marks_no_vote_and_no_pending_edits(self) -> None:
-        params = {"view_as_user": "dave@renphil.org"}
+    def test_view_as_from_keeps_the_callers_votes_not_theirs(self) -> None:
+        params = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
         detail = self._detail(self.thread.id, params)
-        self.assertEqual((detail["my_vote"], detail["up_count"], detail["down_count"]), (0, 1, 1))
+        self.assertEqual((detail["my_vote"], detail["up_count"], detail["down_count"]), (-1, 1, 1))
+        # Dave's pending edit is not the caller's.
         self.assertEqual((detail["pending_revision_count"], detail["pending_revisions"]), (0, []))
         self.assertIs(detail["viewer_is_editor"], False)
-        self.assertEqual((detail["view_as"], detail["view_as_user"]), (True, "dave@renphil.org"))
+        self.assertEqual((detail["view_as"], detail["view_as_from"]), (True, "dave@renphil.org"))
         comments = self._comments(self.thread.id, params)
         self.assertEqual(
-            [(c["my_vote"], c["up_count"], c["down_count"]) for c in comments["items"]], [(0, 1, 1)]
+            [(c["my_vote"], c["up_count"], c["down_count"]) for c in comments["items"]], [(1, 1, 1)]
         )
-        self.assertEqual((comments["view_as"], comments["view_as_user"]), (True, "dave@renphil.org"))
+        self.assertEqual((comments["view_as"], comments["view_as_from"]), (True, "dave@renphil.org"))
 
-    def test_view_as_user_does_not_open_their_own_pending_thread(self) -> None:
-        for title in ("dave-pending", "alice-pending"):
-            with self.subTest(title=title):
-                self._detail(self.threads[title].id, {"view_as_user": "dave@renphil.org"}, status=404)
+    def test_view_as_from_opens_the_callers_pending_thread_not_theirs(self) -> None:
+        params = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
+        self._detail(self.threads["dave-pending"].id, params, status=404)
+        self.assertEqual(self._detail(self.threads["alice-pending"].id, params)["title"], "alice-pending")
 
-    def test_editor_status_comes_from_roles_only(self) -> None:
+    def test_editor_status_comes_from_the_pairs_only(self) -> None:
         self.db.add(ResourceGrantV2(component_id=self.component.id, user_id=self.dave.id, level="edit", created_at=NOW))
         self.db.commit()
-        params = {"view_as_user": "dave@renphil.org"}
+        params = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
         detail = self._detail(self.thread.id, params)
         self.assertEqual((detail["viewer_is_editor"], detail["pending_revisions"]), (False, []))
 
@@ -1360,25 +1333,25 @@ class ThreadReadViewAsTests(_ThreadsFixture):
         self.db.commit()
         detail = self._detail(self.thread.id, params)
         self.assertIs(detail["viewer_is_editor"], True)
-        # An editor sees the widget's pending edits and pending threads, as under anonymous.
+        # An editor sees the widget's pending edits and pending threads.
         self.assertEqual(detail["pending_revision_count"], 1)
-        self.assertEqual(detail["my_vote"], 0)
+        self.assertEqual(detail["my_vote"], -1)
         self.assertEqual(self._detail(self.threads["dave-pending"].id, params)["title"], "dave-pending")
 
-    def test_access_follows_the_selected_users_roles_only(self) -> None:
+    def test_access_follows_the_pairs_only(self) -> None:
         # P is shared directly with Dave and reached by no role: closed to everyone here.
-        params = {"view_as_user": "dave@renphil.org"}
+        params = {"view_as": "member:progA", "view_as_from": "dave@renphil.org"}
         for get in (self._detail, self._comments):
             with self.subTest(get=get.__name__):
                 get(self.private_thread.id, status=403)
                 get(self.private_thread.id, params, status=403)
-                get(self.thread.id, {"view_as_user": "frank@renphil.org"}, status=403)
+                get(self.thread.id, {"view_as": "public:hub", "view_as_from": "frank@renphil.org"}, status=403)
 
     def test_anonymous_marks_nothing_as_the_callers(self) -> None:
         params = {"anonymous": "true"}
         detail = self._detail(self.thread.id, params)
         self.assertEqual((detail["my_vote"], detail["up_count"], detail["down_count"]), (0, 1, 1))
-        self.assertEqual((detail["view_as"], detail["view_as_user"]), (False, None))
+        self.assertEqual((detail["view_as"], detail["view_as_from"]), (False, None))
         comments = self._comments(self.thread.id, params)
         self.assertEqual([(c["my_vote"], c["up_count"], c["down_count"]) for c in comments["items"]], [(0, 1, 1)])
         self._detail(self.threads["alice-pending"].id, status=200)
@@ -1388,7 +1361,7 @@ class ThreadReadViewAsTests(_ThreadsFixture):
         params = {"view_as": "member:progA"}
         detail = self._detail(self.thread.id, params)
         self.assertEqual((detail["my_vote"], detail["pending_revision_count"]), (-1, 0))
-        self.assertEqual((detail["view_as"], detail["view_as_user"]), (True, None))
+        self.assertEqual((detail["view_as"], detail["view_as_from"]), (True, None))
         comments = self._comments(self.thread.id, params)
         self.assertEqual([c["my_vote"] for c in comments["items"]], [1])
         self.assertEqual(self._detail(self.threads["alice-pending"].id, params)["title"], "alice-pending")
@@ -1409,19 +1382,12 @@ class ThreadReadViewAsTests(_ThreadsFixture):
         self.assertEqual(self._detail(own.id, params)["pending_revision_count"], 1)
         self.assertEqual(self._detail(own.id, {**params, "anonymous": "true"})["pending_revision_count"], 0)
 
-    def test_anonymous_with_view_as_user_is_refused(self) -> None:
-        params = {"view_as_user": "dave@renphil.org", "anonymous": "true"}
-        for path in (f"/data/threads/{self.thread.id}", f"/data/threads/{self.thread.id}/comments"):
-            with self.subTest(path=path):
-                with self.assertLogs("app.dependencies", level=logging.WARNING):
-                    response = self.client.get(path, params=params)
-                self.assertEqual(response.status_code, 400, response.text)
-                self.assertEqual(response.json()["detail"]["code"], "view_as_user_with_anonymous")
-
     def test_view_as_errors(self) -> None:
-        response = self.client.get(f"/data/threads/{self.thread.id}", params={"view_as_user": "carol@renphil.org"})
+        response = self.client.get(
+            f"/data/threads/{self.thread.id}", params={"view_as": "lead:progB", "view_as_from": "carol@renphil.org"}
+        )
         self.assertEqual(response.status_code, 403, response.text)
-        self.assertEqual(response.json()["detail"]["code"], "view_as_user_not_allowed")
+        self.assertEqual(response.json()["detail"]["code"], "view_as_pairs_not_allowed")
         response = self.client.get(f"/data/threads/{self.thread.id}/comments", params={"view_as": "bogus"})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["detail"]["code"], "view_as_invalid_pairs")
@@ -1444,7 +1410,7 @@ class AnonymousViewAsTests(_ViewAsAssignments):
         with self.assertLogs("app.dependencies", level=logging.INFO) as logs:
             response = self.client.get("/v2/nav-tabs", params={"anonymous": "true"})
         self.assertEqual(self._nav_titles(response), {"N1", "N2"})
-        self.assertEqual((response.json()["view_as"], response.json()["view_as_user"]), (False, None))
+        self.assertEqual((response.json()["view_as"], response.json()["view_as_from"]), (False, None))
         self.assertTrue(any("Anonymous view requested" in line for line in logs.output))
 
     def test_anonymous_with_pairs_drops_own_direct_shares(self) -> None:
@@ -1465,28 +1431,12 @@ class AnonymousViewAsTests(_ViewAsAssignments):
         self.assertEqual(self._nav_titles(response), {"N1", "N2", "N3", "N8"})
         self.assertIs(response.json()["hub_edit"], True)
 
-    def test_anonymous_with_view_as_user_is_refused_everywhere(self) -> None:
-        params = {"anonymous": "true", "view_as_user": "dave@renphil.org"}
-        dave_row = self.db.query(RoleAssignmentV2.id).filter_by(user_id=self.dave.id).scalar()
-        requests = [
-            ("get", "/v2/nav-tabs", None),
-            ("get", "/v2/tabs/tab-1/workspace", None),
-            ("get", "/data/threads/moderation/summary", None),
-            ("get", "/v2/rbac/me/revocable", None),
-            ("post", "/v2/rbac/assignments",
-             {"user_email": "bob@renphil.org", "role_id": self.role["member"].id, "scope_id": self.scope["progA1"].id}),
-            ("delete", f"/v2/rbac/assignments/{dave_row}", None),
-        ]
-        for method, path, body in requests:
-            with self.subTest(method=method, path=path):
-                kwargs = {"params": params, **({"json": body} if body else {})}
-                with self.assertLogs("app.dependencies", level=logging.WARNING):
-                    response = getattr(self.client, method)(path, **kwargs)
-                self.assertEqual(response.status_code, 400, response.text)
-                detail = response.json()["detail"]
-                self.assertEqual((detail["code"], detail["view_as_user"]), ("view_as_user_with_anonymous", "dave@renphil.org"))
-        self.assertIsNotNone(self.db.query(RoleAssignmentV2.id).filter_by(id=dave_row).scalar())
-        self.assertIsNone(self.db.query(RoleAssignmentV2.id).filter_by(user_id=self.bob.id, scope_id=self.scope["progA1"].id).scalar())
+    def test_anonymous_combines_with_pairs_and_view_as_from(self) -> None:
+        response = self.client.get(
+            "/v2/nav-tabs", params={"view_as": "member:progA", "view_as_from": "dave@renphil.org", "anonymous": "true"}
+        )
+        self.assertEqual(self._nav_titles(response), {"N1"})
+        self.assertEqual((response.json()["view_as"], response.json()["view_as_from"]), (True, "dave@renphil.org"))
 
     def test_assignment_endpoints_are_unaffected(self) -> None:
         for params in ({}, {"view_as": "lead:progA1"}):
@@ -1516,9 +1466,9 @@ class PersonalEndpointsIgnoreViewAsTests(_ThreadsFixture):
     person's data)."""
 
     VIEW_AS_PARAMS = (
-        {"view_as_user": "dave@renphil.org"},
-        {"view_as_user": "carol@renphil.org"},
-        {"view_as_user": "ghost@renphil.org"},
+        {"view_as": "member:progA", "view_as_from": "dave@renphil.org"},
+        {"view_as_from": "carol@renphil.org"},
+        {"view_as_from": "ghost@renphil.org"},
         {"view_as": "member:progA"},
         {"anonymous": "true"},
     )
@@ -1582,7 +1532,7 @@ class PersonalEndpointsIgnoreViewAsTests(_ThreadsFixture):
                      "/bookmarks/get_bookmarks"):
             with self.subTest(path=path):
                 names = {p["name"] for p in paths[path]["get"].get("parameters", [])}
-                self.assertFalse(names & {"view_as", "view_as_user", "anonymous"}, names)
+                self.assertFalse(names & {"view_as", "view_as_from", "anonymous"}, names)
 
 
 if __name__ == "__main__":

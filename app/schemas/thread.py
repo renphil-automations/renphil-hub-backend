@@ -610,8 +610,10 @@ class MyRevisionsResponse(DeclinedItemsResponse):
     can still view, plus `pending` (M5: their own threads and edits awaiting
     review, newest submission first, capped at 100 with `pending_truncated`).
     Items of a widget the caller can no longer view are neither listed nor
-    counted. Under any View As selection, or `anonymous`, everything is
-    empty and `view_as` is true (M7)."""
+    counted. With `view_as` pairs the items are still the caller's own, but
+    only on widgets the pairs can view (plus content shared directly with
+    the caller); with `anonymous` everything is empty (M7). `view_as` is
+    true in both cases."""
 
     pending: list[PendingItem] = Field(default_factory=list)
     pending_truncated: bool = False
@@ -622,7 +624,8 @@ class MyRevisionsSummary(BaseModel):
     """`GET /threads/me/revisions/summary` (plan_my_revisions §4.1) — polled
     every 60 s by every signed-in user; ETag'd like the moderation summary.
     `open_count` is the sidebar badge; `has_any` decides whether the
-    sidebar item shows at all (M4)."""
+    sidebar item shows at all (M4). Every count follows the list's exact
+    filter, View As included, so the badge matches the list."""
 
     open_count: int = 0
     closed_count: int = 0
@@ -704,9 +707,9 @@ class ThreadListResponse(BaseModel):
     next_cursor: str | None = None
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
     # plan_thread_reject_resubmit §4.7 — how many of the CALLER'S OWN items
     # on this widget await their changes (declined threads + declined,
     # not-yet-reworked edits — OPEN only, closed ones never count, §12.7). Scoped
@@ -822,9 +825,9 @@ class ThreadRevisionModerationSummary(BaseModel):
     pending_count: int
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadDetailViewAsResponse(ThreadDetail):
@@ -833,9 +836,9 @@ class ThreadDetailViewAsResponse(ThreadDetail):
 
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadModerationListResponse(BaseModel):
@@ -976,9 +979,9 @@ class ThreadModerationSummary(BaseModel):
     pending_count: int
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadWidgetCounts(BaseModel):
@@ -1015,9 +1018,9 @@ class CommentListResponse(BaseModel):
     next_cursor: str | None = None
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class VoteResponse(BaseModel):

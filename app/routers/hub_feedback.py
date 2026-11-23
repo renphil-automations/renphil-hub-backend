@@ -43,7 +43,7 @@ class FeedbackRoute(APIRoute):
             try:
                 # Reads as well as writes operate as the real caller. Do not
                 # let an impersonation surface display the caller's feedback.
-                markers = ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")
+                markers = ("view_as", "view_as_from", "view_as_role", "view_as_scope", "anonymous")
                 if any(request.query_params.get(key) for key in markers):
                     raise HTTPException(403, "Exit View As to use feedback.")
                 if request.method == "POST":
@@ -110,7 +110,7 @@ def _legacy_write(payload, current, environment):
 
 
 async def submit_legacy_feedback(request: Request, current: CurrentHubUser):
-    if any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+    if any(request.query_params.get(key) for key in ("view_as", "view_as_from", "view_as_role", "view_as_scope", "anonymous")):
         raise HTTPException(403, "Exit View As to use feedback.", headers=PRIVATE)
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/json":
         raise HTTPException(415, "Feedback requires JSON.", headers=PRIVATE)

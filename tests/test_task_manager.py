@@ -834,13 +834,13 @@ class TaskManagerViewAsTests(_DbTestCase):
         self.foreign = self._create(caller=self.other, title="other's", assignee_emails=[])["id"]
         self.access = VIEWER
         self.pairs_grants: list[GrantMatch] = []
-        self.selection = view_as_service.ViewAsSelection(targets=[], user=None)
+        self.selection = view_as_service.ViewAsSelection(targets=[])
         self.resolved_for: list[int | None] = []
         self.fold_calls = 0
 
         def view_as_access():
             self.fold_calls += 1
-            return ViewAsAccess(access=self.access, view_as=True, view_as_user="sel@renphil.org")
+            return ViewAsAccess(access=self.access, view_as=True, view_as_from="sel@renphil.org")
 
         def grants(db, targets, *, user_id, closures):
             self.resolved_for.append(user_id)
@@ -869,7 +869,7 @@ class TaskManagerViewAsTests(_DbTestCase):
     def test_list_keeps_own_and_assigned_tasks_without_anonymous(self) -> None:
         body = self._list("?view_as=r:s")
         self.assertEqual({t["id"] for t in body["tasks"]}, {self.mine, self.assigned})
-        self.assertEqual((body["view_as"], body["view_as_user"], body["can_create_tasks"]), (True, "sel@renphil.org", True))
+        self.assertEqual((body["view_as"], body["view_as_from"], body["can_create_tasks"]), (True, "sel@renphil.org", True))
         flags = {t["id"]: (t["is_owner"], t["is_assignee"], t["can_manage"]) for t in body["tasks"]}
         self.assertEqual(flags, {self.mine: (True, False, True), self.assigned: (False, True, False)})
 
