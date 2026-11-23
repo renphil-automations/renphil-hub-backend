@@ -17,6 +17,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from urllib.parse import urlsplit
 
 import jwt
 from google.oauth2 import id_token as google_id_token
@@ -55,6 +56,45 @@ class AuthService:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+
+    def is_allowed_login_redirect_uri(self, redirect_uri: str) -> bool:
+        """Accept only a Hub frontend callback on an allowed origin.
+
+        ``/auth/callback`` (and ``/auth/dev-login``) later add the Hub session
+        token to this location, so accepting arbitrary schemes, origins,
+        paths, queries, or fragments would turn the normal Google login into
+        an open redirect/token leak. Allowed: an http(s) origin listed in
+        ``ALLOWED_ORIGINS`` (scheme and host compared case-insensitively)
+        with the path exactly ``/auth/callback``.
+        """
+        try:
+            candidate = urlsplit(redirect_uri)
+        except (TypeError, ValueError):
+            return False
+        if (
+            candidate.scheme.lower() not in {"http", "https"}
+            or not candidate.netloc
+            or candidate.username is not None
+            or candidate.password is not None
+            or candidate.query
+            or candidate.fragment
+        ):
+            return False
+
+        candidate_origin = f"{candidate.scheme.lower()}://{candidate.netloc.lower()}"
+        for origin in self._settings.ALLOWED_ORIGINS:
+            parsed_origin = urlsplit(origin)
+            if (
+                parsed_origin.scheme.lower() in {"http", "https"}
+                and parsed_origin.netloc
+                and not parsed_origin.query
+                and not parsed_origin.fragment
+                and parsed_origin.path in {"", "/"}
+                and candidate_origin == f"{parsed_origin.scheme.lower()}://{parsed_origin.netloc.lower()}"
+                and candidate.path == "/auth/callback"
+            ):
+                return True
+        return False
 
     # ── Step 1: authorization URL ──────────────────────────────────────
     def get_authorization_url(self, redirect_uri: str) -> str:
