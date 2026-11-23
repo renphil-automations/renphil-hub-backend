@@ -203,18 +203,31 @@ def _refresh_confirmation(family_jkt: str | None, dpop_jkt: str | None, *, allow
     """Access-token binding for a refresh.
 
     A DPoP-bound family needs a proof for the same key. An unbound family
-    binds the access token when a proof is sent, and is only issued unbound
-    while its provider is still allowed unbound tokens.
+    only ever issues unbound tokens (security review S2): a proof on its
+    refresh is ``invalid_grant`` so a stolen bearer refresh token can never be
+    upgraded to a token bound to the thief's key. Callers check unbound
+    families with ``_unbound_family_refusal`` first.
     """
     if family_jkt:
         if not isinstance(dpop_jkt, str) or not hmac.compare_digest(dpop_jkt.encode("utf-8"), family_jkt.encode("utf-8")):
             raise McpOAuthDPoPBindingError("A DPoP proof for the refresh token's key is required.")
         return {"cnf": {"jkt": family_jkt}}, family_jkt
-    if dpop_jkt is not None:
-        return _confirmation(dpop_jkt), dpop_jkt
-    if allow_unbound:
+    if dpop_jkt is None and allow_unbound:
         return {}, None
-    raise McpOAuthDPoPBindingError("A DPoP proof is required.")
+    raise McpOAuthInvalidGrant("The refresh token is invalid.")
+
+
+def _unbound_family_refusal(family_jkt: str | None, dpop_jkt: str | None, *, allow_unbound: bool) -> str | None:
+    """For an unbound family: ``"refuse"`` (invalid_grant, nothing consumed)
+    when a DPoP proof is presented, ``"revoke"`` (invalid_grant and revoke the
+    family) when its provider no longer may receive unbound tokens."""
+    if family_jkt:
+        return None
+    if dpop_jkt is not None:
+        return "refuse"
+    if not allow_unbound:
+        return "revoke"
+    return None
 
 
 def _aware(value: datetime) -> datetime:
@@ -417,6 +430,11 @@ class LocalMcpOAuthService:
                 kind = None
             if kind is None or (user_is_active is not None and not user_is_active(record.subject, record.email)):
                 self._revoke_family(record.family_id, now)
+                raise McpOAuthInvalidGrant("The refresh token is invalid.")
+            refusal = _unbound_family_refusal(record.jkt, dpop_jkt, allow_unbound=allow_unbound)
+            if refusal == "revoke":
+                self._revoke_family(record.family_id, now)
+            if refusal is not None:
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             # Raises before anything is consumed when the proof is missing.
             confirmation, bound_jkt = _refresh_confirmation(record.jkt, dpop_jkt, allow_unbound=allow_unbound)
@@ -776,6 +794,14 @@ class PersistentMcpOAuthService:
             if kind is None or (user_is_active is not None and not user_is_active(db, row.user_subject, row.user_email)):
                 self._revoke_family(db, family_id, now)
                 db.commit()
+                raise McpOAuthInvalidGrant("The refresh token is invalid.")
+            refusal = _unbound_family_refusal(row.jkt, dpop_jkt, allow_unbound=allow_unbound)
+            if refusal == "revoke":
+                self._revoke_family(db, family_id, now)
+                db.commit()
+                raise McpOAuthInvalidGrant("The refresh token is invalid.")
+            if refusal == "refuse":
+                db.rollback()
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             try:
                 confirmation, bound_jkt = _refresh_confirmation(row.jkt, dpop_jkt, allow_unbound=allow_unbound)

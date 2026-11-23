@@ -180,13 +180,34 @@ class RefreshEnabledTests(_Base):
         self.assertEqual(rotated.status_code, 200, rotated.text)
         self.assertEqual(rotated.json()["token_type"], "Bearer")
         self.assertNotIn("cnf", self._claims(rotated.json()["access_token"]))
-        # A proof that is sent binds the new access token (never downgraded).
-        bound = self._refresh(http, rotated.json()["refresh_token"])
-        self.assertEqual(bound.json()["token_type"], "DPoP")
-        # Provider removed from the bearer set: an unbound family needs DPoP.
+
+    def test_dpop_on_an_unbound_family_is_invalid_grant_and_consumes_nothing(self):
+        """Security review S2: a thief must not upgrade a stolen unbound
+        refresh token into a token bound to the thief's own key."""
+        self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True, MCP_OAUTH_BEARER_PROVIDERS="claude")
+        http = self.client()
+        token = self._login(http, signer=False)["refresh_token"]
+        stolen = self._refresh(http, token, signer=Signer())
+        self.assertEqual(stolen.status_code, 400)
+        self.assertEqual(stolen.json()["error"], "invalid_grant")
+        self.assertNotIn("access_token", stolen.text)
+        row = self._rows()[0]
+        self.assertIsNone(row.used_at)
+        self.assertIsNone(row.revoked_at)
+        rotated = self._refresh(http, token, signer=False)
+        self.assertEqual(rotated.status_code, 200)
+        self.assertEqual(rotated.json()["token_type"], "Bearer")
+
+    def test_provider_removed_from_the_bearer_set_revokes_its_unbound_families(self):
+        self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True, MCP_OAUTH_BEARER_PROVIDERS="claude")
+        http = self.client()
+        token = self._login(http, signer=False)["refresh_token"]
         self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True)
-        refused = self._refresh(http, bound.json()["refresh_token"], signer=False)
-        self.assertEqual(refused.json()["error"], "invalid_dpop_proof")
+        refused = self._refresh(http, token, signer=False)
+        self.assertEqual(refused.json()["error"], "invalid_grant")
+        self.assertTrue(all(row.revoked_at is not None for row in self._rows()))
+        self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True, MCP_OAUTH_BEARER_PROVIDERS="claude")
+        self.assertEqual(self._refresh(http, token, signer=False).json()["error"], "invalid_grant")
 
     # -- live re-checks ------------------------------------------------------
     def test_switching_the_provider_off_refuses_and_revokes_the_family(self):
@@ -299,6 +320,22 @@ class LocalServiceRefreshTests(unittest.TestCase):
         self.assertNotIn("refresh_token", self._login())
         with self.assertRaises(McpOAuthInvalidGrant):
             self._refresh("anything")
+
+    def test_unbound_family_never_binds_and_is_revoked_when_bearer_is_withdrawn(self):
+        verifier = "v" * 64
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        request_id = self.service.start_authorization(client_id="local-client", redirect_uri="http://127.0.0.1:9876/callback", state="s", code_challenge=challenge, code_challenge_method="S256")
+        code, _, _ = self.service.complete_authorization(request_id=request_id, email="member@renphil.org", subject="1")
+        token = self.service.exchange_code(code=code, client_id="local-client", redirect_uri="http://127.0.0.1:9876/callback",
+                                           code_verifier=verifier, dpop_jkt=None, client_kind="claude", allow_unbound=True)["refresh_token"]
+        with self.assertRaises(McpOAuthInvalidGrant):
+            self._refresh(token, dpop_jkt="thief", allow_unbound=True)
+        rotated = self._refresh(token, dpop_jkt=None, allow_unbound=True)
+        self.assertEqual(rotated["token_type"], "Bearer")
+        with self.assertRaises(McpOAuthInvalidGrant):
+            self._refresh(rotated["refresh_token"], dpop_jkt=None, allow_unbound=False)
+        with self.assertRaises(McpOAuthInvalidGrant):  # the family was revoked
+            self._refresh(rotated["refresh_token"], dpop_jkt=None, allow_unbound=True)
 
     def test_expiry_is_enforced(self):
         token = self._login()["refresh_token"]
