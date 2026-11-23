@@ -16,19 +16,28 @@
 -- index match the Agent's scripts/create_bot_telemetry_tables.py.
 --
 -- What it does (all guarded, so running it twice changes nothing):
---   1. Refuses to run if bot_telemetry_runs does not exist (create the Bot
---      telemetry tables with the Agent's script first).
---   2. Widens actor_kind / kind to VARCHAR(16) only if a narrower type is
---      found (16 already fits every value; no rewrite otherwise).
---   3. Replaces the actor_kind and kind CHECK constraints with supersets of
---      the previous ones. Added NOT VALID and then validated, so existing
---      rows are checked without holding an exclusive lock for the scan.
---   4. Adds index ix_bot_telemetry_runs_kind_actor_started.
---      CREATE INDEX blocks writes to bot_telemetry_runs while it builds;
---      on a very large table run that one statement separately as
---      CREATE INDEX CONCURRENTLY IF NOT EXISTS ... outside a transaction.
+--   Transaction 1:
+--     1. Refuses to run if bot_telemetry_runs does not exist (create the Bot
+--        telemetry tables with the Agent's script first).
+--     2. Widens actor_kind / kind to VARCHAR(16) only if a narrower type is
+--        found (16 already fits every value; no rewrite otherwise).
+--     3. Replaces the actor_kind and kind CHECK constraints with supersets
+--        of the previous ones, added NOT VALID. This takes a brief ACCESS
+--        EXCLUSIVE lock but does not scan the table; new and updated rows
+--        are checked from the moment it commits.
+--   Transaction 2:
+--     4. VALIDATE CONSTRAINT scans the existing rows under a SHARE UPDATE
+--        EXCLUSIVE lock, so reads and writes continue meanwhile. If it
+--        fails, the constraint stays NOT VALID (new rows are still checked);
+--        investigate the reported rows, then run this file again.
+--   Separately:
+--     5. Adds index ix_bot_telemetry_runs_kind_actor_started. CREATE INDEX
+--        blocks writes to bot_telemetry_runs while it builds; on a very large
+--        table run that one statement as CREATE INDEX CONCURRENTLY IF NOT
+--        EXISTS ... instead (it cannot run inside a transaction block).
 --
--- Usage (after review, against the approved database only):
+-- Usage (after review, against the approved database only; do NOT pass
+-- psql -1 / --single-transaction, which would merge the transactions):
 --   psql "<approved connection string>" -v ON_ERROR_STOP=1 -f scripts/sql/mcp_telemetry_actor_kind.sql
 -- =====================================================================
 
@@ -54,15 +63,18 @@ ALTER TABLE bot_telemetry_runs DROP CONSTRAINT IF EXISTS bot_telemetry_runs_acto
 ALTER TABLE bot_telemetry_runs ADD CONSTRAINT bot_telemetry_runs_actor_kind_check
     CHECK (actor_kind IN ('user', 'system', 'mcp_client', 'mcp_hub_agent', 'mcp_claude', 'mcp_chatgpt', 'mcp_gemini'))
     NOT VALID;
-ALTER TABLE bot_telemetry_runs VALIDATE CONSTRAINT bot_telemetry_runs_actor_kind_check;
 
 ALTER TABLE bot_telemetry_runs DROP CONSTRAINT IF EXISTS bot_telemetry_runs_kind_check;
 ALTER TABLE bot_telemetry_runs ADD CONSTRAINT bot_telemetry_runs_kind_check
     CHECK (kind IN ('request', 'job', 'mcp'))
     NOT VALID;
+
+COMMIT;
+
+BEGIN;
+ALTER TABLE bot_telemetry_runs VALIDATE CONSTRAINT bot_telemetry_runs_actor_kind_check;
 ALTER TABLE bot_telemetry_runs VALIDATE CONSTRAINT bot_telemetry_runs_kind_check;
+COMMIT;
 
 CREATE INDEX IF NOT EXISTS ix_bot_telemetry_runs_kind_actor_started
     ON bot_telemetry_runs (kind, actor_kind, started_at DESC);
-
-COMMIT;
