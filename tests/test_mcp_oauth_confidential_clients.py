@@ -89,6 +89,40 @@ class ClientSecretHashTests(unittest.TestCase):
         self.assertEqual(empty.stdout, "")
 
 
+class ClientSecretCostTests(unittest.TestCase):
+    """S9: high-entropy client secrets need no slow KDF; verification cost is capped."""
+
+    def test_new_hashes_use_about_ten_thousand_iterations(self):
+        from app.services import mcp_oauth_client_secret as module
+
+        self.assertEqual(module.DEFAULT_ITERATIONS, 10_000)
+        self.assertTrue(hash_client_secret(SECRET).startswith("pbkdf2_sha256$10000$"))
+
+    def test_existing_600k_hashes_still_verify_but_the_cap_bounds_cpu(self):
+        import base64 as b64
+        import hashlib as hl
+
+        salt = b"0123456789abcdef"
+        digest = hl.pbkdf2_hmac("sha256", SECRET.encode(), salt, 600_000, dklen=32)
+        encode = lambda raw: b64.urlsafe_b64encode(raw).rstrip(b"=").decode()  # noqa: E731
+        legacy = f"pbkdf2_sha256$600000${encode(salt)}${encode(digest)}"
+        self.assertTrue(verify_client_secret(SECRET, legacy))
+        too_slow = f"pbkdf2_sha256$1000000${encode(salt)}${encode(digest)}"
+        with self.assertRaises(ClientSecretHashError):
+            parse_client_secret_hash(too_slow)
+        with self.assertRaises(ClientSecretHashError):
+            hash_client_secret(SECRET, iterations=1_000_000)
+
+    def test_helper_script_refuses_short_secrets(self):
+        result = subprocess.run(
+            [sys.executable, str(BACKEND_ROOT / "scripts" / "hash_mcp_client_secret.py")],
+            input="short-secret\n", capture_output=True, text=True, timeout=60, cwd=str(BACKEND_ROOT),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("short-secret", result.stderr)
+
+
 class ConfidentialClientTokenRouteTests(_Base):
     def setUp(self) -> None:
         super().setUp()

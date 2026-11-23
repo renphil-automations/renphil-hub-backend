@@ -20,11 +20,15 @@ import secrets
 from dataclasses import dataclass
 
 ALGORITHM = "pbkdf2_sha256"
-DEFAULT_ITERATIONS = 600_000
+# Client secrets are high-entropy random values (the helper script requires
+# at least 32 characters), so a slow password KDF adds nothing; ~10k rounds
+# keep each token request cheap. Existing hashes up to 600k rounds verify.
+DEFAULT_ITERATIONS = 10_000
 # Bounded so a registry value can neither weaken the hash nor turn every
 # token request into a CPU denial of service.
-MIN_ITERATIONS = 100_000
-MAX_ITERATIONS = 5_000_000
+MIN_ITERATIONS = 10_000
+MAX_ITERATIONS = 600_000
+MIN_NEW_SECRET_CHARS = 32
 MIN_SALT_BYTES = 16
 DIGEST_BYTES = 32
 MAX_SECRET_CHARS = 512

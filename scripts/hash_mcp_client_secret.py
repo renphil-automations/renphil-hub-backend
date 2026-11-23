@@ -23,7 +23,11 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.mcp_oauth_client_secret import ClientSecretHashError, hash_client_secret  # noqa: E402
+from app.services.mcp_oauth_client_secret import (  # noqa: E402
+    MIN_NEW_SECRET_CHARS,
+    ClientSecretHashError,
+    hash_client_secret,
+)
 
 
 def read_secret(stream=None) -> str:
@@ -39,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     del argv
     try:
         secret = read_secret()
+        if len(secret) < MIN_NEW_SECRET_CHARS:
+            # The fast hash assumes a high-entropy, provider-generated secret.
+            raise ClientSecretHashError(f"Client secret must be at least {MIN_NEW_SECRET_CHARS} characters.")
         print(hash_client_secret(secret))
     except ClientSecretHashError as exc:
         print(f"error: {exc}", file=sys.stderr)
