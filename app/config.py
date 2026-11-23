@@ -88,6 +88,15 @@ class Settings(BaseSettings):
     # (a trailing slash is ignored), otherwise ``invalid_target``. Requests
     # without ``resource`` are unaffected. Unset: any ``resource`` is refused.
     MCP_OAUTH_RESOURCE_URL: str | None = None
+    # Rotating refresh tokens for external MCP clients (off by default). When
+    # on, the code exchange also returns an opaque refresh token (stored only
+    # as a SHA-256 digest in mcp_oauth_refresh_tokens, which must exist
+    # first); reuse of a rotated token revokes its whole family.
+    MCP_OAUTH_REFRESH_TOKENS_ENABLED: bool = False
+    # Idle lifetime of one refresh token (5 minutes to 30 days, default 7 days)
+    # and absolute lifetime of a login's family (1 to 90 days, default 30).
+    MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS: int = Field(default=7 * 24 * 3600, ge=300, le=30 * 24 * 3600)
+    MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS: int = Field(default=30 * 24 * 3600, ge=3600, le=90 * 24 * 3600)
 
     @field_validator("MCP_OAUTH_BEARER_PROVIDERS")
     @classmethod

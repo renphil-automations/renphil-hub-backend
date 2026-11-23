@@ -23,7 +23,14 @@ from app.dependencies import CurrentHubUser, get_current_hub_user
 from app.services.mcp_access_policy import AdmissionDecision, admit_client, bearer_providers, load_approved_clients
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
 from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError
-from app.services.mcp_oauth_service import LocalMcpOAuthService, McpOAuthError, PersistentMcpOAuthService, authenticate_client
+from app.services.mcp_oauth_service import (
+    LocalMcpOAuthService,
+    McpOAuthDPoPBindingError,
+    McpOAuthError,
+    McpOAuthInvalidGrant,
+    PersistentMcpOAuthService,
+    authenticate_client,
+)
 from app.services import mcp_oauth_dpop_replay as dpop_replay
 from app.services import mcp_oauth_rate_limit as rate_limit
 from app.services.agent_identity import require_agent_sync_token
@@ -235,6 +242,9 @@ def _service() -> PersistentMcpOAuthService:
             signing_key=HubMcpSigningKey(private_pem=private_key, key_id=key_id),
             code_ttl_seconds=settings.MCP_OAUTH_CODE_TTL_SECONDS,
             access_token_ttl_seconds=settings.MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+            refresh_tokens_enabled=settings.MCP_OAUTH_REFRESH_TOKENS_ENABLED,
+            refresh_token_idle_seconds=settings.MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS,
+            refresh_family_max_seconds=settings.MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS,
         )
     except (McpOAuthError, McpOAuthKeyError) as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP OAuth is not configured.") from exc
@@ -413,17 +423,20 @@ async def _reserve_token_dpop_proof(request: Request) -> None:
 @router.post("/token", dependencies=[Depends(_reserve_token_dpop_proof)])
 def token(
     grant_type: str = Form(...),
-    code: str = Form(...),
+    code: Annotated[str | None, Form()] = None,
     client_id: Annotated[str | None, Form()] = None,
-    redirect_uri: str = Form(...),
-    code_verifier: str = Form(...),
+    redirect_uri: Annotated[str | None, Form()] = None,
+    code_verifier: Annotated[str | None, Form()] = None,
     dpop: str | None = Header(default=None, alias="DPoP"),
     db: Session = Depends(get_db_v2),
     resource: Annotated[list[str] | None, Form()] = None,
     client_secret: Annotated[str | None, Form()] = None,
     authorization: Annotated[str | None, Header()] = None,
+    refresh_token: Annotated[str | None, Form()] = None,
+    scope: Annotated[str | None, Form()] = None,
 ):
-    if grant_type != "authorization_code":
+    refresh_grant = grant_type == "refresh_token" and _refresh_tokens_enabled()
+    if grant_type != "authorization_code" and not refresh_grant:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported grant type.")
     client_id, client_secret = _token_client_credentials(authorization, client_id, client_secret)
     if _is_agent_client(client_id):
@@ -431,18 +444,33 @@ def token(
     _require_valid_resource(resource)
     decision = _external_admission(db, client_id)
     if not decision.allowed:
+        if refresh_grant and isinstance(refresh_token, str):
+            # External AI, the provider switch or the client mapping changed:
+            # the presented family can never be used again.
+            try:
+                _service().revoke_refresh_family(db, refresh_token)
+            except HTTPException:
+                pass  # unconfigured service: nothing can have been issued
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
     service = _service()
     # Confidential clients (registry entry with client_secret_hash) must
-    # authenticate; public clients must not send a secret (PKCE only).
+    # authenticate; public clients must not send a secret (PKCE only). The
+    # same authentication applies to both grants.
     if not authenticate_client(service.clients, client_id, client_secret):
         raise _invalid_client()
+    unbound_allowed = decision.client_kind in bearer_providers(get_settings())
+    if refresh_grant:
+        return _refresh_grant(
+            db, service, refresh_token=refresh_token, scope=scope, client_id=client_id,
+            client_kind=decision.client_kind, dpop=dpop, unbound_allowed=unbound_allowed,
+        )
+    if not code or not redirect_uri or not code_verifier:
+        raise _invalid_token_request()
     # RFC 9449 §5: external MCP tokens are bound to the client's DPoP key. A
     # missing or invalid proof is rejected without consuming the code. The
     # only bearer issuance is for a provider the operator listed in
     # MCP_OAUTH_BEARER_PROVIDERS that sent no DPoP header at all; a header
     # that is sent is always validated and binds the token (no downgrade).
-    unbound_allowed = decision.client_kind in bearer_providers(get_settings())
     if dpop is None and unbound_allowed:
         dpop_jkt = None
     else:
@@ -465,6 +493,64 @@ def token(
         )
     except McpOAuthError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.") from exc
+
+
+def _refresh_tokens_enabled() -> bool:
+    return getattr(get_settings(), "MCP_OAUTH_REFRESH_TOKENS_ENABLED", False) is True
+
+
+def _invalid_grant() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"error": "invalid_grant", "error_description": "The refresh token is invalid or expired."},
+    )
+
+
+def _hub_user_is_active(db: Session, subject: str, email: str) -> bool:
+    """The refresh token's Hub user still exists and is not soft-deleted.
+
+    Identity is re-derived server-side from the stored email; the stored
+    subject must still be that user's id.
+    """
+    from app.services.user_db_service import find_user_by_email
+
+    user = find_user_by_email(db, email)  # soft-deleted rows are invisible
+    return user is not None and str(user.id) == str(subject) and not getattr(user, "is_deleted", False)
+
+
+def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str, client_kind, dpop, unbound_allowed: bool):
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise _invalid_token_request()
+    if scope is not None and scope.split() != ["renphil.mcp.read"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_scope", "error_description": "Only renphil.mcp.read may be requested."},
+        )
+    dpop_jkt = None
+    if dpop is not None:
+        # A proof that is sent must be valid; the family decides whether one
+        # is required (DPoP-bound families) or merely binds the new token.
+        try:
+            dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
+        except McpDPoPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
+            ) from exc
+    try:
+        return service.refresh_access_token(
+            db, refresh_token=refresh_token, client_id=client_id, client_kind=client_kind, dpop_jkt=dpop_jkt,
+            allow_unbound=unbound_allowed, user_is_active=_hub_user_is_active,
+        )
+    except McpOAuthDPoPBindingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_dpop_proof", "error_description": "A DPoP proof for this refresh token is required."},
+        ) from exc
+    except McpOAuthInvalidGrant as exc:
+        raise _invalid_grant() from exc
+    except McpOAuthError as exc:
+        raise _invalid_token_request() from exc
 
 
 _REGISTRATION_DISABLED = {
@@ -535,7 +621,8 @@ async def authorization_server_metadata():
         "token_endpoint": f"{service.issuer}/token",
         "jwks_uri": f"{service.issuer}/jwks.json",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        # refresh_token only when enabled (rotating, with reuse detection).
+        "grant_types_supported": ["authorization_code", "refresh_token"] if service.refresh_tokens_enabled else ["authorization_code"],
         "scopes_supported": ["renphil.mcp.read"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": _token_endpoint_auth_methods(service),

@@ -1,7 +1,8 @@
-"""Alembic coverage for the Hub MCP OAuth schema (``0001_mcp_oauth``).
+"""Alembic coverage for the Hub MCP OAuth schema.
 
 The real ``migrations_v2`` chain has a single root revision, ``0001_mcp_oauth``
-(``down_revision = None``); its preceding state is the empty Alembic base.
+(``down_revision = None``), extended by ``0002_mcp_oauth_refresh_tokens``; the
+root's preceding state is the empty Alembic base.
 These tests run the real migration scripts against a temporary SQLite database.
 """
 
@@ -20,11 +21,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.db_v2.database import BaseV2
-from app.db_v2.models.mcp_oauth import McpOAuthAuthorizationCodeV2, McpOAuthAuthorizationRequestV2
+from app.db_v2.models.mcp_oauth import McpOAuthAuthorizationCodeV2, McpOAuthAuthorizationRequestV2, McpOAuthRefreshTokenV2
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REVISION = "0001_mcp_oauth"
-REQUESTS, CODES = "mcp_oauth_authorization_requests", "mcp_oauth_authorization_codes"
+HEAD = "0002_mcp_oauth_refresh_tokens"
+REQUESTS, CODES, REFRESH = "mcp_oauth_authorization_requests", "mcp_oauth_authorization_codes", "mcp_oauth_refresh_tokens"
 
 
 class McpOAuthMigrationTests(unittest.TestCase):
@@ -57,16 +59,17 @@ class McpOAuthMigrationTests(unittest.TestCase):
 
     def test_real_chain_has_one_root_head(self):
         script = ScriptDirectory.from_config(self.config)
-        self.assertEqual(script.get_heads(), [REVISION])
+        self.assertEqual(script.get_heads(), [HEAD])
         self.assertEqual(script.get_bases(), [REVISION])
         revision = script.get_revision(REVISION)
         self.assertIsNone(revision.down_revision)
         self.assertIsNone(revision.dependencies)
+        self.assertEqual(script.get_revision(HEAD).down_revision, REVISION)
 
     def test_fresh_upgrade_creates_tables_columns_indexes_and_constraints(self):
         command.upgrade(self.config, "head")
-        self.assertEqual(self._current(), {REVISION})
-        self.assertTrue({REQUESTS, CODES} <= self._tables())
+        self.assertEqual(self._current(), {HEAD})
+        self.assertTrue({REQUESTS, CODES, REFRESH} <= self._tables())
         code_columns = self._columns(CODES)
         self.assertEqual(
             set(code_columns),
@@ -95,10 +98,30 @@ class McpOAuthMigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.downgrade(self.config, "base")
         self.assertEqual(self._current(), set())
-        self.assertFalse({REQUESTS, CODES} & self._tables())
+        self.assertFalse({REQUESTS, CODES, REFRESH} & self._tables())
         command.upgrade(self.config, "head")
-        self.assertEqual(self._current(), {REVISION})
+        self.assertEqual(self._current(), {HEAD})
+        self.assertTrue({REQUESTS, CODES, REFRESH} <= self._tables())
+        command.downgrade(self.config, REVISION)
+        self.assertNotIn(REFRESH, self._tables())
         self.assertTrue({REQUESTS, CODES} <= self._tables())
+
+    def test_refresh_token_table_matches_the_model_and_is_idempotent(self):
+        BaseV2.metadata.create_all(bind=self.engine, tables=[McpOAuthRefreshTokenV2.__table__])
+        command.upgrade(self.config, "head")  # table already present: no error
+        columns = self._columns(REFRESH)
+        self.assertEqual(set(columns), {column.name for column in McpOAuthRefreshTokenV2.__table__.columns})
+        for name in ("jkt", "used_at", "revoked_at"):
+            self.assertTrue(columns[name]["nullable"], name)
+        for name in ("family_id", "token_hash", "client_id", "user_email", "user_subject", "scope", "created_at", "expires_at", "family_expires_at"):
+            self.assertFalse(columns[name]["nullable"], name)
+        self.assertEqual(self._indexes(REFRESH), {
+            "ix_mcp_oauth_refresh_tokens_token_hash": True,
+            "ix_mcp_oauth_refresh_tokens_family_id": False,
+            "ix_mcp_oauth_refresh_tokens_client_id": False,
+            "ix_mcp_oauth_refresh_tokens_user_email": False,
+            "ix_mcp_oauth_refresh_tokens_expires_at": False,
+        })
 
     def test_upgrade_is_idempotent_over_model_created_tables_without_the_role_column(self):
         BaseV2.metadata.create_all(
