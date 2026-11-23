@@ -160,7 +160,7 @@ from app.services.access_visibility_service import (
     walk_ancestors,
 )
 from app.services.rbac_graph_service import RbacClosures
-from app.services.resource_grant_service import _hub_user_email_map, resolve_node_labels
+from app.services.resource_grant_service import GrantMatch, _hub_user_email_map, resolve_node_labels
 
 logger = logging.getLogger(__name__)
 
@@ -2114,7 +2114,7 @@ def list_threads_for_link(
 ) -> ThreadListResponse:
     """Approved threads only. `user` is whose votes, authored-revision
     counts and own declined / pending COUNTS are computed — the caller,
-    with or without View As pairs or a selected user, or nobody (`None`)
+    with or without View As pairs, or nobody (`None`)
     for `anonymous`, which therefore gets `my_vote` 0 and zero counts
     (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
@@ -2172,7 +2172,7 @@ def list_threads_for_link(
 
     # plan_thread_reject_resubmit §4.7 — the caller's OWN declined items on
     # this widget (two cheap COUNTs, the inbox's exact predicate). 0 for a
-    # no-subject caller (`anonymous` / view-as with no user).
+    # no-subject caller (`anonymous`).
     declined_count = 0
     pending_count = 0
     pending_edit_count = 0
@@ -2286,7 +2286,7 @@ def get_thread_by_id(
     access to the widget at all keeps getting 403, never 404.
 
     `user` is whose authorship, vote and authored revisions count — the
-    caller, with or without View As pairs or a selected user, and nobody
+    caller, with or without View As pairs, and nobody
     (`None`) for `anonymous`.
 
     plan_thread_reject_resubmit §12.7: a CLOSED declined thread is NOT a
@@ -3488,7 +3488,7 @@ def list_declined_items(
       the Revisions view's "Closed (k)" section).
 
     A reworked edit is in neither list. 404 (widget) → 403 (view). A
-    no-subject caller (`user=None`: anonymous / view-as-user) gets empty
+    no-subject caller (`user=None`: `anonymous`) gets empty
     lists. Every item carries its widget's fields (plan_my_revisions §4.1 —
     the same item shape as `/threads/me/revisions`)."""
     component = resolve_thread_widget_component(db, link)
@@ -3680,6 +3680,9 @@ PENDING_ITEMS_CAP = 100
 # with the shared closures); a domain service must not import the FastAPI
 # dependency module.
 IsAdminFn = Callable[[RbacClosures], bool]
+# `grants(closures)` — View As only: the seed grants the per-widget gate
+# checks instead of the caller's own (`view_as_service.view_as_grants`).
+GrantsFn = Callable[[RbacClosures], list[GrantMatch]]
 
 
 def _has_my_revision_rows(db: Session, email: str) -> bool:
@@ -3738,20 +3741,29 @@ def _my_revision_component_ids(db: Session, email: str) -> set[int]:
 
 
 def _viewable_component_ids(
-    db: Session, component_ids: Collection[int], *, hub_user_id: int, is_admin: IsAdminFn
+    db: Session,
+    component_ids: Collection[int],
+    *,
+    hub_user_id: int,
+    is_admin: IsAdminFn,
+    grants: GrantsFn | None = None,
 ) -> set[int]:
     """plan_my_revisions §4.2 step 2 — the widgets in `component_ids` the
     caller can still VIEW, by the same `is_granted` rule
     `_check_view_access` applies (`granted_single_node` is its O(depth)
     single-node twin). ONE `RbacClosures` for the admin check and every
-    widget; a Hub Admin keeps them all."""
+    widget; a Hub Admin keeps them all. `grants` (View As) replaces the
+    caller's own grants as the seed set, looked up once."""
     closures = RbacClosures(db)
     if is_admin(closures):
         return set(component_ids)
+    seeds = grants(closures) if grants is not None else None
     return {
         cid
         for cid in sorted(component_ids)
-        if granted_single_node(db, hub_user_id, ("component", cid), is_admin=False, closures=closures)
+        if granted_single_node(
+            db, hub_user_id, ("component", cid), is_admin=False, closures=closures, grants=seeds
+        )
     }
 
 
@@ -3819,16 +3831,20 @@ def list_my_declined_items(
     *,
     hub_user_id: int,
     is_admin: IsAdminFn,
+    grants: GrantsFn | None = None,
 ) -> MyRevisionsResponse:
     """`GET /threads/me/revisions` (plan_my_revisions §4.2) — the caller's
     own declined items (open + closed, the per-widget inbox's exact lists
     and caps) and pending items (M5), across every thread widget they can
-    still view. The router answers View As / `anonymous` itself (empty,
-    `view_as: true`) and never reaches here for them."""
+    still view — or, under View As, that the pairs can view (`is_admin` /
+    `grants` from the pairs). The router answers `anonymous` itself (empty,
+    `view_as: true`) and never reaches here for it."""
     component_ids = _my_revision_component_ids(db, user.email)
     if not component_ids:
         return MyRevisionsResponse()
-    allowed = _viewable_component_ids(db, component_ids, hub_user_id=hub_user_id, is_admin=is_admin)
+    allowed = _viewable_component_ids(
+        db, component_ids, hub_user_id=hub_user_id, is_admin=is_admin, grants=grants
+    )
     if not allowed:
         return MyRevisionsResponse()
     widgets = _widget_fields(db, allowed)
@@ -3852,6 +3868,8 @@ def my_revisions_summary(
     *,
     hub_user_id: int,
     is_admin: IsAdminFn,
+    grants: GrantsFn | None = None,
+    view_as: bool = False,
 ) -> tuple[MyRevisionsSummary, str]:
     """`GET /threads/me/revisions/summary` (plan_my_revisions §4.2). The
     EXISTS short-circuit comes FIRST: an author with no rows (almost every
@@ -3861,11 +3879,18 @@ def my_revisions_summary(
     ETag `"{open}-{closed}-{pending}-{max_id_t}-{max_id_r}"` — every body
     field is a function of the three counts, so the tag covers the body
     (the `moderation_summary` discipline, followups §1); the max ids make a
-    decline-then-close that leaves the counts equal still change it."""
+    decline-then-close that leaves the counts equal still change it.
+
+    Under View As (`view_as=True`, `is_admin` / `grants` from the pairs) the
+    counts follow the list's exact per-widget filter, and the tag gains
+    `-va` because the body's `view_as` differs."""
+    suffix = "-va" if view_as else ""
     if not _has_my_revision_rows(db, user.email):
-        return MyRevisionsSummary(), '"0-0-0-0-0"'
+        return MyRevisionsSummary(view_as=view_as), f'"0-0-0-0-0{suffix}"'
     component_ids = _my_revision_component_ids(db, user.email)
-    allowed = _viewable_component_ids(db, component_ids, hub_user_id=hub_user_id, is_admin=is_admin)
+    allowed = _viewable_component_ids(
+        db, component_ids, hub_user_id=hub_user_id, is_admin=is_admin, grants=grants
+    )
     email = user.email
     open_t = _declined_threads_query(db, allowed, email)
     open_r = _declined_revisions_query(db, allowed, email)
@@ -3885,13 +3910,14 @@ def my_revisions_summary(
         closed_count=closed_count,
         pending_count=pending_count,
         has_any=(open_count + closed_count + pending_count) > 0,
+        view_as=view_as,
     )
-    return summary, f'"{open_count}-{closed_count}-{pending_count}-{max_t}-{max_r}"'
+    return summary, f'"{open_count}-{closed_count}-{pending_count}-{max_t}-{max_r}{suffix}"'
 
 
 def my_revisions_view_as_answer() -> tuple[MyRevisionsSummary, str]:
-    """M7 — the section is personal and View As is read-only: any View As
-    selection (pairs, a user) or `anonymous` gets the empty summary."""
+    """M7 — `anonymous` has no subject, so the personal section is empty
+    (with or without `view_as` pairs)."""
     return MyRevisionsSummary(view_as=True), '"0-0-0-0-0-va"'
 
 
@@ -4603,15 +4629,15 @@ def thread_history_facets(
     )
 
 
-def _view_as_etag_suffix(view_as: bool, view_as_user: str | None) -> str:
-    """`-va` for a View As body, plus a short hash of the selected user's
-    email so two View As bodies that differ only by `view_as_user` never
+def _view_as_etag_suffix(view_as: bool, view_as_from: str | None) -> str:
+    """`-va` for a View As body, plus a short hash of the `view_as_from`
+    email so two View As bodies that differ only by `view_as_from` never
     share a tag (the email itself stays out of the header)."""
     if not view_as:
         return ""
-    if not view_as_user:
+    if not view_as_from:
         return "-va"
-    return "-va-" + hashlib.sha256(view_as_user.encode()).hexdigest()[:12]
+    return "-va-" + hashlib.sha256(view_as_from.encode()).hexdigest()[:12]
 
 
 def moderation_summary(
@@ -4619,7 +4645,7 @@ def moderation_summary(
     *,
     access: ViewerAccess | None = None,
     view_as: bool = False,
-    view_as_user: str | None = None,
+    view_as_from: str | None = None,
 ) -> tuple[ThreadModerationSummary, str]:
     """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
     top of the `ViewerAccess` the dependency already built; polled like the
@@ -4635,18 +4661,18 @@ def moderation_summary(
     `view_as=True` means `access` was built from the View As parameters
     (`dependencies.get_view_as_access`): its only direct grants are the
     caller's own, unless `anonymous`. `view_as` and
-    `view_as_user` are echoed in the body and suffix the ETag
+    `view_as_from` are echoed in the body and suffix the ETag
     (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
-    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_from)
 
     if not component_ids:
         return (
             ThreadModerationSummary(
                 can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
-                view_as=view_as, view_as_user=view_as_user,
+                view_as=view_as, view_as_from=view_as_from,
             ),
             f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
@@ -4667,7 +4693,7 @@ def moderation_summary(
             moderated_component_count=len(component_ids),
             pending_count=count,
             view_as=view_as,
-            view_as_user=view_as_user,
+            view_as_from=view_as_from,
         ),
         etag,
     )
@@ -5530,7 +5556,7 @@ def revision_moderation_summary(
     *,
     access: ViewerAccess | None = None,
     view_as: bool = False,
-    view_as_user: str | None = None,
+    view_as_from: str | None = None,
 ) -> tuple[ThreadRevisionModerationSummary, str]:
     """`GET /threads/revision-moderation/summary` — Revision Management's
     own sidebar badge (amendment A4), the same shape and ETag discipline as
@@ -5542,13 +5568,13 @@ def revision_moderation_summary(
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
-    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_from)
 
     if not component_ids:
         return (
             ThreadRevisionModerationSummary(
                 can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
-                view_as=view_as, view_as_user=view_as_user,
+                view_as=view_as, view_as_from=view_as_from,
             ),
             f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
@@ -5573,7 +5599,7 @@ def revision_moderation_summary(
             moderated_component_count=len(component_ids),
             pending_count=count,
             view_as=view_as,
-            view_as_user=view_as_user,
+            view_as_from=view_as_from,
         ),
         etag,
     )

@@ -301,7 +301,7 @@ def test_environment_lock_and_local_comparison(hub):
     assert hub.client.get(f"/v2/hub-feedback/{sandbox['id']}?environment=sandbox").status_code == 200
 
 
-@pytest.mark.parametrize("query", ["view_as=role:scope", "view_as_user=someone@example.org", "anonymous=true"])
+@pytest.mark.parametrize("query", ["view_as=role:scope", "view_as_from=someone@example.org", "anonymous=true"])
 def test_view_as_neither_submits_nor_reads_as_real_user(hub, query):
     assert hub.client.post("/v2/hub-feedback?" + query, json=payload()).status_code == 403
     assert hub.client.get("/v2/hub-feedback?" + query).status_code == 403

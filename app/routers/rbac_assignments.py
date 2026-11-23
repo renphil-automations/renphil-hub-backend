@@ -77,7 +77,7 @@ async def _release_now_unauthorized_locks(db: Session) -> None:
 ADMIN_ONLY = [Depends(require_hub_admin)]
 
 VIEW_AS_ERROR_RESPONSES = {
-    400: {"description": "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"},
+    400: {"description": "View As: a malformed `view_as` pair, an unknown key, or too many pairs"},
     403: {"description": "View As refused: the caller may not adopt one or more of the given pairs"},
 }
 
@@ -91,8 +91,7 @@ def _delegation_identity(
     """``(is_hub_admin, held)`` for ``assert_can_delegate`` /
     ``list_revocable``: the caller's own assignments normally (``held=None``
     lets the delegation service load them), or exactly the verified View As
-    selection — the given pairs plus the selected user's rows, one held row
-    per pair. Direct-to-user grants play no part in delegation, so
+    selection — one held row per given pair. Direct-to-user grants play no part in delegation, so
     ``anonymous`` changes nothing here."""
     if selection is None:
         return is_hub_admin(db, current, closures=closures), None
@@ -102,8 +101,8 @@ def _delegation_identity(
     )
 
 
-def _view_as_user(selection: view_as_service.ViewAsSelection | None) -> str | None:
-    return selection.user_email if selection is not None else None
+def _view_as_from(selection: view_as_service.ViewAsSelection | None) -> str | None:
+    return selection.view_as_from if selection is not None else None
 
 
 CONFLICT_RESPONSE = {
@@ -259,12 +258,11 @@ def get_my_revocable(
     is symmetric, not ownership-based, so this can include assignments some
     other admin granted. A Hub Admin gets everything, unconditionally.
 
-    With View As parameters, the answer is for a holder of exactly the
-    given pairs plus the selected user's assignments, instead of the
-    caller's own."""
+    With View As pairs, the answer is for a holder of exactly those
+    pairs, instead of the caller's own assignments."""
     admin, held = _delegation_identity(db, current, selection, RbacClosures(db))
     data = rbac_assignment_service.list_revocable(db, current.hub_user_id, is_hub_admin=admin, held=held)
-    return {"data": data, "view_as": selection is not None, "view_as_user": _view_as_user(selection)}
+    return {"data": data, "view_as": selection is not None, "view_as_from": _view_as_from(selection)}
 
 
 @router.get(
@@ -313,7 +311,7 @@ def create_assignment(
     cosmetic — see `_assert_not_public`.
 
     With View As parameters, the delegation gate checks the verified
-    pairs (given and the selected user's) instead of the caller's own assignments. The row is still
+    pairs instead of the caller's own assignments. The row is still
     recorded as granted by the real caller."""
     role = rbac_service.get_role(db, request.role_id)
     if role is None:
@@ -348,7 +346,7 @@ def create_assignment(
     except RbacGraphError as e:
         raise _conflict(e)
     db.commit()
-    return {"data": assignment, "view_as": selection is not None, "view_as_user": _view_as_user(selection)}
+    return {"data": assignment, "view_as": selection is not None, "view_as_from": _view_as_from(selection)}
 
 
 @router.delete(
@@ -381,7 +379,7 @@ async def delete_assignment(
     why the bypass every other gate applies first is inverted there.
 
     With View As parameters, the delegation gate checks the verified
-    pairs (given and the selected user's) instead of the caller's own assignments. The admin floor
+    pairs instead of the caller's own assignments. The admin floor
     is unaffected."""
     assignment = rbac_assignment_service.get_assignment(db, assignment_id)
     if assignment is None:

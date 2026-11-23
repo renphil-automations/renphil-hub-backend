@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas.view_as import VIEW_AS_FLAG_DESCRIPTION, VIEW_AS_USER_DESCRIPTION
+from app.schemas.view_as import VIEW_AS_FLAG_DESCRIPTION, VIEW_AS_FROM_DESCRIPTION
 
 TaskStatus = Literal["Pending", "In Progress", "Blocked", "Closed"]
 NotificationCadence = Literal["always", "never", "on_status_change"]
@@ -34,7 +34,7 @@ class TaskAssignee(BaseModel):
 
 class _ViewAsEcho(BaseModel):
     view_as: bool = Field(default=False, description=VIEW_AS_FLAG_DESCRIPTION)
-    view_as_user: str | None = Field(default=None, description=VIEW_AS_USER_DESCRIPTION)
+    view_as_from: str | None = Field(default=None, description=VIEW_AS_FROM_DESCRIPTION)
 
 
 class TaskResponse(BaseModel):

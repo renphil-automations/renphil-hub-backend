@@ -109,7 +109,7 @@ def get_nav_tabs(
         "data": get_nav_tabs_v2(db, access=access, lock_view=lock_view),
         "hub_edit": hub_edit,
         "view_as": view_as_access.view_as,
-        "view_as_user": view_as_access.view_as_user,
+        "view_as_from": view_as_access.view_as_from,
     }
 
 
@@ -140,7 +140,7 @@ def get_nav_tab_tabs(
     return {
         "data": get_root_tabs_v2(db, nav_tab_id=nav_tab.id, access=access, lock_view=lock_view),
         "view_as": view_as_access.view_as,
-        "view_as_user": view_as_access.view_as_user,
+        "view_as_from": view_as_access.view_as_from,
     }
 
 
