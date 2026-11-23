@@ -24,7 +24,7 @@ from app.db_v2.models.bot_management import BotConfigurationStateV2, BotConfigur
 from app.dependencies import CurrentHubUser, get_current_hub_user
 from app.services.mcp_access_policy import PROVIDER_LABELS, AdmissionDecision, admit_client, bearer_providers, load_approved_clients
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
-from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError
+from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError, parse_additional_public_keys
 from app.services.mcp_oauth_service import (
     LocalMcpOAuthService,
     McpOAuthDPoPBindingError,
@@ -297,7 +297,13 @@ def _service() -> PersistentMcpOAuthService:
             clients=clients,
             issuer=issuer,
             audience=settings.MCP_OAUTH_AUDIENCE,
-            signing_key=HubMcpSigningKey(private_pem=private_key, key_id=key_id),
+            signing_key=HubMcpSigningKey(
+                private_pem=private_key, key_id=key_id,
+                # Published in the JWKS for rotation overlap; never used to sign.
+                additional_public_keys=parse_additional_public_keys(
+                    getattr(settings, "MCP_OAUTH_SIGNING_PUBLIC_KEYS_NEXT", ""), current_kid=key_id,
+                ),
+            ),
             code_ttl_seconds=settings.MCP_OAUTH_CODE_TTL_SECONDS,
             access_token_ttl_seconds=settings.MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
             refresh_tokens_enabled=settings.MCP_OAUTH_REFRESH_TOKENS_ENABLED,

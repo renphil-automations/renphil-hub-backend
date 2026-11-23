@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     MCP_OAUTH_AGENT_CLIENT_ID: str = "renphil-agent"
     MCP_OAUTH_SIGNING_PRIVATE_KEY: str | None = None
     MCP_OAUTH_SIGNING_KEY_ID: str | None = None
+    # Key rotation overlap: JSON object {"<kid>": "<RSA public key PEM>"} of
+    # keys published in the JWKS but never used to sign - the next key before
+    # signing switches to it, or the previous key until its tokens expire.
+    # Public keys only (a private PEM is rejected); each kid must differ from
+    # MCP_OAUTH_SIGNING_KEY_ID. Empty (default): only the signing key.
+    MCP_OAUTH_SIGNING_PUBLIC_KEYS_NEXT: str = ""
     # Comma-separated subset of claude,chatgpt,gemini whose hosted connectors
     # cannot sign DPoP proofs. For these providers only, /token issues an
     # unbound Bearer token when no DPoP header is sent; a DPoP header is
