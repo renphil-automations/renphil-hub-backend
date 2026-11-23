@@ -15,8 +15,11 @@ import base64
 import hashlib
 import logging
 import secrets
+import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Callable, Literal
 from urllib.parse import SplitResult, urlsplit
 
 import jwt
@@ -32,9 +35,72 @@ from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
 
-# In-memory PKCE store: state → (code_verifier, frontend_redirect_uri)
-# Fine for single-process / dev; replace with Redis/cache in production.
-_pkce_store: dict[str, tuple[str, str]] = {}
+PKCE_STATE_TTL_SECONDS = 600
+PKCE_STATE_MAX_ENTRIES = 10_000
+
+
+class _PkceStateStore:
+    """In-memory, per-process login state: state → (code_verifier, redirect_uri).
+
+    Entries expire ``ttl_seconds`` after they are written (abandoned logins
+    must not live forever), expired entries are purged whenever the store is
+    touched, and at ``max_entries`` the oldest entry is evicted so the store
+    cannot grow without bound. ``pop`` keeps the single-use semantics: a
+    state is returned at most once.
+
+    Still per process: a login that starts on one instance and calls back to
+    another fails, as before. A shared store (e.g. Redis) is an
+    infrastructure decision, deliberately not made here.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = PKCE_STATE_TTL_SECONDS,
+        max_entries: int = PKCE_STATE_MAX_ENTRIES,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._max = max_entries
+        self._clock = clock
+        # Insertion order == age order (a rewrite moves the key to the end).
+        self._entries: OrderedDict[str, tuple[float, tuple[str, str]]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _purge_expired(self, now: float) -> None:
+        while self._entries:
+            oldest = next(iter(self._entries))
+            if self._entries[oldest][0] > now:
+                break
+            del self._entries[oldest]
+
+    def __setitem__(self, state: str, value: tuple[str, str]) -> None:
+        with self._lock:
+            now = self._clock()
+            self._purge_expired(now)
+            self._entries.pop(state, None)
+            while len(self._entries) >= self._max:
+                self._entries.popitem(last=False)
+            self._entries[state] = (now + self._ttl, value)
+
+    def pop(self, state: str, default: tuple[str, str] | None = None) -> tuple[str, str] | None:
+        with self._lock:
+            self._purge_expired(self._clock())
+            entry = self._entries.pop(state, None)
+        return default if entry is None else entry[1]
+
+    def __contains__(self, state: object) -> bool:
+        with self._lock:
+            self._purge_expired(self._clock())
+            return state in self._entries
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired(self._clock())
+            return len(self._entries)
+
+
+_pkce_store = _PkceStateStore()
 
 # Which rule in `_enforce_login_allowed` let an email through.
 LoginAdmission = Literal["domain", "users"]
