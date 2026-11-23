@@ -461,8 +461,10 @@ def _redirect_with_params(redirect_uri: str, params: tuple[tuple[str, str], ...]
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
-def _redirect_with_code(*, redirect_uri: str, code: str, state: str) -> str:
-    return _redirect_with_params(redirect_uri, (("code", code), ("state", state)))
+def _redirect_with_code(*, redirect_uri: str, code: str, state: str, issuer: str) -> str:
+    # RFC 9207: every authorization response names its issuer, so clients
+    # (ChatGPT requires it for its stable callback) can detect mix-up attacks.
+    return _redirect_with_params(redirect_uri, (("code", code), ("state", state), ("iss", issuer)))
 
 
 def _continuation_request_id(issuer: str, continuation_uri: str) -> str | None:
@@ -523,7 +525,7 @@ def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subjec
     code, redirect_uri, client_state = service.complete_authorization(
         db, request_id=request_id, email=email, subject=subject,
     )
-    return _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state)
+    return _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state, issuer=service.issuer)
 
 
 # ── Consent and browser binding (MCP_OAUTH_CONSENT_REQUIRED) ──────────────
@@ -776,7 +778,7 @@ def consent_decision(
     try:
         if decision == "deny":
             redirect_uri, client_state = service.deny_consent(db, request_id=request_id, pending_hash=pending_hash)
-            target = _redirect_with_params(redirect_uri, (("error", "access_denied"), ("state", client_state)))
+            target = _redirect_with_params(redirect_uri, (("error", "access_denied"), ("state", client_state), ("iss", service.issuer)))
         else:
             pending = service.pending_consent(db, request_id=request_id, pending_hash=pending_hash)
             if pending is None:
@@ -785,7 +787,7 @@ def consent_decision(
                 # Switched off since sign-in: nothing is issued.
                 return _consent_problem(status.HTTP_403_FORBIDDEN)
             code, redirect_uri, client_state = service.approve_consent(db, request_id=request_id, pending_hash=pending_hash)
-            target = _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state)
+            target = _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state, issuer=service.issuer)
     except McpOAuthError:
         return _consent_problem()
     response = RedirectResponse(url=target, status_code=status.HTTP_303_SEE_OTHER, headers={"Cache-Control": "no-store"})
@@ -942,7 +944,11 @@ def _hub_user_is_active(db: Session, subject: str, email: str) -> bool:
 def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str, client_kind, dpop_jkt: str | None, unbound_allowed: bool):
     if not isinstance(refresh_token, str) or not refresh_token:
         raise _invalid_token_request()
-    if scope is not None and scope.split() != ["renphil.mcp.read"]:
+    # The granted scope is renphil.mcp.read; offline_access (requested by
+    # hosted connectors to obtain refresh tokens) may accompany it.
+    if scope is not None and (
+        "renphil.mcp.read" not in scope.split() or not set(scope.split()) <= {"renphil.mcp.read", "offline_access"}
+    ):
         raise _bad_request("invalid_scope", "Only renphil.mcp.read may be requested.")
     # The family decides whether the (already verified) proof is required
     # (DPoP-bound families) or forbidden (unbound families, S2).
@@ -1112,8 +1118,12 @@ async def authorization_server_metadata():
         "response_types_supported": ["code"],
         # refresh_token only when enabled (rotating, with reuse detection).
         "grant_types_supported": ["authorization_code", "refresh_token"] if service.refresh_tokens_enabled else ["authorization_code"],
-        "scopes_supported": ["renphil.mcp.read"],
+        # offline_access is accepted (refresh tokens are governed by Hub's own
+        # setting, not by this scope); advertised only when refresh is on.
+        "scopes_supported": ["renphil.mcp.read", "offline_access"] if service.refresh_tokens_enabled else ["renphil.mcp.read"],
         "code_challenge_methods_supported": ["S256"],
+        # RFC 9207: code and error redirects carry ``iss``.
+        "authorization_response_iss_parameter_supported": True,
         "token_endpoint_auth_methods_supported": _token_endpoint_auth_methods(service),
         "revocation_endpoint": f"{service.issuer}/revoke",
         "revocation_endpoint_auth_methods_supported": _token_endpoint_auth_methods(service),

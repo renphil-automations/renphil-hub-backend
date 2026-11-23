@@ -132,6 +132,7 @@ class ConsentTests(_Base):
         self.assertEqual(f"{location.scheme}://{location.netloc}{location.path}", REDIRECT)
         params = parse_qs(location.query)
         self.assertEqual(params["state"], ["client-state"])
+        self.assertEqual(params["iss"], [ISSUER])  # RFC 9207
         self.assertIn("max-age=0", approved.headers["set-cookie"].lower())
         exchanged = http.post("/mcp/oauth/token", data={
             "grant_type": "authorization_code", "code": params["code"][0], "client_id": CLAUDE_CLIENT,
@@ -152,7 +153,7 @@ class ConsentTests(_Base):
         denied = self.decide(http, request_id, csrf, "deny")
         self.assertEqual(denied.status_code, 303)
         params = parse_qs(urlsplit(denied.headers["location"]).query)
-        self.assertEqual(params, {"error": ["access_denied"], "state": ["client-state"]})
+        self.assertEqual(params, {"error": ["access_denied"], "state": ["client-state"], "iss": [ISSUER]})
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 0)
         self.assertEqual(self.db.query(McpOAuthAuthorizationRequestV2).count(), 0)
 

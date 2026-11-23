@@ -268,6 +268,22 @@ class RefreshEnabledTests(_Base):
         self.assertEqual(refused.json()["error"], "invalid_scope")
         self.assertEqual(self._refresh(http, token, extra={"scope": "renphil.mcp.read"}).status_code, 200)
 
+    def test_offline_access_may_accompany_the_mcp_scope_but_never_replace_it(self):
+        http = self.client()
+        token = self._login(http)["refresh_token"]
+        for scope in ("offline_access", "offline_access admin", "renphil.mcp.read offline_access admin"):
+            with self.subTest(scope=scope):
+                refused = self._refresh(http, token, extra={"scope": scope})
+                self.assertEqual(refused.json()["error"], "invalid_scope")
+        rotated = self._refresh(http, token, extra={"scope": "offline_access renphil.mcp.read"})
+        self.assertEqual(rotated.status_code, 200, rotated.text)
+        self.assertEqual(rotated.json()["scope"], "renphil.mcp.read")
+
+    def test_metadata_advertises_offline_access_and_rfc9207_when_refresh_is_on(self):
+        metadata = self.client().get("/.well-known/oauth-authorization-server/mcp/oauth").json()
+        self.assertIn("offline_access", metadata["scopes_supported"])
+        self.assertIs(metadata["authorization_response_iss_parameter_supported"], True)
+
 
 class LocalServiceRefreshTests(unittest.TestCase):
     def setUp(self) -> None:
