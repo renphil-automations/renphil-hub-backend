@@ -269,6 +269,11 @@ async def dev_login(
     if not email:
         return HTMLResponse(_DEV_LOGIN_FORM_HTML)
 
+    # Same rule as /auth/login: the minted session token is appended to this
+    # location, so it must be an allowed frontend's /auth/callback.
+    if not auth_service.is_allowed_login_redirect_uri(redirect_uri):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid login redirect URI.")
+
     normalized_email = email.strip().lower()
     try:
         user = UserInfo(email=normalized_email, name=_default_dev_name(normalized_email), roles=[])

@@ -65,7 +65,7 @@ from app.db_v2.models.user import UserV2  # noqa: E402
 from app.db_v2.models.role import RoleV2  # noqa: E402
 from app.db_v2.models.role_assignment import RoleAssignmentV2  # noqa: E402
 from app.db_v2.models.scope import ScopeV2  # noqa: E402
-from app.dependencies import HUB_ADMIN_ROLE_KEY  # noqa: E402
+from app.dependencies import HUB_ADMIN_ROLE_KEY, get_auth_service  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.services.airtable_service import AirtableService  # noqa: E402
 from app.services.auth_service import AuthService  # noqa: E402
@@ -109,6 +109,13 @@ class DevLoginFixture(unittest.TestCase):
                 db.close()
 
         app.dependency_overrides[get_db_v2] = _override_db
+        # dev-login only redirects to an allowed origin's /auth/callback (the
+        # same rule as /auth/login); allow the two frontend dev servers these
+        # tests use, whatever ALLOWED_ORIGINS the runner happens to set.
+        settings = get_settings().model_copy(
+            update={"ALLOWED_ORIGINS": ["http://localhost:5000", "http://localhost:5173"]}
+        )
+        app.dependency_overrides[get_auth_service] = lambda: AuthService(settings)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def tearDown(self) -> None:
@@ -225,6 +232,19 @@ class TestDevLoginRedirectShape(DevLoginFixture):
         parsed = urlparse(resp.headers["location"])
         self.assertEqual(f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
                           "http://localhost:5173/auth/callback")
+
+    def test_redirect_to_an_unapproved_location_is_refused_and_mints_nothing(self):
+        os.environ["DEBUG"] = "True"
+        for redirect_uri in (
+            "https://attacker.example/auth/callback",
+            "http://localhost:5173/elsewhere",
+            "http://localhost:5173/auth/callback?next=/x",
+        ):
+            resp = self._get(email="persona@example.com", redirect_uri=redirect_uri)
+            self.assertEqual(resp.status_code, 400, redirect_uri)
+            self.assertNotIn("location", resp.headers)
+            self.assertNotIn("access_token", resp.text)
+        self.assertEqual(self.db.query(UserV2).count(), 0)
 
 
 class TestDevLoginProvisionsHubUserSynchronously(DevLoginFixture):
