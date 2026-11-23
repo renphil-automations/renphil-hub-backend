@@ -148,12 +148,31 @@ def _client_bucket(settings, client_id: object) -> str:
     return rate_limit.client_bucket(client_id, mapping, agent_client_id)
 
 
+def _basic_client_id(authorization: str | None) -> str | None:
+    """Client ID from a well-formed ``Basic`` header (RFC 6749 §2.3.1), for
+    bucketing only; authentication happens in the handler. Never raises."""
+    scheme, _, value = (authorization or "").strip().partition(" ")
+    if scheme.lower() != "basic" or not value.strip() or len(value) > 4096:
+        return None
+    try:
+        decoded = base64.b64decode(value.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    raw_id, separator, _secret = decoded.partition(":")
+    client_id = unquote_plus(raw_id)
+    return client_id if separator and client_id else None
+
+
 async def _token_client_bucket(request: Request, settings) -> str:
     try:
         form = await request.form()
         client_id = form.get("client_id")
     except Exception:
         return "unknown"
+    if not client_id:
+        # client_secret_basic clients send their ID only in the header
+        # (security review S4); otherwise they would share "unknown".
+        client_id = _basic_client_id(request.headers.get("authorization"))
     return _client_bucket(settings, client_id)
 
 
