@@ -744,7 +744,7 @@ def consent_page(request: Request, request_id: str = Query(default=""), db: Sess
         f"<p>{label} is asking to connect to RenPhil Hub as <strong>{html.escape(email)}</strong>.</p>"
         f"<p>It will be able to: {html.escape(_SCOPE_DESCRIPTION)}</p>"
         f"<p>RenPhil Hub administrators can turn this access off at any time. "
-        f"Disconnecting the connector in {label} revokes it.</p>"
+        f"Disconnecting the connector in {label} may also revoke it.</p>"
         '<div class="actions">'
         f'<form method="post" action="{action}">{hidden}<input type="hidden" name="decision" value="approve">'
         f'<button type="submit" class="approve">Allow</button></form>'

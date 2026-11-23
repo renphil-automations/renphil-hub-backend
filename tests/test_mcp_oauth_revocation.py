@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -126,6 +127,40 @@ class BotManagementSwitchOffTests(_Harness):
         self._save({**ENABLED_EXTERNAL, "mcp_external_connections_enabled": False})
         self.assertFalse(bot_management._active_version(self.db).settings["mcp_external_connections_enabled"])
 
+    def test_a_row_committed_by_an_in_flight_refresh_is_also_revoked(self):
+        # N-3: on PostgreSQL a refresh holding its row lock makes the bulk
+        # UPDATE wait, then commits a new row that UPDATE's snapshot misses.
+        # Simulate that commit landing right after the first pass.
+        from sqlalchemy.orm import Query
+
+        from app.services.mcp_oauth_service import revoke_refresh_families_for_clients
+
+        now = datetime.now(timezone.utc)
+        self.db.add(McpOAuthRefreshTokenV2(
+            family_id="claude-family", token_hash="a" * 64, client_id=CLAUDE_CLIENT, user_email="x@renphil.org",
+            user_subject="9", jkt=None, scope="renphil.mcp.read", created_at=now,
+            expires_at=now + timedelta(hours=1), family_expires_at=now + timedelta(days=1),
+        ))
+        self.db.commit()
+        original_update = Query.update
+        passes = []
+
+        def racing_update(query, values, **kwargs):
+            result = original_update(query, values, **kwargs)
+            if not passes:
+                query.session.add(McpOAuthRefreshTokenV2(
+                    family_id="claude-family", token_hash="b" * 64, client_id=CLAUDE_CLIENT,
+                    user_email="x@renphil.org", user_subject="9", jkt=None, scope="renphil.mcp.read",
+                    created_at=now, expires_at=now + timedelta(hours=1), family_expires_at=now + timedelta(days=1),
+                ))
+                query.session.flush()
+            passes.append(result)
+            return result
+
+        with patch.object(Query, "update", racing_update):
+            revoke_refresh_families_for_clients(self.db, [CLAUDE_CLIENT])
+        self.assertGreaterEqual(len(passes), 2)
+        self.assertTrue(all(row.revoked_at is not None for row in self._rows() if row.client_id == CLAUDE_CLIENT))
 
 class ConsentTextTests(_Harness):
     def test_consent_page_describes_revocation_truthfully(self):
@@ -145,4 +180,4 @@ class ConsentTextTests(_Harness):
         page = http.get("/mcp/oauth/consent", params={"request_id": parse_qs(urlsplit(url).query)["request_id"][0]}).text
         self.assertNotIn("at any time by disconnecting it in the application", page)
         self.assertIn("RenPhil Hub administrators can turn this access off at any time", page)
-        self.assertIn("Disconnecting the connector in Claude revokes it", page)
+        self.assertIn("Disconnecting the connector in Claude may also revoke it", page)

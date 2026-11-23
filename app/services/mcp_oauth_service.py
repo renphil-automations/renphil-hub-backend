@@ -245,6 +245,9 @@ def _external_kind(client_kind: str | None) -> str:
     return client_kind
 
 
+_REVOKE_FAMILIES_MAX_PASSES = 5
+
+
 def revoke_refresh_families_for_clients(db: Session, client_ids) -> int:
     """Revoke every refresh-token family issued to ``client_ids``.
 
@@ -255,11 +258,20 @@ def revoke_refresh_families_for_clients(db: Session, client_ids) -> int:
     ids = sorted({client_id for client_id in client_ids if isinstance(client_id, str) and client_id})
     if not ids:
         return 0
-    count = db.query(McpOAuthRefreshTokenV2).filter(
-        McpOAuthRefreshTokenV2.client_id.in_(ids), McpOAuthRefreshTokenV2.revoked_at.is_(None),
-    ).update({McpOAuthRefreshTokenV2.revoked_at: datetime.now(timezone.utc)}, synchronize_session=False)
+    # A refresh that holds its row lock when this UPDATE starts makes it wait,
+    # then commits a new row this statement's snapshot cannot see. Under READ
+    # COMMITTED the next statement can, so repeat until nothing is left
+    # (bounded: each pass only waits for refreshes already in flight).
+    total = 0
+    for _ in range(_REVOKE_FAMILIES_MAX_PASSES):
+        count = int(db.query(McpOAuthRefreshTokenV2).filter(
+            McpOAuthRefreshTokenV2.client_id.in_(ids), McpOAuthRefreshTokenV2.revoked_at.is_(None),
+        ).update({McpOAuthRefreshTokenV2.revoked_at: datetime.now(timezone.utc)}, synchronize_session=False) or 0)
+        total += count
+        if count == 0:
+            break
     db.commit()
-    return int(count or 0)
+    return total
 
 
 class LocalMcpOAuthService:
