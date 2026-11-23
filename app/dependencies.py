@@ -248,7 +248,7 @@ def _ensure_hub_user(
     return user
 
 
-async def get_current_hub_user(
+def get_current_hub_user(
     user: UserInfo = Depends(get_current_user),
     db: Session = Depends(get_db_v2),
 ) -> CurrentHubUser:
@@ -256,6 +256,11 @@ async def get_current_hub_user(
 
     Normalizes emails with `.strip().lower()`, the same rule every other
     email comparison in this codebase applies.
+
+    A plain ``def`` on purpose, like every dependency below that queries the
+    database: FastAPI runs it in the threadpool, whereas an ``async def``
+    one would run its blocking SQLAlchemy calls on the event loop and stall
+    every concurrent request.
     """
     email = (user.email or "").strip().lower()
 
@@ -446,7 +451,7 @@ def is_hub_admin(
 #     writes are the half `is_hub_admin` above now genuinely resolves.
 
 
-async def require_hub_admin(
+def require_hub_admin(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> UserInfo:
@@ -486,7 +491,7 @@ async def require_hub_admin(
 # endpoints) ─────────────────────────────────────────────────────────────
 
 
-async def get_viewer_access(
+def get_viewer_access(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> ViewerAccess:
@@ -600,7 +605,7 @@ async def get_view_as_anonymous(
     return anonymous
 
 
-async def get_view_as_selection(
+def get_view_as_selection(
     view_as: list[str] | None = Query(
         default=None,
         description=(
@@ -634,7 +639,7 @@ async def get_view_as_selection(
     return _verify_view_as(db, current, values, user_email, anonymous=anonymous)
 
 
-async def get_view_as_access(
+def get_view_as_access(
     selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     anonymous: bool = Depends(get_view_as_anonymous),
     current: CurrentHubUser = Depends(get_current_hub_user),
@@ -651,7 +656,7 @@ async def get_view_as_access(
     access under ``anonymous`` (direct shares add nothing to it)."""
     if selection is None:
         if not anonymous:
-            return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
+            return ViewAsAccess(access=get_viewer_access(current=current, db=db), view_as=False)
         closures = RbacClosures(db)
         if is_hub_admin(db, current, closures=closures):
             access = resolve_viewer_access(db, current.hub_user_id, is_admin=True, closures=closures)
@@ -667,7 +672,7 @@ async def get_view_as_access(
 # ── Lock propagation (plan_lock_propagation_2026-09-08.md §4.3) ──────────
 
 
-async def get_lock_view(
+def get_lock_view(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> edit_lock_service.LockView:

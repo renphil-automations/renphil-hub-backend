@@ -23,6 +23,7 @@ from typing import Callable, Literal
 from urllib.parse import SplitResult, urlsplit
 
 import jwt
+from fastapi.concurrency import run_in_threadpool
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from sqlalchemy.orm import Session
@@ -251,8 +252,11 @@ class AuthService:
 
         flow = build_oauth_flow(self._settings)
 
+        # Both Google calls below are blocking HTTP requests (the token
+        # exchange, and the certificate fetch behind id_token verification);
+        # run them in the threadpool so a slow Google never stalls the loop.
         try:
-            flow.fetch_token(code=code, code_verifier=code_verifier)
+            await run_in_threadpool(flow.fetch_token, code=code, code_verifier=code_verifier)
         except Exception as exc:
             logger.error("Token exchange failed: %s", exc)
             raise GoogleOAuthError("Failed to exchange authorization code.") from exc
@@ -261,7 +265,8 @@ class AuthService:
 
         # Verify the Google-issued id_token
         try:
-            id_info = google_id_token.verify_oauth2_token(
+            id_info = await run_in_threadpool(
+                google_id_token.verify_oauth2_token,
                 credentials.id_token,
                 google_requests.Request(),
                 self._settings.GOOGLE_CLIENT_ID,
