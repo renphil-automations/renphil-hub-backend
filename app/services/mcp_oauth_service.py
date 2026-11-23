@@ -338,12 +338,14 @@ class LocalMcpOAuthService:
             calculated = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
             if not hmac.compare_digest(calculated, record.code_challenge):
                 raise McpOAuthError("OAuth PKCE verification failed.")
+            refresh_token = _new_refresh_token() if self.refresh_tokens_enabled else None
+            # Sign first: a signing failure leaves the code unconsumed.
+            response = self._issue(subject=record.subject, email=record.email, client_id=client_id, kind=kind,
+                                   confirmation=confirmation, dpop_jkt=dpop_jkt, refresh_token=refresh_token)
+            if refresh_token is not None:
+                self._new_family(token=refresh_token, client_id=client_id, email=record.email, subject=record.subject, jkt=dpop_jkt)
             record.consumed = True
-            refresh_token = None
-            if self.refresh_tokens_enabled:
-                refresh_token = self._new_family(client_id=client_id, email=record.email, subject=record.subject, jkt=dpop_jkt)
-        return self._issue(subject=record.subject, email=record.email, client_id=client_id, kind=kind,
-                           confirmation=confirmation, dpop_jkt=dpop_jkt, refresh_token=refresh_token)
+        return response
 
     def _issue(self, *, subject: str, email: str, client_id: str, kind: str, confirmation: dict, dpop_jkt: str | None, refresh_token: str | None) -> dict[str, object]:
         now = int(time.time())
@@ -365,10 +367,9 @@ class LocalMcpOAuthService:
         )
         return _token_response(token, ttl_seconds=self.access_token_ttl_seconds, dpop_jkt=dpop_jkt, refresh_token=refresh_token)
 
-    def _new_family(self, *, client_id: str, email: str, subject: str, jkt: str | None) -> str:
+    def _new_family(self, *, token: str, client_id: str, email: str, subject: str, jkt: str | None) -> str:
         """Start a refresh-token family (the caller holds ``self._lock``)."""
         now = time.time()
-        token = _new_refresh_token()
         self._refresh[_sha256(token)] = _RefreshRecord(
             family_id=secrets.token_hex(16), client_id=client_id, email=email, subject=subject, jkt=jkt,
             created_at=now, expires_at=now + self.refresh_token_idle_seconds,
@@ -419,16 +420,18 @@ class LocalMcpOAuthService:
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             # Raises before anything is consumed when the proof is missing.
             confirmation, bound_jkt = _refresh_confirmation(record.jkt, dpop_jkt, allow_unbound=allow_unbound)
-            record.used_at = now
             new_token = _new_refresh_token()
+            # Sign first: a signing failure leaves the presented token usable.
+            response = self._issue(subject=record.subject, email=record.email, client_id=client_id, kind=kind,
+                                   confirmation=confirmation, dpop_jkt=bound_jkt, refresh_token=new_token)
+            record.used_at = now
             self._refresh[_sha256(new_token)] = _RefreshRecord(
                 family_id=record.family_id, client_id=record.client_id, email=record.email, subject=record.subject,
                 jkt=record.jkt, created_at=now, expires_at=min(now + self.refresh_token_idle_seconds, record.family_expires_at),
                 family_expires_at=record.family_expires_at,
             )
             self._purge_refresh(now)
-        return self._issue(subject=record.subject, email=record.email, client_id=client_id, kind=kind,
-                           confirmation=confirmation, dpop_jkt=bound_jkt, refresh_token=new_token)
+        return response
 
     def _purge_refresh(self, now: float) -> None:
         # A used record is kept until it expires so its replay is detected.
@@ -670,14 +673,17 @@ class PersistentMcpOAuthService:
                     db, family_id=secrets.token_hex(16), client_id=client_id, email=email, subject=subject,
                     jkt=dpop_jkt, now=now, family_expires_at=now + timedelta(seconds=self.refresh_family_max_seconds),
                 )
+            # Sign inside the transaction, before the commit that consumes the
+            # code: a signing failure rolls back and the code stays usable.
+            response = self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
+                                   dpop_jkt=dpop_jkt, refresh_token=refresh_token, now=now)
             db.commit()
         except McpOAuthError:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
-        return self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
-                           dpop_jkt=dpop_jkt, refresh_token=refresh_token, now=now)
+            raise McpOAuthStorageError("OAuth token issuance is unavailable.") from exc
+        return response
 
     def _issue(self, *, subject: str, email: str, client_id: str, kind: str, confirmation: dict, dpop_jkt: str | None, refresh_token: str | None, now: datetime) -> dict[str, object]:
         issued_at = int(now.timestamp())
@@ -784,14 +790,16 @@ class PersistentMcpOAuthService:
                 now=now, family_expires_at=family_expires_at,
             )
             self._purge_refresh(db, now)
+            # Sign before the commit that marks the presented token used.
+            response = self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
+                                   dpop_jkt=bound_jkt, refresh_token=new_token, now=now)
             db.commit()
         except McpOAuthError:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
-        return self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
-                           dpop_jkt=bound_jkt, refresh_token=new_token, now=now)
+            raise McpOAuthStorageError("OAuth token issuance is unavailable.") from exc
+        return response
 
     def issue_agent_delegated_token(
         self, *, email: str, subject: str, client_id: str, model_key: str | None = None,
