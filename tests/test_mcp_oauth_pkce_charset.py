@@ -203,7 +203,7 @@ class PersistentServicePkceCharsetTests(unittest.TestCase):
                     code_challenge="A" * 64, code_challenge_method="S256", db=self.db,
                 ))
         self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(caught.exception.detail, "Invalid OAuth authorization request.")
+        self.assertEqual(caught.exception.detail["error"], "invalid_request")
 
         code = self._code(VALID_VERIFIER)
         admitted = type("Decision", (), {"allowed": True, "client_kind": "claude"})()
@@ -217,7 +217,7 @@ class PersistentServicePkceCharsetTests(unittest.TestCase):
                         code_verifier=verifier, dpop="proof", db=self.db,
                     ))
                 self.assertEqual(caught.exception.status_code, 400)
-                self.assertEqual(caught.exception.detail, "Invalid OAuth token request.")
+                self.assertEqual(caught.exception.detail["error"], "invalid_grant")
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 1)
 
 

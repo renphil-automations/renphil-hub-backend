@@ -246,7 +246,7 @@ class LegitimateFlowTests(_Base):
         # A code is still single use while limiting is active.
         replay = self.exchange(http, code)
         self.assertEqual(replay.status_code, 400)
-        self.assertEqual(replay.json(), {"detail": "Invalid OAuth token request."})
+        self.assertEqual(replay.json()["error"], "invalid_grant")
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 0)
 
     def test_authorize_still_redirects_into_normal_hub_login(self):
@@ -368,11 +368,12 @@ class UnknownAndMalformedClientTests(_Base):
         for index, client_id in enumerate(weird):
             params = dict(self.authorize_params(), client_id=client_id)
             response = http.get("/mcp/oauth/authorize", params=params, headers={"x-forwarded-for": f"192.0.2.{index}"})
-            self.assertIn(response.status_code, {400, 403, 422}, (client_id[:20], response.status_code))
+            self.assertIn(response.status_code, {400, 401, 403}, (client_id[:20], response.status_code))
             token = self.exchange(http, "c", client_id=client_id, ip=f"192.0.2.{index}")
-            self.assertIn(token.status_code, {400, 403, 422})
+            self.assertIn(token.status_code, {400, 401, 403})
         missing = http.get("/mcp/oauth/authorize", headers={"x-forwarded-for": "192.0.2.200"})
-        self.assertEqual(missing.status_code, 422)
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json()["error"], "invalid_request")
         garbage = http.post("/mcp/oauth/token", content=b"\xff\xfe\x00", headers={"content-type": "multipart/form-data; boundary=x"})
         self.assertLess(garbage.status_code, 500)
         client_keys = {key for keys, _ in self.redis.calls for key in keys if ":client:" in key}

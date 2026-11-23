@@ -30,6 +30,7 @@ from app.services.mcp_oauth_service import (
     McpOAuthDPoPBindingError,
     McpOAuthError,
     McpOAuthInvalidGrant,
+    McpOAuthStorageError,
     PersistentMcpOAuthService,
     authenticate_client,
 )
@@ -80,10 +81,57 @@ def _rate_limit_store(settings):
     return _STORES[cache_key]
 
 
+# RFC 6749 §5.2: OAuth errors are a top-level JSON object, never cached.
+_NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
 def _oauth_error(status_code: int, body: dict, retry_after: int) -> JSONResponse:
     return JSONResponse(
         status_code=status_code, content=body,
-        headers={"Retry-After": str(int(retry_after)), "Cache-Control": "no-store"},
+        headers={"Retry-After": str(int(retry_after)), **_NO_STORE},
+    )
+
+
+class OAuthErrorResponse(HTTPException):
+    """An RFC 6749 error raised by an authorization-server endpoint.
+
+    It is still an ``HTTPException`` (status and a dict ``detail``), so code
+    that only inspects the status keeps working. ``McpOAuthRateLimitedRoute``
+    renders it as the top-level body ``{"error", "error_description"?}``
+    with ``Cache-Control: no-store`` and ``Pragma: no-cache`` instead of
+    FastAPI's ``{"detail": ...}`` wrapper.
+    """
+
+    def __init__(self, status_code: int, error: str, description: str | None = None, *, headers: dict[str, str] | None = None):
+        body = {"error": error}
+        if description:
+            body["error_description"] = description
+        super().__init__(status_code=status_code, detail=body, headers=headers)
+        self.body = body
+
+
+def _oauth_error_response(exc: OAuthErrorResponse) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content=exc.body, headers={**(exc.headers or {}), **_NO_STORE})
+
+
+def _with_oauth_errors(handler):
+    async def render_oauth_errors(request: Request):
+        try:
+            return await handler(request)
+        except OAuthErrorResponse as exc:
+            return _oauth_error_response(exc)
+
+    return render_oauth_errors
+
+
+def _bad_request(error: str, description: str | None = None) -> OAuthErrorResponse:
+    return OAuthErrorResponse(status.HTTP_400_BAD_REQUEST, error, description)
+
+
+def _temporarily_unavailable() -> OAuthErrorResponse:
+    return OAuthErrorResponse(
+        status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE["error"], _UNAVAILABLE["error_description"],
+        headers={"Retry-After": str(rate_limit.UNAVAILABLE_RETRY_AFTER_SECONDS)},
     )
 
 
@@ -125,7 +173,7 @@ class McpOAuthRateLimitedRoute(APIRoute):
     """
 
     def get_route_handler(self):
-        original = super().get_route_handler()
+        original = _with_oauth_errors(super().get_route_handler())
         endpoint = RATE_LIMITED_ENDPOINTS.get(self.path)
         if endpoint is None:
             return original
@@ -263,16 +311,26 @@ def _service() -> PersistentMcpOAuthService:
 _CLIENT_AUTH_CHALLENGE = 'Basic realm="renphil-mcp-oauth"'
 
 
-def _invalid_client() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail={"error": "invalid_client", "error_description": "Client authentication failed."},
-        headers={"WWW-Authenticate": _CLIENT_AUTH_CHALLENGE, "Cache-Control": "no-store"},
+def _invalid_client() -> OAuthErrorResponse:
+    return OAuthErrorResponse(
+        status.HTTP_401_UNAUTHORIZED, "invalid_client", "Client authentication failed.",
+        headers={"WWW-Authenticate": _CLIENT_AUTH_CHALLENGE},
     )
 
 
-def _invalid_token_request() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.")
+def _invalid_token_request() -> OAuthErrorResponse:
+    return _bad_request("invalid_request", "The token request is missing a required parameter or is malformed.")
+
+
+def _oauth_service() -> PersistentMcpOAuthService:
+    """``_service()`` for OAuth endpoints: an unconfigured issuer is the
+    RFC 6749 ``temporarily_unavailable`` error; disabled stays a plain 404."""
+    try:
+        return _service()
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise _temporarily_unavailable() from exc
+        raise
 
 
 def _token_client_credentials(
@@ -306,9 +364,9 @@ def _token_client_credentials(
     return form_client_id, form_client_secret
 
 
-_INVALID_TARGET = {
+_INVALID_TARGET_ARGS = {
     "error": "invalid_target",
-    "error_description": "The requested resource is not served by this authorization server.",
+    "description": "The requested resource is not served by this authorization server.",
 }
 
 
@@ -327,11 +385,11 @@ def _require_valid_resource(resources: list[str] | None) -> None:
         return
     configured = _normalized_resource(getattr(get_settings(), "MCP_OAUTH_RESOURCE_URL", None) or "")
     if not configured or not resources:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVALID_TARGET)
+        raise _bad_request(**_INVALID_TARGET_ARGS)
     for value in resources:
         supplied = _normalized_resource(value)
         if not supplied or not hmac.compare_digest(supplied.encode("utf-8"), configured.encode("utf-8")):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVALID_TARGET)
+            raise _bad_request(**_INVALID_TARGET_ARGS)
 
 
 def _redirect_with_params(redirect_uri: str, params: tuple[tuple[str, str], ...]) -> str:
@@ -490,33 +548,43 @@ def _verified_consent(request: Request, request_id: str):
 # FastAPI runs them in its threadpool instead of blocking the event loop.
 @router.get("/authorize")
 def authorize(
-    response_type: str = Query(...),
-    client_id: str = Query(...),
-    redirect_uri: str = Query(...),
-    state: str = Query(...),
-    code_challenge: str = Query(...),
-    code_challenge_method: str = Query(...),
+    response_type: Annotated[str | None, Query()] = None,
+    client_id: Annotated[str | None, Query()] = None,
+    redirect_uri: Annotated[str | None, Query()] = None,
+    state: Annotated[str | None, Query()] = None,
+    code_challenge: Annotated[str | None, Query()] = None,
+    code_challenge_method: Annotated[str | None, Query()] = None,
     db: Session = Depends(get_db_v2),
     resource: Annotated[list[str] | None, Query()] = None,
 ):
-    """Begin authorization, then reuse normal Hub Google sign-in."""
+    """Begin authorization, then reuse normal Hub Google sign-in.
+
+    Every error here is returned to the browser as an RFC 6749 JSON error and
+    never redirected: the client and its exact callback are not yet trusted
+    (§4.1.2.1), so nothing is sent to an unverified redirect URI.
+    """
+    invalid_request = "The authorization request is missing a required parameter or is malformed."
+    if not response_type:
+        raise _bad_request("invalid_request", invalid_request)
     if response_type != "code":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="response_type must be code.")
+        raise _bad_request("unsupported_response_type", "Only response_type=code is supported.")
+    if not all((client_id, redirect_uri, state, code_challenge, code_challenge_method)):
+        raise _bad_request("invalid_request", invalid_request)
     if _is_agent_client(client_id):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth authorization request.")
-    # Refused before any redirect, so an invalid target never reaches the
-    # client callback (no open redirect on an unvalidated request).
+        raise _bad_request("unauthorized_client", "This client may not use the authorization endpoint.")
     _require_valid_resource(resource)
     if not _external_client_is_enabled(db, client_id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
-    service = _service()
+        raise OAuthErrorResponse(status.HTTP_403_FORBIDDEN, "access_denied", "External MCP access is not available for this client.")
+    service = _oauth_service()
     try:
         request_id = service.start_authorization(db,
             client_id=client_id, redirect_uri=redirect_uri, state=state,
             code_challenge=code_challenge, code_challenge_method=code_challenge_method,
         )
+    except McpOAuthStorageError as exc:
+        raise _temporarily_unavailable() from exc
     except McpOAuthError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth authorization request.") from exc
+        raise _bad_request("invalid_request", invalid_request) from exc
     # The existing Hub callback recognizes this continuation and converts the
     # verified login directly into an authorization code. This avoids a second
     # Google callback registration and never exposes a Hub session token.
@@ -527,7 +595,7 @@ def authorize(
         try:
             _set_consent_cookie(response, issuer=service.issuer, request_id=request_id)
         except McpOAuthError as exc:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP OAuth is not configured.") from exc
+            raise _temporarily_unavailable() from exc
     return response
 
 
@@ -624,7 +692,7 @@ async def _reserve_token_dpop_proof(request: Request) -> None:
     if raw is None or not raw.strip():
         return
     settings = get_settings()
-    service = _service()
+    service = _oauth_service()
     try:
         proof = verify_token_request_proof(
             raw, token_endpoint=f"{service.issuer}/token", max_age_seconds=dpop_replay.PROOF_MAX_AGE_SECONDS,
@@ -632,15 +700,12 @@ async def _reserve_token_dpop_proof(request: Request) -> None:
     except McpDPoPError:
         return
     if not await dpop_replay.reserve_proof(_rate_limit_store(settings), settings, proof):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
-        )
+        raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.")
 
 
 @router.post("/token", dependencies=[Depends(_reserve_token_dpop_proof)])
 def token(
-    grant_type: str = Form(...),
+    grant_type: Annotated[str | None, Form()] = None,
     code: Annotated[str | None, Form()] = None,
     client_id: Annotated[str | None, Form()] = None,
     redirect_uri: Annotated[str | None, Form()] = None,
@@ -653,12 +718,15 @@ def token(
     refresh_token: Annotated[str | None, Form()] = None,
     scope: Annotated[str | None, Form()] = None,
 ):
+    # Errors are RFC 6749 §5.2 bodies (rendered by the route class).
+    if not grant_type:
+        raise _invalid_token_request()
     refresh_grant = grant_type == "refresh_token" and _refresh_tokens_enabled()
     if grant_type != "authorization_code" and not refresh_grant:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported grant type.")
+        raise _bad_request("unsupported_grant_type", "This grant type is not supported.")
     client_id, client_secret = _token_client_credentials(authorization, client_id, client_secret)
     if _is_agent_client(client_id):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.")
+        raise _bad_request("unauthorized_client", "This client may not use the token endpoint.")
     _require_valid_resource(resource)
     decision = _external_admission(db, client_id)
     if not decision.allowed:
@@ -669,8 +737,8 @@ def token(
                 _service().revoke_refresh_family(db, refresh_token)
             except HTTPException:
                 pass  # unconfigured service: nothing can have been issued
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
-    service = _service()
+        raise OAuthErrorResponse(status.HTTP_403_FORBIDDEN, "unauthorized_client", "External MCP access is not available for this client.")
+    service = _oauth_service()
     # Confidential clients (registry entry with client_secret_hash) must
     # authenticate; public clients must not send a secret (PKCE only). The
     # same authentication applies to both grants.
@@ -693,35 +761,29 @@ def token(
         dpop_jkt = None
     else:
         if not isinstance(dpop, str) or not dpop.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "invalid_dpop_proof", "error_description": "A DPoP proof is required."},
-            )
+            raise _bad_request("invalid_dpop_proof", "A DPoP proof is required.")
         try:
             dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
         except McpDPoPError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
-            ) from exc
+            raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from exc
     try:
         return service.exchange_code(
             db, code=code, client_id=client_id, redirect_uri=redirect_uri, code_verifier=code_verifier,
             dpop_jkt=dpop_jkt, client_kind=decision.client_kind, allow_unbound=dpop_jkt is None,
         )
+    except McpOAuthStorageError as exc:
+        raise _temporarily_unavailable() from exc
     except McpOAuthError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.") from exc
+        # Unknown, used or expired code, wrong redirect URI or PKCE verifier.
+        raise _bad_request("invalid_grant", "The authorization code is invalid or expired.") from exc
 
 
 def _refresh_tokens_enabled() -> bool:
     return getattr(get_settings(), "MCP_OAUTH_REFRESH_TOKENS_ENABLED", False) is True
 
 
-def _invalid_grant() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail={"error": "invalid_grant", "error_description": "The refresh token is invalid or expired."},
-    )
+def _invalid_grant() -> OAuthErrorResponse:
+    return _bad_request("invalid_grant", "The refresh token is invalid or expired.")
 
 
 def _hub_user_is_active(db: Session, subject: str, email: str) -> bool:
@@ -740,10 +802,7 @@ def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str
     if not isinstance(refresh_token, str) or not refresh_token:
         raise _invalid_token_request()
     if scope is not None and scope.split() != ["renphil.mcp.read"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_scope", "error_description": "Only renphil.mcp.read may be requested."},
-        )
+        raise _bad_request("invalid_scope", "Only renphil.mcp.read may be requested.")
     dpop_jkt = None
     if dpop is not None:
         # A proof that is sent must be valid; the family decides whether one
@@ -751,22 +810,18 @@ def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str
         try:
             dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
         except McpDPoPError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
-            ) from exc
+            raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from exc
     try:
         return service.refresh_access_token(
             db, refresh_token=refresh_token, client_id=client_id, client_kind=client_kind, dpop_jkt=dpop_jkt,
             allow_unbound=unbound_allowed, user_is_active=_hub_user_is_active,
         )
     except McpOAuthDPoPBindingError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_dpop_proof", "error_description": "A DPoP proof for this refresh token is required."},
-        ) from exc
+        raise _bad_request("invalid_dpop_proof", "A DPoP proof for this refresh token is required.") from exc
     except McpOAuthInvalidGrant as exc:
         raise _invalid_grant() from exc
+    except McpOAuthStorageError as exc:
+        raise _temporarily_unavailable() from exc
     except McpOAuthError as exc:
         raise _invalid_token_request() from exc
 
@@ -784,13 +839,13 @@ async def register_dynamic_client() -> JSONResponse:
     The request body is never parsed, so no client metadata can influence the
     response or create a client.
     """
-    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=_REGISTRATION_DISABLED)
+    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=_REGISTRATION_DISABLED, headers=_NO_STORE)
 
 
 @metadata_router.post("/register", include_in_schema=False)
 async def register_dynamic_client_root_alias() -> JSONResponse:
     """Root-path alias some MCP clients probe; rejected identically."""
-    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=_REGISTRATION_DISABLED)
+    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=_REGISTRATION_DISABLED, headers=_NO_STORE)
 
 
 @router.post("/agent-token", include_in_schema=False, dependencies=[Depends(require_agent_sync_token)])

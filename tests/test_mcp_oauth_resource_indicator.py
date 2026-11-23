@@ -46,7 +46,7 @@ class ResourceIndicatorTests(_Base):
             with self.subTest(value=value):
                 refused = self._authorize(http, resource=value)
                 self.assertEqual(refused.status_code, 400)
-                self.assertEqual(refused.json()["detail"]["error"], INVALID_TARGET)
+                self.assertEqual(refused.json()["error"], INVALID_TARGET)
                 self.assertNotIn("location", refused.headers)
         # One valid and one invalid value: still refused.
         refused = http.get("/mcp/oauth/authorize", params=[*self.authorize_params().items(), ("resource", RESOURCE), ("resource", "https://other.example/")])
@@ -58,7 +58,7 @@ class ResourceIndicatorTests(_Base):
         code = self.issue_code(http)
         refused = self._token(http, code, resource="https://other.example/mcp")
         self.assertEqual(refused.status_code, 400)
-        self.assertEqual(refused.json()["detail"]["error"], INVALID_TARGET)
+        self.assertEqual(refused.json()["error"], INVALID_TARGET)
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 1)
         self.assertEqual(self._token(http, code, resource=RESOURCE).status_code, 200)
 
@@ -67,7 +67,7 @@ class ResourceIndicatorTests(_Base):
         http = self.client()
         refused = self._authorize(http, resource=RESOURCE)
         self.assertEqual(refused.status_code, 400)
-        self.assertEqual(refused.json()["detail"]["error"], INVALID_TARGET)
+        self.assertEqual(refused.json()["error"], INVALID_TARGET)
 
 
 if __name__ == "__main__":

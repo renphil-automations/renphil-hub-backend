@@ -52,6 +52,10 @@ class McpOAuthError(ValueError):
     """An OAuth request is invalid without disclosing sensitive state."""
 
 
+class McpOAuthStorageError(McpOAuthError):
+    """The shared OAuth store failed; a transient outage, not a bad request."""
+
+
 class McpOAuthInvalidGrant(McpOAuthError):
     """RFC 6749 ``invalid_grant``: the refresh token cannot be used."""
 
@@ -489,7 +493,7 @@ class PersistentMcpOAuthService:
             db.commit()
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return request_id
 
     def complete_authorization(self, db: Session, *, request_id: str, email: str, subject: str) -> tuple[str, str, str]:
@@ -521,7 +525,7 @@ class PersistentMcpOAuthService:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return code, redirect_uri, client_state
 
     # -- Consent (MCP_OAUTH_CONSENT_REQUIRED) --------------------------------
@@ -561,7 +565,7 @@ class PersistentMcpOAuthService:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
 
     def pending_consent(self, db: Session, *, request_id: str, pending_hash: str) -> tuple[str, str] | None:
         """``(client_id, user_email)`` of a signed-in request awaiting consent."""
@@ -578,7 +582,7 @@ class PersistentMcpOAuthService:
             ).one_or_none()
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         if request is None or pending is None or pending.client_id != request.client_id:
             return None
         return request.client_id, pending.user_email
@@ -612,7 +616,7 @@ class PersistentMcpOAuthService:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return code, redirect_uri, client_state
 
     def deny_consent(self, db: Session, *, request_id: str, pending_hash: str) -> tuple[str, str]:
@@ -629,7 +633,7 @@ class PersistentMcpOAuthService:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return redirect_uri, client_state
 
     def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None, allow_unbound: bool = False) -> dict[str, object]:
@@ -671,7 +675,7 @@ class PersistentMcpOAuthService:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
                            dpop_jkt=dpop_jkt, refresh_token=refresh_token, now=now)
 
@@ -785,7 +789,7 @@ class PersistentMcpOAuthService:
             raise
         except Exception as exc:
             db.rollback()
-            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
                            dpop_jkt=bound_jkt, refresh_token=new_token, now=now)
 

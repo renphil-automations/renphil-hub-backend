@@ -132,7 +132,7 @@ class ConfidentialClientTokenRouteTests(_Base):
             with self.subTest(name):
                 refused = self._token(http, code, **kwargs)
                 self.assertEqual(refused.status_code, 401, refused.text)
-                self.assertEqual(refused.json()["detail"]["error"], "invalid_client")
+                self.assertEqual(refused.json()["error"], "invalid_client")
                 self.assertIn("Basic", refused.headers["www-authenticate"])
                 self.assertNotIn(SECRET, refused.text)
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 1)

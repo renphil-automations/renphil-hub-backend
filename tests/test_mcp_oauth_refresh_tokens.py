@@ -47,7 +47,7 @@ class RefreshDisabledTests(_Base):
             "grant_type": "refresh_token", "refresh_token": "x" * 64, "client_id": CLAUDE_CLIENT,
         }, headers={"DPoP": signer.proof()})
         self.assertEqual(refused.status_code, 400)
-        self.assertEqual(refused.json(), {"detail": "Unsupported grant type."})
+        self.assertEqual(refused.json()["error"], "unsupported_grant_type")
         metadata = http.get("/.well-known/oauth-authorization-server").json()
         self.assertEqual(metadata["grant_types_supported"], ["authorization_code"])
 
@@ -132,10 +132,10 @@ class RefreshEnabledTests(_Base):
         second = self._refresh(http, first).json()["refresh_token"]
         reuse = self._refresh(http, first)
         self.assertEqual(reuse.status_code, 400)
-        self.assertEqual(reuse.json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(reuse.json()["error"], "invalid_grant")
         self.assertTrue(all(row.revoked_at is not None for row in self._rows()))
         # The legitimate holder's newest token is dead too.
-        self.assertEqual(self._refresh(http, second).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, second).json()["error"], "invalid_grant")
 
     def test_other_families_are_untouched_by_a_revocation(self):
         http = self.client()
@@ -147,17 +147,17 @@ class RefreshEnabledTests(_Base):
 
     def test_unknown_or_expired_tokens_are_invalid_grant(self):
         http = self.client()
-        self.assertEqual(self._refresh(http, "not-a-real-token").json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, "not-a-real-token").json()["error"], "invalid_grant")
         token = self._login(http)["refresh_token"]
         row = self._rows()[0]
         row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         self.db.commit()
-        self.assertEqual(self._refresh(http, token).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, token).json()["error"], "invalid_grant")
         family_expired = self._login(http)["refresh_token"]
         row = self._rows()[-1]
         row.family_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         self.db.commit()
-        self.assertEqual(self._refresh(http, family_expired).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, family_expired).json()["error"], "invalid_grant")
 
     # -- DPoP binding --------------------------------------------------------
     def test_a_bound_family_needs_a_proof_for_the_same_key_and_is_not_consumed_without_it(self):
@@ -167,7 +167,7 @@ class RefreshEnabledTests(_Base):
             with self.subTest(signer="missing" if signer is False else "other-key"):
                 refused = self._refresh(http, token, signer=signer)
                 self.assertEqual(refused.status_code, 400)
-                self.assertEqual(refused.json()["detail"]["error"], "invalid_dpop_proof")
+                self.assertEqual(refused.json()["error"], "invalid_dpop_proof")
         self.assertIsNone(self._rows()[0].used_at)
         self.assertEqual(self._refresh(http, token).status_code, 200)
 
@@ -186,7 +186,7 @@ class RefreshEnabledTests(_Base):
         # Provider removed from the bearer set: an unbound family needs DPoP.
         self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True)
         refused = self._refresh(http, bound.json()["refresh_token"], signer=False)
-        self.assertEqual(refused.json()["detail"]["error"], "invalid_dpop_proof")
+        self.assertEqual(refused.json()["error"], "invalid_dpop_proof")
 
     # -- live re-checks ------------------------------------------------------
     def test_switching_the_provider_off_refuses_and_revokes_the_family(self):
@@ -199,7 +199,7 @@ class RefreshEnabledTests(_Base):
                 self.assertEqual(self._refresh(http, token).status_code, 403)
                 # Switching back on does not resurrect the revoked family.
                 self._activate(ENABLED_EXTERNAL)
-                self.assertEqual(self._refresh(http, token).json()["detail"]["error"], "invalid_grant")
+                self.assertEqual(self._refresh(http, token).json()["error"], "invalid_grant")
 
     def test_removing_the_client_mapping_revokes_the_family(self):
         http = self.client()
@@ -207,7 +207,7 @@ class RefreshEnabledTests(_Base):
         self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True, MCP_OAUTH_CLIENT_PROVIDERS_JSON=json.dumps({GPT_CLIENT: "chatgpt"}))
         self.assertEqual(self._refresh(http, token).status_code, 403)
         self.settings = mcp_settings(MCP_OAUTH_REFRESH_TOKENS_ENABLED=True)
-        self.assertEqual(self._refresh(http, token).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, token).json()["error"], "invalid_grant")
 
     def test_soft_deleted_or_missing_user_revokes_the_family(self):
         http = self.client()
@@ -215,18 +215,18 @@ class RefreshEnabledTests(_Base):
         user = self.db.get(UserV2, 42)
         user.is_deleted = True
         self.db.commit()
-        self.assertEqual(self._refresh(http, token).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, token).json()["error"], "invalid_grant")
         user.is_deleted = False
         self.db.commit()
-        self.assertEqual(self._refresh(http, token).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, token).json()["error"], "invalid_grant")
         self.assertTrue(all(row.revoked_at is not None for row in self._rows()))
 
     def test_another_client_presenting_the_token_revokes_the_family(self):
         http = self.client()
         token = self._login(http)["refresh_token"]
         stolen = self._refresh(http, token, client_id=GPT_CLIENT)
-        self.assertEqual(stolen.json()["detail"]["error"], "invalid_grant")
-        self.assertEqual(self._refresh(http, token).json()["detail"]["error"], "invalid_grant")
+        self.assertEqual(stolen.json()["error"], "invalid_grant")
+        self.assertEqual(self._refresh(http, token).json()["error"], "invalid_grant")
 
     def test_confidential_client_must_authenticate_to_refresh(self):
         registry = json.loads(self.settings.MCP_OAUTH_CLIENTS_JSON)
@@ -244,7 +244,7 @@ class RefreshEnabledTests(_Base):
         http = self.client()
         token = self._login(http)["refresh_token"]
         refused = self._refresh(http, token, extra={"scope": "renphil.mcp.read admin"})
-        self.assertEqual(refused.json()["detail"]["error"], "invalid_scope")
+        self.assertEqual(refused.json()["error"], "invalid_scope")
         self.assertEqual(self._refresh(http, token, extra={"scope": "renphil.mcp.read"}).status_code, 200)
 
 

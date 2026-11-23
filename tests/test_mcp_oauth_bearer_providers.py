@@ -80,7 +80,7 @@ class BearerProviderTokenRouteTests(_Base):
             with self.subTest(bad=bad):
                 refused = self._exchange(http, code, dpop=bad)
                 self.assertEqual(refused.status_code, 400)
-                self.assertEqual(refused.json()["detail"]["error"], "invalid_dpop_proof")
+                self.assertEqual(refused.json()["error"], "invalid_dpop_proof")
         # The code was never consumed by a refused request.
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 1)
 
@@ -90,14 +90,14 @@ class BearerProviderTokenRouteTests(_Base):
         code = self.issue_code(http)
         refused = self._exchange(http, code, dpop=None)
         self.assertEqual(refused.status_code, 400)
-        self.assertEqual(refused.json()["detail"], {"error": "invalid_dpop_proof", "error_description": "A DPoP proof is required."})
+        self.assertEqual(refused.json(), {"error": "invalid_dpop_proof", "error_description": "A DPoP proof is required."})
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 1)
 
     def test_default_configuration_requires_dpop(self):
         http = self.client()
         refused = self._exchange(http, self.issue_code(http), dpop=None)
         self.assertEqual(refused.status_code, 400)
-        self.assertEqual(refused.json()["detail"]["error"], "invalid_dpop_proof")
+        self.assertEqual(refused.json()["error"], "invalid_dpop_proof")
 
     def test_service_never_issues_unbound_tokens_unless_the_route_allows_it(self):
         from app.services.mcp_oauth_service import McpOAuthError

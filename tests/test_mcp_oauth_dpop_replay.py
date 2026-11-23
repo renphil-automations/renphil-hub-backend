@@ -58,7 +58,7 @@ class DPoPReplayTests(_Base):
         second_code = self.issue_code(http)
         replay = self._token(http, second_code, proof)
         self.assertEqual(replay.status_code, 400)
-        self.assertEqual(replay.json()["detail"]["error"], "invalid_dpop_proof")
+        self.assertEqual(replay.json()["error"], "invalid_dpop_proof")
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 1)
         # A fresh proof from the same key still works.
         self.assertEqual(self._token(http, second_code, signer.proof()).status_code, 200)
