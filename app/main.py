@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -72,9 +73,45 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete.")
 
 
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def check_cors_origins(settings) -> None:
+    """Refuse to start with an unsafe credentialed-CORS origin list.
+
+    CORS runs with ``allow_credentials=True``. ``*`` or ``null`` (the origin
+    of sandboxed iframes and ``file:`` pages) is refused everywhere; outside
+    local/debug every origin must also be HTTPS, loopback excepted.
+    """
+    strict = not settings.is_local_or_debug
+    problems = []
+    for origin in settings.ALLOWED_ORIGINS:
+        value = str(origin).strip()
+        if value == "*" or value.lower() == "null":
+            problems.append(f"{value!r} is not allowed with credentialed CORS")
+            continue
+        if not strict:
+            continue
+        try:
+            parts = urlsplit(value)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            problems.append(f"{value!r} is not a valid origin")
+            continue
+        loopback = host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+        if parts.scheme.lower() == "https" and host:
+            continue
+        if parts.scheme.lower() == "http" and loopback:
+            continue
+        problems.append(f"{value!r} must be https outside local/debug")
+    if problems:
+        raise RuntimeError("Refusing to start: unsafe ALLOWED_ORIGINS: " + "; ".join(problems))
+
+
 def create_app() -> FastAPI:
     """Application factory."""
     settings = get_settings()
+    check_cors_origins(settings)
 
     app = FastAPI(
         title=settings.APP_NAME,
