@@ -31,6 +31,7 @@ from app.services.mcp_oauth_service import (
     McpOAuthError,
     McpOAuthInvalidGrant,
     McpOAuthStorageError,
+    CONSENT_WINDOW_SECONDS,
     PersistentMcpOAuthService,
     authenticate_client,
 )
@@ -537,9 +538,15 @@ def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subjec
 # /auth/callback and the consent page and cannot be planted by a sibling
 # domain. A loopback issuer (local development without TLS) uses the plain
 # name without Secure.
+#
+# Each authorization gets its own cookie (name suffixed with a keyed tag of
+# the request ID), so parallel authorizations in one browser do not
+# overwrite each other (security review S10).
 CONSENT_COOKIE = "renphil_mcp_oauth_consent"
 CONSENT_COOKIE_HOST = "__Host-renphil_mcp_oauth_consent"
-CONSENT_COOKIE_MAX_AGE_SECONDS = 600
+# The cookie, the authorization request and the parked sign-in all live for
+# the same consent window.
+CONSENT_COOKIE_MAX_AGE_SECONDS = CONSENT_WINDOW_SECONDS
 _CONSENT_KEY_LABEL = b"renphil-hub-mcp-oauth-consent-v1"
 _SCOPE_DESCRIPTION = "Read RenPhil Hub information you are already allowed to see (renphil.mcp.read)."
 _CONSENT_STYLE = (
@@ -574,29 +581,32 @@ def _same(left: object, right: str) -> bool:
     return isinstance(left, str) and hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
-def _consent_cookie_name(issuer: str) -> str:
-    return CONSENT_COOKIE if rate_limit.is_local_issuer(issuer) else CONSENT_COOKIE_HOST
+def consent_cookie_name(issuer: str, request_id: str) -> str:
+    """Per-authorization cookie name. Raises ``McpOAuthError`` without key material."""
+    base = CONSENT_COOKIE if rate_limit.is_local_issuer(issuer) else CONSENT_COOKIE_HOST
+    return f"{base}_{_consent_mac(_consent_key(), 'cookie-name', request_id)[:16]}"
 
 
 def _browser_bound(cookies, request_id: str, issuer: str) -> bool:
     try:
         binding = _consent_mac(_consent_key(), "binding", request_id)
+        name = consent_cookie_name(issuer, request_id)
     except McpOAuthError:
         return False
-    return _same((cookies or {}).get(_consent_cookie_name(issuer)), binding)
+    return _same((cookies or {}).get(name), binding)
 
 
 def _set_consent_cookie(response, *, issuer: str, request_id: str) -> None:
     response.set_cookie(
-        _consent_cookie_name(issuer), _consent_mac(_consent_key(), "binding", request_id),
+        consent_cookie_name(issuer, request_id), _consent_mac(_consent_key(), "binding", request_id),
         max_age=CONSENT_COOKIE_MAX_AGE_SECONDS, path="/",
         secure=not rate_limit.is_local_issuer(issuer), httponly=True, samesite="lax",
     )
 
 
-def _clear_consent_cookie(response, *, issuer: str) -> None:
+def _clear_consent_cookie(response, *, issuer: str, request_id: str) -> None:
     response.delete_cookie(
-        _consent_cookie_name(issuer), path="/",
+        consent_cookie_name(issuer, request_id), path="/",
         secure=not rate_limit.is_local_issuer(issuer), httponly=True, samesite="lax",
     )
 
@@ -643,7 +653,7 @@ def _verified_consent(request: Request, request_id: str, issuer: str):
     except McpOAuthError:
         return None
     binding = _consent_mac(key, "binding", request_id)
-    if not _same(request.cookies.get(_consent_cookie_name(issuer)), binding):
+    if not _same(request.cookies.get(consent_cookie_name(issuer, request_id)), binding):
         return None
     return key, binding, _consent_mac(key, "pending-code", request_id)
 
@@ -779,7 +789,7 @@ def consent_decision(
     except McpOAuthError:
         return _consent_problem()
     response = RedirectResponse(url=target, status_code=status.HTTP_303_SEE_OTHER, headers={"Cache-Control": "no-store"})
-    _clear_consent_cookie(response, issuer=service.issuer)
+    _clear_consent_cookie(response, issuer=service.issuer, request_id=request_id)
     return response
 
 

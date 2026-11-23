@@ -13,6 +13,7 @@ from __future__ import annotations
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -79,6 +80,14 @@ async def callback(
     token_response, frontend_redirect_uri = await auth_service.handle_callback(
         code, state, db
     )
+    # Everything below uses the synchronous DB session: run it in the
+    # threadpool so a slow database never blocks the event loop.
+    cookies = dict(request.cookies) if request is not None else None
+    return await run_in_threadpool(_complete_callback, db, token_response, frontend_redirect_uri, cookies)
+
+
+def _complete_callback(db: Session, token_response, frontend_redirect_uri: str, cookies):
+    """Synchronous part of ``/auth/callback`` (runs in the threadpool)."""
 
     # findings_dev_login_live_testing_2026-09-12.md #1: the frontend never
     # actually calls GET /me after this redirect (AuthCallbackPage.tsx builds
@@ -126,7 +135,7 @@ async def callback(
                 continuation_uri=frontend_redirect_uri,
                 email=hub_user.email,
                 subject=str(hub_user.id),
-                cookies=request.cookies if request is not None else None,
+                cookies=cookies,
             )
         except McpOAuthError as exc:
             detail = str(exc).strip().lower()

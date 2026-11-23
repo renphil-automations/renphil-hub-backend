@@ -54,7 +54,7 @@ class ConsentTests(_Base):
     def test_authorize_sets_a_short_lived_httponly_secure_lax_cookie(self):
         started, _request_id, _ = self.start(self.browser())
         cookie = started.headers["set-cookie"]
-        self.assertIn(f"{mcp_oauth_router.CONSENT_COOKIE_HOST}=", cookie)
+        self.assertIn(f"{mcp_oauth_router.CONSENT_COOKIE_HOST}_", cookie)
         for attribute in ("HttpOnly", "Secure", "SameSite=lax", "Max-Age=600", "Path=/"):
             self.assertIn(attribute.lower(), cookie.lower(), attribute)
 
@@ -123,7 +123,8 @@ class ConsentTests(_Base):
         http = self.browser()
         _, request_id, _ = self.start(http)
         csrf = self.csrf(self.page(http, request_id).text)
-        binding = http.cookies.get(mcp_oauth_router.CONSENT_COOKIE_HOST)
+        cookie_name = mcp_oauth_router.consent_cookie_name(ISSUER, request_id)
+        binding = http.cookies.get(cookie_name)
         self.assertRegex(binding, r"^[0-9a-f]{64}$")
         approved = self.decide(http, request_id, csrf, "approve")
         self.assertEqual(approved.status_code, 303, approved.text)
@@ -139,8 +140,8 @@ class ConsentTests(_Base):
         self.assertEqual(exchanged.status_code, 200, exchanged.text)
         # The request is gone: replaying the approval (even with the old
         # cookie restored) cannot mint another code.
-        self.assertIsNone(http.cookies.get(mcp_oauth_router.CONSENT_COOKIE_HOST))
-        http.cookies.set(mcp_oauth_router.CONSENT_COOKIE_HOST, binding, domain="hub.example", path="/")
+        self.assertIsNone(http.cookies.get(cookie_name))
+        http.cookies.set(cookie_name, binding, domain="hub.example", path="/")
         self.assertEqual(self.decide(http, request_id, csrf, "approve").status_code, 400)
         self.assertEqual(self.db.query(McpOAuthAuthorizationCodeV2).count(), 0)
 

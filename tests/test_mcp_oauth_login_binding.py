@@ -72,7 +72,7 @@ class LoginBindingTests(_Base):
     def test_binding_cookie_is_a_host_prefixed_secure_root_cookie(self):
         started, _ = self.start(self.browser())
         cookie = started.headers["set-cookie"]
-        self.assertTrue(cookie.startswith(HOST_COOKIE + "="), cookie)
+        self.assertTrue(cookie.startswith(HOST_COOKIE + "_"), cookie)
         for attribute in ("httponly", "secure", "samesite=lax", "path=/;", "max-age=600"):
             self.assertIn(attribute, cookie.lower() + ";", attribute)
         self.assertNotIn("domain=", cookie.lower())
@@ -85,7 +85,7 @@ class LoginBindingTests(_Base):
         self.settings = mcp_settings(MCP_OAUTH_CONSENT_REQUIRED=True, MCP_OAUTH_ISSUER="https://localhost:8443/mcp/oauth")
         started = self.browser().get("/mcp/oauth/authorize", params=self.authorize_params())
         cookie = started.headers["set-cookie"]
-        self.assertTrue(cookie.startswith("renphil_mcp_oauth_consent="), cookie)
+        self.assertTrue(cookie.startswith("renphil_mcp_oauth_consent_"), cookie)
         self.assertNotIn("secure", cookie.lower())
 
     def test_sign_in_in_another_browser_is_refused_at_login(self):

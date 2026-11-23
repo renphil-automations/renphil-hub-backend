@@ -65,6 +65,10 @@ class McpOAuthDPoPBindingError(McpOAuthError):
 
 
 SCOPE = "renphil.mcp.read"
+# How long a browser authorization (request -> Hub sign-in -> consent) may
+# take; matches the consent cookie. Issued codes still expire after the
+# (shorter) code TTL, which exchange_code enforces explicitly.
+CONSENT_WINDOW_SECONDS = 600
 # Refresh-token lifetimes (seconds). Idle: how long one unused refresh token
 # stays valid; family: absolute lifetime of a login's whole rotation chain.
 REFRESH_IDLE_DEFAULT_SECONDS = 7 * 24 * 3600
@@ -514,7 +518,9 @@ class PersistentMcpOAuthService:
         )
 
     def _cutoff(self) -> datetime:
-        return datetime.now(timezone.utc) - timedelta(seconds=self.code_ttl_seconds)
+        # Rows are kept for the whole consent window so a user on the consent
+        # page is not cut off; code age is checked separately at exchange.
+        return datetime.now(timezone.utc) - timedelta(seconds=max(self.code_ttl_seconds, CONSENT_WINDOW_SECONDS))
 
     def _purge(self, db: Session) -> None:
         cutoff = self._cutoff()
@@ -701,6 +707,9 @@ class PersistentMcpOAuthService:
             ).with_for_update().one_or_none()
             calculated = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
             if record is None or record.client_id != client_id or record.redirect_uri != redirect_uri or not hmac.compare_digest(calculated, record.code_challenge):
+                db.rollback()
+                raise McpOAuthError("OAuth authorization code is invalid or already used.")
+            if _aware(record.created_at) < now - timedelta(seconds=self.code_ttl_seconds):
                 db.rollback()
                 raise McpOAuthError("OAuth authorization code is invalid or already used.")
             # The code is single-use because its hash disappears atomically
