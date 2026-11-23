@@ -241,6 +241,23 @@ def _external_kind(client_kind: str | None) -> str:
     return client_kind
 
 
+def revoke_refresh_families_for_clients(db: Session, client_ids) -> int:
+    """Revoke every refresh-token family issued to ``client_ids``.
+
+    Used when Bot Management switches a provider (or External AI) off. The
+    live admission check already refuses those refreshes; this makes the
+    revocation permanent. Returns the number of rows newly revoked.
+    """
+    ids = sorted({client_id for client_id in client_ids if isinstance(client_id, str) and client_id})
+    if not ids:
+        return 0
+    count = db.query(McpOAuthRefreshTokenV2).filter(
+        McpOAuthRefreshTokenV2.client_id.in_(ids), McpOAuthRefreshTokenV2.revoked_at.is_(None),
+    ).update({McpOAuthRefreshTokenV2.revoked_at: datetime.now(timezone.utc)}, synchronize_session=False)
+    db.commit()
+    return int(count or 0)
+
+
 class LocalMcpOAuthService:
     """Thread-safe local store. It is deliberately rejected for shared use."""
 
@@ -394,6 +411,15 @@ class LocalMcpOAuthService:
         for item in self._refresh.values():
             if item.family_id == family_id and item.revoked_at is None:
                 item.revoked_at = now
+
+    def revoke_refresh_token(self, refresh_token: str, *, client_id: str) -> None:
+        """RFC 7009: revoke the family of a refresh token issued to ``client_id``."""
+        if not self.refresh_tokens_enabled or not isinstance(refresh_token, str) or len(refresh_token) > _MAX_REFRESH_TOKEN_CHARS:
+            return
+        with self._lock:
+            record = self._refresh.get(_sha256(refresh_token))
+            if record is not None and record.client_id == client_id:
+                self._revoke_family(record.family_id, time.time())
 
     def revoke_refresh_family(self, refresh_token: str) -> None:
         """Revoke the family of a presented refresh token (e.g. provider off)."""
@@ -738,6 +764,24 @@ class PersistentMcpOAuthService:
         db.query(McpOAuthRefreshTokenV2).filter(
             McpOAuthRefreshTokenV2.family_id == family_id, McpOAuthRefreshTokenV2.revoked_at.is_(None),
         ).update({McpOAuthRefreshTokenV2.revoked_at: now}, synchronize_session=False)
+
+    def revoke_refresh_token(self, db: Session, refresh_token: str, *, client_id: str) -> None:
+        """RFC 7009 revocation: revoke the whole family of a refresh token,
+        but only when it was issued to the authenticated ``client_id``.
+        Unknown or foreign tokens change nothing (the endpoint still answers
+        200, so it is not an oracle)."""
+        if not self.refresh_tokens_enabled or not isinstance(refresh_token, str) or not refresh_token or len(refresh_token) > _MAX_REFRESH_TOKEN_CHARS:
+            return
+        try:
+            row = db.query(McpOAuthRefreshTokenV2).filter(
+                McpOAuthRefreshTokenV2.token_hash == _sha256(refresh_token)
+            ).with_for_update().one_or_none()
+            if row is not None and row.client_id == client_id:
+                self._revoke_family(db, row.family_id, datetime.now(timezone.utc))
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
 
     def revoke_refresh_family(self, db: Session, refresh_token: str) -> None:
         """Revoke the family of a presented refresh token. Best effort."""

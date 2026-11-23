@@ -758,7 +758,41 @@ def _save_version(
     )
     db.commit()
     db.refresh(version)
+    _revoke_mcp_refresh_families(db, version.settings)
     return version
+
+
+def _revoke_mcp_refresh_families(db: Session, active_settings: dict) -> None:
+    """Revoke the refresh-token families of every external MCP provider that
+    is not effectively enabled after this save (External AI off = all).
+
+    Runs after the settings commit and never blocks it: switching a provider
+    off must always succeed, and the MCP OAuth token endpoint already refuses
+    (and revokes) such refreshes on the live provider check. Skipped while
+    refresh tokens are disabled, so the table is never touched then.
+    """
+    app_settings = get_app_settings()
+    if getattr(app_settings, "MCP_OAUTH_REFRESH_TOKENS_ENABLED", False) is not True:
+        return
+    from app.services.mcp_access_policy import EXTERNAL_PROVIDERS, load_approved_clients, normalized_mcp_settings
+    from app.services.mcp_oauth_service import revoke_refresh_families_for_clients
+
+    values = normalized_mcp_settings(active_settings)
+    approved = load_approved_clients(app_settings)
+    client_ids = [
+        approved.client_by_provider[provider]
+        for provider in EXTERNAL_PROVIDERS
+        if provider in approved.client_by_provider
+        and not (values["mcp_external_connections_enabled"] and values[f"mcp_{provider}_enabled"])
+    ]
+    try:
+        revoked = revoke_refresh_families_for_clients(db, client_ids)
+    except Exception:
+        db.rollback()
+        logger.warning("MCP refresh-token revocation after a Bot Management change failed; refreshes stay refused by the live provider check.")
+        return
+    if revoked:
+        logger.info("MCP refresh tokens revoked after a Bot Management change: rows=%d", revoked)
 
 
 @router.get("/models")

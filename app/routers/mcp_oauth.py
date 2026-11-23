@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Annotated
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 RATE_LIMITED_ENDPOINTS: dict[str, str] = {
     "/mcp/oauth/authorize": "authorize",
     "/mcp/oauth/consent": "consent",
+    "/mcp/oauth/revoke": "revoke",
     "/mcp/oauth/token": "token",
     "/mcp/oauth/register": "register",
     "/register": "register",
@@ -200,7 +201,7 @@ class McpOAuthRateLimitedRoute(APIRoute):
                         decision = await rate_limit.evaluate(
                             store, rate_limit.build_checks(settings, endpoint, network=network, client=client, phase="client"), endpoint,
                         )
-                elif endpoint == "consent":
+                elif endpoint in {"consent", "revoke"}:
                     # Part of the same browser sign-in: counted against the
                     # authorize per-network budget only, so floods of unknown
                     # clients can never exhaust a shared consent bucket.
@@ -678,7 +679,8 @@ def consent_page(request: Request, request_id: str = Query(default=""), db: Sess
         f"<h1>Allow {label} to access RenPhil Hub?</h1>"
         f"<p>{label} is asking to connect to RenPhil Hub as <strong>{html.escape(email)}</strong>.</p>"
         f"<p>It will be able to: {html.escape(_SCOPE_DESCRIPTION)}</p>"
-        "<p>You can turn this off at any time by disconnecting it in the application.</p>"
+        f"<p>RenPhil Hub administrators can turn this access off at any time. "
+        f"Disconnecting the connector in {label} revokes it.</p>"
         '<div class="actions">'
         f'<form method="post" action="{action}">{hidden}<input type="hidden" name="decision" value="approve">'
         f'<button type="submit" class="approve">Allow</button></form>'
@@ -875,6 +877,37 @@ def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str
         raise _invalid_token_request() from exc
 
 
+@router.post("/revoke", include_in_schema=False)
+def revoke(
+    token: Annotated[str | None, Form()] = None,
+    token_type_hint: Annotated[str | None, Form()] = None,
+    client_id: Annotated[str | None, Form()] = None,
+    client_secret: Annotated[str | None, Form()] = None,
+    authorization: Annotated[str | None, Header()] = None,
+    db: Session = Depends(get_db_v2),
+):
+    """RFC 7009 token revocation (what a connector calls on disconnect).
+
+    The client authenticates exactly as at /token. A refresh token issued to
+    that client is revoked together with its whole family. The answer is 200
+    for unknown, foreign or access tokens too (access tokens are short-lived
+    JWTs and expire on their own), so the endpoint is not an oracle. It works
+    while the provider is switched off, so users can always disconnect.
+    """
+    del token_type_hint  # a hint only; every token is looked up as a refresh token
+    client_id, client_secret = _token_client_credentials(authorization, client_id, client_secret)
+    service = _oauth_service()
+    if not authenticate_client(service.clients, client_id, client_secret):
+        raise _invalid_client()
+    if not isinstance(token, str) or not token:
+        raise _bad_request("invalid_request", "The token parameter is required.")
+    try:
+        service.revoke_refresh_token(db, token, client_id=client_id)
+    except McpOAuthStorageError as exc:
+        raise _temporarily_unavailable() from exc
+    return Response(status_code=status.HTTP_200_OK, headers=_NO_STORE)
+
+
 _REGISTRATION_DISABLED = {
     "error": "invalid_client_metadata",
     "error_description": "Dynamic client registration is not supported. Only pre-approved clients may connect.",
@@ -998,6 +1031,8 @@ async def authorization_server_metadata():
         "scopes_supported": ["renphil.mcp.read"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": _token_endpoint_auth_methods(service),
+        "revocation_endpoint": f"{service.issuer}/revoke",
+        "revocation_endpoint_auth_methods_supported": _token_endpoint_auth_methods(service),
         # RFC 9449 §5.1: clients that can sign proofs receive DPoP-bound tokens.
         "dpop_signing_alg_values_supported": list(DPOP_SIGNING_ALGORITHMS),
     }

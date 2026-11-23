@@ -159,7 +159,7 @@ class ConsentTests(_Base):
         http = self.browser()
         _, request_id, _ = self.start(http)
         csrf = self.csrf(self.page(http, request_id).text)
-        for token, decision in (("0" * 64, "approve"), ("", "approve"), (csrf, "maybe"), (csrf[:-1] + "0", "deny")):
+        for token, decision in (("0" * 64, "approve"), ("", "approve"), (csrf, "maybe"), (csrf[:-1] + ("1" if csrf.endswith("0") else "0"), "deny")):
             with self.subTest(token=token[:8], decision=decision):
                 refused = self.decide(http, request_id, token, decision)
                 self.assertEqual(refused.status_code, 400)
