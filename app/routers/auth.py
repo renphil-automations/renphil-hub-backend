@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -42,10 +42,22 @@ async def login(
         description="Frontend URL to redirect to after authentication",
     ),
     auth_service: AuthService = Depends(get_auth_service),
+    request: Request = None,  # type: ignore[assignment]  # always injected by FastAPI
 ):
     """Redirect the caller to the Google consent screen."""
     if not auth_service.is_allowed_login_redirect_uri(redirect_uri):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid login redirect URI.")
+    settings = get_settings()
+    if getattr(settings, "MCP_OAUTH_ENABLED", False) and is_mcp_continuation_uri(redirect_uri, getattr(settings, "MCP_OAUTH_ISSUER", None)):
+        # An MCP authorization may only be signed into from the browser that
+        # started it (consent binding cookie), never from a lured victim's.
+        from app.routers.mcp_oauth import continuation_browser_bound
+
+        if not continuation_browser_bound(request.cookies if request is not None else {}, redirect_uri):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OAuth authorization request expired or is invalid.",
+            )
     url = auth_service.get_authorization_url(redirect_uri)
     return RedirectResponse(url)
 
@@ -56,6 +68,7 @@ async def callback(
     state: str = Query(..., description="OAuth state parameter (PKCE tie-back)"),
     auth_service: AuthService = Depends(get_auth_service),
     db: Session = Depends(get_db_v2),
+    request: Request = None,  # type: ignore[assignment]  # always injected by FastAPI
 ):
     """
     Google redirects here after the user consents.
@@ -113,6 +126,7 @@ async def callback(
                 continuation_uri=frontend_redirect_uri,
                 email=hub_user.email,
                 subject=str(hub_user.id),
+                cookies=request.cookies if request is not None else None,
             )
         except McpOAuthError as exc:
             detail = str(exc).strip().lower()

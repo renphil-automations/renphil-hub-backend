@@ -409,11 +409,37 @@ def _redirect_with_code(*, redirect_uri: str, code: str, state: str) -> str:
     return _redirect_with_params(redirect_uri, (("code", code), ("state", state)))
 
 
-def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subject: str) -> str | None:
+def _continuation_request_id(issuer: str, continuation_uri: str) -> str | None:
+    prefix = f"{issuer}/continue/" if issuer else ""
+    if not prefix or not isinstance(continuation_uri, str) or not continuation_uri.startswith(prefix):
+        return None
+    request_id = continuation_uri.removeprefix(prefix)
+    if not request_id or "/" in request_id or "?" in request_id or "#" in request_id:
+        return None
+    return request_id
+
+
+def continuation_browser_bound(cookies, continuation_uri: str) -> bool:
+    """True when this browser started the authorization behind ``continuation_uri``.
+
+    Used by /auth/login before sending the browser to Google, so a victim
+    lured onto an attacker's continuation is refused before signing in.
+    Always true when consent (and with it browser binding) is disabled.
+    """
+    if not _consent_required():
+        return True
+    issuer = (get_settings().MCP_OAUTH_ISSUER or "").rstrip("/")
+    request_id = _continuation_request_id(issuer, continuation_uri)
+    return request_id is not None and _browser_bound(cookies, request_id, issuer)
+
+
+def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subject: str, cookies=None) -> str | None:
     """Convert a validated Hub sign-in into an external OAuth code.
 
     Returning ``None`` preserves the normal Hub login flow. No Hub session JWT
     is placed in an internal callback URL or sent to the external MCP client.
+    ``cookies`` are the callback request's cookies: with consent required,
+    the sign-in must happen in the browser that started /authorize.
     """
     # Check the continuation shape before loading the MCP configuration.  An
     # enabled but incomplete MCP configuration must never break normal Hub
@@ -427,6 +453,10 @@ def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subjec
     if not request_id or "/" in request_id or "?" in request_id or "#" in request_id:
         raise McpOAuthError("OAuth continuation is invalid.")
     if _consent_required():
+        # The sign-in must come from the browser that started /authorize
+        # (security review S1); otherwise nothing is parked.
+        if not _browser_bound(cookies, request_id, service.issuer):
+            raise McpOAuthError("OAuth authorization request is invalid or expired.")
         # Park the verified identity until the user approves on Hub's own
         # consent page (bound to the browser that started /authorize).
         service.record_login_for_consent(
@@ -448,7 +478,12 @@ def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subjec
 # CSRF token derived from that cookie can approve or deny. The internal Agent
 # token path never uses any of this.
 
+# A host-only, Secure, Path=/ cookie (``__Host-``) so it reaches /auth/login,
+# /auth/callback and the consent page and cannot be planted by a sibling
+# domain. A loopback issuer (local development without TLS) uses the plain
+# name without Secure.
 CONSENT_COOKIE = "renphil_mcp_oauth_consent"
+CONSENT_COOKIE_HOST = "__Host-renphil_mcp_oauth_consent"
 CONSENT_COOKIE_MAX_AGE_SECONDS = 600
 _CONSENT_KEY_LABEL = b"renphil-hub-mcp-oauth-consent-v1"
 _SCOPE_DESCRIPTION = "Read RenPhil Hub information you are already allowed to see (renphil.mcp.read)."
@@ -484,21 +519,29 @@ def _same(left: object, right: str) -> bool:
     return isinstance(left, str) and hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
-def _consent_cookie_path(issuer: str) -> str:
-    return urlsplit(issuer).path or "/"
+def _consent_cookie_name(issuer: str) -> str:
+    return CONSENT_COOKIE if rate_limit.is_local_issuer(issuer) else CONSENT_COOKIE_HOST
+
+
+def _browser_bound(cookies, request_id: str, issuer: str) -> bool:
+    try:
+        binding = _consent_mac(_consent_key(), "binding", request_id)
+    except McpOAuthError:
+        return False
+    return _same((cookies or {}).get(_consent_cookie_name(issuer)), binding)
 
 
 def _set_consent_cookie(response, *, issuer: str, request_id: str) -> None:
     response.set_cookie(
-        CONSENT_COOKIE, _consent_mac(_consent_key(), "binding", request_id),
-        max_age=CONSENT_COOKIE_MAX_AGE_SECONDS, path=_consent_cookie_path(issuer),
+        _consent_cookie_name(issuer), _consent_mac(_consent_key(), "binding", request_id),
+        max_age=CONSENT_COOKIE_MAX_AGE_SECONDS, path="/",
         secure=not rate_limit.is_local_issuer(issuer), httponly=True, samesite="lax",
     )
 
 
 def _clear_consent_cookie(response, *, issuer: str) -> None:
     response.delete_cookie(
-        CONSENT_COOKIE, path=_consent_cookie_path(issuer),
+        _consent_cookie_name(issuer), path="/",
         secure=not rate_limit.is_local_issuer(issuer), httponly=True, samesite="lax",
     )
 
@@ -536,7 +579,7 @@ def _consent_problem(status_code: int = status.HTTP_400_BAD_REQUEST) -> HTMLResp
     )
 
 
-def _verified_consent(request: Request, request_id: str):
+def _verified_consent(request: Request, request_id: str, issuer: str):
     """``(key, binding, pending_hash)`` when this browser started ``request_id``."""
     if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
         return None
@@ -545,7 +588,7 @@ def _verified_consent(request: Request, request_id: str):
     except McpOAuthError:
         return None
     binding = _consent_mac(key, "binding", request_id)
-    if not _same(request.cookies.get(CONSENT_COOKIE), binding):
+    if not _same(request.cookies.get(_consent_cookie_name(issuer)), binding):
         return None
     return key, binding, _consent_mac(key, "pending-code", request_id)
 
@@ -611,7 +654,7 @@ def consent_page(request: Request, request_id: str = Query(default=""), db: Sess
     if not _consent_required():
         raise _disabled()
     service = _service()
-    verified = _verified_consent(request, request_id)
+    verified = _verified_consent(request, request_id, service.issuer)
     if verified is None:
         return _consent_problem()
     _key, binding, pending_hash = verified
@@ -658,7 +701,7 @@ def consent_decision(
     if not _consent_required():
         raise _disabled()
     service = _service()
-    verified = _verified_consent(request, request_id)
+    verified = _verified_consent(request, request_id, service.issuer)
     if verified is None or decision not in {"approve", "deny"}:
         return _consent_problem()
     key, binding, pending_hash = verified
