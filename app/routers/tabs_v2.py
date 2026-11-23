@@ -426,7 +426,7 @@ def get_workspace(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Tab not found")
 
-    return {"data": workspace, "view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+    return {"data": workspace, "view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
 
 
 @router.get(
@@ -447,7 +447,7 @@ def get_children(
     if children is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
-    return {"data": children, "view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+    return {"data": children, "view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
 
 
 @router.get(
@@ -471,7 +471,7 @@ def get_variants(
     if variants is None:
         raise HTTPException(status_code=404, detail="Parent tab not found")
 
-    return {"data": variants, "view_as": view_as_access.view_as, "view_as_user": view_as_access.view_as_user}
+    return {"data": variants, "view_as": view_as_access.view_as, "view_as_from": view_as_access.view_as_from}
 
 
 @router.post(

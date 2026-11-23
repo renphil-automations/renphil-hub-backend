@@ -359,9 +359,10 @@ class ThreadListResponse(BaseModel):
     next_cursor: str | None = None
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
     view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadModerationRow(ThreadSummary):
@@ -447,9 +448,9 @@ class ThreadRevisionModerationSummary(BaseModel):
     pending_count: int
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadDetailViewAsResponse(ThreadDetail):
@@ -458,9 +459,9 @@ class ThreadDetailViewAsResponse(ThreadDetail):
 
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadModerationListResponse(BaseModel):
@@ -478,9 +479,9 @@ class ThreadModerationSummary(BaseModel):
     pending_count: int
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class ThreadWidgetCounts(BaseModel):
@@ -517,9 +518,9 @@ class CommentListResponse(BaseModel):
     next_cursor: str | None = None
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class VoteResponse(BaseModel):

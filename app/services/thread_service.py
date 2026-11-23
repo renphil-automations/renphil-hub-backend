@@ -1626,8 +1626,7 @@ def list_threads_for_link(
     anonymous: bool = False,
 ) -> ThreadListResponse:
     """`user` is whose own pending/rejected threads, votes and authored
-    revisions show up — the caller, with or without View As pairs or a
-    selected user, or nobody (`None`) for `anonymous`, which therefore lists
+    revisions show up — the caller, with or without View As pairs, or nobody (`None`) for `anonymous`, which therefore lists
     approved threads only with `my_vote` 0 (vote counts stay exact)."""
     component = _get_thread_widget_component(db, link)
     if component is None:
@@ -1774,7 +1773,7 @@ def get_thread_by_id(
     access to the widget at all keeps getting 403, never 404.
 
     `user` is whose authorship, vote and authored revisions count — the
-    caller, with or without View As pairs or a selected user, and nobody
+    caller, with or without View As pairs, and nobody
     (`None`) for `anonymous`."""
     thread, component = _require_thread_and_component(db, thread_id)
     # 403 BEFORE the status check (landmine 2) — a caller with no view
@@ -2597,15 +2596,15 @@ def thread_history_facets(
     )
 
 
-def _view_as_etag_suffix(view_as: bool, view_as_user: str | None) -> str:
-    """`-va` for a View As body, plus a short hash of the selected user's
-    email so two View As bodies that differ only by `view_as_user` never
+def _view_as_etag_suffix(view_as: bool, view_as_from: str | None) -> str:
+    """`-va` for a View As body, plus a short hash of the `view_as_from`
+    email so two View As bodies that differ only by `view_as_from` never
     share a tag (the email itself stays out of the header)."""
     if not view_as:
         return ""
-    if not view_as_user:
+    if not view_as_from:
         return "-va"
-    return "-va-" + hashlib.sha256(view_as_user.encode()).hexdigest()[:12]
+    return "-va-" + hashlib.sha256(view_as_from.encode()).hexdigest()[:12]
 
 
 def moderation_summary(
@@ -2613,7 +2612,7 @@ def moderation_summary(
     *,
     access: ViewerAccess | None = None,
     view_as: bool = False,
-    view_as_user: str | None = None,
+    view_as_from: str | None = None,
 ) -> tuple[ThreadModerationSummary, str]:
     """`GET /threads/moderation/summary` (plan §5.7) — one cheap query on
     top of the `ViewerAccess` the dependency already built; polled like the
@@ -2629,18 +2628,18 @@ def moderation_summary(
     `view_as=True` means `access` was built from the View As parameters
     (`dependencies.get_view_as_access`): its only direct grants are the
     caller's own, unless `anonymous`. `view_as` and
-    `view_as_user` are echoed in the body and suffix the ETag
+    `view_as_from` are echoed in the body and suffix the ETag
     (`_view_as_etag_suffix`), keeping the tag covering every body field."""
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
-    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_from)
 
     if not component_ids:
         return (
             ThreadModerationSummary(
                 can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
-                view_as=view_as, view_as_user=view_as_user,
+                view_as=view_as, view_as_from=view_as_from,
             ),
             f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
@@ -2661,7 +2660,7 @@ def moderation_summary(
             moderated_component_count=len(component_ids),
             pending_count=count,
             view_as=view_as,
-            view_as_user=view_as_user,
+            view_as_from=view_as_from,
         ),
         etag,
     )
@@ -2918,7 +2917,7 @@ def revision_moderation_summary(
     *,
     access: ViewerAccess | None = None,
     view_as: bool = False,
-    view_as_user: str | None = None,
+    view_as_from: str | None = None,
 ) -> tuple[ThreadRevisionModerationSummary, str]:
     """`GET /threads/revision-moderation/summary` — Revision Management's
     own sidebar badge (amendment A4), the same shape and ETag discipline as
@@ -2930,13 +2929,13 @@ def revision_moderation_summary(
     component_ids = _moderated_component_ids(db, access)
     can_moderate = (access is not None and access.full_access) or bool(component_ids)
     can_moderate_flag = 1 if can_moderate else 0
-    etag_suffix = _view_as_etag_suffix(view_as, view_as_user)
+    etag_suffix = _view_as_etag_suffix(view_as, view_as_from)
 
     if not component_ids:
         return (
             ThreadRevisionModerationSummary(
                 can_moderate=can_moderate, moderated_component_count=0, pending_count=0,
-                view_as=view_as, view_as_user=view_as_user,
+                view_as=view_as, view_as_from=view_as_from,
             ),
             f'"{can_moderate_flag}-0-0-0{etag_suffix}"',
         )
@@ -2961,7 +2960,7 @@ def revision_moderation_summary(
             moderated_component_count=len(component_ids),
             pending_count=count,
             view_as=view_as,
-            view_as_user=view_as_user,
+            view_as_from=view_as_from,
         ),
         etag,
     )
