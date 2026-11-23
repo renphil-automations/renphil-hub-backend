@@ -162,6 +162,68 @@ class BotManagementSwitchOffTests(_Harness):
         self.assertGreaterEqual(len(passes), 2)
         self.assertTrue(all(row.revoked_at is not None for row in self._rows() if row.client_id == CLAUDE_CLIENT))
 
+class FamilyRevocationRaceTests(_Harness):
+    """A refresh holding the family's live row commits a new row after the
+    family UPDATE waited on it (PostgreSQL READ COMMITTED). Simulate that
+    commit landing right after the first pass."""
+
+    def _racing_update(self, row_template):
+        from sqlalchemy.orm import Query
+
+        original_update = Query.update
+        passes = []
+
+        def racing_update(query, values, **kwargs):
+            result = original_update(query, values, **kwargs)
+            if not passes:
+                query.session.add(McpOAuthRefreshTokenV2(
+                    family_id=row_template.family_id, token_hash="c" * 64, client_id=row_template.client_id,
+                    user_email=row_template.user_email, user_subject=row_template.user_subject, jkt=row_template.jkt,
+                    scope=row_template.scope, created_at=row_template.created_at, expires_at=row_template.expires_at,
+                    family_expires_at=row_template.family_expires_at,
+                ))
+                query.session.flush()
+            passes.append(result)
+            return result
+
+        return patch.object(Query, "update", racing_update), passes
+
+    def test_rfc7009_revoke_also_revokes_a_row_committed_by_an_in_flight_refresh(self):
+        token = self._login(self.client())["refresh_token"]
+        racing, passes = self._racing_update(self._rows()[0])
+        with racing:
+            self.service.revoke_refresh_token(self.db, token, client_id=CLAUDE_CLIENT)
+        self.assertGreaterEqual(len(passes), 2)
+        rows = self._rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row.revoked_at is not None for row in rows))
+
+    def test_reuse_detection_also_revokes_a_row_committed_by_an_in_flight_refresh(self):
+        http = self.client()
+        first = self._login(http)["refresh_token"]
+        self.assertEqual(self._refresh(http, first).status_code, 200)
+        racing, passes = self._racing_update(self._rows()[-1])
+        with racing:
+            self.assertEqual(self._refresh(http, first).json()["error"], "invalid_grant")  # replay
+        self.assertGreaterEqual(len(passes), 2)
+        self.assertTrue(all(row.revoked_at is not None for row in self._rows()))
+
+    def test_expired_rows_are_still_purged_and_live_rows_kept(self):
+        http = self.client()
+        token = self._login(http)["refresh_token"]
+        live = self._rows()[0]
+        past = live.created_at - timedelta(days=60)
+        self.db.add(McpOAuthRefreshTokenV2(
+            family_id="old-family", token_hash="d" * 64, client_id=CLAUDE_CLIENT, user_email="x@renphil.org",
+            user_subject="9", jkt=None, scope="renphil.mcp.read", created_at=past,
+            expires_at=past + timedelta(hours=1), family_expires_at=past + timedelta(days=1),
+        ))
+        self.db.commit()
+        self.assertEqual(self._refresh(http, token).status_code, 200)
+        families = {row.family_id for row in self._rows()}
+        self.assertNotIn("old-family", families)
+        self.assertEqual(len(self._rows()), 2)
+
 class ConsentTextTests(_Harness):
     def test_consent_page_describes_revocation_truthfully(self):
         import re

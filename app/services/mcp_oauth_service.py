@@ -35,6 +35,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 import jwt
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db_v2.models.mcp_oauth import McpOAuthAuthorizationCodeV2, McpOAuthAuthorizationRequestV2, McpOAuthRefreshTokenV2
@@ -775,16 +776,27 @@ class PersistentMcpOAuthService:
         """Delete rows that can no longer be used (expired token or family).
 
         A used row is kept until it expires so that its replay is detected.
+        Rows another transaction holds (a concurrent revoke) are skipped, so
+        this housekeeping never deadlocks with it; a later purge removes them.
         """
-        db.query(McpOAuthRefreshTokenV2).filter(
+        doomed = select(McpOAuthRefreshTokenV2.id).where(
             (McpOAuthRefreshTokenV2.expires_at <= now) | (McpOAuthRefreshTokenV2.family_expires_at <= now)
+        ).with_for_update(skip_locked=True)
+        db.query(McpOAuthRefreshTokenV2).filter(
+            McpOAuthRefreshTokenV2.id.in_(doomed.scalar_subquery())
         ).delete(synchronize_session=False)
 
     @staticmethod
     def _revoke_family(db: Session, family_id: str, now: datetime) -> None:
-        db.query(McpOAuthRefreshTokenV2).filter(
-            McpOAuthRefreshTokenV2.family_id == family_id, McpOAuthRefreshTokenV2.revoked_at.is_(None),
-        ).update({McpOAuthRefreshTokenV2.revoked_at: now}, synchronize_session=False)
+        # Same snapshot gap as revoke_refresh_families_for_clients: a refresh
+        # holding the family's live row commits a new row after this UPDATE
+        # waited on it. Repeat (bounded) until nothing is left to revoke.
+        for _ in range(_REVOKE_FAMILIES_MAX_PASSES):
+            count = db.query(McpOAuthRefreshTokenV2).filter(
+                McpOAuthRefreshTokenV2.family_id == family_id, McpOAuthRefreshTokenV2.revoked_at.is_(None),
+            ).update({McpOAuthRefreshTokenV2.revoked_at: now}, synchronize_session=False)
+            if not count:
+                break
 
     def revoke_refresh_token(self, db: Session, refresh_token: str, *, client_id: str) -> None:
         """RFC 7009 revocation: revoke the whole family of a refresh token,
