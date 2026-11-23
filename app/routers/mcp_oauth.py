@@ -854,7 +854,57 @@ async def register_dynamic_client_root_alias() -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=_REGISTRATION_DISABLED, headers=_NO_STORE)
 
 
-@router.post("/agent-token", include_in_schema=False, dependencies=[Depends(require_agent_sync_token)])
+_AGENT_TOKEN_KEY_LABEL = b"renphil-hub-mcp-oauth-agent-token-rate-limit-v1"
+_AGENT_TOKEN_WINDOW_SECONDS = 60
+
+
+async def _limit_agent_token(current: CurrentHubUser = Depends(get_current_hub_user)) -> None:
+    """Per verified Hub user budget for delegated MCP tokens.
+
+    Runs after the Agent sync-token check and Hub session verification, in
+    the same shared store as the public MCP OAuth limiter and with the same
+    posture: no store or a store failure is a 503 with Retry-After (a
+    loopback issuer uses the local-only store). The key is a keyed HMAC of
+    the user id; no identity is stored or logged. Disabled MCP OAuth never
+    touches the store. The response shape stays this endpoint's own
+    ``{"detail": ...}`` contract.
+    """
+    settings = get_settings()
+    if not getattr(settings, "MCP_OAUTH_ENABLED", False):
+        return
+    unavailable = HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP delegated authorization is unavailable.",
+        headers={"Retry-After": str(rate_limit.UNAVAILABLE_RETRY_AFTER_SECONDS), "Cache-Control": "no-store"},
+    )
+    secret = str(getattr(settings, "JWT_SECRET_KEY", "") or "")
+    store = _rate_limit_store(settings)
+    if store is None or not secret:
+        logger.warning("MCP OAuth request denied: endpoint=agent-token category=rate_limit_store_unavailable")
+        raise unavailable
+    key = hmac.new(secret.encode("utf-8"), _AGENT_TOKEN_KEY_LABEL, hashlib.sha256).digest()
+    environment = hmac.new(key, ("issuer:" + str(getattr(settings, "MCP_OAUTH_ISSUER", "") or "")).encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    user = hmac.new(key, f"user:{current.hub_user_id}".encode("utf-8"), hashlib.sha256).hexdigest()[:40]
+    limit = int(getattr(settings, "MCP_OAUTH_AGENT_TOKEN_RATE_LIMIT_PER_MINUTE", 120) or 120)
+    check = rate_limit.Check(
+        key=f"renphil:mcp-oauth:rl:v1:{environment}:agent-token:user:{user}", limit=limit, window=_AGENT_TOKEN_WINDOW_SECONDS,
+    )
+    try:
+        decision = await rate_limit.evaluate(store, [check], "agent-token")
+    except rate_limit.RateLimitStoreUnavailable:
+        logger.warning("MCP OAuth request denied: endpoint=agent-token category=rate_limit_store_unavailable")
+        raise unavailable from None
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many MCP delegation token requests. Retry later.",
+            headers={"Retry-After": str(decision.retry_after_seconds), "Cache-Control": "no-store"},
+        )
+
+
+@router.post(
+    "/agent-token", include_in_schema=False,
+    # Order matters: the sync token is checked before anything is counted.
+    dependencies=[Depends(require_agent_sync_token), Depends(_limit_agent_token)],
+)
 def agent_token(
     current: CurrentHubUser = Depends(get_current_hub_user),
     model_key: str | None = Query(default=None, max_length=128),

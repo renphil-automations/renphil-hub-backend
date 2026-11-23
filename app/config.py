@@ -120,6 +120,9 @@ class Settings(BaseSettings):
     # consent page (provider + scope, CSRF-protected Approve/Deny) must be
     # approved before a code is issued. The Agent token path is unaffected.
     MCP_OAUTH_CONSENT_REQUIRED: bool = True
+    # Per verified Hub user limit on /mcp/oauth/agent-token (delegated MCP
+    # tokens for the Hub Agent), in the shared MCP OAuth limiter store.
+    MCP_OAUTH_AGENT_TOKEN_RATE_LIMIT_PER_MINUTE: int = Field(default=120, ge=1, le=100_000)
     MCP_OAUTH_REFRESH_TOKENS_ENABLED: bool = False
     # Idle lifetime of one refresh token (5 minutes to 30 days, default 7 days)
     # and absolute lifetime of a login's family (1 to 90 days, default 30).
