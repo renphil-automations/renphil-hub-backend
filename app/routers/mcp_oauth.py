@@ -125,6 +125,20 @@ def _with_oauth_errors(handler):
     return render_oauth_errors
 
 
+# RFC 6749 §5.1: every token-endpoint response, success included, is
+# marked non-cacheable. Bodies are unchanged.
+NO_STORE_PATHS = frozenset({"/mcp/oauth/token"})
+
+
+def _with_no_store(handler):
+    async def no_store(request: Request):
+        response = await handler(request)
+        response.headers.update(_NO_STORE)
+        return response
+
+    return no_store
+
+
 def _bad_request(error: str, description: str | None = None) -> OAuthErrorResponse:
     return OAuthErrorResponse(status.HTTP_400_BAD_REQUEST, error, description)
 
@@ -204,6 +218,8 @@ class McpOAuthRateLimitedRoute(APIRoute):
 
     def get_route_handler(self):
         original = _with_oauth_errors(super().get_route_handler())
+        if self.path in NO_STORE_PATHS:
+            original = _with_no_store(original)
         endpoint = RATE_LIMITED_ENDPOINTS.get(self.path)
         if endpoint is None:
             return original
