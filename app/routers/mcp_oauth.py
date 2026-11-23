@@ -17,7 +17,7 @@ from app.config import get_settings
 from app.db_v2.database import get_db_v2
 from app.db_v2.models.bot_management import BotConfigurationStateV2, BotConfigurationVersionV2
 from app.dependencies import CurrentHubUser, get_current_hub_user
-from app.services.mcp_access_policy import AdmissionDecision, admit_client, load_approved_clients
+from app.services.mcp_access_policy import AdmissionDecision, admit_client, bearer_providers, load_approved_clients
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
 from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError
 from app.services.mcp_oauth_service import LocalMcpOAuthService, McpOAuthError, PersistentMcpOAuthService
@@ -313,25 +313,31 @@ def token(
     if not decision.allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
     service = _service()
-    # RFC 9449 §5: every external MCP token is bound to the client's DPoP key.
-    # A missing or invalid proof is rejected without consuming the code, and
-    # there is no bearer-token fallback.
-    if not isinstance(dpop, str) or not dpop.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_dpop_proof", "error_description": "A DPoP proof is required."},
-        )
-    try:
-        dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
-    except McpDPoPError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
-        ) from exc
+    # RFC 9449 §5: external MCP tokens are bound to the client's DPoP key. A
+    # missing or invalid proof is rejected without consuming the code. The
+    # only bearer issuance is for a provider the operator listed in
+    # MCP_OAUTH_BEARER_PROVIDERS that sent no DPoP header at all; a header
+    # that is sent is always validated and binds the token (no downgrade).
+    unbound_allowed = decision.client_kind in bearer_providers(get_settings())
+    if dpop is None and unbound_allowed:
+        dpop_jkt = None
+    else:
+        if not isinstance(dpop, str) or not dpop.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "invalid_dpop_proof", "error_description": "A DPoP proof is required."},
+            )
+        try:
+            dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
+        except McpDPoPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
+            ) from exc
     try:
         return service.exchange_code(
             db, code=code, client_id=client_id, redirect_uri=redirect_uri, code_verifier=code_verifier,
-            dpop_jkt=dpop_jkt, client_kind=decision.client_kind,
+            dpop_jkt=dpop_jkt, client_kind=decision.client_kind, allow_unbound=dpop_jkt is None,
         )
     except McpOAuthError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.") from exc

@@ -4,7 +4,7 @@ Uses pydantic-settings so every value is validated at startup.
 """
 
 from functools import lru_cache
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -77,6 +77,19 @@ class Settings(BaseSettings):
     MCP_OAUTH_AGENT_CLIENT_ID: str = "renphil-agent"
     MCP_OAUTH_SIGNING_PRIVATE_KEY: str | None = None
     MCP_OAUTH_SIGNING_KEY_ID: str | None = None
+    # Comma-separated subset of claude,chatgpt,gemini whose hosted connectors
+    # cannot sign DPoP proofs. For these providers only, /token issues an
+    # unbound Bearer token when no DPoP header is sent; a DPoP header is
+    # still validated and binds the token. Empty (default): DPoP is required
+    # for every external provider. Unknown names fail start-up.
+    MCP_OAUTH_BEARER_PROVIDERS: str = ""
+
+    @field_validator("MCP_OAUTH_BEARER_PROVIDERS")
+    @classmethod
+    def _validate_bearer_providers(cls, value: str) -> str:
+        from app.services.mcp_access_policy import parse_bearer_providers
+
+        return ",".join(sorted(parse_bearer_providers(value)))
 
     # ── Google Drive ───────────────────────────────────────────────────
     GOOGLE_DRIVE_FOLDER_ID: str

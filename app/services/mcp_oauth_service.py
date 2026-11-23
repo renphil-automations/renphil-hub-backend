@@ -10,8 +10,9 @@ Access tokens are identity-only and reusable until ``exp``.  External
 clients (Claude, ChatGPT, Gemini) must send an RFC 9449 DPoP proof with the
 token request; the issued token is sender-constrained through ``cnf.jkt`` and
 returned with ``token_type`` ``DPoP``, and the MCP server then requires a
-fresh proof per request. There is no bearer-only issuance for external
-clients.
+fresh proof per request. The only exception is a provider an operator lists
+in ``MCP_OAUTH_BEARER_PROVIDERS`` (off by default) that sends no proof: it
+receives an unbound ``Bearer`` token. A proof that is sent is always bound.
 
 Every MCP access token carries ``renphil_client_kind`` (``hub_agent``,
 ``claude``, ``chatgpt`` or ``gemini``), assigned here from Hub's exact client
@@ -109,8 +110,15 @@ def _token_response(token: str, *, ttl_seconds: int, dpop_jkt: str | None) -> di
     }
 
 
-def _confirmation(dpop_jkt: str | None) -> dict[str, object]:
-    """External MCP tokens are always DPoP-bound; there is no bearer fallback."""
+def _confirmation(dpop_jkt: str | None, *, allow_unbound: bool = False) -> dict[str, object]:
+    """Bind the token to the DPoP key; unbound only when explicitly allowed.
+
+    ``allow_unbound`` is set by the token route solely for a provider listed
+    in ``MCP_OAUTH_BEARER_PROVIDERS`` that sent no DPoP proof. A supplied
+    thumbprint is always bound (never downgraded).
+    """
+    if allow_unbound and dpop_jkt is None:
+        return {}
     if not isinstance(dpop_jkt, str) or not dpop_jkt.strip() or len(dpop_jkt) > 128:
         raise McpOAuthError("OAuth DPoP key binding is required.")
     return {"cnf": {"jkt": dpop_jkt.strip()}}
@@ -201,7 +209,7 @@ class LocalMcpOAuthService:
             )
         return code, request.redirect_uri, request.state
 
-    def exchange_code(self, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None) -> dict[str, object]:
+    def exchange_code(self, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None, allow_unbound: bool = False) -> dict[str, object]:
         if not code or not client_id or not redirect_uri or not code_verifier:
             raise McpOAuthError("OAuth token request is invalid.")
         # Checked before any code lookup, so a malformed verifier never
@@ -209,7 +217,7 @@ class LocalMcpOAuthService:
         if not _is_code_verifier(code_verifier):
             raise McpOAuthError("OAuth token request is invalid.")
         # Validate the key binding and provider before the code is consumed.
-        confirmation = _confirmation(dpop_jkt)
+        confirmation = _confirmation(dpop_jkt, allow_unbound=allow_unbound)
         kind = _external_kind(client_kind)
         with self._lock:
             self._purge()
@@ -325,7 +333,7 @@ class PersistentMcpOAuthService:
             raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
         return code, redirect_uri, client_state
 
-    def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None) -> dict[str, object]:
+    def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None, allow_unbound: bool = False) -> dict[str, object]:
         if not code or not client_id or not redirect_uri or not code_verifier:
             raise McpOAuthError("OAuth token request is invalid.")
         # Checked before any code lookup, so a malformed verifier never
@@ -333,7 +341,7 @@ class PersistentMcpOAuthService:
         if not _is_code_verifier(code_verifier):
             raise McpOAuthError("OAuth token request is invalid.")
         # Validate the key binding and provider before the code is consumed.
-        confirmation = _confirmation(dpop_jkt)
+        confirmation = _confirmation(dpop_jkt, allow_unbound=allow_unbound)
         kind = _external_kind(client_kind)
         now = datetime.now(timezone.utc)
         try:

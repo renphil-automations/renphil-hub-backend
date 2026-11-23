@@ -147,6 +147,38 @@ def load_approved_clients(settings: Any) -> ApprovedClients:
     return ApprovedClients(agent_client_id or None, provider_by_client, client_by_provider, oauth_enabled)
 
 
+def parse_bearer_providers(raw: object) -> frozenset[str]:
+    """Strictly parse ``MCP_OAUTH_BEARER_PROVIDERS`` (comma-separated).
+
+    Only ``claude``, ``chatgpt`` and ``gemini`` are accepted; anything else
+    (including the Hub Agent kind) raises ``ValueError`` so a typo fails
+    settings validation instead of silently changing the token policy.
+    """
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, str):
+        raise ValueError("MCP_OAUTH_BEARER_PROVIDERS must be a comma-separated string.")
+    names = [item.strip() for item in raw.split(",") if item.strip()]
+    unknown = sorted({name for name in names if name not in EXTERNAL_PROVIDERS})
+    if unknown:
+        raise ValueError(
+            "MCP_OAUTH_BEARER_PROVIDERS may only contain: " + ", ".join(EXTERNAL_PROVIDERS) + "."
+        )
+    return frozenset(names)
+
+
+def bearer_providers(settings: Any) -> frozenset[str]:
+    """Providers allowed an unbound token when they send no DPoP proof.
+
+    Fails closed: an invalid value (which settings validation already
+    rejects at start-up) yields the empty set, i.e. DPoP required for all.
+    """
+    try:
+        return parse_bearer_providers(getattr(settings, "MCP_OAUTH_BEARER_PROVIDERS", "") or "")
+    except ValueError:
+        return frozenset()
+
+
 def _exact_https_or_loopback(uri: str) -> bool:
     parsed = urlparse(uri)
     if "*" in uri:
@@ -241,8 +273,10 @@ __all__ = [
     "READINESS_LABELS",
     "VERIFICATION_STATES",
     "admit_client",
+    "bearer_providers",
     "is_wellformed_client_id",
     "load_approved_clients",
     "normalized_mcp_settings",
+    "parse_bearer_providers",
     "provider_readiness",
 ]
