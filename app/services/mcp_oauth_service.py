@@ -24,6 +24,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import threading
 import time
@@ -54,6 +55,22 @@ def _b64url(raw: bytes) -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+# RFC 7636 §4.1-4.2: an S256 code_challenge is BASE64URL(SHA256(verifier))
+# without padding (always 43 characters); a code_verifier is 43-128
+# unreserved characters. Explicit ASCII classes and fullmatch(): no Unicode
+# digits and no trailing newline slip through.
+_S256_CODE_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
+_CODE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+
+
+def _is_s256_code_challenge(value: object) -> bool:
+    return isinstance(value, str) and _S256_CODE_CHALLENGE.fullmatch(value) is not None
+
+
+def _is_code_verifier(value: object) -> bool:
+    return isinstance(value, str) and _CODE_VERIFIER.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -163,6 +180,8 @@ class LocalMcpOAuthService:
             raise McpOAuthError("OAuth authorization request is invalid.")
         if code_challenge_method != "S256":
             raise McpOAuthError("OAuth PKCE S256 is required.")
+        if not _is_s256_code_challenge(code_challenge):
+            raise McpOAuthError("OAuth authorization request is invalid.")
         request_id = secrets.token_urlsafe(32)
         with self._lock:
             self._purge()
@@ -184,6 +203,10 @@ class LocalMcpOAuthService:
 
     def exchange_code(self, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None) -> dict[str, object]:
         if not code or not client_id or not redirect_uri or not code_verifier:
+            raise McpOAuthError("OAuth token request is invalid.")
+        # Checked before any code lookup, so a malformed verifier never
+        # consumes the code (same as a wrong one).
+        if not _is_code_verifier(code_verifier):
             raise McpOAuthError("OAuth token request is invalid.")
         # Validate the key binding and provider before the code is consumed.
         confirmation = _confirmation(dpop_jkt)
@@ -254,6 +277,8 @@ class PersistentMcpOAuthService:
             raise McpOAuthError("Unknown OAuth client or redirect URI.")
         if not state or len(state) > 2048 or not code_challenge or len(code_challenge) < 43 or len(code_challenge) > 128 or code_challenge_method != "S256":
             raise McpOAuthError("OAuth authorization request is invalid.")
+        if not _is_s256_code_challenge(code_challenge):
+            raise McpOAuthError("OAuth authorization request is invalid.")
         request_id = secrets.token_urlsafe(32)
         now = datetime.now(timezone.utc)
         try:
@@ -302,6 +327,10 @@ class PersistentMcpOAuthService:
 
     def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None) -> dict[str, object]:
         if not code or not client_id or not redirect_uri or not code_verifier:
+            raise McpOAuthError("OAuth token request is invalid.")
+        # Checked before any code lookup, so a malformed verifier never
+        # consumes the code (same as a wrong one).
+        if not _is_code_verifier(code_verifier):
             raise McpOAuthError("OAuth token request is invalid.")
         # Validate the key binding and provider before the code is consumed.
         confirmation = _confirmation(dpop_jkt)
