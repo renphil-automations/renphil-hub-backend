@@ -76,6 +76,9 @@ def mcp_settings(**overrides) -> SimpleNamespace:
         UPSTASH_REDIS_REST_URL="https://example-upstash.invalid",
         UPSTASH_REDIS_REST_TOKEN=UPSTASH_TOKEN,
         JWT_SECRET_KEY=JWT_SECRET,
+        # These tests drive the code flow directly; the consent step is
+        # covered in test_mcp_oauth_consent.py.
+        MCP_OAUTH_CONSENT_REQUIRED=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)

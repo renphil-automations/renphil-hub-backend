@@ -524,6 +524,114 @@ class PersistentMcpOAuthService:
             raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
         return code, redirect_uri, client_state
 
+    # -- Consent (MCP_OAUTH_CONSENT_REQUIRED) --------------------------------
+    #
+    # After Hub sign-in the verified identity is parked in a *pending* code
+    # row whose ``code_hash`` is a server-keyed HMAC of the request ID
+    # (``pending_hash``, computed by the router). The token endpoint looks
+    # codes up by plain SHA-256 of the presented code, so a pending row can
+    # never be exchanged. Approval re-keys it to the SHA-256 of a fresh
+    # random code; denial deletes it. No schema change is needed.
+
+    def record_login_for_consent(self, db: Session, *, request_id: str, email: str, subject: str, pending_hash: str) -> None:
+        if not request_id or not isinstance(pending_hash, str) or len(pending_hash) != 64:
+            raise McpOAuthError("OAuth authorization request is invalid or expired.")
+        now = datetime.now(timezone.utc)
+        try:
+            self._purge(db)
+            request = db.query(McpOAuthAuthorizationRequestV2).filter(
+                McpOAuthAuthorizationRequestV2.request_hash == _sha256(request_id)
+            ).with_for_update().one_or_none()
+            if request is None:
+                db.rollback()
+                raise McpOAuthError("OAuth authorization request is invalid or expired.")
+            # A second sign-in for the same request replaces the first.
+            db.query(McpOAuthAuthorizationCodeV2).filter(
+                McpOAuthAuthorizationCodeV2.code_hash == pending_hash
+            ).delete(synchronize_session=False)
+            # The consent step gets a full code TTL from sign-in.
+            request.created_at = now
+            db.add(McpOAuthAuthorizationCodeV2(
+                code_hash=pending_hash, client_id=request.client_id, redirect_uri=request.redirect_uri,
+                code_challenge=request.code_challenge, user_email=email.strip().lower(),
+                user_subject=subject, user_roles_json="[]", created_at=now,
+            ))
+            db.commit()
+        except McpOAuthError:
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+
+    def pending_consent(self, db: Session, *, request_id: str, pending_hash: str) -> tuple[str, str] | None:
+        """``(client_id, user_email)`` of a signed-in request awaiting consent."""
+        if not request_id or not pending_hash:
+            return None
+        try:
+            self._purge(db)
+            db.commit()
+            request = db.query(McpOAuthAuthorizationRequestV2).filter(
+                McpOAuthAuthorizationRequestV2.request_hash == _sha256(request_id)
+            ).one_or_none()
+            pending = db.query(McpOAuthAuthorizationCodeV2).filter(
+                McpOAuthAuthorizationCodeV2.code_hash == pending_hash
+            ).one_or_none()
+        except Exception as exc:
+            db.rollback()
+            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+        if request is None or pending is None or pending.client_id != request.client_id:
+            return None
+        return request.client_id, pending.user_email
+
+    def _locked_consent(self, db: Session, request_id: str, pending_hash: str):
+        self._purge(db)
+        request = db.query(McpOAuthAuthorizationRequestV2).filter(
+            McpOAuthAuthorizationRequestV2.request_hash == _sha256(request_id)
+        ).with_for_update().one_or_none()
+        pending = db.query(McpOAuthAuthorizationCodeV2).filter(
+            McpOAuthAuthorizationCodeV2.code_hash == pending_hash
+        ).with_for_update().one_or_none()
+        if request is None or pending is None or pending.client_id != request.client_id:
+            db.rollback()
+            raise McpOAuthError("OAuth authorization request is invalid or expired.")
+        return request, pending
+
+    def approve_consent(self, db: Session, *, request_id: str, pending_hash: str) -> tuple[str, str, str]:
+        """Issue the one-time code for an approved request (single use)."""
+        if not request_id or not pending_hash:
+            raise McpOAuthError("OAuth authorization request is invalid or expired.")
+        try:
+            request, pending = self._locked_consent(db, request_id, pending_hash)
+            code = secrets.token_urlsafe(48)
+            redirect_uri, client_state = request.redirect_uri, request.client_state
+            db.delete(request)
+            pending.code_hash = _sha256(code)
+            pending.created_at = datetime.now(timezone.utc)
+            db.commit()
+        except McpOAuthError:
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+        return code, redirect_uri, client_state
+
+    def deny_consent(self, db: Session, *, request_id: str, pending_hash: str) -> tuple[str, str]:
+        """Discard a denied request; returns ``(redirect_uri, state)``."""
+        if not request_id or not pending_hash:
+            raise McpOAuthError("OAuth authorization request is invalid or expired.")
+        try:
+            request, pending = self._locked_consent(db, request_id, pending_hash)
+            redirect_uri, client_state = request.redirect_uri, request.client_state
+            db.delete(pending)
+            db.delete(request)
+            db.commit()
+        except McpOAuthError:
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise McpOAuthError("OAuth authorization storage is unavailable.") from exc
+        return redirect_uri, client_state
+
     def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None, allow_unbound: bool = False) -> dict[str, object]:
         if not code or not client_id or not redirect_uri or not code_verifier:
             raise McpOAuthError("OAuth token request is invalid.")

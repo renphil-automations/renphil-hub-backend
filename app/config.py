@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # on, the code exchange also returns an opaque refresh token (stored only
     # as a SHA-256 digest in mcp_oauth_refresh_tokens, which must exist
     # first); reuse of a rotated token revokes its whole family.
+    # External clients only: /authorize binds the request to the browser with
+    # a 10-minute HttpOnly cookie, and after Hub sign-in a server-rendered
+    # consent page (provider + scope, CSRF-protected Approve/Deny) must be
+    # approved before a code is issued. The Agent token path is unaffected.
+    MCP_OAUTH_CONSENT_REQUIRED: bool = True
     MCP_OAUTH_REFRESH_TOKENS_ENABLED: bool = False
     # Idle lifetime of one refresh token (5 minutes to 30 days, default 7 days)
     # and absolute lifetime of a login's family (1 to 90 days, default 30).

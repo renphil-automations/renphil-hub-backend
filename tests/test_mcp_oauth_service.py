@@ -41,6 +41,8 @@ def configured_settings(**overrides) -> SimpleNamespace:
             '"renphil-agent":{"redirect_uris":["https://hub.example/agent"]}}'
         ),
         MCP_OAUTH_CLIENT_PROVIDERS_JSON='{"client": "claude", "gpt-client": "chatgpt"}',
+        # Direct code flow; consent is covered in test_mcp_oauth_consent.py.
+        MCP_OAUTH_CONSENT_REQUIRED=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)

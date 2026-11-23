@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
+import html
 import logging
 import re
 from functools import lru_cache
@@ -12,7 +14,7 @@ from typing import Annotated
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
 
@@ -20,7 +22,7 @@ from app.config import get_settings
 from app.db_v2.database import get_db_v2
 from app.db_v2.models.bot_management import BotConfigurationStateV2, BotConfigurationVersionV2
 from app.dependencies import CurrentHubUser, get_current_hub_user
-from app.services.mcp_access_policy import AdmissionDecision, admit_client, bearer_providers, load_approved_clients
+from app.services.mcp_access_policy import PROVIDER_LABELS, AdmissionDecision, admit_client, bearer_providers, load_approved_clients
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
 from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError
 from app.services.mcp_oauth_service import (
@@ -43,6 +45,7 @@ logger = logging.getLogger(__name__)
 # route use the default route class and are never limited here.
 RATE_LIMITED_ENDPOINTS: dict[str, str] = {
     "/mcp/oauth/authorize": "authorize",
+    "/mcp/oauth/consent": "consent",
     "/mcp/oauth/token": "token",
     "/mcp/oauth/register": "register",
     "/register": "register",
@@ -149,6 +152,13 @@ class McpOAuthRateLimitedRoute(APIRoute):
                         decision = await rate_limit.evaluate(
                             store, rate_limit.build_checks(settings, endpoint, network=network, client=client, phase="client"), endpoint,
                         )
+                elif endpoint == "consent":
+                    # Part of the same browser sign-in: counted against the
+                    # authorize per-network budget only, so floods of unknown
+                    # clients can never exhaust a shared consent bucket.
+                    decision = await rate_limit.evaluate(
+                        store, rate_limit.build_checks(settings, "authorize", network=network, client=None, phase="pre"), "authorize",
+                    )
                 else:
                     client = _client_bucket(settings, request.query_params.get("client_id")) if endpoint == "authorize" else None
                     decision = await rate_limit.evaluate(
@@ -324,11 +334,15 @@ def _require_valid_resource(resources: list[str] | None) -> None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVALID_TARGET)
 
 
-def _redirect_with_code(*, redirect_uri: str, code: str, state: str) -> str:
+def _redirect_with_params(redirect_uri: str, params: tuple[tuple[str, str], ...]) -> str:
     parts = urlsplit(redirect_uri)
     query = parse_qsl(parts.query, keep_blank_values=True)
-    query.extend((("code", code), ("state", state)))
+    query.extend(params)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _redirect_with_code(*, redirect_uri: str, code: str, state: str) -> str:
+    return _redirect_with_params(redirect_uri, (("code", code), ("state", state)))
 
 
 def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subject: str) -> str | None:
@@ -348,10 +362,128 @@ def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subjec
     request_id = continuation_uri.removeprefix(prefix)
     if not request_id or "/" in request_id or "?" in request_id or "#" in request_id:
         raise McpOAuthError("OAuth continuation is invalid.")
+    if _consent_required():
+        # Park the verified identity until the user approves on Hub's own
+        # consent page (bound to the browser that started /authorize).
+        service.record_login_for_consent(
+            db, request_id=request_id, email=email, subject=subject,
+            pending_hash=_consent_mac(_consent_key(), "pending-code", request_id),
+        )
+        return f"{service.issuer}/consent?{urlencode({'request_id': request_id})}"
     code, redirect_uri, client_state = service.complete_authorization(
         db, request_id=request_id, email=email, subject=subject,
     )
     return _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state)
+
+
+# ── Consent and browser binding (MCP_OAUTH_CONSENT_REQUIRED) ──────────────
+#
+# /authorize sets a short-lived HttpOnly cookie bound to the authorization
+# request. After Hub sign-in the user sees a server-rendered page naming the
+# provider and scope; only a POST from the same browser (cookie) carrying the
+# CSRF token derived from that cookie can approve or deny. The internal Agent
+# token path never uses any of this.
+
+CONSENT_COOKIE = "renphil_mcp_oauth_consent"
+CONSENT_COOKIE_MAX_AGE_SECONDS = 600
+_CONSENT_KEY_LABEL = b"renphil-hub-mcp-oauth-consent-v1"
+_SCOPE_DESCRIPTION = "Read RenPhil Hub information you are already allowed to see (renphil.mcp.read)."
+_CONSENT_STYLE = (
+    "body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;padding:24px 16px;"
+    "background:#f6f7f9;color:#1d2430}main{max-width:480px;margin:0 auto;background:#fff;"
+    "border:1px solid #d9dde3;border-radius:8px;padding:24px}h1{font-size:1.25rem;margin:0 0 12px}"
+    "p{line-height:1.5}.actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap}"
+    "form{margin:0}button{font:inherit;padding:10px 18px;border-radius:6px;border:1px solid #1d2430;"
+    "cursor:pointer;background:#fff;color:#1d2430}button.approve{background:#1d2430;color:#fff}"
+    "button:focus-visible{outline:3px solid #2f6fdf;outline-offset:2px}"
+)
+_CONSENT_STYLE_HASH = "sha256-" + base64.b64encode(hashlib.sha256(_CONSENT_STYLE.encode("utf-8")).digest()).decode("ascii")
+
+
+def _consent_required() -> bool:
+    """Default ON whenever MCP OAuth is enabled; only an explicit false disables."""
+    return getattr(get_settings(), "MCP_OAUTH_CONSENT_REQUIRED", True) is not False
+
+
+def _consent_key() -> bytes:
+    secret = str(getattr(get_settings(), "JWT_SECRET_KEY", "") or "")
+    if not secret:
+        raise McpOAuthError("OAuth consent is unavailable.")
+    return hmac.new(secret.encode("utf-8"), _CONSENT_KEY_LABEL, hashlib.sha256).digest()
+
+
+def _consent_mac(key: bytes, label: str, value: str) -> str:
+    return hmac.new(key, f"{label}\x00{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _same(left: object, right: str) -> bool:
+    return isinstance(left, str) and hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def _consent_cookie_path(issuer: str) -> str:
+    return urlsplit(issuer).path or "/"
+
+
+def _set_consent_cookie(response, *, issuer: str, request_id: str) -> None:
+    response.set_cookie(
+        CONSENT_COOKIE, _consent_mac(_consent_key(), "binding", request_id),
+        max_age=CONSENT_COOKIE_MAX_AGE_SECONDS, path=_consent_cookie_path(issuer),
+        secure=not rate_limit.is_local_issuer(issuer), httponly=True, samesite="lax",
+    )
+
+
+def _clear_consent_cookie(response, *, issuer: str) -> None:
+    response.delete_cookie(
+        CONSENT_COOKIE, path=_consent_cookie_path(issuer),
+        secure=not rate_limit.is_local_issuer(issuer), httponly=True, samesite="lax",
+    )
+
+
+def _consent_headers() -> dict[str, str]:
+    return {
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": (
+            f"default-src 'none'; style-src '{_CONSENT_STYLE_HASH}'; frame-ancestors 'none'; base-uri 'none'"
+        ),
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _consent_html(title: str, body: str, *, status_code: int = 200) -> HTMLResponse:
+    page = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{html.escape(title)}</title><style>{_CONSENT_STYLE}</style></head>"
+        f"<body><main>{body}</main></body></html>"
+    )
+    return HTMLResponse(page, status_code=status_code, headers=_consent_headers())
+
+
+def _consent_problem(status_code: int = status.HTTP_400_BAD_REQUEST) -> HTMLResponse:
+    # Never redirects: an unverified request must not reach the client.
+    return _consent_html(
+        "Authorization unavailable",
+        "<h1>This authorization request is invalid or has expired</h1>"
+        "<p>Return to the application and start connecting again.</p>",
+        status_code=status_code,
+    )
+
+
+def _verified_consent(request: Request, request_id: str):
+    """``(key, binding, pending_hash)`` when this browser started ``request_id``."""
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        return None
+    try:
+        key = _consent_key()
+    except McpOAuthError:
+        return None
+    binding = _consent_mac(key, "binding", request_id)
+    if not _same(request.cookies.get(CONSENT_COOKIE), binding):
+        return None
+    return key, binding, _consent_mac(key, "pending-code", request_id)
 
 
 # Handlers that use the synchronous SQLAlchemy session are plain ``def`` so
@@ -389,7 +521,93 @@ def authorize(
     # verified login directly into an authorization code. This avoids a second
     # Google callback registration and never exposes a Hub session token.
     continuation = f"{service.issuer}/continue/{request_id}"
-    return RedirectResponse(url=f"/auth/login?{urlencode({'redirect_uri': continuation})}")
+    response = RedirectResponse(url=f"/auth/login?{urlencode({'redirect_uri': continuation})}")
+    if _consent_required():
+        # Bind the request to this browser for the consent step.
+        try:
+            _set_consent_cookie(response, issuer=service.issuer, request_id=request_id)
+        except McpOAuthError as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP OAuth is not configured.") from exc
+    return response
+
+
+@router.get("/consent", include_in_schema=False)
+def consent_page(request: Request, request_id: str = Query(default=""), db: Session = Depends(get_db_v2)):
+    """Server-rendered consent for a signed-in, browser-bound request."""
+    if not _consent_required():
+        raise _disabled()
+    service = _service()
+    verified = _verified_consent(request, request_id)
+    if verified is None:
+        return _consent_problem()
+    _key, binding, pending_hash = verified
+    try:
+        pending = service.pending_consent(db, request_id=request_id, pending_hash=pending_hash)
+    except McpOAuthError:
+        return _consent_problem(status.HTTP_503_SERVICE_UNAVAILABLE)
+    if pending is None:
+        return _consent_problem()
+    client_id, email = pending
+    decision = _external_admission(db, client_id)
+    if not decision.allowed or decision.client_kind not in PROVIDER_LABELS:
+        return _consent_problem(status.HTTP_403_FORBIDDEN)
+    label = html.escape(PROVIDER_LABELS[decision.client_kind])
+    action = html.escape(f"{service.issuer}/consent", quote=True)
+    hidden = (
+        f'<input type="hidden" name="request_id" value="{html.escape(request_id, quote=True)}">'
+        f'<input type="hidden" name="csrf_token" value="{html.escape(_consent_mac(_key, "csrf", binding), quote=True)}">'
+    )
+    body = (
+        f"<h1>Allow {label} to access RenPhil Hub?</h1>"
+        f"<p>{label} is asking to connect to RenPhil Hub as <strong>{html.escape(email)}</strong>.</p>"
+        f"<p>It will be able to: {html.escape(_SCOPE_DESCRIPTION)}</p>"
+        "<p>You can turn this off at any time by disconnecting it in the application.</p>"
+        '<div class="actions">'
+        f'<form method="post" action="{action}">{hidden}<input type="hidden" name="decision" value="approve">'
+        f'<button type="submit" class="approve">Allow</button></form>'
+        f'<form method="post" action="{action}">{hidden}<input type="hidden" name="decision" value="deny">'
+        f'<button type="submit">Deny</button></form>'
+        "</div>"
+    )
+    return _consent_html(f"Allow {PROVIDER_LABELS[decision.client_kind]} access", body)
+
+
+@router.post("/consent", include_in_schema=False)
+def consent_decision(
+    request: Request,
+    request_id: Annotated[str, Form()] = "",
+    csrf_token: Annotated[str, Form()] = "",
+    decision: Annotated[str, Form()] = "",
+    db: Session = Depends(get_db_v2),
+):
+    """Approve or deny. Verifies cookie binding, CSRF token and request ID."""
+    if not _consent_required():
+        raise _disabled()
+    service = _service()
+    verified = _verified_consent(request, request_id)
+    if verified is None or decision not in {"approve", "deny"}:
+        return _consent_problem()
+    key, binding, pending_hash = verified
+    if not _same(csrf_token, _consent_mac(key, "csrf", binding)):
+        return _consent_problem()
+    try:
+        if decision == "deny":
+            redirect_uri, client_state = service.deny_consent(db, request_id=request_id, pending_hash=pending_hash)
+            target = _redirect_with_params(redirect_uri, (("error", "access_denied"), ("state", client_state)))
+        else:
+            pending = service.pending_consent(db, request_id=request_id, pending_hash=pending_hash)
+            if pending is None:
+                return _consent_problem()
+            if not _external_admission(db, pending[0]).allowed:
+                # Switched off since sign-in: nothing is issued.
+                return _consent_problem(status.HTTP_403_FORBIDDEN)
+            code, redirect_uri, client_state = service.approve_consent(db, request_id=request_id, pending_hash=pending_hash)
+            target = _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state)
+    except McpOAuthError:
+        return _consent_problem()
+    response = RedirectResponse(url=target, status_code=status.HTTP_303_SEE_OTHER, headers={"Cache-Control": "no-store"})
+    _clear_consent_cookie(response, issuer=service.issuer)
+    return response
 
 
 async def _reserve_token_dpop_proof(request: Request) -> None:
