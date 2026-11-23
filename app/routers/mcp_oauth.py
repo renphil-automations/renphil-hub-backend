@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import logging
 import re
 from functools import lru_cache
 from typing import Annotated
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -21,7 +23,7 @@ from app.dependencies import CurrentHubUser, get_current_hub_user
 from app.services.mcp_access_policy import AdmissionDecision, admit_client, bearer_providers, load_approved_clients
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
 from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError
-from app.services.mcp_oauth_service import LocalMcpOAuthService, McpOAuthError, PersistentMcpOAuthService
+from app.services.mcp_oauth_service import LocalMcpOAuthService, McpOAuthError, PersistentMcpOAuthService, authenticate_client
 from app.services import mcp_oauth_rate_limit as rate_limit
 from app.services.agent_identity import require_agent_sync_token
 
@@ -232,6 +234,52 @@ def _service() -> PersistentMcpOAuthService:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP OAuth is not configured.") from exc
 
 
+_CLIENT_AUTH_CHALLENGE = 'Basic realm="renphil-mcp-oauth"'
+
+
+def _invalid_client() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"error": "invalid_client", "error_description": "Client authentication failed."},
+        headers={"WWW-Authenticate": _CLIENT_AUTH_CHALLENGE, "Cache-Control": "no-store"},
+    )
+
+
+def _invalid_token_request() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.")
+
+
+def _token_client_credentials(
+    authorization: str | None, form_client_id: str | None, form_client_secret: str | None,
+) -> tuple[str, str | None]:
+    """Resolve ``client_secret_basic`` / ``client_secret_post`` / ``none``.
+
+    RFC 6749 §2.3: a client uses exactly one authentication method. Basic
+    credentials are form-urlencoded before base64 (§2.3.1). Malformed
+    credentials are ``invalid_client``; nothing is logged or echoed.
+    """
+    scheme, _, value = (authorization or "").strip().partition(" ")
+    if scheme.lower() == "basic":
+        if form_client_secret is not None:
+            raise _invalid_client()  # two authentication methods
+        try:
+            decoded = base64.b64decode(value.strip(), validate=True).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            raise _invalid_client() from None
+        raw_id, separator, raw_secret = decoded.partition(":")
+        basic_id, basic_secret = unquote_plus(raw_id), unquote_plus(raw_secret)
+        if not separator or not basic_id or not basic_secret:
+            raise _invalid_client()
+        if form_client_id is not None and not hmac.compare_digest(form_client_id.encode("utf-8"), basic_id.encode("utf-8")):
+            raise _invalid_client()
+        return basic_id, basic_secret
+    if not isinstance(form_client_id, str) or not form_client_id:
+        raise _invalid_token_request()
+    if form_client_secret is not None and not form_client_secret:
+        raise _invalid_client()
+    return form_client_id, form_client_secret
+
+
 _INVALID_TARGET = {
     "error": "invalid_target",
     "error_description": "The requested resource is not served by this authorization server.",
@@ -332,15 +380,18 @@ def authorize(
 def token(
     grant_type: str = Form(...),
     code: str = Form(...),
-    client_id: str = Form(...),
+    client_id: Annotated[str | None, Form()] = None,
     redirect_uri: str = Form(...),
     code_verifier: str = Form(...),
     dpop: str | None = Header(default=None, alias="DPoP"),
     db: Session = Depends(get_db_v2),
     resource: Annotated[list[str] | None, Form()] = None,
+    client_secret: Annotated[str | None, Form()] = None,
+    authorization: Annotated[str | None, Header()] = None,
 ):
     if grant_type != "authorization_code":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported grant type.")
+    client_id, client_secret = _token_client_credentials(authorization, client_id, client_secret)
     if _is_agent_client(client_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth token request.")
     _require_valid_resource(resource)
@@ -348,6 +399,10 @@ def token(
     if not decision.allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="External MCP access is not available for this client.")
     service = _service()
+    # Confidential clients (registry entry with client_secret_hash) must
+    # authenticate; public clients must not send a secret (PKCE only).
+    if not authenticate_client(service.clients, client_id, client_secret):
+        raise _invalid_client()
     # RFC 9449 §5: external MCP tokens are bound to the client's DPoP key. A
     # missing or invalid proof is rejected without consuming the code. The
     # only bearer issuance is for a provider the operator listed in
@@ -449,12 +504,25 @@ async def authorization_server_metadata():
         "grant_types_supported": ["authorization_code"],
         "scopes_supported": ["renphil.mcp.read"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": _token_endpoint_auth_methods(service),
         # RFC 9449 §5.1: clients that can sign proofs receive DPoP-bound tokens.
         "dpop_signing_alg_values_supported": list(DPOP_SIGNING_ALGORITHMS),
     }
     # No registration_endpoint: dynamic client registration is disabled.
     return metadata
+
+
+def _token_endpoint_auth_methods(service) -> list[str]:
+    """Advertise ``none`` for public clients and the two secret methods only
+    when at least one confidential client is registered."""
+    agent = (getattr(get_settings(), "MCP_OAUTH_AGENT_CLIENT_ID", "") or "").strip()
+    external = [client for client_id, client in service.clients.items() if client_id != agent]
+    methods: list[str] = []
+    if not external or any(client.client_secret_hash is None for client in external):
+        methods.append("none")
+    if any(client.client_secret_hash is not None for client in external):
+        methods.extend(("client_secret_basic", "client_secret_post"))
+    return methods
 
 
 @router.get("/jwks.json")

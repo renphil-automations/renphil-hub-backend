@@ -43,6 +43,7 @@ from app.services.mcp_access_policy import (
     HUB_AGENT_CLIENT_KIND,
     is_wellformed_client_id,
 )
+from app.services.mcp_oauth_client_secret import ClientSecretHashError, parse_client_secret_hash, verify_client_secret
 from app.services.mcp_oauth_keys import HubMcpSigningKey
 
 
@@ -78,6 +79,28 @@ def _is_code_verifier(value: object) -> bool:
 class McpOAuthClient:
     client_id: str
     redirect_uris: tuple[str, ...]
+    # PBKDF2 digest of a confidential client's secret (never the secret).
+    # ``None``: a public client that authenticates with PKCE only.
+    client_secret_hash: str | None = None
+
+    @property
+    def is_confidential(self) -> bool:
+        return self.client_secret_hash is not None
+
+
+def authenticate_client(clients: dict[str, McpOAuthClient], client_id: str, client_secret: str | None) -> bool:
+    """RFC 6749 §2.3.1 client authentication at the token endpoint.
+
+    A client registered with a secret hash MUST present the matching secret
+    (constant-time comparison). A public client must not present one; it is
+    authenticated by PKCE alone.
+    """
+    client = clients.get(client_id) if isinstance(client_id, str) else None
+    if client is None:
+        return False
+    if client.client_secret_hash is not None:
+        return verify_client_secret(client_secret, client.client_secret_hash)
+    return client_secret is None
 
 
 @dataclass
@@ -166,7 +189,13 @@ class LocalMcpOAuthService:
             normalized = tuple(uri.strip() for uri in uris)
             if any(not LocalMcpOAuthService._safe_redirect(uri) for uri in normalized):
                 raise McpOAuthError("MCP OAuth redirect URI is invalid.")
-            clients[client_id] = McpOAuthClient(client_id=client_id, redirect_uris=normalized)
+            secret_hash = item.get("client_secret_hash")
+            if secret_hash is not None:
+                try:
+                    parse_client_secret_hash(secret_hash)
+                except ClientSecretHashError as exc:
+                    raise McpOAuthError("MCP OAuth client secret hash is invalid.") from exc
+            clients[client_id] = McpOAuthClient(client_id=client_id, redirect_uris=normalized, client_secret_hash=secret_hash)
         return clients
 
     @staticmethod
