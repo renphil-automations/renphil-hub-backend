@@ -1163,7 +1163,7 @@ def update_bot_feedback_status(
 ):
     """Resolve or reopen one Bot feedback. Same people as reading it (Admin with All Scopes, enforced by the router)."""
     headers = {"Cache-Control": "no-store", "Vary": "Authorization"}
-    if any(request.query_params.get(key) for key in ("view_as", "view_as_user", "view_as_role", "view_as_scope", "anonymous")):
+    if any(request.query_params.get(key) for key in ("view_as", "view_as_from", "view_as_role", "view_as_scope", "anonymous")):
         raise HTTPException(403, "Exit View As to change feedback.", headers=headers)
     response.headers.update(headers)
     environment = get_app_settings().hub_environment
