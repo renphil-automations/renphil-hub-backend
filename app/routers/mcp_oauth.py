@@ -261,8 +261,10 @@ def complete_hub_login(*, db: Session, continuation_uri: str, email: str, subjec
     return _redirect_with_code(redirect_uri=redirect_uri, code=code, state=client_state)
 
 
+# Handlers that use the synchronous SQLAlchemy session are plain ``def`` so
+# FastAPI runs them in its threadpool instead of blocking the event loop.
 @router.get("/authorize")
-async def authorize(
+def authorize(
     response_type: str = Query(...),
     client_id: str = Query(...),
     redirect_uri: str = Query(...),
@@ -294,7 +296,7 @@ async def authorize(
 
 
 @router.post("/token")
-async def token(
+def token(
     grant_type: str = Form(...),
     code: str = Form(...),
     client_id: str = Form(...),
@@ -358,7 +360,7 @@ async def register_dynamic_client_root_alias() -> JSONResponse:
 
 
 @router.post("/agent-token", include_in_schema=False, dependencies=[Depends(require_agent_sync_token)])
-async def agent_token(
+def agent_token(
     current: CurrentHubUser = Depends(get_current_hub_user),
     model_key: str | None = Query(default=None, max_length=128),
     db: Session = Depends(get_db_v2),

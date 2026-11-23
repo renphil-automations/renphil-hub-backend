@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import math
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -141,6 +142,7 @@ class _Base(unittest.TestCase):
             BotConfigurationVersionV2.__table__, BotConfigurationStateV2.__table__,
         ])
         self.Session = sessionmaker(bind=self.engine)
+        self.db_lock = threading.Lock()
         self.db = self.Session()
         self._activate(ENABLED_EXTERNAL)
         private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -186,11 +188,18 @@ class _Base(unittest.TestCase):
         application.include_router(mcp_oauth_router.metadata_router)
 
         def db_override():
+            # DB-bound OAuth handlers run in FastAPI's threadpool. The test
+            # database is one shared in-memory SQLite connection, which has
+            # no row locks and cannot be used by two threads at once, so one
+            # request holds it at a time (PostgreSQL serializes the same
+            # work with SELECT ... FOR UPDATE).
+            self.db_lock.acquire()
             session = self.Session()
             try:
                 yield session
             finally:
                 session.close()
+                self.db_lock.release()
 
         application.dependency_overrides[get_db_v2] = db_override
         return application

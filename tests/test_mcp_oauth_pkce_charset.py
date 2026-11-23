@@ -130,6 +130,8 @@ class LocalServicePkceCharsetTests(unittest.TestCase):
 class PersistentServicePkceCharsetTests(unittest.TestCase):
     @staticmethod
     def _resolve_noawait(coroutine):
+        if not hasattr(coroutine, "send"):
+            return coroutine  # plain ``def`` handler (threadpool)
         try:
             coroutine.send(None)
         except StopIteration as result:

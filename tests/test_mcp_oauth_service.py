@@ -150,7 +150,13 @@ class McpOAuthServiceTests(unittest.TestCase):
 class PersistentMcpOAuthServiceTests(unittest.TestCase):
     @staticmethod
     def _resolve_noawait(coroutine):
-        """Route handlers under test contain no awaits; avoid Windows sandbox I/O."""
+        """Route handlers under test contain no awaits; avoid Windows sandbox I/O.
+
+        DB-bound handlers are plain ``def`` (run in FastAPI's threadpool), so
+        their result is returned as is.
+        """
+        if not hasattr(coroutine, "send"):
+            return coroutine
         try:
             coroutine.send(None)
         except StopIteration as result:
