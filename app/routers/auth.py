@@ -29,7 +29,7 @@ from app.dependencies import (
 )
 from app.helpers.exceptions import UserRemovedError
 from app.models.auth import MeResponse, TokenResponse, UserInfo
-from app.services.auth_service import AuthService
+from app.services.auth_service import AuthService, is_mcp_continuation_uri
 from app.services.mcp_oauth_service import McpOAuthError
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -127,6 +127,15 @@ async def callback(
             ) from exc
         if oauth_redirect is not None:
             return RedirectResponse(oauth_redirect)
+
+    # A continuation the MCP flow did not consume (MCP disabled, no Hub user
+    # row, or a variant spelling of the issuer) must never fall through to
+    # the normal redirect below, which appends the Hub session token.
+    if is_mcp_continuation_uri(frontend_redirect_uri, getattr(settings, "MCP_OAUTH_ISSUER", None)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth authorization request expired or is invalid.",
+        )
 
     params = urlencode(
         {

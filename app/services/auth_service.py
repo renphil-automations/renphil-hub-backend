@@ -17,7 +17,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 import jwt
 from google.oauth2 import id_token as google_id_token
@@ -49,6 +49,42 @@ def _derive_code_challenge(verifier: str) -> str:
     """Derive the S256 code challenge from a verifier."""
     digest = hashlib.sha256(verifier.encode()).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def _mcp_continuation_request_id(candidate: SplitResult, issuer: str | None) -> str | None:
+    """Return what follows ``<issuer>/continue/`` in ``candidate``'s path.
+
+    ``None`` when no issuer is configured, the scheme/host differ from the
+    issuer's (compared case-insensitively), or the path is not under the
+    issuer's ``/continue/`` prefix. The one place this match is defined, so
+    the login redirect check and the callback guard cannot drift apart.
+    """
+    issuer = (issuer or "").rstrip("/")
+    if not issuer:
+        return None
+    issuer_parts = urlsplit(issuer)
+    candidate_origin = f"{candidate.scheme.lower()}://{candidate.netloc.lower()}"
+    if candidate_origin != f"{issuer_parts.scheme.lower()}://{issuer_parts.netloc.lower()}":
+        return None
+    prefix = f"{issuer_parts.path.rstrip('/')}/continue/"
+    if not candidate.path.startswith(prefix):
+        return None
+    return candidate.path.removeprefix(prefix)
+
+
+def is_mcp_continuation_uri(redirect_uri: str, issuer: str | None) -> bool:
+    """True when ``redirect_uri`` points at the MCP OAuth continuation prefix.
+
+    Deliberately broader than ``is_allowed_login_redirect_uri``: any query,
+    fragment or request id (even an empty or malformed one) still counts, so
+    the callback can refuse to append the Hub session token to such a URI
+    when the MCP flow did not consume it.
+    """
+    try:
+        candidate = urlsplit(redirect_uri)
+    except (TypeError, ValueError):
+        return False
+    return _mcp_continuation_request_id(candidate, issuer) is not None
 
 
 class AuthService:
@@ -92,15 +128,8 @@ class AuthService:
             ):
                 return True
 
-        issuer = (self._settings.MCP_OAUTH_ISSUER or "").rstrip("/")
-        if not issuer:
-            return False
-        issuer_parts = urlsplit(issuer)
-        if candidate_origin != f"{issuer_parts.scheme.lower()}://{issuer_parts.netloc.lower()}":
-            return False
-        prefix = f"{issuer_parts.path.rstrip('/')}/continue/"
-        request_id = candidate.path.removeprefix(prefix)
-        return bool(request_id) and candidate.path.startswith(prefix) and "/" not in request_id
+        request_id = _mcp_continuation_request_id(candidate, self._settings.MCP_OAUTH_ISSUER)
+        return bool(request_id) and "/" not in request_id
 
     # ── Step 1: authorization URL ──────────────────────────────────────
     def get_authorization_url(self, redirect_uri: str) -> str:
