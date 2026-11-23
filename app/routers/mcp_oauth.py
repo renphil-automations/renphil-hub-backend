@@ -787,15 +787,20 @@ async def _reserve_token_dpop_proof(request: Request) -> None:
     """RFC 9449 §11.1: each verified token-request proof is accepted once.
 
     Runs before the (threadpool) token handler because the shared store is
-    asynchronous. Only a proof that verifies is reserved, so junk proofs
-    cannot burn identifiers; an absent or invalid proof is left to the
-    handler, which rejects or (for an allowed bearer provider) ignores it
-    exactly as before. Store failures raise ``RateLimitStoreUnavailable``,
-    which the route class turns into the limiter's 503.
+    asynchronous. This is the only place the proof is verified (security
+    review S7): a header that is present but does not verify is rejected
+    here, and the verified thumbprint is stashed on ``request.state`` for the
+    handler, so no second verification at a later clock reading can accept a
+    proof that was never reserved. Only a proof that verifies is reserved.
+    Store failures raise ``RateLimitStoreUnavailable``, which the route class
+    turns into the limiter's 503.
     """
+    request.state.mcp_dpop_jkt = None
     raw = request.headers.get("dpop")
-    if raw is None or not raw.strip():
+    if raw is None:
         return
+    if not raw.strip():
+        raise _bad_request("invalid_dpop_proof", "A DPoP proof is required.")
     settings = get_settings()
     service = _oauth_service()
     try:
@@ -803,9 +808,28 @@ async def _reserve_token_dpop_proof(request: Request) -> None:
             raw, token_endpoint=f"{service.issuer}/token", max_age_seconds=dpop_replay.PROOF_MAX_AGE_SECONDS,
         )
     except McpDPoPError:
-        return
+        raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from None
     if not await dpop_replay.reserve_proof(_rate_limit_store(settings), settings, proof):
         raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.")
+    request.state.mcp_dpop_jkt = proof.jkt
+
+
+def _verified_dpop_jkt(request: Request | None, dpop: str | None, issuer: str) -> str | None:
+    """Thumbprint of the proof verified and reserved by the dependency, or
+    ``None`` when no DPoP header was sent.
+
+    Only a direct call without a request (unit tests) verifies here.
+    """
+    if request is not None and hasattr(request.state, "mcp_dpop_jkt"):
+        return request.state.mcp_dpop_jkt
+    if dpop is None:
+        return None
+    if not dpop.strip():
+        raise _bad_request("invalid_dpop_proof", "A DPoP proof is required.")
+    try:
+        return verify_token_request_proof(dpop, token_endpoint=f"{issuer}/token").jkt
+    except McpDPoPError as exc:
+        raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from exc
 
 
 @router.post("/token", dependencies=[Depends(_reserve_token_dpop_proof)])
@@ -822,6 +846,7 @@ def token(
     authorization: Annotated[str | None, Header()] = None,
     refresh_token: Annotated[str | None, Form()] = None,
     scope: Annotated[str | None, Form()] = None,
+    request: Request = None,  # type: ignore[assignment]  # always injected by FastAPI
 ):
     # Errors are RFC 6749 §5.2 bodies (rendered by the route class).
     if not grant_type:
@@ -850,10 +875,11 @@ def token(
     if not authenticate_client(service.clients, client_id, client_secret):
         raise _invalid_client()
     unbound_allowed = decision.client_kind in bearer_providers(get_settings())
+    dpop_jkt = _verified_dpop_jkt(request, dpop, service.issuer)
     if refresh_grant:
         return _refresh_grant(
             db, service, refresh_token=refresh_token, scope=scope, client_id=client_id,
-            client_kind=decision.client_kind, dpop=dpop, unbound_allowed=unbound_allowed,
+            client_kind=decision.client_kind, dpop_jkt=dpop_jkt, unbound_allowed=unbound_allowed,
         )
     if not code or not redirect_uri or not code_verifier:
         raise _invalid_token_request()
@@ -862,15 +888,8 @@ def token(
     # only bearer issuance is for a provider the operator listed in
     # MCP_OAUTH_BEARER_PROVIDERS that sent no DPoP header at all; a header
     # that is sent is always validated and binds the token (no downgrade).
-    if dpop is None and unbound_allowed:
-        dpop_jkt = None
-    else:
-        if not isinstance(dpop, str) or not dpop.strip():
-            raise _bad_request("invalid_dpop_proof", "A DPoP proof is required.")
-        try:
-            dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
-        except McpDPoPError as exc:
-            raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from exc
+    if dpop_jkt is None and not unbound_allowed:
+        raise _bad_request("invalid_dpop_proof", "A DPoP proof is required.")
     try:
         return service.exchange_code(
             db, code=code, client_id=client_id, redirect_uri=redirect_uri, code_verifier=code_verifier,
@@ -903,19 +922,13 @@ def _hub_user_is_active(db: Session, subject: str, email: str) -> bool:
     return user is not None and str(user.id) == str(subject) and not getattr(user, "is_deleted", False)
 
 
-def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str, client_kind, dpop, unbound_allowed: bool):
+def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str, client_kind, dpop_jkt: str | None, unbound_allowed: bool):
     if not isinstance(refresh_token, str) or not refresh_token:
         raise _invalid_token_request()
     if scope is not None and scope.split() != ["renphil.mcp.read"]:
         raise _bad_request("invalid_scope", "Only renphil.mcp.read may be requested.")
-    dpop_jkt = None
-    if dpop is not None:
-        # A proof that is sent must be valid; the family decides whether one
-        # is required (DPoP-bound families) or merely binds the new token.
-        try:
-            dpop_jkt = verify_token_request_proof(dpop, token_endpoint=f"{service.issuer}/token").jkt
-        except McpDPoPError as exc:
-            raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from exc
+    # The family decides whether the (already verified) proof is required
+    # (DPoP-bound families) or forbidden (unbound families, S2).
     try:
         return service.refresh_access_token(
             db, refresh_token=refresh_token, client_id=client_id, client_kind=client_kind, dpop_jkt=dpop_jkt,
