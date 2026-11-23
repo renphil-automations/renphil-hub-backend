@@ -5,7 +5,7 @@ Uses pydantic-settings so every value is validated at startup.
 
 import ipaddress
 from functools import lru_cache
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -126,6 +126,17 @@ class Settings(BaseSettings):
         from app.services.mcp_access_policy import parse_bearer_providers
 
         return ",".join(sorted(parse_bearer_providers(value)))
+
+    @model_validator(mode="after")
+    def _validate_mcp_oauth_signing_key(self):
+        # Only when MCP OAuth is enabled: the key must be an RSA key of at
+        # least 2048 bits that can sign RS256. Raises McpOAuthKeyError (not a
+        # ValueError) on purpose, so start-up fails with a short message and
+        # pydantic never renders the settings (and their secrets) in an error.
+        from app.services.mcp_oauth_keys import validate_signing_configuration
+
+        validate_signing_configuration(self)
+        return self
 
     # ── Google Drive ───────────────────────────────────────────────────
     GOOGLE_DRIVE_FOLDER_ID: str
