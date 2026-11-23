@@ -484,7 +484,8 @@ class PrivacyTests(_Base):
             self.assertNotIn(value, material, value[:24])
         for keys, _ in self.redis.calls:
             for key in keys:
-                self.assertRegex(key, r"^renphil:mcp-oauth:rl:v1:[0-9a-f]{16}:(authorize|token|register|discovery|jwks):(network|failures|client|global):([0-9a-f]{40}|claude|chatgpt|gemini|unknown|all)$")
+                # Limiter buckets, or the keyed DPoP proof replay reservation.
+                self.assertRegex(key, r"^renphil:mcp-oauth:(rl:v1:[0-9a-f]{16}:(authorize|token|register|discovery|jwks):(network|failures|client|global):([0-9a-f]{40}|claude|chatgpt|gemini|unknown|all)|dpop-jti:v1:[0-9a-f]{16}:[0-9a-f]{48})$")
 
     def test_network_digest_is_keyed_and_environment_scoped(self):
         one = rate_limit.build_checks(mcp_settings(), "jwks", network=CLIENT_IP, client=None)[0].key

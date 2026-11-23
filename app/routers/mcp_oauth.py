@@ -24,6 +24,7 @@ from app.services.mcp_access_policy import AdmissionDecision, admit_client, bear
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
 from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError
 from app.services.mcp_oauth_service import LocalMcpOAuthService, McpOAuthError, PersistentMcpOAuthService, authenticate_client
+from app.services import mcp_oauth_dpop_replay as dpop_replay
 from app.services import mcp_oauth_rate_limit as rate_limit
 from app.services.agent_identity import require_agent_sync_token
 
@@ -155,6 +156,11 @@ class McpOAuthRateLimitedRoute(APIRoute):
                 return await original(request)
             try:
                 response = await original(request)
+            except rate_limit.RateLimitStoreUnavailable:
+                # The DPoP replay reservation shares the limiter's store and
+                # its fail-closed posture.
+                logger.warning("MCP OAuth request denied: endpoint=token category=dpop_replay_store_unavailable")
+                return _oauth_error(503, _UNAVAILABLE, rate_limit.UNAVAILABLE_RETRY_AFTER_SECONDS)
             except Exception:
                 await _record_token_failure(store, settings, network)
                 raise
@@ -376,7 +382,35 @@ def authorize(
     return RedirectResponse(url=f"/auth/login?{urlencode({'redirect_uri': continuation})}")
 
 
-@router.post("/token")
+async def _reserve_token_dpop_proof(request: Request) -> None:
+    """RFC 9449 §11.1: each verified token-request proof is accepted once.
+
+    Runs before the (threadpool) token handler because the shared store is
+    asynchronous. Only a proof that verifies is reserved, so junk proofs
+    cannot burn identifiers; an absent or invalid proof is left to the
+    handler, which rejects or (for an allowed bearer provider) ignores it
+    exactly as before. Store failures raise ``RateLimitStoreUnavailable``,
+    which the route class turns into the limiter's 503.
+    """
+    raw = request.headers.get("dpop")
+    if raw is None or not raw.strip():
+        return
+    settings = get_settings()
+    service = _service()
+    try:
+        proof = verify_token_request_proof(
+            raw, token_endpoint=f"{service.issuer}/token", max_age_seconds=dpop_replay.PROOF_MAX_AGE_SECONDS,
+        )
+    except McpDPoPError:
+        return
+    if not await dpop_replay.reserve_proof(_rate_limit_store(settings), settings, proof):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_dpop_proof", "error_description": "Invalid DPoP proof."},
+        )
+
+
+@router.post("/token", dependencies=[Depends(_reserve_token_dpop_proof)])
 def token(
     grant_type: str = Form(...),
     code: str = Form(...),
