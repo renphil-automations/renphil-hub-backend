@@ -862,11 +862,18 @@ def token(
     if not decision.allowed:
         if refresh_grant and isinstance(refresh_token, str):
             # External AI, the provider switch or the client mapping changed:
-            # the presented family can never be used again.
+            # the presented family can never be used again. Only the
+            # authenticated client the token was issued to can trigger this
+            # (security review S8); anyone else changes nothing.
             try:
-                _service().revoke_refresh_family(db, refresh_token)
+                denied_service = _service()
             except HTTPException:
-                pass  # unconfigured service: nothing can have been issued
+                denied_service = None  # unconfigured: nothing can have been issued
+            if denied_service is not None and authenticate_client(denied_service.clients, client_id, client_secret):
+                try:
+                    denied_service.revoke_refresh_token(db, refresh_token, client_id=client_id)
+                except McpOAuthError:
+                    pass  # the live admission check still refuses every refresh
         raise OAuthErrorResponse(status.HTTP_403_FORBIDDEN, "unauthorized_client", "External MCP access is not available for this client.")
     service = _oauth_service()
     # Confidential clients (registry entry with client_secret_hash) must
