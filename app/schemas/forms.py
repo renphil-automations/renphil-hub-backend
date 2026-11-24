@@ -48,7 +48,7 @@ class FormComponentEmbedResponse(BaseModel):
     embed_url: str = Field(
         ...,
         description="URL to load in the iframe, freshly fetched from the form builder. "
-        "For a non-public form it carries `hide_back_button=true|false`; when "
+        "For a non-public form it carries `hide_back_btn=true|false`; when "
         "`requires_authentication` is true and `authentication_type` is `user`, it "
         "also carries the viewer's `token=<jwt>` query param.",
     )
