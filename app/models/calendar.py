@@ -51,7 +51,11 @@ class CalendarEvent(BaseModel):
     location: str | None = None
     description: str | None = None
     html_link: str | None = Field(
-        default=None, description="Link back to the canonical event in Google Calendar."
+        default=None,
+        description=(
+            "Link to the event in Google Calendar; for a recurring event, to "
+            "the occurrence shown."
+        ),
     )
     meeting_link: str | None = Field(
         default=None,

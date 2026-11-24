@@ -63,6 +63,29 @@ def test_index_event_uses_next_recurring_instance() -> None:
     assert result.start == future.isoformat()
 
 
+def test_index_event_uses_occurrence_details_but_series_title_when_blank() -> None:
+    future = datetime.now(timezone.utc) + timedelta(days=7)
+    service = _service(
+        {
+            "id": "series-1",
+            "summary": "All Hands Meeting",
+            "description": "Old agenda",
+            "recurrence": ["RRULE:FREQ=WEEKLY"],
+        },
+        {
+            "summary": "  ",
+            "description": "Impact report agenda",
+            "start": {"dateTime": future.isoformat()},
+            "end": {"dateTime": (future + timedelta(hours=1)).isoformat()},
+        },
+    )
+
+    result = service.get_index_event("series-1")
+
+    assert result.summary == "All Hands Meeting"
+    assert result.description == "Impact report agenda"
+
+
 def test_index_event_rejects_expired_one_off_event() -> None:
     past = datetime.now(timezone.utc) - timedelta(days=2)
     service = _service(

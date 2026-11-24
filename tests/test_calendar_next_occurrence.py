@@ -4,6 +4,7 @@ and following a series split by "This and following events"."""
 
 from __future__ import annotations
 
+import re
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -24,6 +25,15 @@ def _at(days: float) -> dict[str, str]:
 
 def _occ(series: str, days: float) -> dict[str, Any]:
     return {"id": f"{series}_{days}", "start": _at(days), "end": _at(days + 0.01)}
+
+
+def _only_fields(items: list[dict[str, Any]], fields: str | None) -> list[dict[str, Any]]:
+    """Keep only the item keys named in ``fields``, as Google does."""
+    match = re.search(r"items\(([^)]*)\)", fields or "")
+    if not match:
+        return items
+    keep = set(match.group(1).split(","))
+    return [{k: v for k, v in item.items() if k in keep} for item in items]
 
 
 class _Request:
@@ -67,7 +77,9 @@ class _FakeEvents:
                 self.occurrences.get(kw["iCalUID"], []),
                 key=lambda o: o["start"]["dateTime"],
             )
-            return _Request({"items": occ[: kw.get("maxResults", 250)]})
+            return _Request(
+                {"items": _only_fields(occ[: kw.get("maxResults", 250)], kw.get("fields"))}
+            )
         # singleEvents=False: series/one-offs with any occurrence ending after now.
         live = [
             e for e in self.events.values()
@@ -124,6 +136,57 @@ def test_next_occurrence_follows_empty_pages() -> None:
     )
 
     assert _service(fake).get_event("s", "me@example.org").start == _at(2)["dateTime"]
+
+
+def _zoom(meeting_id: str) -> dict[str, Any]:
+    return {
+        "conferenceSolution": {"name": "Zoom Meeting"},
+        "entryPoints": [{"entryPointType": "video", "uri": f"https://zoom.us/j/{meeting_id}"}],
+    }
+
+
+def test_card_shows_the_next_occurrences_own_edits() -> None:
+    series = _series(
+        "s",
+        description="Join https://zoom.us/j/111",
+        location="Room A",
+        htmlLink="https://calendar.google.com/series",
+        conferenceData=_zoom("111"),
+    )
+    edited = {
+        **_occ("s", 3),
+        "summary": "Weekly Sync: Annual Planning",
+        "description": "Join https://zoom.us/j/222",
+        "location": "Room B",
+        "htmlLink": "https://calendar.google.com/occurrence",
+        "conferenceData": _zoom("222"),
+    }
+    fake = _FakeEvents({"s": series}, {"s@google.com": [edited]})
+
+    event = _service(fake).get_event("s", "me@example.org")
+
+    assert event.summary == "Weekly Sync: Annual Planning"
+    assert event.description == "Join https://zoom.us/j/222"
+    assert event.location == "Room B"
+    assert event.html_link == "https://calendar.google.com/occurrence"
+    assert event.meeting_link == "https://zoom.us/j/222"
+    assert event.meeting_label == "Zoom Meeting"
+
+
+def test_cleared_fields_on_an_occurrence_do_not_fall_back_to_the_series() -> None:
+    # Google leaves out empty fields, so the occurrence has no description,
+    # location or conference at all.
+    series = _series(
+        "s", description="Old agenda", location="Room A", hangoutLink="https://meet.google.com/old"
+    )
+    fake = _FakeEvents({"s": series}, {"s@google.com": [_occ("s", 3)]})
+
+    event = _service(fake).get_event("s", "me@example.org")
+
+    assert event.summary == "Weekly Sync"
+    assert event.description is None
+    assert event.location is None
+    assert event.meeting_link is None
 
 
 def test_occurrence_id_is_resolved_to_its_series() -> None:
