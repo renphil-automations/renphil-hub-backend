@@ -25,6 +25,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 import threading
@@ -46,6 +47,14 @@ from app.services.mcp_access_policy import (
     is_wellformed_client_id,
 )
 from app.services.mcp_oauth_client_secret import ClientSecretHashError, parse_client_secret_hash, verify_client_secret
+from app.services.mcp_oauth_hardening import (
+    SID_CLAIM,
+    TokenLifetimes,
+    audit,
+    audit_family_revoked,
+    family_ref,
+    user_ref,
+)
 from app.services.mcp_oauth_keys import HubMcpSigningKey
 
 
@@ -249,7 +258,7 @@ def _external_kind(client_kind: str | None) -> str:
 _REVOKE_FAMILIES_MAX_PASSES = 5
 
 
-def revoke_refresh_families_for_clients(db: Session, client_ids) -> int:
+def revoke_refresh_families_for_clients(db: Session, client_ids, *, reason: str = "provider_switched_off") -> int:
     """Revoke every refresh-token family issued to ``client_ids``.
 
     Used when Bot Management switches a provider (or External AI) off. The
@@ -259,6 +268,11 @@ def revoke_refresh_families_for_clients(db: Session, client_ids) -> int:
     ids = sorted({client_id for client_id in client_ids if isinstance(client_id, str) and client_id})
     if not ids:
         return 0
+    families = db.query(
+        McpOAuthRefreshTokenV2.family_id, McpOAuthRefreshTokenV2.client_id, McpOAuthRefreshTokenV2.user_subject,
+    ).filter(
+        McpOAuthRefreshTokenV2.client_id.in_(ids), McpOAuthRefreshTokenV2.revoked_at.is_(None),
+    ).distinct().all()
     # A refresh that holds its row lock when this UPDATE starts makes it wait,
     # then commits a new row this statement's snapshot cannot see. Under READ
     # COMMITTED the next statement can, so repeat until nothing is left
@@ -272,7 +286,79 @@ def revoke_refresh_families_for_clients(db: Session, client_ids) -> int:
         if count == 0:
             break
     db.commit()
+    for family_id, client_id, subject in families:
+        audit_family_revoked(family_id=family_id, reason=reason, client_id=client_id, subject=subject)
     return total
+
+
+def revoke_refresh_families_for_user(db: Session, *, subject: str, client_ids=None, reason: str = "user_revoke") -> int:
+    """Revoke every live refresh family of one Hub user (admin action).
+
+    ``subject`` is the Hub user id the families were issued to (the token
+    ``sub``; the stored email may be either of the user's addresses, so it
+    is not used). ``client_ids`` limits it to those clients (``None``: every
+    external client; the Hub Agent never has refresh families). Returns the
+    number of families newly revoked. Commits.
+    """
+    query = db.query(McpOAuthRefreshTokenV2.family_id, McpOAuthRefreshTokenV2.client_id).filter(
+        McpOAuthRefreshTokenV2.user_subject == str(subject), McpOAuthRefreshTokenV2.revoked_at.is_(None),
+    )
+    if client_ids is not None:
+        ids = sorted({client_id for client_id in client_ids if isinstance(client_id, str) and client_id})
+        if not ids:
+            return 0
+        query = query.filter(McpOAuthRefreshTokenV2.client_id.in_(ids))
+    families = dict(query.distinct().all())
+    if not families:
+        db.rollback()
+        return 0
+    now = datetime.now(timezone.utc)
+    for family_id, client_id in families.items():
+        PersistentMcpOAuthService._revoke_family(db, family_id, now, reason=reason, client_id=client_id, subject=subject, log=False)
+    db.commit()
+    for family_id, client_id in families.items():
+        audit_family_revoked(family_id=family_id, reason=reason, client_id=client_id, subject=subject)
+    return len(families)
+
+
+def session_is_live(db: Session, *, sid: str, client_id: str, email: str) -> bool:
+    """True when the refresh family ``sid`` can still be refreshed.
+
+    One indexed lookup (``family_id``): a live family has a current token
+    that is unused, unrevoked and inside both its idle and absolute lifetime,
+    and it belongs to this client and user. Revoked, expired, purged or
+    unknown families (and any mismatch) are not live.
+    """
+    now = datetime.now(timezone.utc)
+    row = db.query(McpOAuthRefreshTokenV2.id).filter(
+        McpOAuthRefreshTokenV2.family_id == sid,
+        McpOAuthRefreshTokenV2.client_id == client_id,
+        McpOAuthRefreshTokenV2.user_email == (email or "").strip().lower(),
+        McpOAuthRefreshTokenV2.revoked_at.is_(None),
+        McpOAuthRefreshTokenV2.used_at.is_(None),
+        McpOAuthRefreshTokenV2.expires_at > now,
+        McpOAuthRefreshTokenV2.family_expires_at > now,
+    ).first()
+    return row is not None
+
+
+def revoke_session_family(db: Session, *, sid: str, client_id: str, email: str, reason: str) -> int:
+    """Revoke the family ``sid`` of this client and user (e.g. anomaly). Commits."""
+    owner = db.query(McpOAuthRefreshTokenV2.user_subject).filter(
+        McpOAuthRefreshTokenV2.family_id == sid,
+        McpOAuthRefreshTokenV2.client_id == client_id,
+        McpOAuthRefreshTokenV2.user_email == (email or "").strip().lower(),
+    ).first()
+    if owner is None:
+        db.rollback()
+        return 0
+    count = PersistentMcpOAuthService._revoke_family(
+        db, sid, datetime.now(timezone.utc), reason=reason, client_id=client_id, subject=owner[0], log=False,
+    )
+    db.commit()
+    if count:
+        audit_family_revoked(family_id=sid, reason=reason, client_id=client_id, subject=owner[0], rows=count)
+    return count
 
 
 class LocalMcpOAuthService:
@@ -702,7 +788,15 @@ class PersistentMcpOAuthService:
             raise McpOAuthStorageError("OAuth authorization storage is unavailable.") from exc
         return redirect_uri, client_state
 
-    def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None, allow_unbound: bool = False) -> dict[str, object]:
+    def lifetimes(self) -> TokenLifetimes:
+        """The service-wide (already clamped) lifetimes."""
+        return TokenLifetimes(self.access_token_ttl_seconds, self.refresh_token_idle_seconds, self.refresh_family_max_seconds)
+
+    def exchange_code(self, db: Session, *, code: str, client_id: str, redirect_uri: str, code_verifier: str, dpop_jkt: str | None = None, client_kind: str | None = None, allow_unbound: bool = False,
+                      lifetimes: TokenLifetimes | None = None, supersede_other_families: bool = False) -> dict[str, object]:
+        """``lifetimes``: per-provider policy (never longer than the service's).
+        ``supersede_other_families``: revoke this user's other refresh
+        families for the same client in the same transaction."""
         if not code or not client_id or not redirect_uri or not code_verifier:
             raise McpOAuthError("OAuth token request is invalid.")
         # Checked before any code lookup, so a malformed verifier never
@@ -712,7 +806,10 @@ class PersistentMcpOAuthService:
         # Validate the key binding and provider before the code is consumed.
         confirmation = _confirmation(dpop_jkt, allow_unbound=allow_unbound)
         kind = _external_kind(client_kind)
+        life = lifetimes or self.lifetimes()
         now = datetime.now(timezone.utc)
+        family_id = None
+        superseded: list[str] = []
         try:
             self._purge(db)
             record = db.query(McpOAuthAuthorizationCodeV2).filter(
@@ -735,38 +832,64 @@ class PersistentMcpOAuthService:
                 # Same transaction: the code is consumed only together with
                 # the creation of its refresh-token family.
                 self._purge_refresh(db, now)
+                if supersede_other_families:
+                    superseded = [
+                        row[0] for row in db.query(McpOAuthRefreshTokenV2.family_id).filter(
+                            McpOAuthRefreshTokenV2.user_email == email, McpOAuthRefreshTokenV2.user_subject == subject,
+                            McpOAuthRefreshTokenV2.client_id == client_id, McpOAuthRefreshTokenV2.revoked_at.is_(None),
+                        ).distinct().all()
+                    ]
+                    for old_family in superseded:
+                        self._revoke_family(db, old_family, now, reason="superseded", client_id=client_id, subject=subject, log=False)
+                # 128 random bits, hex: opaque and URL-safe, so it doubles as
+                # the access token's ``sid`` claim.
+                family_id = secrets.token_hex(16)
                 refresh_token = self._add_refresh_row(
-                    db, family_id=secrets.token_hex(16), client_id=client_id, email=email, subject=subject,
-                    jkt=dpop_jkt, now=now, family_expires_at=now + timedelta(seconds=self.refresh_family_max_seconds),
+                    db, family_id=family_id, client_id=client_id, email=email, subject=subject,
+                    jkt=dpop_jkt, now=now, family_expires_at=now + timedelta(seconds=life.refresh_family_max_seconds),
+                    idle_seconds=life.refresh_idle_seconds,
                 )
             # Sign inside the transaction, before the commit that consumes the
             # code: a signing failure rolls back and the code stays usable.
             response = self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
-                                   dpop_jkt=dpop_jkt, refresh_token=refresh_token, now=now)
+                                   dpop_jkt=dpop_jkt, refresh_token=refresh_token, now=now,
+                                   access_ttl=life.access_token_ttl_seconds, sid=family_id)
             db.commit()
         except McpOAuthError:
             raise
         except Exception as exc:
             db.rollback()
             raise McpOAuthStorageError("OAuth token issuance is unavailable.") from exc
+        for old_family in superseded:
+            audit_family_revoked(family_id=old_family, reason="superseded", client_id=client_id, subject=subject)
+        audit("token_issued", grant="authorization_code", client_kind=kind, client_id=client_id,
+              family=family_ref(family_id), user=user_ref(subject))
         return response
 
-    def _issue(self, *, subject: str, email: str, client_id: str, kind: str, confirmation: dict, dpop_jkt: str | None, refresh_token: str | None, now: datetime) -> dict[str, object]:
+    def _issue(self, *, subject: str, email: str, client_id: str, kind: str, confirmation: dict, dpop_jkt: str | None, refresh_token: str | None, now: datetime,
+               access_ttl: int | None = None, sid: str | None = None) -> dict[str, object]:
         issued_at = int(now.timestamp())
-        token = self._signing_key.sign({
+        ttl = min(int(access_ttl), self.access_token_ttl_seconds) if access_ttl else self.access_token_ttl_seconds
+        claims: dict[str, object] = {
             "iss": self.issuer, "aud": self.audience, "sub": subject,
             "email": email, "client_id": client_id, "iat": issued_at,
-            "exp": issued_at + self.access_token_ttl_seconds, "jti": secrets.token_urlsafe(24),
+            "exp": issued_at + ttl, "jti": secrets.token_urlsafe(24),
             "scope": SCOPE, CLIENT_KIND_CLAIM: kind, **confirmation,
-        })
-        return _token_response(token, ttl_seconds=self.access_token_ttl_seconds, dpop_jkt=dpop_jkt, refresh_token=refresh_token)
+        }
+        if sid:
+            # Opaque session id (the refresh family) for live revocation.
+            claims[SID_CLAIM] = sid
+        token = self._signing_key.sign(claims)
+        return _token_response(token, ttl_seconds=ttl, dpop_jkt=dpop_jkt, refresh_token=refresh_token)
 
-    def _add_refresh_row(self, db: Session, *, family_id: str, client_id: str, email: str, subject: str, jkt: str | None, now: datetime, family_expires_at: datetime) -> str:
+    def _add_refresh_row(self, db: Session, *, family_id: str, client_id: str, email: str, subject: str, jkt: str | None, now: datetime, family_expires_at: datetime,
+                         idle_seconds: int | None = None) -> str:
         token = _new_refresh_token()
+        idle = min(int(idle_seconds), self.refresh_token_idle_seconds) if idle_seconds else self.refresh_token_idle_seconds
         db.add(McpOAuthRefreshTokenV2(
             family_id=family_id, token_hash=_sha256(token), client_id=client_id, user_email=email,
             user_subject=subject, jkt=jkt, scope=SCOPE, created_at=now,
-            expires_at=min(now + timedelta(seconds=self.refresh_token_idle_seconds), family_expires_at),
+            expires_at=min(now + timedelta(seconds=idle), family_expires_at),
             family_expires_at=family_expires_at,
         ))
         return token
@@ -787,18 +910,27 @@ class PersistentMcpOAuthService:
         ).delete(synchronize_session=False)
 
     @staticmethod
-    def _revoke_family(db: Session, family_id: str, now: datetime) -> None:
+    def _revoke_family(db: Session, family_id: str, now: datetime, *, reason: str = "unspecified", client_id: str | None = None,
+                       subject: object = None, log: bool = True) -> int:
+        """Revoke a family; the caller commits. Logs ``family_revoked`` with
+        ``reason`` when rows were newly revoked (``log=False``: the caller
+        logs after its own commit)."""
         # Same snapshot gap as revoke_refresh_families_for_clients: a refresh
         # holding the family's live row commits a new row after this UPDATE
         # waited on it. Repeat (bounded) until nothing is left to revoke.
+        total = 0
         for _ in range(_REVOKE_FAMILIES_MAX_PASSES):
             count = db.query(McpOAuthRefreshTokenV2).filter(
                 McpOAuthRefreshTokenV2.family_id == family_id, McpOAuthRefreshTokenV2.revoked_at.is_(None),
             ).update({McpOAuthRefreshTokenV2.revoked_at: now}, synchronize_session=False)
             if not count:
                 break
+            total += int(count)
+        if total and log:
+            audit_family_revoked(family_id=family_id, reason=reason, client_id=client_id, subject=subject, rows=total)
+        return total
 
-    def revoke_refresh_token(self, db: Session, refresh_token: str, *, client_id: str) -> None:
+    def revoke_refresh_token(self, db: Session, refresh_token: str, *, client_id: str, reason: str = "revoke_endpoint") -> None:
         """RFC 7009 revocation: revoke the whole family of a refresh token,
         but only when it was issued to the authenticated ``client_id``.
         Unknown or foreign tokens change nothing (the endpoint still answers
@@ -810,7 +942,7 @@ class PersistentMcpOAuthService:
                 McpOAuthRefreshTokenV2.token_hash == _sha256(refresh_token)
             ).with_for_update().one_or_none()
             if row is not None and row.client_id == client_id:
-                self._revoke_family(db, row.family_id, datetime.now(timezone.utc))
+                self._revoke_family(db, row.family_id, datetime.now(timezone.utc), reason=reason, client_id=client_id, subject=row.user_subject)
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -825,7 +957,8 @@ class PersistentMcpOAuthService:
                 McpOAuthRefreshTokenV2.token_hash == _sha256(refresh_token)
             ).with_for_update().one_or_none()
             if row is not None:
-                self._revoke_family(db, row.family_id, datetime.now(timezone.utc))
+                self._revoke_family(db, row.family_id, datetime.now(timezone.utc), reason="provider_switched_off",
+                                    client_id=row.client_id, subject=row.user_subject)
             db.commit()
         except Exception:
             db.rollback()
@@ -833,6 +966,7 @@ class PersistentMcpOAuthService:
     def refresh_access_token(
         self, db: Session, *, refresh_token: str, client_id: str, client_kind: str | None, dpop_jkt: str | None = None,
         allow_unbound: bool = False, user_is_active: Callable[[Session, str, str], bool] | None = None,
+        lifetimes: TokenLifetimes | None = None,
     ) -> dict[str, object]:
         """Rotate a refresh token with reuse detection.
 
@@ -858,7 +992,15 @@ class PersistentMcpOAuthService:
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             family_id = row.family_id
             if row.client_id != client_id or row.used_at is not None or row.revoked_at is not None:
-                self._revoke_family(db, family_id, now)
+                reused = row.revoked_at is None or row.client_id != client_id
+                if reused:
+                    # A rotated token (or one presented by another client) is
+                    # being replayed: the family is treated as compromised.
+                    audit("refresh_reuse_detected", level=logging.WARNING, category="refresh_reuse",
+                          client_id=client_id, issued_client_id=row.client_id, family=family_ref(family_id),
+                          user=user_ref(row.user_subject))
+                self._revoke_family(db, family_id, now, reason="reuse" if reused else "revoked_token_presented",
+                                    client_id=row.client_id, subject=row.user_subject)
                 db.commit()
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             if _aware(row.expires_at) <= now or _aware(row.family_expires_at) <= now:
@@ -869,12 +1011,13 @@ class PersistentMcpOAuthService:
             except McpOAuthError:
                 kind = None
             if kind is None or (user_is_active is not None and not user_is_active(db, row.user_subject, row.user_email)):
-                self._revoke_family(db, family_id, now)
+                self._revoke_family(db, family_id, now, reason="provider_not_approved" if kind is None else "user_inactive",
+                                    client_id=client_id, subject=row.user_subject)
                 db.commit()
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             refusal = _unbound_family_refusal(row.jkt, dpop_jkt, allow_unbound=allow_unbound)
             if refusal == "revoke":
-                self._revoke_family(db, family_id, now)
+                self._revoke_family(db, family_id, now, reason="bearer_no_longer_allowed", client_id=client_id, subject=row.user_subject)
                 db.commit()
                 raise McpOAuthInvalidGrant("The refresh token is invalid.")
             if refusal == "refuse":
@@ -887,21 +1030,25 @@ class PersistentMcpOAuthService:
                 raise
             subject, email, family_jkt = row.user_subject, row.user_email, row.jkt
             family_expires_at = _aware(row.family_expires_at)
+            life = lifetimes or self.lifetimes()
             row.used_at = now
             new_token = self._add_refresh_row(
                 db, family_id=family_id, client_id=client_id, email=email, subject=subject, jkt=family_jkt,
-                now=now, family_expires_at=family_expires_at,
+                now=now, family_expires_at=family_expires_at, idle_seconds=life.refresh_idle_seconds,
             )
             self._purge_refresh(db, now)
             # Sign before the commit that marks the presented token used.
             response = self._issue(subject=subject, email=email, client_id=client_id, kind=kind, confirmation=confirmation,
-                                   dpop_jkt=bound_jkt, refresh_token=new_token, now=now)
+                                   dpop_jkt=bound_jkt, refresh_token=new_token, now=now,
+                                   access_ttl=life.access_token_ttl_seconds, sid=family_id)
             db.commit()
         except McpOAuthError:
             raise
         except Exception as exc:
             db.rollback()
             raise McpOAuthStorageError("OAuth token issuance is unavailable.") from exc
+        audit("refresh_rotated", grant="refresh_token", client_kind=kind, client_id=client_id,
+              family=family_ref(family_id), user=user_ref(subject))
         return response
 
     def issue_agent_delegated_token(
