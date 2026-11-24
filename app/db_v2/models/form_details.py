@@ -42,7 +42,7 @@ class FormDetailsV2(BaseV2):
     # (so stored retrievable, not hashed — same as the Airtable widget PAT).
     # Write-only: never returned by any endpoint.
     pat = Column(Text, nullable=False)
-    # Appended to a non-public form's embed URL as `hide_back_button=true|false`.
+    # Appended to a non-public form's embed URL as `hide_back_btn=true|false`.
     hide_back_button = Column(Boolean, nullable=True, default=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

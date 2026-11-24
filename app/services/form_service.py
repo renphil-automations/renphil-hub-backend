@@ -68,7 +68,7 @@ FORM_AUTH_TYPES = ("none", "submission", "user")
 NO_AUTH_TYPE = "none"
 USER_AUTH_TYPE = "user"
 
-HIDE_BACK_BUTTON_PARAM = "hide_back_button"
+HIDE_BACK_BUTTON_PARAM = "hide_back_btn"
 
 
 class FormBuilderError(Exception):
@@ -347,7 +347,7 @@ def get_form_embed_target(
 async def resolve_form_embed(target: FormEmbedTarget, user_email: str) -> dict[str, Any]:
     """The embed info to hand the viewer. The form's current embed URL and
     authentication settings are fetched from the form builder under the
-    stored PAT. A non-public form gets `hide_back_button=true|false`
+    stored PAT. A non-public form gets `hide_back_btn=true|false`
     appended; one that requires authentication with type "user" also gets a
     per-user token, minted under the stored PAT for `user_email`. Public
     forms get the embed URL as-is."""

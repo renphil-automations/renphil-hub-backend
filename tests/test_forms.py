@@ -578,7 +578,7 @@ class FormEmbedServiceTests(_EmbedTestCase):
                 result = self._resolve(link)
                 self.assertEqual(
                     result["embed_url"],
-                    f"https://forms.example.org/e/1?theme=dark%20blue&hide_back_button={expected}",
+                    f"https://forms.example.org/e/1?theme=dark%20blue&hide_back_btn={expected}",
                 )
                 self.assertEqual(result["authentication_type"], "submission")
                 self.assertIsNone(result["expires_in_seconds"])
@@ -592,7 +592,7 @@ class FormEmbedServiceTests(_EmbedTestCase):
 
         self.assertEqual(
             result["embed_url"],
-            "https://forms.example.org/e/1?theme=dark%20blue&hide_back_button=true&token=jwt.abc-123_",
+            "https://forms.example.org/e/1?theme=dark%20blue&hide_back_btn=true&token=jwt.abc-123_",
         )
         self.assertEqual((result["expires_in_seconds"], result["max_uses"]), (3600, 100))
         self.assertTrue(result["requires_authentication"])
@@ -613,7 +613,7 @@ class FormEmbedServiceTests(_EmbedTestCase):
         result = self._resolve(link)
         self.assertEqual(
             result["embed_url"],
-            "https://forms.example.org/e/1?theme=dark%20blue&hide_back_button=false&token=jwt.abc-123_",
+            "https://forms.example.org/e/1?theme=dark%20blue&hide_back_btn=false&token=jwt.abc-123_",
         )
         self.assertEqual(len(self.calls), 2)
 
@@ -622,7 +622,7 @@ class FormEmbedServiceTests(_EmbedTestCase):
         self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/1?theme=dark%20blue")
 
         self._set_auth(True, "submission", embed_url="https://forms.example.org/e/2")
-        self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/2?hide_back_button=true")
+        self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/2?hide_back_btn=true")
 
         self._set_auth(False, None)
         self.assertEqual(self._resolve(link)["embed_url"], "https://forms.example.org/e/2")
@@ -636,8 +636,8 @@ class FormEmbedServiceTests(_EmbedTestCase):
         for url, expected in cases.items():
             self.assertEqual(form_service.with_embed_token(url, "t.k-n_"), expected)
         self.assertEqual(
-            form_service.with_query_param("https://f.example.org/e/1?hide_back_button=true&a=1", "hide_back_button", "false"),
-            "https://f.example.org/e/1?a=1&hide_back_button=false",
+            form_service.with_query_param("https://f.example.org/e/1?hide_back_btn=true&a=1", "hide_back_btn", "false"),
+            "https://f.example.org/e/1?a=1&hide_back_btn=false",
         )
 
     def test_form_lookup_errors_are_mapped(self) -> None:
@@ -721,7 +721,7 @@ class FormEmbedRouterTests(_EmbedTestCase):
                 "success": True,
                 "link": link,
                 "form_id": FORM_1,
-                "embed_url": "https://forms.example.org/e/1?hide_back_button=true&token=jwt.abc-123_",
+                "embed_url": "https://forms.example.org/e/1?hide_back_btn=true&token=jwt.abc-123_",
                 "requires_authentication": True,
                 "authentication_type": "user",
                 "hide_back_button": True,
