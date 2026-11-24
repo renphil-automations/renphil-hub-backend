@@ -361,12 +361,16 @@ def _bucket_key(settings, key: bytes, endpoint: str, bucket: Bucket, *, network:
     return f"renphil:mcp-oauth:rl:v1:{environment}:{endpoint}:{bucket.dimension}:{value}"
 
 
-def build_checks(settings, endpoint: str, *, network: str, client: str | None, phase: str = "all") -> list[Check]:
+def build_checks(
+    settings, endpoint: str, *, network: str, client: str | None, phase: str = "all", network_limit: int | None = None,
+) -> list[Check]:
     """Ordered checks for ``endpoint``.
 
     ``phase`` splits the token endpoint so network buckets are evaluated
     before the form body is parsed: ``pre`` = buckets that need no client,
     ``client`` = buckets that need the client bucket, ``all`` = both.
+    ``network_limit`` replaces the per-network limit (same key), e.g. the
+    higher refresh limit for a provider's own egress network.
     """
     key = _hash_key(settings)
     checks: list[Check] = []
@@ -377,6 +381,8 @@ def build_checks(settings, endpoint: str, *, network: str, client: str | None, p
         if phase == "client" and not needs_client:
             continue
         limit = bucket.limit
+        if bucket.dimension == "network" and network_limit is not None:
+            limit = max(1, int(network_limit))
         if bucket.dimension == "client" and client == "unknown":
             limit = min(limit, UNKNOWN_CLIENT_LIMITS.get(endpoint, limit))
         checks.append(Check(

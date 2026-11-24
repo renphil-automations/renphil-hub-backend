@@ -14,6 +14,7 @@ from typing import Annotated
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
@@ -25,6 +26,7 @@ from app.dependencies import CurrentHubUser, get_current_hub_user
 from app.services.mcp_access_policy import PROVIDER_LABELS, AdmissionDecision, admit_client, bearer_providers, load_approved_clients
 from app.services.mcp_oauth_dpop import DPOP_SIGNING_ALGORITHMS, McpDPoPError, verify_token_request_proof
 from app.services.mcp_oauth_keys import HubMcpSigningKey, McpOAuthKeyError, parse_additional_public_keys
+from app.services import mcp_oauth_hardening as hardening
 from app.services.mcp_oauth_service import (
     LocalMcpOAuthService,
     McpOAuthDPoPBindingError,
@@ -201,6 +203,33 @@ async def _token_client_bucket(request: Request, settings) -> str:
     return _client_bucket(settings, client_id)
 
 
+def _strict_caller_address(request: Request | None, settings):
+    """Caller IP for provider source-network decisions: ``X-Forwarded-For``
+    only from a ``TRUSTED_PROXY_CIDRS`` peer (see mcp_oauth_hardening)."""
+    if request is None:
+        return None
+    return hardening.strict_client_address(
+        forwarded_for=request.headers.get("x-forwarded-for"),
+        peer_host=request.client.host if request.client else None,
+        trusted_proxies=hardening.trusted_proxies(settings),
+    )
+
+
+def _refresh_network_limit(request: Request, settings) -> int | None:
+    """Higher per-network refresh limit for a provider's own egress network
+    (``MCP_OAUTH_PROVIDER_NETWORK_REFRESH_LIMIT_PER_MINUTE``); ``None`` keeps
+    the ordinary limit. Shared provider egress (one network for all of the
+    provider's customers) would otherwise exhaust the ordinary budget."""
+    limit = getattr(settings, "MCP_OAUTH_PROVIDER_NETWORK_REFRESH_LIMIT_PER_MINUTE", None)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        return None
+    try:
+        address = _strict_caller_address(request, settings)
+    except Exception:
+        return None
+    return limit if hardening.in_any_provider_network(settings, address) else None
+
+
 async def _record_token_failure(store, settings, network: str) -> None:
     """Count a failed exchange toward the per-network failure budget."""
     try:
@@ -242,10 +271,18 @@ class McpOAuthRateLimitedRoute(APIRoute):
                     grant_type, client = await _token_form_bucket(request, settings)
                     refresh_grant = grant_type == "refresh_token"
                     if refresh_grant:
-                        # Own budget (per network, per client, global) and no
-                        # part in the code-exchange failure lockout (S5).
+                        # Own budget and no part in the code-exchange
+                        # failure lockout (S5). Before client authentication
+                        # only the per-network budget is charged (higher for
+                        # a provider's own egress network); the per-client and
+                        # global buckets are charged by _charge_refresh_client
+                        # once the client has authenticated, so unauthenticated
+                        # requests naming a real client ID cannot exhaust them.
                         decision = await rate_limit.evaluate(
-                            store, rate_limit.build_checks(settings, "refresh", network=network, client=client), "refresh",
+                            store, rate_limit.build_checks(
+                                settings, "refresh", network=network, client=None, phase="pre",
+                                network_limit=_refresh_network_limit(request, settings),
+                            ), "refresh",
                         )
                     else:
                         decision = await rate_limit.evaluate(
@@ -844,7 +881,90 @@ def _verified_dpop_jkt(request: Request | None, dpop: str | None, issuer: str) -
         raise _bad_request("invalid_dpop_proof", "Invalid DPoP proof.") from exc
 
 
-@router.post("/token", dependencies=[Depends(_reserve_token_dpop_proof)])
+async def _charge_refresh_client(request: Request) -> None:
+    """Refresh grants: charge the per-client and global refresh buckets only
+    after client authentication succeeds.
+
+    Runs after the route class's per-network check. A request whose client
+    does not authenticate is charged to the per-network failure budget
+    instead (never to a client bucket) and then fails in the handler as
+    before. A successful authentication is remembered on ``request.state``
+    so the handler does not hash a confidential client's secret twice.
+    """
+    request.state.mcp_refresh_client_authenticated = None
+    settings = get_settings()
+    if not getattr(settings, "MCP_OAUTH_ENABLED", False) or not _refresh_tokens_enabled():
+        return
+    try:
+        form = await request.form()
+    except Exception:
+        return
+    if form.get("grant_type") != "refresh_token":
+        return
+    form_client_id, form_secret = form.get("client_id"), form.get("client_secret")
+    if not isinstance(form_client_id, (str, type(None))) or not isinstance(form_secret, (str, type(None))):
+        return  # the handler rejects the malformed request
+    try:
+        service = _service()
+    except HTTPException:
+        return  # unconfigured: the handler answers
+    store = _rate_limit_store(settings)
+    if store is None:
+        raise rate_limit.RateLimitStoreUnavailable("rate-limit store not configured")
+    network = rate_limit.client_network(
+        forwarded_for=request.headers.get("x-forwarded-for"),
+        peer_host=request.client.host if request.client else None,
+    )
+    try:
+        client_id, client_secret = _token_client_credentials(request.headers.get("authorization"), form_client_id, form_secret)
+        authenticated = await run_in_threadpool(authenticate_client, service.clients, client_id, client_secret)
+    except HTTPException:
+        client_id, authenticated = None, False
+    if not authenticated:
+        await _record_token_failure(store, settings, network)
+        return
+    request.state.mcp_refresh_client_authenticated = client_id
+    decision = await rate_limit.evaluate(
+        store, rate_limit.build_checks(settings, "refresh", network=network, client=_client_bucket(settings, client_id), phase="client"),
+        "refresh",
+    )
+    if not decision.allowed:
+        raise OAuthErrorResponse(
+            status.HTTP_429_TOO_MANY_REQUESTS, _THROTTLED["error"], _THROTTLED["error_description"],
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
+
+
+def _source_network_allowed(request: Request | None, *, client_kind: str | None, client_id: str, grant_type: str) -> bool:
+    """``MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON``: a listed provider's token
+    requests must come from its own networks. Unlisted providers: allowed.
+    Fails closed on an invalid setting or an unresolvable caller address."""
+    settings = get_settings()
+    networks = hardening.provider_source_networks(settings)
+    if isinstance(networks, dict) and client_kind not in networks:
+        return True
+    if not isinstance(networks, dict):
+        reason = "configuration_invalid"
+    else:
+        address = _strict_caller_address(request, settings)
+        if address is not None and hardening.address_in(address, networks[client_kind]):
+            return True
+        reason = "address_unresolved" if address is None else "outside_provider_networks"
+    hardening.audit(
+        "source_network_denied", level=logging.WARNING, category="source_network",
+        grant=grant_type, client_kind=client_kind, client_id=client_id, reason=reason,
+    )
+    return False
+
+
+def _token_lifetimes(service, client_kind: str | None):
+    return hardening.token_lifetimes(
+        get_settings(), client_kind, access_ttl=service.access_token_ttl_seconds,
+        idle=service.refresh_token_idle_seconds, family=service.refresh_family_max_seconds,
+    )
+
+
+@router.post("/token", dependencies=[Depends(_reserve_token_dpop_proof), Depends(_charge_refresh_client)])
 def token(
     grant_type: Annotated[str | None, Form()] = None,
     code: Annotated[str | None, Form()] = None,
@@ -883,22 +1003,29 @@ def token(
                 denied_service = None  # unconfigured: nothing can have been issued
             if denied_service is not None and authenticate_client(denied_service.clients, client_id, client_secret):
                 try:
-                    denied_service.revoke_refresh_token(db, refresh_token, client_id=client_id)
+                    denied_service.revoke_refresh_token(db, refresh_token, client_id=client_id, reason="provider_switched_off")
                 except McpOAuthError:
                     pass  # the live admission check still refuses every refresh
         raise OAuthErrorResponse(status.HTTP_403_FORBIDDEN, "unauthorized_client", "External MCP access is not available for this client.")
     service = _oauth_service()
     # Confidential clients (registry entry with client_secret_hash) must
     # authenticate; public clients must not send a secret (PKCE only). The
-    # same authentication applies to both grants.
-    if not authenticate_client(service.clients, client_id, client_secret):
+    # same authentication applies to both grants. A refresh whose client
+    # _charge_refresh_client already authenticated is not hashed again.
+    pre_authenticated = getattr(getattr(request, "state", None), "mcp_refresh_client_authenticated", None)
+    if not (refresh_grant and _same(pre_authenticated, client_id)) and not authenticate_client(service.clients, client_id, client_secret):
+        raise _invalid_client()
+    # Provider source networks (opt-in): same answer as a failed client
+    # authentication; the specific reason is only logged.
+    if not _source_network_allowed(request, client_kind=decision.client_kind, client_id=client_id, grant_type=grant_type):
         raise _invalid_client()
     unbound_allowed = decision.client_kind in bearer_providers(get_settings())
     dpop_jkt = _verified_dpop_jkt(request, dpop, service.issuer)
+    lifetimes = _token_lifetimes(service, decision.client_kind)
     if refresh_grant:
         return _refresh_grant(
             db, service, refresh_token=refresh_token, scope=scope, client_id=client_id,
-            client_kind=decision.client_kind, dpop_jkt=dpop_jkt, unbound_allowed=unbound_allowed,
+            client_kind=decision.client_kind, dpop_jkt=dpop_jkt, unbound_allowed=unbound_allowed, lifetimes=lifetimes,
         )
     if not code or not redirect_uri or not code_verifier:
         raise _invalid_token_request()
@@ -912,7 +1039,8 @@ def token(
     try:
         return service.exchange_code(
             db, code=code, client_id=client_id, redirect_uri=redirect_uri, code_verifier=code_verifier,
-            dpop_jkt=dpop_jkt, client_kind=decision.client_kind, allow_unbound=dpop_jkt is None,
+            dpop_jkt=dpop_jkt, client_kind=decision.client_kind, allow_unbound=dpop_jkt is None, lifetimes=lifetimes,
+            supersede_other_families=decision.client_kind in hardening.single_family_providers(get_settings()),
         )
     except McpOAuthStorageError as exc:
         raise _temporarily_unavailable() from exc
@@ -941,7 +1069,7 @@ def _hub_user_is_active(db: Session, subject: str, email: str) -> bool:
     return user is not None and str(user.id) == str(subject) and not getattr(user, "is_deleted", False)
 
 
-def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str, client_kind, dpop_jkt: str | None, unbound_allowed: bool):
+def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str, client_kind, dpop_jkt: str | None, unbound_allowed: bool, lifetimes=None):
     if not isinstance(refresh_token, str) or not refresh_token:
         raise _invalid_token_request()
     # The granted scope is renphil.mcp.read; offline_access (requested by
@@ -955,7 +1083,7 @@ def _refresh_grant(db: Session, service, *, refresh_token, scope, client_id: str
     try:
         return service.refresh_access_token(
             db, refresh_token=refresh_token, client_id=client_id, client_kind=client_kind, dpop_jkt=dpop_jkt,
-            allow_unbound=unbound_allowed, user_is_active=_hub_user_is_active,
+            allow_unbound=unbound_allowed, user_is_active=_hub_user_is_active, lifetimes=lifetimes,
         )
     except McpOAuthDPoPBindingError as exc:
         raise _bad_request("invalid_dpop_proof", "A DPoP proof for this refresh token is required.") from exc
