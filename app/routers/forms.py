@@ -7,7 +7,7 @@ Embedded forms router.
 * `PUT /forms/component` — upsert a `form` component's settings (form id,
   PAT, `hide_back_button`).
 * `GET /forms/component/{link}/embed` — the embed URL to render one form
-  component, fetched fresh from the form builder, with `hide_back_button`
+  component, fetched fresh from the form builder, with `hide_back_btn`
   for non-public forms and a per-viewer token when the form requires `user`
   authentication.
 """
@@ -164,12 +164,12 @@ cached, so changes in the form builder show up immediately.
 * `requires_authentication: false`, or `true` with `authentication_type:
   none` — returns the form builder's `embed_url` as-is.
 * `requires_authentication: true` with `authentication_type: submission` —
-  returns `embed_url` with `hide_back_button=true|false` appended.
+  returns `embed_url` with `hide_back_btn=true|false` appended.
 * `requires_authentication: true` with `authentication_type: user` (or an
   unknown type) — also calls the form builder's
   `POST /api/authenticate_with_pat` with the stored PAT, the form id and the
   signed-in user's email (from the JWT), and appends `token=<jwt>` after
-  `hide_back_button`. The token is per-viewer and short-lived
+  `hide_back_btn`. The token is per-viewer and short-lived
   (`expires_in_seconds`, `max_uses`): fetch this right before rendering the
   iframe, and again to refresh it. The response is never cached.
 
