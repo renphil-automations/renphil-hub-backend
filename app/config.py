@@ -129,12 +129,99 @@ class Settings(BaseSettings):
     MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS: int = Field(default=7 * 24 * 3600, ge=300, le=30 * 24 * 3600)
     MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS: int = Field(default=30 * 24 * 3600, ge=3600, le=90 * 24 * 3600)
 
+    # ── External MCP client hardening (all off by default) ────────────
+    # JSON {"<provider>": ["<CIDR>", ...]} (providers: claude, chatgpt,
+    # gemini). A listed provider may use /token (authorization_code and
+    # refresh_token) only from inside its CIDRs; otherwise invalid_client.
+    # The caller address honours X-Forwarded-For ONLY when the direct peer is
+    # in TRUSTED_PROXY_CIDRS, so behind a proxy that must be set or every
+    # request is denied. Strict CIDRs, nothing broader than /16 IPv4 or /32
+    # IPv6 (same rule as the MCP server); invalid values refuse to start.
+    # "{}" (default): off.
+    MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON: str = "{}"
+    # Per-minute, per-network refresh limit for networks inside a provider's
+    # MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON ranges (shared provider egress).
+    # Default: the ordinary per-network refresh limit (30).
+    MCP_OAUTH_PROVIDER_NETWORK_REFRESH_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=100_000)
+    # Access tokens issued with a refresh token carry ``sid`` (the refresh
+    # family). When true, the Agent's per-tool-call live ACL check also
+    # requires a live family for that sid (X-RenPhil-MCP-Sid) for external
+    # clients: revoked, expired, unknown or missing -> 403. Requires
+    # MCP_OAUTH_REFRESH_TOKENS_ENABLED=true. Default false.
+    MCP_OAUTH_SESSION_LIVE_CHECK_ENABLED: bool = False
+    # Comma-separated providers allowed only one live refresh family per
+    # (user, client): a new code exchange revokes the older ones. Default "".
+    MCP_OAUTH_SINGLE_FAMILY_PROVIDERS: str = ""
+    # JSON {"<provider>": {"access_token_ttl_seconds": n,
+    # "refresh_idle_seconds": n, "refresh_family_max_seconds": n}} (each
+    # optional). Values may only shorten the global lifetimes; access tokens
+    # at most 600 s. Invalid values refuse to start. "{}" (default): global.
+    MCP_OAUTH_PROVIDER_TOKEN_POLICY_JSON: str = "{}"
+    # JSON {"<provider>": <max tool calls per user per UTC day>}, counted on
+    # the live ACL check (when a sid is forwarded) in the shared limiter
+    # store. Exceeding it revokes that session's family and denies. "{}"
+    # (default): off.
+    MCP_OAUTH_ANOMALY_DAILY_CALL_LIMIT_JSON: str = "{}"
+
     @field_validator("MCP_OAUTH_BEARER_PROVIDERS")
     @classmethod
     def _validate_bearer_providers(cls, value: str) -> str:
         from app.services.mcp_access_policy import parse_bearer_providers
 
         return ",".join(sorted(parse_bearer_providers(value)))
+
+    @field_validator("MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON")
+    @classmethod
+    def _validate_provider_source_cidrs(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_provider_source_cidrs
+
+        parse_provider_source_cidrs(value)
+        return value
+
+    @field_validator("MCP_OAUTH_SINGLE_FAMILY_PROVIDERS")
+    @classmethod
+    def _validate_single_family_providers(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_provider_set
+
+        return ",".join(sorted(parse_provider_set(value, "MCP_OAUTH_SINGLE_FAMILY_PROVIDERS")))
+
+    @field_validator("MCP_OAUTH_PROVIDER_TOKEN_POLICY_JSON")
+    @classmethod
+    def _validate_provider_token_policy(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_provider_token_policy
+
+        parse_provider_token_policy(value)
+        return value
+
+    @field_validator("MCP_OAUTH_ANOMALY_DAILY_CALL_LIMIT_JSON")
+    @classmethod
+    def _validate_anomaly_limits(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_anomaly_limits
+
+        parse_anomaly_limits(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_mcp_oauth_hardening(self):
+        # Cross-field checks. McpOAuthHardeningConfigError is not a
+        # ValueError, so pydantic never renders the settings in the error.
+        from app.services.mcp_oauth_hardening import (
+            McpOAuthHardeningConfigError,
+            check_provider_token_policy,
+            parse_provider_token_policy,
+        )
+
+        check_provider_token_policy(
+            parse_provider_token_policy(self.MCP_OAUTH_PROVIDER_TOKEN_POLICY_JSON),
+            access_ttl=self.MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+            idle=self.MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS,
+            family=self.MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS,
+        )
+        if self.MCP_OAUTH_SESSION_LIVE_CHECK_ENABLED and not self.MCP_OAUTH_REFRESH_TOKENS_ENABLED:
+            raise McpOAuthHardeningConfigError(
+                "MCP_OAUTH_SESSION_LIVE_CHECK_ENABLED requires MCP_OAUTH_REFRESH_TOKENS_ENABLED."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_mcp_oauth_signing_key(self):
