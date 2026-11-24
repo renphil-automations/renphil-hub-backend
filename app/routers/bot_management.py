@@ -1184,6 +1184,73 @@ def update_bot_feedback_status(
         raise HTTPException(503, "Bot feedback is temporarily unavailable.") from None
 
 
+class RevokeMcpSessionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Omitted (or {}): every external provider.
+    client_kind: Literal["claude", "chatgpt", "gemini"] | None = None
+
+
+def _mcp_client_ids_for_provider(app_settings, provider: str) -> set[str]:
+    """Every client ID mapped to ``provider`` (including a mapping that is not
+    currently admissible), so a revoke never misses an older family."""
+    import json
+
+    from app.services.mcp_access_policy import load_approved_clients
+
+    try:
+        mapping = json.loads(getattr(app_settings, "MCP_OAUTH_CLIENT_PROVIDERS_JSON", "") or "{}")
+    except (TypeError, ValueError):
+        mapping = {}
+    ids = {client_id for client_id, kind in mapping.items() if kind == provider and isinstance(client_id, str)} if isinstance(mapping, dict) else set()
+    approved = load_approved_clients(app_settings).client_by_provider.get(provider)
+    if approved:
+        ids.add(approved)
+    return ids
+
+
+@router.post("/mcp/users/{user_id}/revoke-sessions")
+def revoke_mcp_user_sessions(
+    user_id: int,
+    request: Request,
+    response: Response,
+    payload: RevokeMcpSessionsRequest | None = None,
+    current: CurrentHubUser = Depends(get_current_hub_user),
+    db: Session = Depends(get_db_v2),
+):
+    """Revoke one user's external MCP sessions (refresh-token families).
+
+    Admin with All Scopes (router dependency); refused under View As. With
+    ``client_kind`` only that provider's families are revoked, otherwise all
+    external providers'. Access tokens already issued expire on their own
+    (minutes), or at once on the next tool call when the session live check
+    is enabled. Returns ``{"revoked": <families newly revoked>}``.
+    """
+    headers = {"Cache-Control": "no-store", "Vary": "Authorization"}
+    if any(request.query_params.get(key) for key in ("view_as", "view_as_from", "view_as_role", "view_as_scope", "anonymous")):
+        raise HTTPException(403, "Exit View As to revoke MCP sessions.", headers=headers)
+    response.headers.update(headers)
+    if user_id < 1:
+        raise HTTPException(422, "Invalid user id.")
+    app_settings = get_app_settings()
+    if getattr(app_settings, "MCP_OAUTH_REFRESH_TOKENS_ENABLED", False) is not True:
+        # No refresh families exist (the table is never touched while off).
+        return {"revoked": 0}
+    from app.services.mcp_oauth_hardening import audit, user_ref
+    from app.services.mcp_oauth_service import revoke_refresh_families_for_user
+
+    client_kind = payload.client_kind if payload is not None else None
+    client_ids = None if client_kind is None else _mcp_client_ids_for_provider(app_settings, client_kind)
+    try:
+        revoked = revoke_refresh_families_for_user(db, subject=str(user_id), client_ids=client_ids, reason="user_revoke")
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning("MCP session revocation unavailable: %s", type(exc).__name__)
+        raise HTTPException(503, "MCP session revocation is temporarily unavailable.", headers=headers) from None
+    audit("admin_user_revoke", client_kind=client_kind or "all", user=user_ref(user_id),
+          actor=user_ref(current.hub_user_id), families=revoked)
+    return {"revoked": revoked}
+
+
 @router.get("/analytics/summary")
 def get_bot_analytics_summary(
     date_from: date | None = None,
