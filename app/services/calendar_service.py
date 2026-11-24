@@ -187,6 +187,32 @@ def _meeting_from(event: dict[str, Any]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _shown_details(
+    master: dict[str, Any], instance: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Title, text and links for the occurrence being shown.
+
+    A recurring event shows its next occurrence's own values, so a "This event"
+    edit in Google appears on the card. Google returns every field for each
+    occurrence, edited or not. Only a blank title falls back to the series:
+    Google leaves out empty fields, so falling back on the others would bring
+    back a description someone cleared or a conference someone removed.
+    """
+    shown = instance or master
+    summary = shown.get("summary") or ""
+    if not summary.strip():
+        summary = master.get("summary") or ""
+    meeting_link, meeting_label = _meeting_from(shown)
+    return {
+        "summary": summary,
+        "location": shown.get("location"),
+        "description": shown.get("description"),
+        "html_link": shown.get("htmlLink"),
+        "meeting_link": meeting_link,
+        "meeting_label": meeting_label,
+    }
+
+
 # (series_id, master, next_instance): see CalendarService._resolve.
 _Resolved = tuple[str, dict[str, Any], "dict[str, Any] | None"]
 
@@ -404,13 +430,14 @@ class CalendarService:
         Resolve *event_id* to the nearest upcoming occurrence and report
         whether *viewer_email* is on the guest list.
 
-        Series-level details (summary, location, links, attendees) come from
-        the master; for a recurring event the start/end are taken from its
-        next instance. The returned ``id`` is the series actually shown, which
-        differs from *event_id* once a split series has been followed (see
-        ``_resolve``) — the widget RSVPs against it, so attendance lands on the
-        live series. Raises 404 if the event is gone, a one-off has ended, or
-        the series (and any continuation of it) has no future occurrences.
+        For a recurring event the times, title, text and links come from its
+        next instance (see ``_shown_details``), while the guest list comes from
+        the master that RSVPs patch. The returned ``id`` is the series actually
+        shown, which differs from *event_id* once a split series has been
+        followed (see ``_resolve``) — the widget RSVPs against it, so
+        attendance lands on the live series. Raises 404 if the event is gone, a
+        one-off has ended, or the series (and any continuation of it) has no
+        future occurrences.
 
         Served from the event cache, so Google-side edits can take up to a minute
         to show. ``attending`` is worked out per viewer from the cached guest list.
@@ -426,21 +453,14 @@ class CalendarService:
             (a.get("email", "").lower() == viewer_email.lower()) for a in attendees
         )
 
-        meeting_link, meeting_label = _meeting_from(master)
-
         return CalendarEvent(
             id=series_id,
-            summary=master.get("summary", ""),
             start=_start_str(start_node),
             end=_start_str(end_node),
             is_all_day=_is_all_day(start_node),
-            location=master.get("location"),
-            description=master.get("description"),
-            html_link=master.get("htmlLink"),
-            meeting_link=meeting_link,
-            meeting_label=meeting_label,
             recurring=recurring,
             attending=attending,
+            **_shown_details(master, instance),
         )
 
     def get_events(
@@ -520,21 +540,15 @@ class CalendarService:
         start_node = (instance or master).get("start")
         end_node = (instance or master).get("end")
 
-        meeting_link, meeting_label = _meeting_from(master)
         return CalendarIndexEvent(
             # Keyed by the stored id, not the followed series, so the Agent's
             # vectors stay attached to the widget that references them.
             id=event_id,
-            summary=master.get("summary", ""),
             start=_start_str(start_node),
             end=_start_str(end_node),
             is_all_day=_is_all_day(start_node),
-            location=master.get("location"),
-            description=master.get("description"),
-            html_link=master.get("htmlLink"),
-            meeting_link=meeting_link,
-            meeting_label=meeting_label,
             recurring=recurring,
+            **_shown_details(master, instance),
         )
 
     # ── RSVP toggle ────────────────────────────────────────────────────
@@ -756,7 +770,8 @@ class CalendarService:
         scrambled for some series, so its first item can be weeks away. Pages
         are followed because Google may return an empty page with a
         ``nextPageToken``. ``timeMin`` filters on *end* time, so a meeting in
-        progress is still "next" until it finishes.
+        progress is still "next" until it finishes. The fields shown on the card
+        are read too, so ``_shown_details`` can show a "This event" edit.
         """
         page_token: str | None = None
         while True:
@@ -771,7 +786,10 @@ class CalendarService:
                         timeMin=_now_rfc3339(),
                         maxResults=5,
                         pageToken=page_token,
-                        fields="nextPageToken,items(id,start,end)",
+                        fields=(
+                            "nextPageToken,items(id,start,end,summary,description,"
+                            "location,htmlLink,hangoutLink,conferenceData)"
+                        ),
                     )
                     .execute(num_retries=_READ_RETRIES)
                 )
