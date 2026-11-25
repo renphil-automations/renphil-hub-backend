@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,7 @@ from app.routers import (
     forms,
     knowledge,
     locks_v2,
+    mcp_oauth,
     nav_tabs,
     product_analytics,
     hub_feedback,
@@ -45,6 +47,7 @@ from app.routers import (
     threads,
     view_as,
 )
+from app.services import mcp_oauth_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,7 @@ async def lifespan(app: FastAPI):
     # Google access / refresh / id tokens on every sign-in. Never below WARNING.
     for name in ("requests_oauthlib", "oauthlib"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    mcp_oauth_rate_limit.warn_if_forwarded_for_untrusted(settings)
     logger.info("Starting %s …", settings.APP_NAME)
     await init_http_client()
     yield
@@ -69,9 +73,45 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete.")
 
 
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def check_cors_origins(settings) -> None:
+    """Refuse to start with an unsafe credentialed-CORS origin list.
+
+    CORS runs with ``allow_credentials=True``. ``*`` or ``null`` (the origin
+    of sandboxed iframes and ``file:`` pages) is refused everywhere; outside
+    local/debug every origin must also be HTTPS, loopback excepted.
+    """
+    strict = not settings.is_local_or_debug
+    problems = []
+    for origin in settings.ALLOWED_ORIGINS:
+        value = str(origin).strip()
+        if value == "*" or value.lower() == "null":
+            problems.append(f"{value!r} is not allowed with credentialed CORS")
+            continue
+        if not strict:
+            continue
+        try:
+            parts = urlsplit(value)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            problems.append(f"{value!r} is not a valid origin")
+            continue
+        loopback = host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+        if parts.scheme.lower() == "https" and host:
+            continue
+        if parts.scheme.lower() == "http" and loopback:
+            continue
+        problems.append(f"{value!r} must be https outside local/debug")
+    if problems:
+        raise RuntimeError("Refusing to start: unsafe ALLOWED_ORIGINS: " + "; ".join(problems))
+
+
 def create_app() -> FastAPI:
     """Application factory."""
     settings = get_settings()
+    check_cors_origins(settings)
 
     app = FastAPI(
         title=settings.APP_NAME,
@@ -109,6 +149,8 @@ def create_app() -> FastAPI:
     api_prefix = ""
 
     app.include_router(auth.router, prefix=api_prefix)
+    app.include_router(mcp_oauth.router, prefix=api_prefix)
+    app.include_router(mcp_oauth.metadata_router, prefix=api_prefix)
     app.include_router(drive.router, prefix=api_prefix)
     app.include_router(dify.router, prefix=api_prefix)
     app.include_router(bot_management.router, prefix=api_prefix)

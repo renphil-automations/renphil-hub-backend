@@ -85,7 +85,7 @@ BUILTIN_SURFACES = frozenset({
 })
 BUILTIN_CONTROLS = frozenset({
     "view_selected", "filter_changed", "search_used", "refreshed", "exported", "saved", "status_changed",
-    "decision_changed", "details_opened", "page_changed", "load_more", "check_now", "pause_changed",
+    "decision_changed", "details_opened", "document_previewed", "page_changed", "load_more", "check_now", "pause_changed",
     "created", "deleted", "approved", "declined", "changes_requested", "granted", "revoked",
 })
 # Sub-views of built-in pages (`view`), plus the thread list tabs.

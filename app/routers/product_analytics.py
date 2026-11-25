@@ -183,7 +183,7 @@ def _viewer_access(db: Session, current: CurrentHubUser) -> ViewerAccess:
 def _ingest_in_worker(
     events: list[Any], *, current: CurrentHubUser, environment: str,
     view_as_role: str | None = None, view_as_scope: str | None = None,
-    view_as: list[str] | None = None, view_as_user: str | None = None,
+    view_as: list[str] | None = None, view_as_from: str | None = None,
 ) -> dict[str, Any]:
     """The whole synchronous database half of one ingest, run in ONE worker
     thread with a session created and closed in that same thread.
@@ -200,7 +200,7 @@ def _ingest_in_worker(
         view_as_role_key, view_as_scope_key = _verified_view_as_context(
             db, current=current, role_candidate=view_as_role, scope_candidate=view_as_scope
         )
-        context = _verified_selection_context(db, current, view_as, view_as_user)
+        context = _verified_selection_context(db, current, view_as, view_as_from)
         return service.ingest_events(
             db,
             events,
@@ -222,7 +222,7 @@ def _ingest_in_worker(
 def _ingest_engagements_in_worker(
     engagements: list[Any], *, current: CurrentHubUser, environment: str,
     view_as_role: str | None = None, view_as_scope: str | None = None,
-    view_as: list[str] | None = None, view_as_user: str | None = None,
+    view_as: list[str] | None = None, view_as_from: str | None = None,
 ) -> dict[str, Any]:
     """Persist active-time intervals in their own short-lived DB session."""
     db = SessionLocalV2()
@@ -230,7 +230,7 @@ def _ingest_engagements_in_worker(
         view_as_role_key, view_as_scope_key = _verified_view_as_context(
             db, current=current, role_candidate=view_as_role, scope_candidate=view_as_scope
         )
-        context = _verified_selection_context(db, current, view_as, view_as_user)
+        context = _verified_selection_context(db, current, view_as, view_as_from)
         return service.ingest_engagements(
             db,
             engagements,
@@ -249,15 +249,20 @@ def _ingest_engagements_in_worker(
         db.close()
 
 
-def _verified_selection_context(db: Session, current: CurrentHubUser, values: list[str] | None, user: str | None) -> dict | None:
+def _verified_selection_context(
+    db: Session, current: CurrentHubUser, values: list[str] | None, view_as_from: str | None
+) -> dict | None:
+    """The verified `view_as` pairs, plus the internal id of the
+    `view_as_from` user (audit only, unverified: `None` when the email
+    matches no active user)."""
     pairs = view_as_service.normalize_pair_values(values)
-    email = view_as_service.normalize_email(user)
+    email = view_as_service.normalize_email(view_as_from)
     if not pairs and not email:
         return None
     caller_id = view_as_service.resolve_user_id(db, current.email) or current.hub_user_id
-    selection = view_as_service.resolve_view_as_selection(db, caller_id, pairs, email)
+    selection = view_as_service.resolve_view_as_selection(db, caller_id, pairs)
     return {"pairs": [{"role": target.role_key, "scope": target.scope_key} for target in selection.targets],
-            "user_id": selection.user.id if selection.user else None}
+            "user_id": view_as_service.resolve_user_id(db, email) if email else None}
 
 
 def _verified_view_as_context(
@@ -326,7 +331,7 @@ async def ingest_product_events(
     view_as_role: str | None = Query(default=None),
     view_as_scope: str | None = Query(default=None),
     view_as: list[str] | None = Query(default=None),
-    view_as_user: str | None = Query(default=None),
+    view_as_from: str | None = Query(default=None),
     view_as_anonymous: bool = Query(default=False, alias="anonymous"),
 ):
     # 1. Size: 413 before anything is parsed, validated, counted or stored.
@@ -363,7 +368,7 @@ async def ingest_product_events(
             environment=get_settings().hub_environment,
             view_as_role=view_as_role,
             view_as_scope=view_as_scope,
-            view_as=view_as, view_as_user=view_as_user,
+            view_as=view_as, view_as_from=view_as_from,
         )
     except view_as_service.ViewAsPairsError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from None
@@ -387,7 +392,7 @@ async def ingest_product_engagements(
     view_as_role: str | None = Query(default=None),
     view_as_scope: str | None = Query(default=None),
     view_as: list[str] | None = Query(default=None),
-    view_as_user: str | None = Query(default=None),
+    view_as_from: str | None = Query(default=None),
     view_as_anonymous: bool = Query(default=False, alias="anonymous"),
 ):
     """Record active page time. Hidden/background time is never sent by the UI."""
@@ -413,7 +418,7 @@ async def ingest_product_engagements(
             environment=get_settings().hub_environment,
             view_as_role=view_as_role,
             view_as_scope=view_as_scope,
-            view_as=view_as, view_as_user=view_as_user,
+            view_as=view_as, view_as_from=view_as_from,
         )
     except view_as_service.ViewAsPairsError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from None

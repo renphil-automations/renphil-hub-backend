@@ -46,9 +46,9 @@ class AssignmentListAPIResponse(BaseModel):
 class RevocableAssignmentListAPIResponse(AssignmentListAPIResponse):
     view_as: bool = Field(
         default=False,
-        description="True when computed from the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when computed from the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class AssignmentAPIResponse(BaseModel):
@@ -58,9 +58,9 @@ class AssignmentAPIResponse(BaseModel):
 class CreatedAssignmentAPIResponse(AssignmentAPIResponse):
     view_as: bool = Field(
         default=False,
-        description="True when the grant was authorised against the View As parameters (`view_as` and/or `view_as_user`).",
+        description="True when the grant was authorised against the View As parameters (`view_as` pairs).",
     )
-    view_as_user: str | None = Field(default=None, description="Email of the user selected through `view_as_user`, echoed back; null when none.")
+    view_as_from: str | None = Field(default=None, description="The `view_as_from` audit email, echoed back under View As; null when none was sent or without `view_as` pairs.")
 
 
 class CreateAssignmentRequest(StrictRequestModel):

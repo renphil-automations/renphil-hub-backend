@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -29,7 +30,8 @@ from app.dependencies import (
 )
 from app.helpers.exceptions import UserRemovedError
 from app.models.auth import MeResponse, TokenResponse, UserInfo
-from app.services.auth_service import AuthService
+from app.services.auth_service import AuthService, is_mcp_continuation_uri
+from app.services.mcp_oauth_service import McpOAuthError
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -41,8 +43,22 @@ async def login(
         description="Frontend URL to redirect to after authentication",
     ),
     auth_service: AuthService = Depends(get_auth_service),
+    request: Request = None,  # type: ignore[assignment]  # always injected by FastAPI
 ):
     """Redirect the caller to the Google consent screen."""
+    if not auth_service.is_allowed_login_redirect_uri(redirect_uri):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid login redirect URI.")
+    settings = get_settings()
+    if getattr(settings, "MCP_OAUTH_ENABLED", False) and is_mcp_continuation_uri(redirect_uri, getattr(settings, "MCP_OAUTH_ISSUER", None)):
+        # An MCP authorization may only be signed into from the browser that
+        # started it (consent binding cookie), never from a lured victim's.
+        from app.routers.mcp_oauth import continuation_browser_bound
+
+        if not continuation_browser_bound(request.cookies if request is not None else {}, redirect_uri):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OAuth authorization request expired or is invalid.",
+            )
     url = auth_service.get_authorization_url(redirect_uri)
     return RedirectResponse(url)
 
@@ -53,6 +69,7 @@ async def callback(
     state: str = Query(..., description="OAuth state parameter (PKCE tie-back)"),
     auth_service: AuthService = Depends(get_auth_service),
     db: Session = Depends(get_db_v2),
+    request: Request = None,  # type: ignore[assignment]  # always injected by FastAPI
 ):
     """
     Google redirects here after the user consents.
@@ -63,6 +80,14 @@ async def callback(
     token_response, frontend_redirect_uri = await auth_service.handle_callback(
         code, state, db
     )
+    # Everything below uses the synchronous DB session: run it in the
+    # threadpool so a slow database never blocks the event loop.
+    cookies = dict(request.cookies) if request is not None else None
+    return await run_in_threadpool(_complete_callback, db, token_response, frontend_redirect_uri, cookies)
+
+
+def _complete_callback(db: Session, token_response, frontend_redirect_uri: str, cookies):
+    """Synchronous part of ``/auth/callback`` (runs in the threadpool)."""
 
     # findings_dev_login_live_testing_2026-09-12.md #1: the frontend never
     # actually calls GET /me after this redirect (AuthCallbackPage.tsx builds
@@ -97,6 +122,43 @@ async def callback(
             email=normalized_email,
         )
         admin = is_hub_admin(db, current)
+
+    # MCP OAuth reuses the already verified Google callback. The normal Hub
+    # session JWT never travels through the external MCP client redirect.
+    settings = get_settings()
+    if settings.MCP_OAUTH_ENABLED and hub_user is not None:
+        from app.routers.mcp_oauth import complete_hub_login
+
+        try:
+            oauth_redirect = complete_hub_login(
+                db=db,
+                continuation_uri=frontend_redirect_uri,
+                email=hub_user.email,
+                subject=str(hub_user.id),
+                cookies=cookies,
+            )
+        except McpOAuthError as exc:
+            detail = str(exc).strip().lower()
+            if "invalid or expired" in detail:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="OAuth authorization request expired or is invalid.",
+                ) from exc
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="MCP authorization is temporarily unavailable. Please try again.",
+            ) from exc
+        if oauth_redirect is not None:
+            return RedirectResponse(oauth_redirect)
+
+    # A continuation the MCP flow did not consume (MCP disabled, no Hub user
+    # row, or a variant spelling of the issuer) must never fall through to
+    # the normal redirect below, which appends the Hub session token.
+    if is_mcp_continuation_uri(frontend_redirect_uri, getattr(settings, "MCP_OAUTH_ISSUER", None)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth authorization request expired or is invalid.",
+        )
 
     params = urlencode(
         {
@@ -229,6 +291,15 @@ async def dev_login(
 
     if not email:
         return HTMLResponse(_DEV_LOGIN_FORM_HTML)
+
+    # Same rule as /auth/login: the minted session token is appended to this
+    # location, so it must be an allowed frontend's /auth/callback.
+    if not auth_service.is_allowed_login_redirect_uri(redirect_uri):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid login redirect URI.")
+    # Dev-login never completes an MCP authorization: the session token would
+    # land on a Hub continuation URL (and in its access logs).
+    if is_mcp_continuation_uri(redirect_uri, getattr(settings, "MCP_OAUTH_ISSUER", None)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid login redirect URI.")
 
     normalized_email = email.strip().lower()
     try:

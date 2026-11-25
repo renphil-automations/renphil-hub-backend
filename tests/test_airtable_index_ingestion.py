@@ -77,9 +77,10 @@ def test_airtable_index_sync_auth_uses_constant_time_compare():
                 "expected-sync-token"
             )
 
+            # Bytes, so a non-ASCII header is a 401 rather than a TypeError 500.
             compare.assert_called_once_with(
-                "expected-sync-token",
-                "expected-sync-token",
+                b"expected-sync-token",
+                b"expected-sync-token",
             )
 
         with pytest.raises(HTTPException) as exc:

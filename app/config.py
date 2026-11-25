@@ -3,9 +3,26 @@ Centralised application settings loaded from environment variables.
 Uses pydantic-settings so every value is validated at startup.
 """
 
+import ipaddress
 from functools import lru_cache
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_cidrs(value: str) -> tuple[IPNetwork, ...]:
+    """Parse a comma-separated CIDR list; ``ValueError`` names a bad entry."""
+    networks = []
+    for raw in (value or "").split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"TRUSTED_PROXY_CIDRS: invalid CIDR {entry!r}") from exc
+    return tuple(networks)
 
 
 class Settings(BaseSettings):
@@ -62,6 +79,160 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+
+    # ── MCP OAuth authorization server ────────────────────────────────
+    # Hub is the issuer. The private RS256 key is held only by Hub; MCP
+    # receives the matching public JWKS document.
+    MCP_OAUTH_ENABLED: bool = False
+    MCP_OAUTH_ISSUER: str | None = None
+    MCP_OAUTH_AUDIENCE: str = "renphil-data-mcp"
+    # Exact clients and exact callbacks only; wildcard redirects are rejected.
+    MCP_OAUTH_CLIENTS_JSON: str = "{}"
+    MCP_OAUTH_CLIENT_PROVIDERS_JSON: str = "{}"
+    MCP_OAUTH_CODE_TTL_SECONDS: int = 120
+    MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: int = 300
+    MCP_OAUTH_AGENT_CLIENT_ID: str = "renphil-agent"
+    MCP_OAUTH_SIGNING_PRIVATE_KEY: str | None = None
+    MCP_OAUTH_SIGNING_KEY_ID: str | None = None
+    # Key rotation overlap: JSON object {"<kid>": "<RSA public key PEM>"} of
+    # keys published in the JWKS but never used to sign - the next key before
+    # signing switches to it, or the previous key until its tokens expire.
+    # Public keys only (a private PEM is rejected); each kid must differ from
+    # MCP_OAUTH_SIGNING_KEY_ID. Empty (default): only the signing key.
+    MCP_OAUTH_SIGNING_PUBLIC_KEYS_NEXT: str = ""
+    # Comma-separated subset of claude,chatgpt,gemini whose hosted connectors
+    # cannot sign DPoP proofs. For these providers only, /token issues an
+    # unbound Bearer token when no DPoP header is sent; a DPoP header is
+    # still validated and binds the token. Empty (default): DPoP is required
+    # for every external provider. Unknown names fail start-up.
+    MCP_OAUTH_BEARER_PROVIDERS: str = ""
+    # RFC 8707: the MCP server's resource URL (e.g. https://mcp.example/mcp).
+    # A ``resource`` parameter sent to /authorize or /token must equal it
+    # (a trailing slash is ignored), otherwise ``invalid_target``. Requests
+    # without ``resource`` are unaffected. Unset: any ``resource`` is refused.
+    MCP_OAUTH_RESOURCE_URL: str | None = None
+    # Rotating refresh tokens for external MCP clients (off by default). When
+    # on, the code exchange also returns an opaque refresh token (stored only
+    # as a SHA-256 digest in mcp_oauth_refresh_tokens, which must exist
+    # first); reuse of a rotated token revokes its whole family.
+    # External clients only: /authorize binds the request to the browser with
+    # a 10-minute HttpOnly cookie, and after Hub sign-in a server-rendered
+    # consent page (provider + scope, CSRF-protected Approve/Deny) must be
+    # approved before a code is issued. The Agent token path is unaffected.
+    MCP_OAUTH_CONSENT_REQUIRED: bool = True
+    # Per verified Hub user limit on /mcp/oauth/agent-token (delegated MCP
+    # tokens for the Hub Agent), in the shared MCP OAuth limiter store.
+    MCP_OAUTH_AGENT_TOKEN_RATE_LIMIT_PER_MINUTE: int = Field(default=120, ge=1, le=100_000)
+    MCP_OAUTH_REFRESH_TOKENS_ENABLED: bool = False
+    # Idle lifetime of one refresh token (5 minutes to 30 days, default 7 days)
+    # and absolute lifetime of a login's family (1 to 90 days, default 30).
+    MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS: int = Field(default=7 * 24 * 3600, ge=300, le=30 * 24 * 3600)
+    MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS: int = Field(default=30 * 24 * 3600, ge=3600, le=90 * 24 * 3600)
+
+    # ── External MCP client hardening (all off by default) ────────────
+    # JSON {"<provider>": ["<CIDR>", ...]} (providers: claude, chatgpt,
+    # gemini). A listed provider may use /token (authorization_code and
+    # refresh_token) only from inside its CIDRs; otherwise invalid_client.
+    # The caller address honours X-Forwarded-For ONLY when the direct peer is
+    # in TRUSTED_PROXY_CIDRS, so behind a proxy that must be set or every
+    # request is denied. Strict CIDRs, nothing broader than /16 IPv4 or /32
+    # IPv6 (same rule as the MCP server); invalid values refuse to start.
+    # "{}" (default): off.
+    MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON: str = "{}"
+    # Per-minute, per-network refresh limit for networks inside a provider's
+    # MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON ranges (shared provider egress).
+    # Default: the ordinary per-network refresh limit (30).
+    MCP_OAUTH_PROVIDER_NETWORK_REFRESH_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=100_000)
+    # Access tokens issued with a refresh token carry ``sid`` (the refresh
+    # family). When true, the Agent's per-tool-call live ACL check also
+    # requires a live family for that sid (X-RenPhil-MCP-Sid) for external
+    # clients: revoked, expired, unknown or missing -> 403. Requires
+    # MCP_OAUTH_REFRESH_TOKENS_ENABLED=true. Default false.
+    MCP_OAUTH_SESSION_LIVE_CHECK_ENABLED: bool = False
+    # Comma-separated providers allowed only one live refresh family per
+    # (user, client): a new code exchange revokes the older ones. Default "".
+    MCP_OAUTH_SINGLE_FAMILY_PROVIDERS: str = ""
+    # JSON {"<provider>": {"access_token_ttl_seconds": n,
+    # "refresh_idle_seconds": n, "refresh_family_max_seconds": n}} (each
+    # optional). Values may only shorten the global lifetimes; access tokens
+    # at most 600 s. Invalid values refuse to start. "{}" (default): global.
+    MCP_OAUTH_PROVIDER_TOKEN_POLICY_JSON: str = "{}"
+    # JSON {"<provider>": <max tool calls per user per UTC day>}, counted on
+    # the live ACL check (when a sid is forwarded) in the shared limiter
+    # store. Exceeding it revokes that session's family and denies. "{}"
+    # (default): off.
+    MCP_OAUTH_ANOMALY_DAILY_CALL_LIMIT_JSON: str = "{}"
+
+    @field_validator("MCP_OAUTH_BEARER_PROVIDERS")
+    @classmethod
+    def _validate_bearer_providers(cls, value: str) -> str:
+        from app.services.mcp_access_policy import parse_bearer_providers
+
+        return ",".join(sorted(parse_bearer_providers(value)))
+
+    @field_validator("MCP_OAUTH_PROVIDER_SOURCE_CIDRS_JSON")
+    @classmethod
+    def _validate_provider_source_cidrs(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_provider_source_cidrs
+
+        parse_provider_source_cidrs(value)
+        return value
+
+    @field_validator("MCP_OAUTH_SINGLE_FAMILY_PROVIDERS")
+    @classmethod
+    def _validate_single_family_providers(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_provider_set
+
+        return ",".join(sorted(parse_provider_set(value, "MCP_OAUTH_SINGLE_FAMILY_PROVIDERS")))
+
+    @field_validator("MCP_OAUTH_PROVIDER_TOKEN_POLICY_JSON")
+    @classmethod
+    def _validate_provider_token_policy(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_provider_token_policy
+
+        parse_provider_token_policy(value)
+        return value
+
+    @field_validator("MCP_OAUTH_ANOMALY_DAILY_CALL_LIMIT_JSON")
+    @classmethod
+    def _validate_anomaly_limits(cls, value: str) -> str:
+        from app.services.mcp_oauth_hardening import parse_anomaly_limits
+
+        parse_anomaly_limits(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_mcp_oauth_hardening(self):
+        # Cross-field checks. McpOAuthHardeningConfigError is not a
+        # ValueError, so pydantic never renders the settings in the error.
+        from app.services.mcp_oauth_hardening import (
+            McpOAuthHardeningConfigError,
+            check_provider_token_policy,
+            parse_provider_token_policy,
+        )
+
+        check_provider_token_policy(
+            parse_provider_token_policy(self.MCP_OAUTH_PROVIDER_TOKEN_POLICY_JSON),
+            access_ttl=self.MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+            idle=self.MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS,
+            family=self.MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS,
+        )
+        if self.MCP_OAUTH_SESSION_LIVE_CHECK_ENABLED and not self.MCP_OAUTH_REFRESH_TOKENS_ENABLED:
+            raise McpOAuthHardeningConfigError(
+                "MCP_OAUTH_SESSION_LIVE_CHECK_ENABLED requires MCP_OAUTH_REFRESH_TOKENS_ENABLED."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_mcp_oauth_signing_key(self):
+        # Only when MCP OAuth is enabled: the key must be an RSA key of at
+        # least 2048 bits that can sign RS256. Raises McpOAuthKeyError (not a
+        # ValueError) on purpose, so start-up fails with a short message and
+        # pydantic never renders the settings (and their secrets) in an error.
+        from app.services.mcp_oauth_keys import validate_signing_configuration
+
+        validate_signing_configuration(self)
+        return self
 
     # ── Google Drive ───────────────────────────────────────────────────
     GOOGLE_DRIVE_FOLDER_ID: str
@@ -658,6 +829,33 @@ class Settings(BaseSettings):
     def hub_environment(self) -> str:
         value = self.HUB_ENVIRONMENT.strip().lower()
         return value if value in {"local", "sandbox", "production"} else "unconfigured"
+
+    @property
+    def is_local_or_debug(self) -> bool:
+        """Local development: ``DEBUG=true`` or ``HUB_ENVIRONMENT=local``."""
+        return bool(self.DEBUG) or self.hub_environment == "local"
+
+    # ══════════════════════════════════════════════════════════════════
+    # Reverse proxies
+    # ══════════════════════════════════════════════════════════════════
+    # Comma-separated CIDRs (or bare addresses) of the reverse proxies in
+    # front of the API. When set, `X-Forwarded-For` is honoured only when
+    # the direct peer is inside one of them, walking the header right to
+    # left past trusted hops. Empty (the default) keeps the historical
+    # behaviour: the right-most `X-Forwarded-For` entry from ANY peer, which
+    # a client that can reach the API directly can spoof; a startup warning
+    # is logged outside local/debug. An invalid entry fails validation.
+    TRUSTED_PROXY_CIDRS: str = ""
+
+    @field_validator("TRUSTED_PROXY_CIDRS")
+    @classmethod
+    def _validate_trusted_proxy_cidrs(cls, value: str) -> str:
+        _parse_cidrs(value)
+        return value
+
+    @property
+    def trusted_proxy_networks(self) -> tuple[IPNetwork, ...]:
+        return _parse_cidrs(self.TRUSTED_PROXY_CIDRS)
 
 
 def get_settings() -> Settings:

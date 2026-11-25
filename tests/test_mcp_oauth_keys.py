@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import unittest
+
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from app.services.mcp_oauth_keys import HubMcpSigningKey
+
+
+class McpOAuthKeyTests(unittest.TestCase):
+    def test_rs256_token_and_public_jwks_are_verifiable(self):
+        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        key = HubMcpSigningKey(private_pem=pem, key_id="sandbox-2026-10")
+        token = key.sign({"sub": "hub-user-1", "iss": "https://hub.example/mcp/oauth", "aud": "mcp", "exp": 4_000_000_000})
+        header = jwt.get_unverified_header(token)
+        self.assertEqual((header["alg"], header["kid"]), ("RS256", "sandbox-2026-10"))
+        jwk = key.jwks()["keys"][0]
+        public = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
+        claims = jwt.decode(token, public, algorithms=["RS256"], audience="mcp", issuer="https://hub.example/mcp/oauth")
+        self.assertEqual(claims["sub"], "hub-user-1")
+        self.assertNotIn("PRIVATE", str(key.jwks()))
+
+
+def _pem(private) -> str:
+    return private.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+    ).decode("utf-8")
+
+
+class SigningKeyStartupValidationTests(unittest.TestCase):
+    """K-2: an unusable signing key fails start-up, only when MCP OAuth is on."""
+
+    def _settings(self, **overrides):
+        from app.config import Settings
+
+        return Settings(_env_file=None, **overrides)
+
+    def test_weak_non_rsa_garbage_or_missing_keys_fail_startup_without_leaking_material(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from app.services.mcp_oauth_keys import McpOAuthKeyError
+
+        weak = _pem(rsa.generate_private_key(public_exponent=65537, key_size=1024))
+        cases = {
+            "rsa-1024": (weak, "k"),
+            "ec": (_pem(ec.generate_private_key(ec.SECP256R1())), "k"),
+            "garbage": ("-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----", "k"),
+            "missing-key": ("", "k"),
+            "missing-kid": (_pem(rsa.generate_private_key(public_exponent=65537, key_size=2048)), ""),
+        }
+        for name, (pem, kid) in cases.items():
+            with self.subTest(name), self.assertRaises(McpOAuthKeyError) as caught:
+                self._settings(MCP_OAUTH_ENABLED=True, MCP_OAUTH_SIGNING_PRIVATE_KEY=pem, MCP_OAUTH_SIGNING_KEY_ID=kid)
+            message = str(caught.exception)
+            self.assertNotIn("BEGIN", message)
+            self.assertNotIn("not-a-key", message)
+            self.assertLess(len(message), 200)
+
+    def test_valid_key_and_disabled_oauth_start(self):
+        good = _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048))
+        self.assertTrue(self._settings(MCP_OAUTH_ENABLED=True, MCP_OAUTH_SIGNING_PRIVATE_KEY=good, MCP_OAUTH_SIGNING_KEY_ID="k").MCP_OAUTH_ENABLED)
+        # Disabled: nothing is validated, even a weak key.
+        weak = _pem(rsa.generate_private_key(public_exponent=65537, key_size=1024))
+        self._settings(MCP_OAUTH_ENABLED=False, MCP_OAUTH_SIGNING_PRIVATE_KEY=weak, MCP_OAUTH_SIGNING_KEY_ID="k")
+        self._settings()
+
+    def test_signing_key_object_rejects_weak_keys(self):
+        from app.services.mcp_oauth_keys import McpOAuthKeyError
+
+        with self.assertRaises(McpOAuthKeyError):
+            HubMcpSigningKey(private_pem=_pem(rsa.generate_private_key(public_exponent=65537, key_size=1024)), key_id="k")
+
+
+def _public_pem(private) -> str:
+    return private.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
+
+class SigningKeyRotationOverlapTests(unittest.TestCase):
+    """K-1: the JWKS can publish the next key before signing switches to it."""
+
+    def setUp(self) -> None:
+        import json
+
+        self.current = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.next = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.next_json = json.dumps({"hub-2026-12": _public_pem(self.next)})
+
+    def _key(self, raw):
+        from app.services.mcp_oauth_keys import parse_additional_public_keys
+
+        return HubMcpSigningKey(
+            private_pem=_pem(self.current), key_id="hub-2026-11",
+            additional_public_keys=parse_additional_public_keys(raw, current_kid="hub-2026-11"),
+        )
+
+    def test_jwks_publishes_both_keys_with_public_members_only_and_signs_with_current(self):
+        key = self._key(self.next_json)
+        keys = key.jwks()["keys"]
+        self.assertEqual([item["kid"] for item in keys], ["hub-2026-11", "hub-2026-12"])
+        for item in keys:
+            self.assertEqual(set(item), {"kty", "n", "e", "kid", "use", "alg"})
+            self.assertEqual((item["kty"], item["alg"], item["use"]), ("RSA", "RS256", "sig"))
+        token = key.sign({"sub": "1", "aud": "mcp", "exp": 4_000_000_000})
+        self.assertEqual(jwt.get_unverified_header(token)["kid"], "hub-2026-11")
+        current_public = jwt.algorithms.RSAAlgorithm.from_jwk(keys[0])
+        self.assertEqual(jwt.decode(token, current_public, algorithms=["RS256"], audience="mcp")["sub"], "1")
+        # A token signed later by the next key verifies against the published JWKS.
+        future = jwt.encode({"sub": "2", "aud": "mcp"}, self.next, algorithm="RS256", headers={"kid": "hub-2026-12"})
+        next_public = jwt.algorithms.RSAAlgorithm.from_jwk(keys[1])
+        self.assertEqual(jwt.decode(future, next_public, algorithms=["RS256"], audience="mcp")["sub"], "2")
+        self.assertNotIn("PRIVATE", str(key.jwks()))
+
+    def test_default_publishes_only_the_signing_key(self):
+        self.assertEqual(len(self._key("").jwks()["keys"]), 1)
+
+    def test_invalid_next_keys_are_rejected_without_echoing_material(self):
+        import json
+
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from app.services.mcp_oauth_keys import McpOAuthKeyError
+
+        weak = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        cases = {
+            "private-pem": json.dumps({"next": _pem(self.next)}),
+            "weak": json.dumps({"next": _public_pem(weak)}),
+            "ec": json.dumps({"next": _public_pem(ec.generate_private_key(ec.SECP256R1()))}),
+            "same-kid": json.dumps({"hub-2026-11": _public_pem(self.next)}),
+            "bad-kid": json.dumps({" spaced ": _public_pem(self.next)}),
+            "not-json": "{",
+            "list": json.dumps([_public_pem(self.next)]),
+            "garbage": json.dumps({"next": "-----BEGIN PUBLIC KEY-----\nzzz\n-----END PUBLIC KEY-----"}),
+        }
+        for name, raw in cases.items():
+            with self.subTest(name), self.assertRaises(McpOAuthKeyError) as caught:
+                self._key(raw)
+            self.assertNotIn("BEGIN", str(caught.exception))
+
+    def test_startup_validation_covers_next_keys(self):
+        import json
+
+        from app.config import Settings
+        from app.services.mcp_oauth_keys import McpOAuthKeyError
+
+        base = dict(MCP_OAUTH_ENABLED=True, MCP_OAUTH_SIGNING_PRIVATE_KEY=_pem(self.current), MCP_OAUTH_SIGNING_KEY_ID="hub-2026-11")
+        Settings(_env_file=None, MCP_OAUTH_SIGNING_PUBLIC_KEYS_NEXT=self.next_json, **base)
+        with self.assertRaises(McpOAuthKeyError):
+            Settings(_env_file=None, MCP_OAUTH_SIGNING_PUBLIC_KEYS_NEXT=json.dumps({"x": _pem(self.next)}), **base)
+
+    def test_router_jwks_endpoint_publishes_the_next_key(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import app.routers.mcp_oauth as router
+
+        settings = SimpleNamespace(
+            MCP_OAUTH_ENABLED=True, MCP_OAUTH_ISSUER="https://hub.example/mcp/oauth", MCP_OAUTH_AUDIENCE="renphil-data-mcp",
+            MCP_OAUTH_SIGNING_PRIVATE_KEY=_pem(self.current), MCP_OAUTH_SIGNING_KEY_ID="hub-2026-11",
+            MCP_OAUTH_SIGNING_PUBLIC_KEYS_NEXT=self.next_json, MCP_OAUTH_CLIENTS_JSON="{}",
+            MCP_OAUTH_CODE_TTL_SECONDS=120, MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=300,
+            MCP_OAUTH_REFRESH_TOKENS_ENABLED=False, MCP_OAUTH_REFRESH_TOKEN_IDLE_SECONDS=604800,
+            MCP_OAUTH_REFRESH_FAMILY_MAX_SECONDS=2592000,
+        )
+        router._service.cache_clear()
+        try:
+            with patch.object(router, "get_settings", return_value=settings):
+                kids = [item["kid"] for item in router._service().jwks()["keys"]]
+        finally:
+            router._service.cache_clear()
+        self.assertEqual(kids, ["hub-2026-11", "hub-2026-12"])
+
+
+if __name__ == "__main__":
+    unittest.main()

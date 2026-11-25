@@ -6,7 +6,7 @@ component.
 * `PATCH  /v2/task-manager/tasks/{task_id}` — update a task's details/status.
 * `DELETE /v2/task-manager/tasks` — delete one or more tasks (partial success).
 
-All four accept the View As parameters (`view_as`, `view_as_user`,
+All four accept the View As parameters (`view_as`, `view_as_from`,
 `anonymous`). Component access and edit rights then follow the selected
 pairs (plus content shared directly with the caller, unless `anonymous`); the
 caller's own and assigned tasks stay theirs unless `anonymous`. Writes are
@@ -45,14 +45,14 @@ router = APIRouter(prefix="/v2/task-manager", tags=["Task Manager"])
 
 ANONYMOUS_READ_ONLY_CODE = "VIEW_AS_ANONYMOUS_READ_ONLY"
 
-_VIEW_AS_400 = "View As: a malformed `view_as` pair, an unknown key or user, or too many pairs"
+_VIEW_AS_400 = "View As: a malformed `view_as` pair, an unknown key, or too many pairs"
 _VIEW_AS_403 = (
     "View As refused (the caller may not adopt one or more of the given pairs), or "
     f"`{ANONYMOUS_READ_ONLY_CODE}`: tasks can't be created, edited or deleted with `anonymous=true`"
 )
 
 _VIEW_AS_WRITE_DOC = """
-**View As** (`view_as` pairs, `view_as_user`): edit on the Task Manager and
+**View As** (`view_as` pairs): edit on the Task Manager and
 Admin on All Scopes follow the selected pairs (plus content shared directly
 with the caller) instead of the caller's own assignments; the caller's own
 ownership / assignments still count. The change is recorded and notified as
@@ -120,7 +120,7 @@ def _task_permissions(
 def _view_as_echo(selection: view_as_service.ViewAsSelection | None) -> dict:
     return {
         "view_as": selection is not None,
-        "view_as_user": selection.user_email if selection is not None else None,
+        "view_as_from": selection.view_as_from if selection is not None else None,
     }
 
 
@@ -146,7 +146,7 @@ inherited from an ancestor (role/scope pairs or a share to their email).
 Each task carries `is_owner` / `is_assignee` / `can_manage` / `can_edit_status`
 for the caller.
 
-**View As** (`view_as` pairs, `view_as_user`, `anonymous`): view and edit on
+**View As** (`view_as` pairs, `anonymous`): view and edit on
 the component (and Admin on All Scopes) follow the selected pairs, plus
 content shared directly with the caller unless `anonymous`.
 * Without `anonymous`, the caller's own and assigned tasks are still listed
@@ -176,7 +176,7 @@ def list_tasks(
     except task_manager_service.TaskManagerError as e:
         raise _to_http(e)
     return ListTasksResponse(
-        success=True, view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user, **result
+        success=True, view_as=view_as_access.view_as, view_as_from=view_as_access.view_as_from, **result
     )
 
 
@@ -202,7 +202,7 @@ gets a "You've been assigned …" notification.
 
 `tasks` lists every created task, in assignee order.
 
-**View As** (`view_as` pairs, `view_as_user`): the selected pairs (plus content
+**View As** (`view_as` pairs): the selected pairs (plus content
 shared directly with the caller) must be able to view the component. The task
 is still owned by the caller. Refused with 403 `VIEW_AS_ANONYMOUS_READ_ONLY`
 when `anonymous=true`.
@@ -240,7 +240,7 @@ def create_task(
     except task_manager_service.TaskManagerError as e:
         raise _to_http(e)
     return TaskMutationResponse(
-        success=True, tasks=tasks, view_as=view_as_access.view_as, view_as_user=view_as_access.view_as_user
+        success=True, tasks=tasks, view_as=view_as_access.view_as, view_as_from=view_as_access.view_as_from
     )
 
 

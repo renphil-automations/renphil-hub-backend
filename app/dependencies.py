@@ -248,7 +248,7 @@ def _ensure_hub_user(
     return user
 
 
-async def get_current_hub_user(
+def get_current_hub_user(
     user: UserInfo = Depends(get_current_user),
     db: Session = Depends(get_db_v2),
 ) -> CurrentHubUser:
@@ -256,6 +256,11 @@ async def get_current_hub_user(
 
     Normalizes emails with `.strip().lower()`, the same rule every other
     email comparison in this codebase applies.
+
+    A plain ``def`` on purpose, like every dependency below that queries the
+    database: FastAPI runs it in the threadpool, whereas an ``async def``
+    one would run its blocking SQLAlchemy calls on the event loop and stall
+    every concurrent request.
     """
     email = (user.email or "").strip().lower()
 
@@ -446,7 +451,7 @@ def is_hub_admin(
 #     writes are the half `is_hub_admin` above now genuinely resolves.
 
 
-async def require_hub_admin(
+def require_hub_admin(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> UserInfo:
@@ -486,7 +491,7 @@ async def require_hub_admin(
 # endpoints) ─────────────────────────────────────────────────────────────
 
 
-async def get_viewer_access(
+def get_viewer_access(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> ViewerAccess:
@@ -516,21 +521,20 @@ async def get_viewer_access(
 @dataclass
 class ViewAsAccess:
     """``access`` is what the read endpoint gates content on; ``view_as`` is
-    True when it was built from the View As parameters rather than from the
-    caller's own assignments; ``view_as_user`` echoes the selected user's
-    email, when one was given."""
+    True when it was built from the View As pairs rather than from the
+    caller's own assignments; ``view_as_from`` echoes the client's
+    ``view_as_from`` audit email under View As."""
 
     access: ViewerAccess
     view_as: bool
-    view_as_user: str | None = None
+    view_as_from: str | None = None
 
 
-VIEW_AS_USER_DESCRIPTION = (
-    "View As: email of a user to see the hub as, through their role/scope assignments only "
-    "(content shared directly with them is not included, and their own threads, votes and "
-    "pending edits are not shown as theirs). Combines with `view_as` pairs. The caller's own "
-    "direct shares, threads, votes and pending edits still count unless `anonymous=true`. "
-    "Pick from `GET /v2/view-as/users`."
+VIEW_AS_FROM_DESCRIPTION = (
+    "View As: email of the user whose role/scope assignments the client adopted as the "
+    "`view_as` pairs (picked from `GET /v2/view-as/users`). Audit context only: it is logged "
+    "and echoed, never verified, and it never changes access — that comes from the `view_as` "
+    "pairs alone."
 )
 
 
@@ -538,24 +542,24 @@ def _verify_view_as(
     db: Session,
     current: CurrentHubUser,
     values: list[str],
-    user_email: str | None,
+    view_as_from: str | None,
     *,
     anonymous: bool = False,
 ) -> view_as_service.ViewAsSelection:
-    """Verify already-normalized View As input, with the logging and the
+    """Verify already-normalized View As pairs, with the logging and the
     400/403 body every View As endpoint shares."""
     logger.info(
-        "View As requested by %s: view_as=%r view_as_user=%r anonymous=%s",
+        "View As requested by %s: view_as=%r view_as_from=%r anonymous=%s",
         current.email,
         values,
-        user_email,
+        view_as_from,
         anonymous,
     )
     caller_id = view_as_service.resolve_user_id(db, current.email)
     if caller_id is None:
         caller_id = current.hub_user_id
     try:
-        selection = view_as_service.resolve_view_as_selection(db, caller_id, values, user_email)
+        selection = view_as_service.resolve_view_as_selection(db, caller_id, values, view_as_from=view_as_from)
     except view_as_service.ViewAsPairsError as e:
         logger.warning(
             "View As verification failed for %s (user %s): %s — %s",
@@ -564,22 +568,20 @@ def _verify_view_as(
             e.code,
             "; ".join(f"{f['source']} {f['pair']!r}: {f['code']}" for f in e.failures) or e.message,
         )
-        detail = {"code": e.code, "message": e.message, "pairs": e.failures}
-        if e.user_email is not None:
-            detail["view_as_user"] = e.user_email
-        raise HTTPException(status_code=e.status_code, detail=detail)
+        raise HTTPException(
+            status_code=e.status_code, detail={"code": e.code, "message": e.message, "pairs": e.failures}
+        )
 
     logger.info(
-        "View As verified for %s (user %s): view_as_user=%s; adopting %s",
+        "View As verified for %s (user %s): view_as_from=%r; adopting %s",
         current.email,
         caller_id,
-        f"{selection.user.email!r} (id {selection.user.id})" if selection.user else None,
+        view_as_from,
         ", ".join(
             f"role {t.role_key!r} ({t.role_name!r}, id {t.role_id}) in scope "
             f"{t.scope_key!r} ({t.scope_name!r}, id {t.scope_id})"
             for t in selection.targets
-        )
-        or "no role/scope pairs",
+        ),
     )
     return selection
 
@@ -591,7 +593,7 @@ async def get_view_as_anonymous(
             "When true, nothing of the caller's own is included: no content shared directly with "
             "their email, and on the thread endpoints no own pending/rejected threads, no own "
             "votes (`my_vote` 0; vote counts stay exact) and no own pending edits. Works with or "
-            "without `view_as` pairs and `view_as_user`."
+            "without `view_as` pairs."
         ),
     ),
 ) -> bool:
@@ -600,7 +602,7 @@ async def get_view_as_anonymous(
     return anonymous
 
 
-async def get_view_as_selection(
+def get_view_as_selection(
     view_as: list[str] | None = Query(
         default=None,
         description=(
@@ -609,15 +611,16 @@ async def get_view_as_selection(
             "`?view_as=program_lead:program_a&view_as=program_member:program_b`."
         ),
     ),
-    view_as_user: str | None = Query(default=None, description=VIEW_AS_USER_DESCRIPTION),
+    view_as_from: str | None = Query(default=None, description=VIEW_AS_FROM_DESCRIPTION),
     anonymous: bool = Depends(get_view_as_anonymous),
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> view_as_service.ViewAsSelection | None:
-    """Parse and verify the View As parameters. ``None`` when neither was
-    sent (blank values are ignored); the verified selection when everything
-    passes; 400/403 listing every blocking item otherwise. ``anonymous``
-    combines with both.
+    """Parse and verify the View As pairs. ``None`` when none was sent
+    (blank values are ignored); the verified selection when every pair
+    passes; 400/403 listing every blocking pair otherwise. ``anonymous``
+    combines with them. ``view_as_from`` rides along for audit and never
+    turns View As on by itself.
 
     Runs AFTER ``get_current_hub_user``, so authentication and first-login
     provisioning are never skipped. Endpoints that gate content on the hub
@@ -625,33 +628,33 @@ async def get_view_as_selection(
     adopted pairs (the assignment endpoints) depend on this directly.
     """
     values = view_as_service.normalize_pair_values(view_as)
-    user_email = view_as_service.normalize_email(view_as_user)
-    if not values and user_email is None:
+    from_email = view_as_service.normalize_email(view_as_from)
+    if not values:
+        if from_email is not None:
+            logger.info("view_as_from=%r sent by %s without view_as pairs; ignored", from_email, current.email)
         if anonymous:
             logger.info("Anonymous view requested by %s (own assignments, no direct shares)", current.email)
         return None
 
-    return _verify_view_as(db, current, values, user_email, anonymous=anonymous)
+    return _verify_view_as(db, current, values, from_email, anonymous=anonymous)
 
 
-async def get_view_as_access(
+def get_view_as_access(
     selection: view_as_service.ViewAsSelection | None = Depends(get_view_as_selection),
     anonymous: bool = Depends(get_view_as_anonymous),
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> ViewAsAccess:
     """``get_viewer_access`` for the read endpoints that support View As:
-    exactly ``get_viewer_access`` without View As parameters, the selection's
-    combined access with them (see ``get_view_as_selection``).
+    exactly ``get_viewer_access`` without View As pairs, the pairs' combined
+    access with them (see ``get_view_as_selection``).
 
     Content shared DIRECTLY with a person counts only for the caller, and
-    only without ``anonymous`` — with or without View As pairs or a
-    selected user. A selected user's own direct shares never count: they are
-    seen through their role/scope assignments alone. A Hub Admin keeps full
-    access under ``anonymous`` (direct shares add nothing to it)."""
+    only without ``anonymous`` — with or without View As pairs. A Hub Admin
+    keeps full access under ``anonymous`` (direct shares add nothing to it)."""
     if selection is None:
         if not anonymous:
-            return ViewAsAccess(access=await get_viewer_access(current=current, db=db), view_as=False)
+            return ViewAsAccess(access=get_viewer_access(current=current, db=db), view_as=False)
         closures = RbacClosures(db)
         if is_hub_admin(db, current, closures=closures):
             access = resolve_viewer_access(db, current.hub_user_id, is_admin=True, closures=closures)
@@ -661,13 +664,13 @@ async def get_view_as_access(
 
     direct_grants_user_id = None if anonymous else current.hub_user_id
     access = view_as_service.resolve_view_as_access(db, selection.targets, user_id=direct_grants_user_id)
-    return ViewAsAccess(access=access, view_as=True, view_as_user=selection.user_email)
+    return ViewAsAccess(access=access, view_as=True, view_as_from=selection.view_as_from)
 
 
 # ── Lock propagation (plan_lock_propagation_2026-09-08.md §4.3) ──────────
 
 
-async def get_lock_view(
+def get_lock_view(
     current: CurrentHubUser = Depends(get_current_hub_user),
     db: Session = Depends(get_db_v2),
 ) -> edit_lock_service.LockView:

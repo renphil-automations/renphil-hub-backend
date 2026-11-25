@@ -65,7 +65,7 @@ from app.db_v2.models.user import UserV2  # noqa: E402
 from app.db_v2.models.role import RoleV2  # noqa: E402
 from app.db_v2.models.role_assignment import RoleAssignmentV2  # noqa: E402
 from app.db_v2.models.scope import ScopeV2  # noqa: E402
-from app.dependencies import HUB_ADMIN_ROLE_KEY  # noqa: E402
+from app.dependencies import HUB_ADMIN_ROLE_KEY, get_auth_service  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.services.airtable_service import AirtableService  # noqa: E402
 from app.services.auth_service import AuthService  # noqa: E402
@@ -109,6 +109,13 @@ class DevLoginFixture(unittest.TestCase):
                 db.close()
 
         app.dependency_overrides[get_db_v2] = _override_db
+        # dev-login only redirects to an allowed origin's /auth/callback (the
+        # same rule as /auth/login); allow the two frontend dev servers these
+        # tests use, whatever ALLOWED_ORIGINS the runner happens to set.
+        settings = get_settings().model_copy(
+            update={"ALLOWED_ORIGINS": ["http://localhost:5000", "http://localhost:5173"]}
+        )
+        app.dependency_overrides[get_auth_service] = lambda: AuthService(settings)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def tearDown(self) -> None:
@@ -226,6 +233,40 @@ class TestDevLoginRedirectShape(DevLoginFixture):
         self.assertEqual(f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
                           "http://localhost:5173/auth/callback")
 
+    def test_redirect_to_an_unapproved_location_is_refused_and_mints_nothing(self):
+        os.environ["DEBUG"] = "True"
+        for redirect_uri in (
+            "https://attacker.example/auth/callback",
+            "http://localhost:5173/elsewhere",
+            "http://localhost:5173/auth/callback?next=/x",
+        ):
+            resp = self._get(email="persona@example.com", redirect_uri=redirect_uri)
+            self.assertEqual(resp.status_code, 400, redirect_uri)
+            self.assertNotIn("location", resp.headers)
+            self.assertNotIn("access_token", resp.text)
+        self.assertEqual(self.db.query(UserV2).count(), 0)
+
+    def test_mcp_continuation_redirect_is_refused_and_mints_nothing(self):
+        # N-1: the login allow-list accepts <issuer>/continue/<id>, but
+        # dev-login must never put a session token on that Hub URL.
+        os.environ["DEBUG"] = "True"
+        issuer = "http://localhost:8000/mcp/oauth"
+        settings = get_settings().model_copy(
+            update={
+                "ALLOWED_ORIGINS": ["http://localhost:5000"],
+                "MCP_OAUTH_ISSUER": issuer,
+            }
+        )
+        app = self.client.app
+        app.dependency_overrides[get_settings] = lambda: settings
+        app.dependency_overrides[get_auth_service] = lambda: AuthService(settings)
+        redirect_uri = f"{issuer}/continue/abc123"
+        self.assertTrue(AuthService(settings).is_allowed_login_redirect_uri(redirect_uri))
+        resp = self._get(email="persona@example.com", redirect_uri=redirect_uri)
+        self.assertEqual(resp.status_code, 400)
+        self.assertNotIn("location", resp.headers)
+        self.assertNotIn("access_token", resp.text)
+        self.assertEqual(self.db.query(UserV2).count(), 0)
 
 class TestDevLoginProvisionsHubUserSynchronously(DevLoginFixture):
     """Item 6: the whole point of extracting `_ensure_hub_user` — the row

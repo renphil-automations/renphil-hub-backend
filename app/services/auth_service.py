@@ -15,10 +15,15 @@ import base64
 import hashlib
 import logging
 import secrets
+import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Callable, Literal
+from urllib.parse import SplitResult, urlsplit
 
 import jwt
+from fastapi.concurrency import run_in_threadpool
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from sqlalchemy.orm import Session
@@ -31,9 +36,72 @@ from app.services.user_db_service import find_user_by_email
 
 logger = logging.getLogger(__name__)
 
-# In-memory PKCE store: state → (code_verifier, frontend_redirect_uri)
-# Fine for single-process / dev; replace with Redis/cache in production.
-_pkce_store: dict[str, tuple[str, str]] = {}
+PKCE_STATE_TTL_SECONDS = 600
+PKCE_STATE_MAX_ENTRIES = 10_000
+
+
+class _PkceStateStore:
+    """In-memory, per-process login state: state → (code_verifier, redirect_uri).
+
+    Entries expire ``ttl_seconds`` after they are written (abandoned logins
+    must not live forever), expired entries are purged whenever the store is
+    touched, and at ``max_entries`` the oldest entry is evicted so the store
+    cannot grow without bound. ``pop`` keeps the single-use semantics: a
+    state is returned at most once.
+
+    Still per process: a login that starts on one instance and calls back to
+    another fails, as before. A shared store (e.g. Redis) is an
+    infrastructure decision, deliberately not made here.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = PKCE_STATE_TTL_SECONDS,
+        max_entries: int = PKCE_STATE_MAX_ENTRIES,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._max = max_entries
+        self._clock = clock
+        # Insertion order == age order (a rewrite moves the key to the end).
+        self._entries: OrderedDict[str, tuple[float, tuple[str, str]]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _purge_expired(self, now: float) -> None:
+        while self._entries:
+            oldest = next(iter(self._entries))
+            if self._entries[oldest][0] > now:
+                break
+            del self._entries[oldest]
+
+    def __setitem__(self, state: str, value: tuple[str, str]) -> None:
+        with self._lock:
+            now = self._clock()
+            self._purge_expired(now)
+            self._entries.pop(state, None)
+            while len(self._entries) >= self._max:
+                self._entries.popitem(last=False)
+            self._entries[state] = (now + self._ttl, value)
+
+    def pop(self, state: str, default: tuple[str, str] | None = None) -> tuple[str, str] | None:
+        with self._lock:
+            self._purge_expired(self._clock())
+            entry = self._entries.pop(state, None)
+        return default if entry is None else entry[1]
+
+    def __contains__(self, state: object) -> bool:
+        with self._lock:
+            self._purge_expired(self._clock())
+            return state in self._entries
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired(self._clock())
+            return len(self._entries)
+
+
+_pkce_store = _PkceStateStore()
 
 # Which rule in `_enforce_login_allowed` let an email through.
 LoginAdmission = Literal["domain", "users"]
@@ -50,11 +118,85 @@ def _derive_code_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+def _mcp_continuation_request_id(candidate: SplitResult, issuer: str | None) -> str | None:
+    """Return what follows ``<issuer>/continue/`` in ``candidate``'s path.
+
+    ``None`` when no issuer is configured, the scheme/host differ from the
+    issuer's (compared case-insensitively), or the path is not under the
+    issuer's ``/continue/`` prefix. The one place this match is defined, so
+    the login redirect check and the callback guard cannot drift apart.
+    """
+    issuer = (issuer or "").rstrip("/")
+    if not issuer:
+        return None
+    issuer_parts = urlsplit(issuer)
+    candidate_origin = f"{candidate.scheme.lower()}://{candidate.netloc.lower()}"
+    if candidate_origin != f"{issuer_parts.scheme.lower()}://{issuer_parts.netloc.lower()}":
+        return None
+    prefix = f"{issuer_parts.path.rstrip('/')}/continue/"
+    if not candidate.path.startswith(prefix):
+        return None
+    return candidate.path.removeprefix(prefix)
+
+
+def is_mcp_continuation_uri(redirect_uri: str, issuer: str | None) -> bool:
+    """True when ``redirect_uri`` points at the MCP OAuth continuation prefix.
+
+    Deliberately broader than ``is_allowed_login_redirect_uri``: any query,
+    fragment or request id (even an empty or malformed one) still counts, so
+    the callback can refuse to append the Hub session token to such a URI
+    when the MCP flow did not consume it.
+    """
+    try:
+        candidate = urlsplit(redirect_uri)
+    except (TypeError, ValueError):
+        return False
+    return _mcp_continuation_request_id(candidate, issuer) is not None
+
+
 class AuthService:
     """Handles every step of the Google OAuth & JWT flow."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+
+    def is_allowed_login_redirect_uri(self, redirect_uri: str) -> bool:
+        """Accept only a Hub frontend callback or an internal MCP continuation.
+
+        ``/auth/callback`` later adds the Hub session token to this location,
+        so accepting arbitrary schemes, origins, paths, queries, or fragments
+        would turn the normal Google login into an open redirect/token leak.
+        """
+        try:
+            candidate = urlsplit(redirect_uri)
+        except (TypeError, ValueError):
+            return False
+        if (
+            candidate.scheme.lower() not in {"http", "https"}
+            or not candidate.netloc
+            or candidate.username is not None
+            or candidate.password is not None
+            or candidate.query
+            or candidate.fragment
+        ):
+            return False
+
+        candidate_origin = f"{candidate.scheme.lower()}://{candidate.netloc.lower()}"
+        for origin in self._settings.ALLOWED_ORIGINS:
+            parsed_origin = urlsplit(origin)
+            if (
+                parsed_origin.scheme.lower() in {"http", "https"}
+                and parsed_origin.netloc
+                and not parsed_origin.query
+                and not parsed_origin.fragment
+                and parsed_origin.path in {"", "/"}
+                and candidate_origin == f"{parsed_origin.scheme.lower()}://{parsed_origin.netloc.lower()}"
+                and candidate.path == "/auth/callback"
+            ):
+                return True
+
+        request_id = _mcp_continuation_request_id(candidate, self._settings.MCP_OAUTH_ISSUER)
+        return bool(request_id) and "/" not in request_id
 
     # ── Step 1: authorization URL ──────────────────────────────────────
     def get_authorization_url(self, redirect_uri: str) -> str:
@@ -110,8 +252,11 @@ class AuthService:
 
         flow = build_oauth_flow(self._settings)
 
+        # Both Google calls below are blocking HTTP requests (the token
+        # exchange, and the certificate fetch behind id_token verification);
+        # run them in the threadpool so a slow Google never stalls the loop.
         try:
-            flow.fetch_token(code=code, code_verifier=code_verifier)
+            await run_in_threadpool(flow.fetch_token, code=code, code_verifier=code_verifier)
         except Exception as exc:
             logger.error("Token exchange failed: %s", exc)
             raise GoogleOAuthError("Failed to exchange authorization code.") from exc
@@ -120,7 +265,8 @@ class AuthService:
 
         # Verify the Google-issued id_token
         try:
-            id_info = google_id_token.verify_oauth2_token(
+            id_info = await run_in_threadpool(
+                google_id_token.verify_oauth2_token,
                 credentials.id_token,
                 google_requests.Request(),
                 self._settings.GOOGLE_CLIENT_ID,
