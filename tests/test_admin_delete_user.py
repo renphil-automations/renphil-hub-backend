@@ -64,7 +64,9 @@ from app.db_v2.models.scope import ScopeV2  # noqa: E402
 from app.db_v2.models.thread import ThreadCommentV2, ThreadV2, ThreadVoteV2  # noqa: E402
 from app.db_v2.models.user import UserV2  # noqa: E402
 from app.dependencies import HubUserRemoved, _ensure_hub_user, get_auth_service  # noqa: E402
+from app.config import get_settings  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.services.auth_service import AuthService  # noqa: E402
 from app.models.airtable import UserUpdate  # noqa: E402
 from app.models.auth import TokenResponse, UserInfo  # noqa: E402
 from app.routers import agent_access as agent_access_router  # noqa: E402
@@ -270,6 +272,10 @@ class AdminDeleteUserFixture(unittest.TestCase):
 
     def dev_login(self, email: str):
         os.environ["DEBUG"] = "True"
+        # dev-login only redirects to an allowed origin's /auth/callback;
+        # allow its default (localhost:5000) whatever ALLOWED_ORIGINS is here.
+        settings = get_settings().model_copy(update={"ALLOWED_ORIGINS": ["http://localhost:5000"]})
+        self.app.dependency_overrides[get_auth_service] = lambda: AuthService(settings)
         try:
             return self.client.get("/auth/dev-login", params={"email": email}, follow_redirects=False)
         finally:
